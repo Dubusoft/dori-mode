@@ -233,12 +233,14 @@ const USAGE = `dori <command> [options]
                                        (--to/--thread override it, as for send) and, once the post returns a message id, record the receipt;
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin;
                                        supervise closes the thread itself once its work is finished and reported (--final is ignored)
-  reported <key> --append TEXT [--note TEXT]
+  reported <key> --append TEXT [--note TEXT] [--no-redirect]
                                        a follow-up after the report (merge result, Toodo done): appended to the lane's last report
                                        by editing it (else its status message), no new post (REPORT_APPENDED)
                                        a report, append or send into a thread the owner closed goes to its parent channel instead
                                        (the owner channel when the parent is unknown),
-                                       as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed
+                                       as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed;
+                                       --append --no-redirect (fact lines: merge, Toodo done) posts nothing anywhere for a closed
+                                       thread and keeps the text in the receipt (REPORT_NOT_REDIRECTED)
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
                                        WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin;
                                        inbox take marks such lines [resolve]; a known event that opens none prints

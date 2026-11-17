@@ -72,17 +72,18 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
       const options = ["text", "append", "to", "thread", "note"];
       const final = flags.values.final === true;
       const append = opt("append");
-      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name) && name !== "final") || options.some((name) => name in flags.values && !opt(name))
-        || !opt("text") === (append === undefined) || (append !== undefined && (final || "to" in flags.values || "thread" in flags.values))) {
-        die("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT] | dori reported <key> --append TEXT [--note TEXT]");
+      const noRedirect = flags.values["no-redirect"] === true;
+      if (!key || flags.positionals.length > 1 || Object.keys(flags.values).some((name) => !options.includes(name) && name !== "final" && name !== "no-redirect") || options.some((name) => name in flags.values && !opt(name))
+        || !opt("text") === (append === undefined) || (append !== undefined && (final || "to" in flags.values || "thread" in flags.values)) || (noRedirect && append === undefined)) {
+        die("usage: dori reported <key> --text TEXT [--to TARGET] [--thread ID] [--note TEXT] | dori reported <key> --append TEXT [--note TEXT] [--no-redirect]");
       }
       const found = (await deps.registry.read(key ?? "")) ?? die(`no registered lane "${key}"`);
       const followUps = await import("./thread-followup.ts");
       const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
       const owner = config.discordChannels[0];
       const note = opt("note");
-      const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }): void => {
-        recordReported(config.stateDir, found.key, realClock.now(), note ? oneLine(note) : undefined, posted);
+      const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }, kept = note): void => {
+        recordReported(config.stateDir, found.key, realClock.now(), kept ? oneLine(kept) : undefined, posted);
       };
       const redirect = async (thread: string, text: string, parent: string | undefined): Promise<void> => {
         const { message, target } = await redirectClosedThread(
@@ -98,6 +99,13 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
         const last = followUps.readLastReports(config.stateDir)[found.key] ?? status
           ?? die(`REPORT_APPEND_NO_MESSAGE ${found.key}: this lane has no report or status message to append to; post the report with --text`);
         const closed = await followUps.closedByOwner(config.stateDir, discord, last.channel);
+        // --no-redirect (a fact line such as a merge or a finished Toodo task): a closed thread gets nothing anywhere; the
+        // text stays in the receipt (its note, unless --note names one).
+        if (closed && noRedirect) {
+          receipt({ message: last.message, target: `discord:${last.channel}`, followUp: true }, note ?? append);
+          console.log(`REPORT_NOT_REDIRECTED ${found.key} ${last.message}: thread ${last.channel} was closed by the owner and --no-redirect is set, so nothing was posted; the text is kept in the receipt`);
+          break;
+        }
         if (closed) { await redirect(last.channel, append, closed.parent); break; }
         const archived = await discord.threadArchived(last.channel).catch(() => false);
         if (!(await followUps.appendToMessage(discord, last.channel, last.message, append, archived))) {

@@ -7,7 +7,7 @@ import { claimDone, closeLane, finishClosedTask, type FlowDeps, watchTick } from
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
-import { taskBlocker, taskFinisher } from "../src/task-finish.ts";
+import { mergeFactLine, taskBlocker, taskFinisher } from "../src/task-finish.ts";
 import { appendFollowUp, type FollowUpDiscord, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { ToodoWriter } from "../src/toodo-client.ts";
 import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } from "./fakes.ts";
@@ -104,7 +104,7 @@ const closeMerged = async (subject: Lane, task: Task, discord: FollowUpDiscord, 
   await at(T0).registry.patch(subject.key, (current) => current.claim ? { claim: { ...current.claim, pulls: [{ repo: "acme/app", number: 1, sha: "a".repeat(40) }] } } : undefined);
   await watchTick(at(T0));
   const writer = new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") });
-  const finishTask = taskFinisher({ writer, append: (l, text) => appendFollowUp(state.dir, discord, l, text) });
+  const finishTask = taskFinisher({ writer, append: (l, text) => appendFollowUp(state.dir, discord, l, text), language: () => "Korean" });
   const base = at(T0 + 5 * MIN + 1);
   return { lines: await watchTick({ ...base, ...(run ? { run: run(base.run) } : {}), finishTask, blockTask: taskBlocker(writer) }), calls: toodo.calls };
 };
@@ -125,18 +125,44 @@ test("a task-linked lane closing after its merge has its task completed and read
   const complete = calls.find((c) => c.name === "complete_task");
   expect(String(complete?.args.note)).toContain(`${PR} merged into its base as ${SHA}`);
   expect(calls.at(-1)?.name).toBe("get_task");
-  expect(fake.edits).toEqual([["900", "m1", `report\n머지 확인: ${PR} (abc1234) · Toodo #951 완료`]]);
+  expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234) · Toodo #951 완료"]]);
   expect(fake.sends).toEqual([]);
 });
 
-test("a lane with no Toodo task closes as before, as digest after a seen claim; toodo is never called", async () => {
+test("a merged lane with no Toodo task gets the merge fact line appended, closes as digest after a seen claim, and toodo is never called", async () => {
   const { task: _none, ...untasked } = lane;
   const fake = fakeDiscord();
   const { lines, calls } = await closeMerged(untasked, inProgress([manual(1)]), fake.discord);
   expect(lines[0]).toBe(`LANE_CLOSED demo-lane closed seen-claim toodo=no-task ${PR}`);
   expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
+  expect(lines[1]).toBe(`MERGE_FACT demo-lane ${PR} merge=${SHA}; report appended (m1)`);
+  expect(eventClass(lines[1] ?? "")).toBe("lead-digest");
   expect(calls).toEqual([]);
+  expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
+  expect(fake.sends).toEqual([]);
+});
+
+test("a merged lane with no Toodo task whose thread is closed gets no edit and no line in its parent channel", async () => {
+  recordOwnerClosed(state.dir, "900", T0);
+  const { task: _none, ...untasked } = lane;
+  const fake = fakeDiscord(["900"]);
+  const { lines } = await closeMerged(untasked, inProgress([]), fake.discord);
+  expect(lines[1]).toBe(`MERGE_FACT demo-lane ${PR} merge=${SHA}; report not appended: thread 900 is closed`);
   expect(fake.edits).toEqual([]);
+  expect(fake.sends).toEqual([]);
+});
+
+test("the merge fact line follows the owner's language, English when it is unset or unknown", () => {
+  const merges = [
+    { repo: "acme/app", number: 1, url: PR, base: "dev", sha: SHA },
+    { repo: "acme/web", number: 22, url: "https://github.com/acme/web/pull/22", base: "dev", sha: "fedcba9876" },
+  ];
+  expect(mergeFactLine(merges, 951, "Korean")).toBe("머지 acme/app#1 (abc1234), acme/web#22 (fedcba9) · Toodo #951 완료");
+  expect(mergeFactLine(merges.slice(0, 1), undefined, "ko-KR")).toBe("머지 acme/app#1 (abc1234)");
+  expect(mergeFactLine(merges.slice(0, 1), 951, "Japanese")).toBe("マージ acme/app#1 (abc1234) · Toodo #951 完了");
+  expect(mergeFactLine(merges.slice(0, 1), 951, "Simplified Chinese")).toBe("已合并 acme/app#1 (abc1234) · Toodo #951 已完成");
+  expect(mergeFactLine(merges.slice(0, 1), 951, undefined)).toBe("Merged acme/app#1 (abc1234) · Toodo #951 done");
+  expect(mergeFactLine(merges.slice(0, 1), undefined, "Klingon")).toBe("Merged acme/app#1 (abc1234)");
 });
 
 test("a task toodo refuses to complete wakes the lead with the reason, and nothing is appended", async () => {
