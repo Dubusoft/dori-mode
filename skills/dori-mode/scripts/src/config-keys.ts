@@ -43,6 +43,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("ignorePanes", "list", "herdr panes the sweeps ignore"),
   spec("autopilot", "json", "Autopilot (always on; dori autopilot pause stops it): tickSec, quota threshold, merge base, executor (default false)"),
   spec("review", "json", "PR review gate: { repos: [\"owner/repo\", ...] } (case-insensitive); unlisted or empty: lane PRs merge without review"),
+  spec("memoryLimits", "json", "Lead memory limits: humanMaxKb (15), systemMaxTokens (omo's advisory, 30000), triggerPct (80: past it the lead is woken at once)"),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */

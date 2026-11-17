@@ -127,7 +127,7 @@ test("only user and environment keys are read: unknown, removed and malformed tu
   expect(code).toBe(0);
   expect(JSON.parse(out)).toEqual({
     same: ["drift", "guard", "heavyKill"],
-    model: "m/lane", base: "release", memoryCheck: { repo: "", maxKb: 15 }, hooks: { threadReply: ["reply", "{text}"] },
+    model: "m/lane", base: "release", memoryCheck: { repo: "" }, hooks: { threadReply: ["reply", "{text}"] },
     sandbox: { command: ["lane-sandbox"] }, runners: false, future: false,
     tunables: [], diskGuard: false,
   });
@@ -143,8 +143,19 @@ test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ci
   }));
   const c = await loadConfig(path, "/home/ana");
   expect(c.memoryCheck.repo).toBe("");
-  expect(c.memoryCheck.maxKb).toBe(15);
+  expect(c.memoryLimits.humanMaxKb).toBe(15);
   expect(c.ciMergeBase).toBe("dev");
+});
+
+test("memoryLimits sets the memory limits key by key; a malformed value is refused", async () => {
+  const path = join(state.dir, "memory-limits.json");
+  expect((await loadConfig(path, "/home/ana")).memoryLimits).toEqual({ humanMaxKb: 15, systemMaxTokens: 30_000, triggerPct: 80 });
+  await Bun.write(path, JSON.stringify({ memoryLimits: { systemMaxTokens: 50_000, triggerPct: 90 } }));
+  expect((await loadConfig(path, "/home/ana")).memoryLimits).toEqual({ humanMaxKb: 15, systemMaxTokens: 50_000, triggerPct: 90 });
+  for (const bad of [{ triggerPct: 101 }, { humanMaxKb: 0 }, { systemMaxTokens: "30000" }, { maxKb: 9 }, 7]) {
+    await Bun.write(path, JSON.stringify({ memoryLimits: bad }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("memoryLimits must be");
+  }
 });
 
 test("hook templates fill each argument separately, so text with spaces or quotes stays one argument", () => {
