@@ -238,7 +238,9 @@ const USAGE = `dori <command> [options]
                                        (the owner channel when the parent is unknown),
                                        as one line linking the thread (REPORT_REDIRECTED / SENT_REDIRECTED); the thread stays closed
   resolved <eventId> [...] [--note TEXT] the lead's receipt that it decided a decision event (a lane question or blocked report, LANE_NOT_DONE,
-                                       WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin
+                                       WAIT_*, DEAD_PANE; config resolveKinds); without it urgent UNRESOLVED <eventId> after resolveTimeoutMin;
+                                       inbox take marks such lines [resolve]; a known event that opens none prints
+                                       RESOLVED_NOT_NEEDED and records nothing
   decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT
                 [--task N] [--lane KEY | --relay-to KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]
                                        lead-only: ask the owner one question with 2-9 numbered options, a recommendation and its
@@ -1055,8 +1057,8 @@ try {
         // What the last cold start carried over, finished lanes still owed to the owner and open decisions are listed every
         // time, before the INBOX_MORE / INBOX_EMPTY sentinel.
         const { takeReminders } = await import("./lane-outcomes.ts");
-        const { takeDecisionReminders } = await import("./decision-obligations.ts");
-        const lines = takeOutput(result);
+        const { opensObligation, takeDecisionReminders } = await import("./decision-obligations.ts");
+        const lines = takeOutput(result, (line) => opensObligation(line, deps.tunables));
         const sentinel = /^INBOX_(MORE|EMPTY)\b/.test(lines.at(-1) ?? "") ? lines.splice(-1) : [];
         const reminders = [...takeCarriedReminders(config.stateDir, new Set(result.events.map((event) => event.id))), ...takeReminders(config.stateDir), ...takeDecisionReminders(config.stateDir)];
         // Owner chat mixed with lane outcomes: one checklist line first, so answering the chat cannot hide the report owed.
@@ -1079,8 +1081,10 @@ try {
       break;
     case "resolved": {
       // `dori resolved <eventId> [...] [--note T]`: the lead has decided these decision events (decision-obligations.ts). An
-      // id with no open obligation is still recorded (its event may not have arrived yet) and named as unmatched.
-      const { publishedDecisions, recordResolved, validEventId } = await import("./decision-obligations.ts");
+      // id with no open obligation is still recorded (its event may not have arrived yet) and named as unmatched, unless the
+      // store knows its event as one that opens none (or pruned it, which an open one never is): then nothing is recorded.
+      const { opensObligation, publishedDecisions, recordResolved, validEventId } = await import("./decision-obligations.ts");
+      const { loadTrace } = await import("./event-trace.ts");
       const ids = flags.positionals;
       if (!ids.length || !ids.every(validEventId) || Object.keys(flags.values).some((name) => name !== "note") || ("note" in flags.values && !opt("note"))) {
         die("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT]");
@@ -1088,8 +1092,19 @@ try {
       const open = new Set(publishedDecisions(config.stateDir).map((item) => item.id));
       const note = opt("note");
       const at = realClock.now();
-      for (const id of ids) recordResolved(config.stateDir, id, at, note ? oneLine(note) : undefined);
-      for (const id of ids) console.log(open.has(id) ? `RESOLVED_RECORDED ${id}` : `RESOLVED_UNMATCHED ${id}: no open decision has this id; recorded anyway`);
+      for (const id of new Set(ids)) {
+        const known = open.has(id) ? undefined : loadTrace(config.stateDir, id);
+        if (known?.event && !opensObligation(known.event.line, deps.tunables)) {
+          console.log(`RESOLVED_NOT_NEEDED ${id}: this event opens no decision; nothing recorded`);
+          continue;
+        }
+        if (known && !known.event && known.tombstoned) {
+          console.log(`RESOLVED_NOT_NEEDED ${id}: this event was pruned and has no open decision; nothing recorded`);
+          continue;
+        }
+        recordResolved(config.stateDir, id, at, note ? oneLine(note) : undefined);
+        console.log(open.has(id) || known?.event ? `RESOLVED_RECORDED ${id}` : `RESOLVED_UNMATCHED ${id}: no open decision has this id; recorded anyway`);
+      }
       break;
     }
     case "decision": {

@@ -216,11 +216,12 @@ const metaHeader = (meta: TakenEvent["meta"]): string =>
 /**
  * The CLI's output for a take: one `id<TAB>line` per event, then INBOX_MORE, or INBOX_EMPTY when there was nothing.
  * When any event carries meta, the events are grouped under `## lane <lane>  thread <thread>  cwd <cwd>` headers in
- * first-seen order (absent parts omitted), and the events without meta follow under `## other`.
+ * first-seen order (absent parts omitted), and the events without meta follow under `## other`. An event `resolves`
+ * accepts (one that opens a decision obligation) reads `id<TAB>[resolve] line`.
  */
-export const takeOutput = (result: Take): string[] => {
+export const takeOutput = (result: Take, resolves: (line: string) => boolean = () => false): string[] => {
   if (!result.events.length) return ["INBOX_EMPTY"];
-  const text = (event: TakenEvent): string => `${event.id}\t${event.line}`;
+  const text = (event: TakenEvent): string => `${event.id}\t${resolves(event.line) ? "[resolve] " : ""}${event.line}`;
   // Owner chat leads, whatever lane groups follow: it never hides behind lane output (log order kept within each part).
   const ownerEvents: TakenEvent[] = [];
   const rest: TakenEvent[] = [];
