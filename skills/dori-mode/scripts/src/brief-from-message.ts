@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+import { type AckReactions, handled, handledLines } from "./ack.ts";
 import { completeLines, EVENT_LOG, parseLogLine } from "./inbox.ts";
 import { EDIT_NOTE, splitChannelName } from "./messenger/discord-inbound.ts";
 
@@ -101,6 +102,31 @@ export const generatedBriefPath = (stateDir: string, key: string): string => {
   const path = join(stateDir, "briefs", `${key}.md`);
   if (path.includes("?")) throw new BriefFromMessageError(`the generated brief path ${path} contains '?'; move the state directory or pass --brief FILE`);
   return path;
+};
+
+/**
+ * After a launch from owner messages, each distinct message is recorded handled by the new lane, as `dori handled
+ * <channel> <messageId> --lane <key>` would (acking it first when it was never acked). A failed link never fails the
+ * launch: it becomes a LAUNCH_HANDLED_FAILED line naming the command that records it.
+ */
+export const linkLaunchMessages = async (
+  stateDir: string, key: string, refs: readonly MessageRef[], discord: () => AckReactions, now: number,
+): Promise<{ readonly out: string[]; readonly err: string[] }> => {
+  const out: string[] = [];
+  const err: string[] = [];
+  const seen = new Set<string>();
+  for (const { channel, message } of refs) {
+    if (seen.has(`${channel}/${message}`)) continue;
+    seen.add(`${channel}/${message}`);
+    try {
+      const lines = handledLines(channel, message, await handled(stateDir, discord, channel, message, now, { lanes: [key] }));
+      out.push(...lines.out);
+      err.push(...lines.err);
+    } catch (e) {
+      err.push(`LAUNCH_HANDLED_FAILED ${channel} ${message}: ${e instanceof Error ? e.message : String(e)}; run dori handled ${channel} ${message} --lane ${key}`);
+    }
+  }
+  return { out, err };
 };
 
 /** Writes the assembled brief to `path` (creating stateDir/briefs). */

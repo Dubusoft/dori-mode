@@ -168,6 +168,19 @@ export const handled = async (
   return outcome;
 };
 
+/** What `dori handled` prints for `outcome`: `out` goes to stdout, `err` to stderr. */
+export const handledLines = (
+  channel: string, message: string, outcome: HandledOutcome, awaiting = false,
+): { readonly out: string[]; readonly err: string[] } => ({
+  out: [
+    ...(outcome.autoAck === "acked" ? [`HANDLED_AUTO_ACKED ${channel} ${message}: no dori ack before dori handled, so it was acked now; run dori ack first next time`] : []),
+    awaiting ? `HANDLED_AWAITING ${channel} ${message}` : `HANDLED_LINKED ${channel} ${message}`,
+  ],
+  err: outcome.autoAck === "failed"
+    ? [`HANDLED_AUTO_ACK_FAILED ${channel} ${message}: no dori ack before dori handled and acking it now failed (${outcome.error}); handled is recorded anyway`]
+    : [],
+});
+
 /**
  * The coverage the supervisor tracks for owner message `id` (`entry` absent when untracked) and its ack time; undefined
  * when the store cannot be read.

@@ -17,7 +17,7 @@ import { guardTick } from "./host-guard.ts";
 import { listGuardMachines } from "./remote-guard.ts";
 import { adoptLane, attachLaneFiles, type LaunchInput, launchNextLine, LaunchError, parseLaneTask, validateLaunch } from "./launch.ts";
 import { admitLaunch, placeLaunch, placementReports } from "./launch-service.ts";
-import { assembleBrief, generatedBriefPath, launchBriefArgs, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
+import { assembleBrief, generatedBriefPath, launchBriefArgs, linkLaunchMessages, ownerMessageText, writeGeneratedBrief } from "./brief-from-message.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { LANE_MODES, type LaneMode, Registry, statusOf } from "./registry.ts";
 import { Repos, ReposError } from "./repos.ts";
@@ -105,7 +105,9 @@ const USAGE = `dori <command> [options]
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
   launch <key> --title T (--brief FILE | --from-message CHANNEL MESSAGE_ID ... [--note TEXT ...]) --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
                 [--from-message CHANNEL MESSAGE_ID]   repeatable, instead of --brief: the brief is "# <title>", "## Owner request" with those owner messages (latest edit) in order,
-                                       then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1
+                                       then "## Lead notes" with each --note as a bullet; written to <stateDir>/briefs/<key>.md; a deleted, visitor or unknown message exits 1;
+                                       once launched, each message is recorded as dori handled <channel> <messageId> --lane <key> (HANDLED_LINKED)
+                [--no-handled]   with --from-message: link no message (a question-only message you park with dori handled --awaiting)
                 [--mode ulw|mass-ulw]   ulw (default): clear, contained work; mass-ulw: wide changes or vague instructions that need investigation
                 [--task ID]   the Toodo task the lane works on (a positive integer, not looked up), recorded on the lane and shown by status;
                                        an autopilot lane gets its reservation's task without it
@@ -381,7 +383,7 @@ const flags = parseArgs({
     port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
     cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
     dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" }, result: { type: "string" },
-    "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" },
+    "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" }, "no-handled": { type: "boolean" },
   },
 });
 const opt = (name: string): string | undefined => {
@@ -724,6 +726,7 @@ try {
       const fromMessage = fromArgs.refs.length > 0;
       if (fromMessage === (flags.values.brief !== undefined)) die("launch needs exactly one of --brief FILE or --from-message <channel> <messageId> (repeatable)");
       if (!fromMessage && fromArgs.notes.length) die("--note goes with --from-message; with --brief put lead notes in the brief file");
+      if (!fromMessage && flags.values["no-handled"]) die("--no-handled goes with --from-message; a --brief launch links no owner message");
       const taskArg = opt("task");
       const flagTask = taskArg === undefined ? undefined : (parseLaneTask(taskArg) ?? die(`--task must be a positive integer (a Toodo task id), got ${JSON.stringify(taskArg)}`));
       // An autopilot lane carries its reservation's task id; a --task naming another task is refused.
@@ -760,6 +763,14 @@ try {
       console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
       console.log(r.startup);
       const next = launchNextLine(r.lane.key, r.startup); if (next) console.log(next);
+      // The lane is registered whatever its startup check said, so it covers the owner messages it was launched from.
+      if (fromMessage && !flags.values["no-handled"]) {
+        const discord = (): Discord => new Discord(fetchHttp, realClock, resolveCredential("DORI_DISCORD_TOKEN") ??
+          (() => { throw new AckError(`DORI_DISCORD_TOKEN is not set in the environment or in ${envFilePath()}`); })());
+        const linked = await linkLaunchMessages(config.stateDir, r.lane.key, fromArgs.refs, discord, realClock.now());
+        for (const line of linked.out) console.log(line);
+        for (const line of linked.err) console.error(line);
+      }
       process.exit(r.startup.startsWith("STARTUP_OK") ? 0 : 3);
     }
     case "autopilot": {
