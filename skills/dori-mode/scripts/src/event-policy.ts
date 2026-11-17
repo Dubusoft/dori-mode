@@ -155,7 +155,7 @@ const DIGEST_KINDS = [
 const ENGINE_KINDS = [
   "GH_PR * opened", "GH_PR * updated", "GH_PR * checks_green", "GH_PR * merged", "MERGE_VERIFIED",
   "RUNNER_STALE", "RUNNER_UNREACHABLE", "RUNNER_UNAVAILABLE", "RUNNER_OFFLINE",
-  "NUDGED", "THREAD_CLOSED_BY_OWNER",
+  "NUDGED", "THREAD_CLOSED_BY_OWNER", "GOAL_RESUMED",
   "TOODO_TASK_STATUS * new->planned", "TOODO_TASK_STATUS * planned->in_progress",
   "LANE_FINISH_NOTICE",
   // A met wait registered with --on-success silent (waits.ts).

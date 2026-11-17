@@ -29,6 +29,7 @@ import { Database } from "bun:sqlite";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
 import { newPendingCleanup } from "./closed-cleanup.ts";
+import { resumeAnsweredGoals } from "./decision-resume.ts";
 import { freshnessTick, scrubForThread } from "./freshness.ts";
 import { quotaReport } from "./claude-quota.ts";
 import { sharedQuotaLookup } from "./quota-cache.ts";
@@ -341,6 +342,8 @@ export const supervisorSweeps = (
     ["dead-panes", async () => deadPaneTick(deps.ops, deps.config, seen, new Date(deps.clock.now()).toISOString().slice(0, 13), dead, await deps.registry.open(), view, deps.clock.now, admitted)],
     // Recovery notices are journaled with stable ids before recover saves the flags that suppress them.
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
+    // A lane that parked its goal on its own blocking ask gets it resumed once the answer reached it and its turn ended.
+    ["decision-resume", async () => resumeAnsweredGoals(deps, view, admitted)],
     ["freshness", async () => (await freshnessTick(deps, view, laneReports(), admitted)).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
     // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
     ["drift", async (emit) => {
