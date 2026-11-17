@@ -425,20 +425,35 @@ describe("T8 (d) stale callbacks", () => {
     });
   }
 
-  test("a pass for the old base arriving after the base moved: stored stale, no merge, a fresh review at the new base", async () => {
+  test("a pass arriving after only the base tip moved (other PRs merged): taken in and merged, no new review", async () => {
     const h = await harness();
     const r = await h.start();
     h.gh.baseTip = sha("d");
     await h.submit(r.job.jobId);
     await h.sup.gate.tick(h.emit);
+    expect(h.sup.gate.jobs.get(r.job.jobId)?.execution.state).toBe("completed");
+    await h.poll();
+    await h.poll();
+    expect(h.merges).toHaveLength(1);
+    expect(h.jobs()).toHaveLength(1);
+    expect(h.objections).toEqual([]);
+  });
+
+  test("a pass for the old merge base arriving after it changed: stored stale, no merge, a fresh review at the new merge base", async () => {
+    const h = await harness();
+    const r = await h.start();
+    h.gh.baseTip = sha("d");
+    h.gh.mergeBase = sha("6");
+    await h.submit(r.job.jobId);
+    await h.sup.gate.tick(h.emit);
     const after = h.sup.gate.jobs.get(r.job.jobId)!;
-    expect(after.execution).toMatchObject({ state: "stale", reason: expect.stringContaining("baseSha") });
+    expect(after.execution).toMatchObject({ state: "stale", reason: expect.stringContaining("mergeBaseSha") });
     expect(after.receipt).toBeUndefined();
     await h.poll();
     await h.poll();
     expect(h.merges).toEqual([]);
     expect(h.objections).toEqual([]);
-    expect(h.running()?.job.snapshot.baseSha).toBe(sha("d"));
+    expect(h.running()?.job.snapshot.mergeBaseSha).toBe(sha("6"));
   });
 
   test("a pass for a job the gate already marked stale (new head polled first) is never taken in", async () => {

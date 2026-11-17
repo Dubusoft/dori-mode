@@ -218,17 +218,18 @@ test("head moved during the pause: after resume the stale pass never merges; the
   expect(h.merges).toEqual([["gh", "pr", "merge", "7", "-R", REPO, "--merge", "--match-head-commit", H9]]);
 });
 
-test("base moved during the pause: after resume the approval is stale and a fresh review runs before any merge", async () => {
+test("merge base moved during the pause: after resume the approval is stale and a fresh review runs before any merge", async () => {
   const h = await harness();
   h.cli("pause", "--reason", REASON);
   await h.approve();
   await h.poll();
   h.gh.baseTip = sha("d");
+  h.gh.mergeBase = sha("6");
   h.cli("resume");
   await h.poll();
   expect(h.merges).toEqual([]);
   const running = h.gate.jobs.list().filter((r) => r.execution.state === "running");
-  expect(running.map((r) => r.job.snapshot.baseSha)).toEqual([sha("d")]);
+  expect(running.map((r) => r.job.snapshot.mergeBaseSha)).toEqual([sha("6")]);
   await h.pass(running[0]!.job.jobId);
   await h.poll();
   expect(h.merges).toEqual([MERGED_AT_H7]);

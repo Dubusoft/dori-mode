@@ -255,7 +255,7 @@ export type ExemptDecision =
   | { readonly kind: "exempt"; readonly key: string; readonly receipt: ExemptReceipt }
   | { readonly kind: "review"; readonly key: string; readonly reason: string; readonly classifiedAt: string };
 
-/** The store key of a snapshot under the current exemption policy: a new head, base or policy is a new key. */
+/** The store key of a snapshot under the current exemption policy: a new head, merge base or policy is a new key. */
 export const exemptKey = (s: ReviewSnapshot): string => `${snapshotKey(s)}/${EXEMPT_POLICY_VERSION}`;
 
 export const exemptReceipt = (

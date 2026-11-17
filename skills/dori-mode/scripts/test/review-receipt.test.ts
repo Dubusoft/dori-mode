@@ -123,8 +123,12 @@ const code = (i: AcceptReviewInput): string => {
 describe("snapshotKey", () => {
   test("stable format", () => {
     expect(snapshotKey(SNAP)).toBe(
-      `Example/demo#42@${hex40("a")}..main@${hex40("b")}/${hex40("c")}/review-policy-1/${SNAP.criteriaSha256}`,
+      `Example/demo#42@${hex40("a")}..main/${hex40("c")}/review-policy-1/${SNAP.criteriaSha256}`,
     );
+  });
+
+  test("a base tip that only moved on keeps the key", () => {
+    expect(snapshotKey({ ...SNAP, baseSha: hex40("e") })).toBe(snapshotKey(SNAP));
   });
 });
 
@@ -296,8 +300,8 @@ describe("acceptReviewSubmission", () => {
   });
 
   test("every identity field mismatch is stale_snapshot and never a receipt", () => {
-    const changed: Record<keyof ReviewSnapshot, unknown> = {
-      repo: "Example/other", prNumber: 43, headSha: hex40("d"), baseRef: "dev", baseSha: hex40("e"),
+    const changed: Record<Exclude<keyof ReviewSnapshot, "baseSha">, unknown> = {
+      repo: "Example/other", prNumber: 43, headSha: hex40("d"), baseRef: "dev",
       mergeBaseSha: hex40("f"), policyVersion: "review-policy-2", criteriaSha256: sha256("criteria-2"),
     };
     for (const [k, v] of Object.entries(changed)) {
@@ -310,10 +314,14 @@ describe("acceptReviewSubmission", () => {
       expect("receipt" in r).toBe(false);
     }
   });
+  test("a base tip that only moved on since the job still yields a receipt", () => {
+    expect(code(input({ observed: { ...SNAP, baseSha: hex40("e") } }))).toBe("ok");
+  });
   test("isApproval rejects a receipt once any identity field moves", () => {
     const r = acceptReviewSubmission(input());
     if (!r.ok) throw new Error(r.detail);
-    expect(isApproval(r.receipt, { ...SNAP, baseSha: hex40("e") })).toBe(false);
+    expect(isApproval(r.receipt, { ...SNAP, mergeBaseSha: hex40("e") })).toBe(false);
+    expect(isApproval(r.receipt, { ...SNAP, baseSha: hex40("e") })).toBe(true);
     expect(isApproval(r.receipt, { ...SNAP, criteriaSha256: sha256("other") })).toBe(false);
   });
 

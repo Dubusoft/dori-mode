@@ -159,9 +159,18 @@ const MAX_JSON_DEPTH = 64;
 /** Lowercase sha256 hex of a UTF-8 string. */
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
-/** Stable identity key of a snapshot: `<repo>#<pr>@<head>..<baseRef>@<baseSha>/<mergeBaseSha>/<policyVersion>/<criteriaSha256>`. */
+/**
+ * The snapshot fields that make up what a review reviewed: the diff from the merge base to the head, into the base
+ * branch, under the policy and criteria. `baseSha` (the base branch tip when the snapshot was read) is recorded but is
+ * no part of it: other PRs landing on the base leave the reviewed diff and its merge base as they were.
+ */
+export const SNAPSHOT_IDENTITY_FIELDS = [
+  "repo", "prNumber", "headSha", "baseRef", "mergeBaseSha", "policyVersion", "criteriaSha256",
+] as const satisfies readonly (keyof ReviewSnapshot)[];
+
+/** Stable identity key of a snapshot ({@link SNAPSHOT_IDENTITY_FIELDS}): `<repo>#<pr>@<head>..<baseRef>/<mergeBaseSha>/<policyVersion>/<criteriaSha256>`. */
 export const snapshotKey = (s: ReviewSnapshot): string =>
-  `${s.repo}#${s.prNumber}@${s.headSha}..${s.baseRef}@${s.baseSha}/${s.mergeBaseSha}/${s.policyVersion}/${s.criteriaSha256}`;
+  `${s.repo}#${s.prNumber}@${s.headSha}..${s.baseRef}/${s.mergeBaseSha}/${s.policyVersion}/${s.criteriaSha256}`;
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Strict JSON: one value, no trailing data, duplicate keys rejected at any depth.
@@ -440,10 +449,6 @@ export type AcceptReviewResult =
   | { ok: true; receipt: ReviewReceipt }
   | { ok: false; code: ReceiptRejectCode; detail: string };
 
-const SNAPSHOT_FIELDS = [
-  "repo", "prNumber", "headSha", "baseRef", "baseSha", "mergeBaseSha", "policyVersion", "criteriaSha256",
-] as const satisfies readonly (keyof ReviewSnapshot)[];
-
 const snapshotProblem = (s: ReviewSnapshot, where: string): string | undefined => {
   if (!s.repo) return `${where}.repo empty`;
   if (!Number.isSafeInteger(s.prNumber) || s.prNumber <= 0) return `${where}.prNumber not a positive integer`;
@@ -506,7 +511,7 @@ export const acceptReviewSubmission = (input: AcceptReviewInput): AcceptReviewRe
   if (sub.laneKey !== job.reviewerLaneKey) return reject("unknown_reviewer", `lane ${sub.laneKey} is not the job's reviewer`);
   if (!tokenMatches(sub.jobToken, job.tokenHash)) return reject("bad_token", "job token does not match");
 
-  for (const k of SNAPSHOT_FIELDS) {
+  for (const k of SNAPSHOT_IDENTITY_FIELDS) {
     if (job.snapshot[k] !== observed[k]) {
       return reject("stale_snapshot", `${k} changed: job ${String(job.snapshot[k])}, now ${String(observed[k])}`);
     }

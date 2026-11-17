@@ -43,9 +43,10 @@ const harness = async () => {
   const views = new Map<number, Record<string, unknown>>([[7, greenView(H7)], [8, greenView(H8)]]);
   /** `tips` (when non-empty) answers the next base-tip reads in order, then `baseTip`. */
   /** `files` holds file texts by `<sha>:<path>` for the exemption classifier; a missing one reads as an error. */
+  /** `mergeBases` holds the merge base with the head by base SHA; any other base has `mergeBase`. */
   const gh = {
     baseTip: sha("b"), tips: [] as string[], mergeBase: sha("c"), parent: undefined as string | undefined, diff: "diff --git a/x b/x\n+1\n",
-    files: new Map<string, string>(),
+    files: new Map<string, string>(), mergeBases: new Map<string, string>(),
   };
   const merges: string[][] = [];
   const base = fakeRunner(world);
@@ -67,7 +68,7 @@ const harness = async () => {
   const io: Partial<ReviewGateIo> = {
     prInfo: async (_repo, num) => { const p = prs.get(num); if (!p) throw new Error(`no PR ${num}`); return p; },
     branchSha: async () => gh.tips.shift() ?? gh.baseTip,
-    mergeBase: async () => gh.mergeBase,
+    mergeBase: async (_repo, baseSha) => gh.mergeBases.get(baseSha) ?? gh.mergeBase,
     diff: async () => gh.diff,
     fileAt: async (_repo, at, path) => {
       const text = gh.files.get(`${at}:${path}`);
@@ -193,7 +194,7 @@ for (const [name, change] of [
     await h.deps.registry.update("author", () => h.author([{ number: 7, sha: H9 }]));
     return h.pull(7, H9);
   }],
-  ["base moved", async (h: Awaited<ReturnType<typeof harness>>) => { h.gh.baseTip = sha("d"); return h.pull(); }],
+  ["merge base moved", async (h: Awaited<ReturnType<typeof harness>>) => { h.gh.baseTip = sha("d"); h.gh.mergeBases.set(sha("d"), sha("6")); return h.pull(); }],
   ["policy changed (receipt made under another policy version)", async (h: Awaited<ReturnType<typeof harness>>) => {
     // The approved job and its receipt were made under an older policy: their snapshot is not the one observed now.
     h.gate.jobs.transact((records, put) => {
@@ -234,21 +235,35 @@ for (const [name, change] of [
   });
 }
 
-test("base moved between the approval check and the final re-read: no merge, the approval goes stale", async () => {
+test("approval present and only the base tip moved (other PRs merged): merged on the same approval, no new job", async () => {
   const h = await harness();
   const jobId = await h.approve();
-  // The approval check reads the approved tip; the final re-read right before the merge sees a new one.
+  h.gh.baseTip = sha("d");
+  await h.poll();
+  expect(h.merges).toEqual([["gh", "pr", "merge", "7", "-R", REPO, "--merge", "--match-head-commit", H7]]);
+  expect(h.gate.jobs.list().map((r) => [r.job.jobId, r.execution.state])).toEqual([[jobId, "completed"]]);
+  expect(h.launches).toHaveLength(1);
+  expect(h.lines("REVIEW_STALE")).toEqual([]);
+  expect(h.lines("REVIEW_BASE_RACE")).toEqual([]);
+});
+
+test("merge base moved between the approval check and the final re-read: no merge, the approval goes stale", async () => {
+  const h = await harness();
+  const jobId = await h.approve();
+  // The approval check reads the approved tip; the final re-read right before the merge sees a new one with a new merge base.
   h.gh.tips = [sha("b"), sha("d")];
+  h.gh.mergeBases.set(sha("d"), sha("6"));
   await h.ci.tick([h.pull()], (id, line) => { h.events.push([id, line]); });
   expect(h.merges).toEqual([]);
   expect(h.gate.jobs.get(jobId)?.execution.state).toBe("stale");
   expect(h.lines("REVIEW_STALE").some((l) => l.includes(`job=${jobId}`))).toBe(true);
 });
 
-test("base race: the merge lands on another base than the approved one: merged, one REVIEW_BASE_RACE, recorded on the job", async () => {
+test("base race: the merge lands on a base without the approved merge base: merged, one REVIEW_BASE_RACE, recorded on the job", async () => {
   const h = await harness();
   const jobId = await h.approve();
   h.gh.parent = sha("e");
+  h.gh.mergeBases.set(sha("e"), sha("6"));
   await h.poll();
   await h.poll();
   expect(h.merges).toHaveLength(1);
@@ -319,10 +334,12 @@ test("a multi-PR claim into one base is reviewed and merged lowest number first"
   const merged = h.ci.tick(both, (id, line) => { h.events.push([id, line]); });
   await merged;
   expect(h.merges.map((m) => m[3])).toEqual(["7"]);
+  // The merge only moves the base tip: #8's merge base is the same, so its review keeps running (no second job).
   h.gh.baseTip = sha("d");
   await h.poll([h.pull(8)]);
-  const job8 = h.gate.jobs.list().filter((r) => r.job.snapshot.prNumber === 8 && r.execution.state === "running").at(-1);
-  expect(job8?.job.snapshot.baseSha).toBe(sha("d"));
+  const jobs8 = h.gate.jobs.list().filter((r) => r.job.snapshot.prNumber === 8);
+  expect(jobs8.map((r) => r.execution.state)).toEqual(["running"]);
+  const job8 = jobs8[0];
   await h.pass(job8!.job.jobId);
   await h.poll([h.pull(8)]);
   expect(h.merges.map((m) => m[3])).toEqual(["7", "8"]);
@@ -375,13 +392,17 @@ test("an exemption binds its head: a new head with code is classified again and 
   expect(h.gate.exemptions.list().map((d) => [d.kind, d.kind === "exempt" ? d.receipt.headSha : d.key.includes(H9)])).toEqual([["exempt", H7], ["review", true]]);
 });
 
-test("an exemption binds its base: a moved base is classified again before the merge, never reviewed for it", async () => {
+test("an exemption binds its merge base: a moved tip keeps it, a new merge base is classified again before the merge, never reviewed for it", async () => {
   const h = await harness();
   docsOnly(h);
   expect((await h.gate.exemption(await h.gate.observeSnapshot(h.pull(), h.author()))).kind).toBe("exempt");
   h.gh.baseTip = sha("d");
+  expect((await h.gate.exemption(await h.gate.observeSnapshot(h.pull(), h.author()))).kind).toBe("exempt");
+  expect(h.gate.exemptions.list()).toHaveLength(1);
+  h.gh.mergeBase = sha("6");
+  docsOnly(h);
   await h.poll();
   expect(h.merges).toHaveLength(1);
   expect(h.launches).toEqual([]);
-  expect(h.gate.exemptions.list().map((d) => (d.kind === "exempt" ? d.receipt.baseSha : d.kind))).toEqual([sha("b"), sha("d")]);
+  expect(h.gate.exemptions.list().map((d) => (d.kind === "exempt" ? d.receipt.mergeBaseSha : d.kind))).toEqual([sha("c"), sha("6")]);
 });
