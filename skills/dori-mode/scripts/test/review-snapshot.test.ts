@@ -39,6 +39,8 @@ beforeEach(async () => {
   writeFileSync(join(repo, "a.txt"), "a\n");
   writeFileSync(join(repo, "b.txt"), "b\n");
   writeFileSync(join(repo, ".gitignore"), "ignored.log\n");
+  mkdirSync(join(repo, ".omo"));
+  writeFileSync(join(repo, ".omo", "omo.jsonc"), '{"setting":true}\n');
   await git(repo, "add", ".");
   await git(repo, "commit", "-q", "-m", "init");
   head = await git(repo, "rev-parse", "HEAD");
@@ -83,12 +85,20 @@ describe("checkReviewScope", () => {
 
   test("ok when only omo config files changed", async () => {
     await prep();
-    mkdirSync(join(snap, ".omo"));
-    writeFileSync(join(snap, ".omo", "omo.jsonc"), "{}\n");
+    writeFileSync(join(snap, ".omo", "omo.jsonc"), '{"setting":true,"_migrations":["v1"]}\n');
     writeFileSync(join(snap, ".omo", "omo.jsonc.bak.123"), "{}\n");
     touchLater(join(snap, ".omo", "omo.jsonc"));
     touchLater(join(snap, ".omo", "omo.jsonc.bak.123"));
     expect(await check()).toEqual({ ok: true });
+  });
+
+  test("scope_violation when omo config has another changed key", async () => {
+    await prep();
+    writeFileSync(join(snap, ".omo", "omo.jsonc"), '{"_migrations":["v1"],"other":true}\n');
+    touchLater(join(snap, ".omo", "omo.jsonc"));
+    const r = await check();
+    expect(r).toMatchObject({ ok: false, code: "scope_violation" });
+    if (!r.ok) expect(r.detail).toContain("worktree is not clean");
   });
 
   test("scope_violation on a modified tracked file", async () => {
@@ -106,8 +116,6 @@ describe("checkReviewScope", () => {
 
   test("scope_violation next to an allowed omo file", async () => {
     await prep();
-    mkdirSync(join(snap, ".omo"));
-    writeFileSync(join(snap, ".omo", "omo.jsonc"), "{}\n");
     writeFileSync(join(snap, ".omo", "other.json"), "{}\n");
     expect(await check()).toMatchObject({ ok: false, code: "scope_violation" });
   });

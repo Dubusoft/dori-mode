@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import type { Runner } from "./run.ts";
+import { omoNoise } from "./runner/lane-git.ts";
 
 export type SnapshotInput = { readonly repoDir: string; readonly path: string; readonly headSha: string; readonly jobId: string };
 export type SnapshotResult = { readonly ok: true; readonly path: string; readonly startedAt: number } | { readonly ok: false; readonly detail: string };
@@ -96,7 +97,9 @@ export const checkReviewScope = async (run: Runner, input: ScopeInput): Promise<
   const st = await run(["git", "-C", path, "status", "--porcelain", "--untracked-files=all"]);
   if (st.code !== 0) return bad(`git status failed: ${tail(st.err)}`);
   const dirty = st.out.split("\n").filter((l) => l.length > 0 && !OMO_CONFIG_RE.test(statusPath(l)));
-  if (dirty.length > 0) return bad(`worktree is not clean: ${dirty.slice(0, 5).join("; ")}`);
+  if (dirty.length > 0 || (st.out.trim() !== "" && !(await omoNoise(run, path)))) {
+    return bad(`worktree is not clean: ${st.out.split("\n").filter((l) => l.length > 0).slice(0, 5).join("; ")}`);
+  }
   const newer: string[] = [];
   try { newerFiles(path, path, since, newer); } catch (e) { return bad(`mtime scan failed: ${(e as Error).message}`); }
   const changed = newer.filter((p) => !OMO_CONFIG_RE.test(p));
