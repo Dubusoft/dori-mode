@@ -96,6 +96,10 @@ const URGENT_KINDS = [
   // Review gate (review-gate.ts): review runs that failed until the lead decides, a merge that landed on another base than
   // the one the review approved, and an owner decision for a reached review limit that could not be opened (review-status.ts).
   "REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED",
+  // The first failure of a PR head's review (timeout queued or running, lost runner, unusable inputs, refused launch,
+  // invalid output): once per head (id review-stalled:<repo>#<n>@<head>), so a failing or stalled review never waits
+  // silently in the digest; later failures of that head stay digest REVIEW_FAILED until REVIEW_ESCALATED.
+  "REVIEW_STALLED",
 ] as const;
 
 /**

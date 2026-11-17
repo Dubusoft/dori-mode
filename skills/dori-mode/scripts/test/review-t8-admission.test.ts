@@ -41,6 +41,7 @@ const world = (cap: number) => {
   w.panes = [{ pane_id: "p0", workspace_id: "w" }];
   w.inspection = { git: undefined };
   const deps = depsFor(w, clock, state.dir, {
+    review: { repos: ["acme/app", "Dubusoft/dori-mode"] },
     guard: { ...defaultConfig("/home/test").guard, panesMax: cap }, autopilot: { ...DEFAULT_AUTOPILOT, executor: true },
   });
   const brief = (key: string): string => {

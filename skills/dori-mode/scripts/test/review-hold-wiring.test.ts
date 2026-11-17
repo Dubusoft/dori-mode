@@ -23,7 +23,7 @@ let pr: PrInfo;
 
 /** Deps whose merge wait reads acme/app#1 OPEN at HEAD, green-pending and mergeable (as review-close-hold.test.ts). */
 const deps = (ms: number): FlowDeps => {
-  const base = depsFor(world, fakeClock(ms), state.dir);
+  const base = depsFor(world, fakeClock(ms), state.dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } });
   const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
     const fields = argv[argv.indexOf("--json") + 1] ?? "";
     if (argv[0] === "gh" && argv[2] === "view" && fields.includes("headRefOid")) {

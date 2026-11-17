@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
 import { alertsChannelOf, defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
+import { reviewEnabledFor } from "../src/review-gate.ts";
 import { withState } from "./fakes.ts";
 import { BUILT_IN } from "../src/tunables.ts";
 
@@ -44,6 +45,25 @@ test("laneRules defaults to none, collapses whitespace, drops blanks, and refuse
   expect((await loadConfig(path, "/home/ana")).laneRules).toEqual(["Do not merge.", "CI runs the typecheck only."]);
   await Bun.write(path, JSON.stringify({ laneRules: "Do not merge." }));
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
+});
+
+test("review.repos turns the review gate on per repo, case-insensitively; absent or empty is off; a bad shape is refused", async () => {
+  const path = join(state.dir, "review.json");
+  await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));
+  const off = await loadConfig(path, "/home/ana");
+  expect(off.review).toEqual({});
+  expect(reviewEnabledFor(off, "Dubusoft/dori-mode")).toBe(false);
+  await Bun.write(path, JSON.stringify({ review: { repos: [] } }));
+  expect(reviewEnabledFor(await loadConfig(path, "/home/ana"), "Dubusoft/dori-mode")).toBe(false);
+  await Bun.write(path, JSON.stringify({ review: { repos: [" Dubusoft/dori-mode "] } }));
+  const on = await loadConfig(path, "/home/ana");
+  expect(on.review).toEqual({ repos: ["Dubusoft/dori-mode"] });
+  expect(reviewEnabledFor(on, "dubusoft/DORI-MODE")).toBe(true);
+  expect(reviewEnabledFor(on, "Dubusoft/other")).toBe(false);
+  for (const bad of [{ review: ["Dubusoft/dori-mode"] }, { review: { repos: "Dubusoft/dori-mode" } }, { review: { repos: ["dori-mode"] } }, { review: { repo: [] } }]) {
+    await Bun.write(path, JSON.stringify(bad));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("review must be");
+  }
 });
 
 test("laneSandbox is lane-sandbox when absent, ignores a leftover default key, and refuses a bad shape", async () => {

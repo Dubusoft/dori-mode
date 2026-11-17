@@ -21,7 +21,7 @@ let asked: string[];
  */
 const pr = { state: "OPEN" };
 const deps = (ms: number, hold = true): FlowDeps => {
-  const base = depsFor(world, fakeClock(ms), state.dir);
+  const base = depsFor(world, fakeClock(ms), state.dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } });
   const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
     const fields = argv[argv.indexOf("--json") + 1] ?? "";
     if (argv[0] === "gh" && argv[2] === "view" && fields.includes("headRefOid")) {

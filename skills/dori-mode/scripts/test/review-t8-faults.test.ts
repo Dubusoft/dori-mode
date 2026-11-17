@@ -73,7 +73,7 @@ const harness = async () => {
     }
     return base(argv, opts);
   };
-  const deps = { ...depsFor(world, clock, dir), run };
+  const deps = { ...depsFor(world, clock, dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } }), run };
   const launches: string[] = [];
   const plan: LaunchPlan[] = [];
   /** objectAuthor calls as [lane key, reasons]; like objectDone it puts the lane in not-done with the reasons. */

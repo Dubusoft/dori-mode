@@ -60,7 +60,7 @@ const harness = async () => {
     }
     return base(argv, opts);
   };
-  const deps = { ...depsFor(world, clock, dir), run };
+  const deps = { ...depsFor(world, clock, dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } }), run };
   const launches: string[] = [];
   let n = 0;
   const home = join(dir, "home");
@@ -162,6 +162,18 @@ test("no approval: no gh pr merge, and exactly one review job is triggered acros
   await h.poll();
   expect(h.lines("MERGE_STALLED")).toEqual([]);
   expect(h.merges).toEqual([]);
+});
+
+test("a repo outside config review.repos: the claimed green mergeable PR merges on the first poll with no review job", async () => {
+  const h = await harness();
+  Object.assign(h.deps.config, { review: { repos: ["other/repo"] } });
+  await h.poll();
+  expect(h.merges).toEqual([["gh", "pr", "merge", "7", "-R", REPO, "--merge", "--match-head-commit", H7]]);
+  expect(h.lines("CI_MERGED")).toHaveLength(1);
+  expect(h.gate.jobs.list()).toEqual([]);
+  expect(h.launches).toEqual([]);
+  expect(h.gate.merges.merges()).toEqual([]);
+  expect(h.events.filter(([, l]) => l.startsWith("REVIEW_"))).toEqual([]);
 });
 
 test("approval and everything green: merged with --match-head-commit at the approved head", async () => {

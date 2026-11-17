@@ -55,10 +55,16 @@ const lane = (patch: Partial<Lane> = {}): Lane => ({
 });
 
 const input = (records: ReviewJobRecord[], patch: Partial<ReviewStatusInput> = {}): ReviewStatusInput => ({
-  records, exemptions: [], merges: [], reviewers: new Map(), defaultModel: "default-model", now: T0 + 5 * 60_000, timeZone: "UTC", ...patch,
+  records, exemptions: [], merges: [], reviewers: new Map(), defaultModel: "default-model", now: T0 + 5 * 60_000, timeZone: "UTC", reviewed: () => true, ...patch,
 });
 
 describe("review status lines (design 5.8)", () => {
+  test("a PR of a repo outside config review.repos gets no review line", () => {
+    const queued = [record({ id: "j1", execution: { state: "queued", reason: "HOLD review reserve" } })];
+    expect(reviewStatusLines(lane(), input(queued))).toHaveLength(1);
+    expect(reviewStatusLines(lane(), input(queued, { reviewed: () => false }))).toEqual([]);
+  });
+
   test("each state names its label and the ids that trace it", () => {
     const one = (records: ReviewJobRecord[], patch: Partial<ReviewStatusInput> = {}, l = lane()): string => reviewStatusLines(l, input(records, patch)).join("\n");
     expect(one([])).toBe(`리뷰 ${REPO}#7: 리뷰 대기 - head aaaaaaa, 아직 시작 전 (CI 통과와 머지 조건 확인 후 시작)`);
@@ -102,7 +108,7 @@ const world = async () => {
   const state = withState();
   cleanups.push(state.done);
   const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, state.dir, { displayTimeZone: "UTC" });
+  const deps = depsFor(newWorld(), clock, state.dir, { displayTimeZone: "UTC", review: { repos: ["acme/app", "Dubusoft/dori-mode"] } });
   await deps.registry.write(lane());
   const jobs = new ReviewJobs(state.dir);
   const statusCalls: { op: string; text?: string; silent?: boolean }[] = [];

@@ -60,7 +60,8 @@ export type FlowDeps = {
    */
   readonly blockTask?: TaskBlocker;
   /**
-   * D11 close hold (review-gate.ts ReviewGate.holdsLane): true while a review of a PR the lane's claim binds is pending,
+   * D11 close hold (review-gate.ts ReviewGate.holdsLane; only PRs of repos in config `review.repos`, reviewEnabledFor,
+   * hold for review): true while a review of a PR the lane's claim binds is pending,
    * so the watcher neither closes nor objects to the lane (nor queues its worktrees), past closeAfterMin and
    * mergeWaitMaxMin too, until every bound PR reads merged. Absent (`dori watch`), nothing is held.
    */

@@ -18,7 +18,7 @@ import { agentRefusal } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { mergePausedText, readMergePause } from "./merge-pause.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
-import type { ReviewGate } from "./review-gate.ts";
+import { type ReviewGate, reviewEnabledFor } from "./review-gate.ts";
 import { canLaunch } from "./routing.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
 import { parseSignal, splitDone } from "./signals.ts";
@@ -27,8 +27,8 @@ import { parseSignal, splitDone } from "./signals.ts";
  * CI follow-up for lane PRs (design 4.5, item 1.4). After each GitHub poll, for every open PR that
  * belongs to an open lane (its Done signal names the PR, or a lane worktree has the PR's branch):
  * - checks failing at the head SHA: a lane message with an ID, delivered safely (deliverLaneMessages);
- * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it only with a reviewer
- *   `pass` receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
+ * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it (a repo outside config
+ *   `review.repos` directly, review-gate.ts reviewEnabledFor; a listed one) only with a reviewer `pass` receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
  *   only while the base it re-reads right before merging is the approved base (`--match-head-commit`, never `--admin`,
  *   never into main); it reads the merge SHA back and reports a merge that landed on another base (REVIEW_BASE_RACE);
  *   while `dori merge pause` is in force (merge-pause.ts) it runs that whole gate but makes no merge (MERGE_PAUSED);
@@ -552,6 +552,8 @@ export class CiFollowUp {
     let op = await this.settle(spec, readBack);
     // The lane whose claim (and review) the merge rests on: the owner, or the merge lane standing in for it (D12).
     let claimant = lane;
+    // A repo outside config `review.repos` merges a claimed green mergeable PR directly: no review job, receipt or record.
+    const reviewed = reviewEnabledFor(deps.config, pull.repo);
     if (op?.state === "ambiguous") return;
     if (op?.state === "failed" && op.attempts >= MERGE_ATTEMPTS) {
       emit(`ci-merge-failed:${op.id}`, `OPERATION_FAILED ${op.id} merge refused ${op.attempts} times: ${op.detail}; merge ${pull.url} by hand or fix it`);
@@ -576,24 +578,26 @@ export class CiFollowUp {
       // D9: a reviewer pass for exactly this snapshot, else the review job is (re)started and the merge waits. The
       // claimed lane is the job's author; the criteria (G1) come from the owner lane's brief even when a merge lane stands
       // in for it (D2), and the job's intake reuses the criteria it was started with.
-      const observed = await this.review.observeSnapshot(pull, fresh);
-      const approval = await this.review.approval(claimed, pull, observed);
-      if (!approval.approved) {
-        await this.review.ensureJob(claimed, pull, observed, emit);
-        return;
-      }
-      // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base. An
-      // exemption is classified again by that poll instead of starting a review now (T6).
-      const now = await this.review.observeSnapshot(pull, fresh);
-      if (now.snapshot.baseSha !== ("exempt" in approval ? approval.exempt.baseSha : approval.receipt.baseSha)) {
-        if (!("exempt" in approval)) await this.review.ensureJob(claimed, pull, now, emit);
-        return;
+      if (reviewed) {
+        const observed = await this.review.observeSnapshot(pull, fresh);
+        const approval = await this.review.approval(claimed, pull, observed);
+        if (!approval.approved) {
+          await this.review.ensureJob(claimed, pull, observed, emit);
+          return;
+        }
+        // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base. An
+        // exemption is classified again by that poll instead of starting a review now (T6).
+        const now = await this.review.observeSnapshot(pull, fresh);
+        if (now.snapshot.baseSha !== ("exempt" in approval ? approval.exempt.baseSha : approval.receipt.baseSha)) {
+          if (!("exempt" in approval)) await this.review.ensureJob(claimed, pull, now, emit);
+          return;
+        }
       }
       // The rollback switch (merge-pause.ts), read fresh each pass: the gate above ran (review jobs and receipts go on),
       // but nothing merges while it is on. After resume a later poll merges only through this whole gate again.
       const paused = readMergePause(deps.config.stateDir);
       if (paused) {
-        emit(`merge-paused:${paused.since}:${target}`, `MERGE_PAUSED ${pull.repo}#${pull.number} lane=${claimed.key} head=${short(pull.sha)} ${mergePausedText(paused)}; approved but not merged until dori merge resume ${pull.url}`);
+        emit(`merge-paused:${paused.since}:${target}`, `MERGE_PAUSED ${pull.repo}#${pull.number} lane=${claimed.key} head=${short(pull.sha)} ${mergePausedText(paused)}; ${reviewed ? "approved" : "mergeable"} but not merged until dori merge resume ${pull.url}`);
         return;
       }
       claimant = claimed;
@@ -607,14 +611,12 @@ export class CiFollowUp {
     const sha = merged?.mergeCommit?.oid ?? (await viewPull(deps, pull, "state,mergeCommit").catch(() => undefined))?.mergeCommit?.oid ?? "unknown";
     emit(`ci-merged:${target}`, `CI_MERGED ${pull.repo}#${pull.number} into ${base} lane=${lane.key} head=${short(pull.sha)} merge=${sha} ${pull.url}`);
     await this.io.merged?.(pull, base);
+    if (sha === "unknown" || !reviewed) return;
     // The owner lane's review status shows the merge (review-status.ts); a failed record only costs that line.
-    if (sha !== "unknown") {
-      try { this.review.recordMerge?.(lane, pull, sha); } catch (e) {
-        console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} merge record: ${e instanceof Error ? e.message : String(e)}`);
-      }
+    try { this.review.recordMerge?.(lane, pull, sha); } catch (e) {
+      console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} merge record: ${e instanceof Error ? e.message : String(e)}`);
     }
     // D10: a merge that landed on another base than the approved one is reported once; never reverted.
-    if (sha === "unknown") return;
     try { await this.review.recordBaseRace(claimant, pull, sha, emit); } catch (e) {
       console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} base race check: ${e instanceof Error ? e.message : String(e)}`);
     }

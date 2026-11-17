@@ -27,7 +27,7 @@ const harness = () => {
   cleanups.push(state.done);
   const dir = state.dir;
   const clock = fakeClock(T0);
-  const deps = depsFor(newWorld(), clock, dir);
+  const deps = depsFor(newWorld(), clock, dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } });
   const prs = new Map<number, PrInfo>([
     [7, { state: "OPEN", baseRef: "dev", headSha: H7, title: "Add thing", body: "body" }],
     [8, { state: "OPEN", baseRef: "dev", headSha: H8, title: "Other", body: "" }],
@@ -312,7 +312,10 @@ describe("review gate failures", () => {
     expect(g.jobs.get(second)?.execution.state).toBe("escalated");
     expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
     expect(g.jobs.list()).toHaveLength(2);
-    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_FAILED", "REVIEW_STARTED", "REVIEW_FAILED", "REVIEW_ESCALATED"]);
+    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_STALLED", "REVIEW_FAILED", "REVIEW_STARTED", "REVIEW_STALLED", "REVIEW_FAILED", "REVIEW_ESCALATED"]);
+    // Both failures of the head carry one stable id, so the event store keeps exactly one urgent REVIEW_STALLED.
+    const stalled = h.events.filter(([, l]) => l.startsWith("REVIEW_STALLED ")).map(([id]) => id);
+    expect([...new Set(stalled)]).toEqual([`review-stalled:${REPO.toLowerCase()}#7@${H7}`]);
     expect(await g.holdsLane(h.author())).toBe(true);
   });
 
@@ -323,6 +326,8 @@ describe("review gate failures", () => {
     h.clock.at += REVIEW_TIMEOUT_MS + 1;
     await g.tick(h.emit);
     expect(g.jobs.list()[0]?.execution).toMatchObject({ state: "error", code: "timeout" });
+    expect(h.kinds()).toEqual(["REVIEW_QUEUED", "REVIEW_STALLED", "REVIEW_FAILED"]);
+    expect(h.events[1]).toEqual([`review-stalled:${REPO.toLowerCase()}#7@${H7}`, expect.stringContaining("code=timeout: queued 15 min without a start")]);
   });
 
   test("model_unavailable escalates at once", async () => {
@@ -333,7 +338,7 @@ describe("review gate failures", () => {
     expect(g.jobs.get(id)?.execution.state).toBe("escalated");
     expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
     expect(g.jobs.list()).toHaveLength(1);
-    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_FAILED", "REVIEW_ESCALATED"]);
+    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_STALLED", "REVIEW_FAILED", "REVIEW_ESCALATED"]);
   });
 
   test("restart recovery marks a running job whose reviewer is gone runner_lost", async () => {
@@ -345,7 +350,7 @@ describe("review gate failures", () => {
     await again.ready;
     expect(again.jobs.get(id)?.execution).toMatchObject({ state: "error", code: "runner_lost" });
     await again.tick(h.emit);
-    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_FAILED"]);
+    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_STALLED", "REVIEW_FAILED"]);
     expect(h.released).toHaveLength(1);
   });
 
@@ -451,8 +456,15 @@ describe("review gate holds and base race", () => {
     expect(g.jobs.get(id)?.baseRace).toMatchObject({ approvedBaseSha: sha("b"), mergedOntoSha: sha("9"), mergeSha: sha("m") });
   });
 
+  test("holdsLane: a PR of a repo outside config review.repos never holds", async () => {
+    const h = harness(), g = h.gate();
+    expect(await g.holdsLane(h.author())).toBe(true);
+    Object.assign(h.deps.config, { review: { repos: ["other/repo"] } });
+    expect(await g.holdsLane(h.author())).toBe(false);
+  });
+
   test("review event kinds are registered as urgent or digest", () => {
-    for (const k of ["REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-urgent");
+    for (const k of ["REVIEW_STALLED", "REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED"]) expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-urgent");
     for (const k of ["REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE", "REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_CAP_REACHED"]) {
       expect(eventClass(`${k} ${REPO}#7 lane=a job=j`)).toBe("lead-digest");
     }

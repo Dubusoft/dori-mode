@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
 import { claimGate } from "./ci-follow.ts";
+import type { DoriConfig } from "./config.ts";
 import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
 import type { OpenPull } from "./github-events.ts";
 import { briefBody } from "./lane-files.ts";
@@ -44,7 +45,7 @@ import { runnerWorktreeRoot } from "./runner/hub.ts";
 
 export const REVIEW_POLICY_VERSION = "t4-1";
 /** D8: a job queued this long without a start, or running this long without a result, fails with `timeout`. */
-export const REVIEW_TIMEOUT_MS = 20 * 60_000;
+export const REVIEW_TIMEOUT_MS = 15 * 60_000;
 /** Per PR: review runs that may go stale on a head or base change and be scheduled again; one more escalates. */
 export const REVIEW_STALE_RESCHEDULES = 2;
 /** Per PR: time from the first review request after which a needed new job escalates instead. */
@@ -66,6 +67,17 @@ const short = (sha: string): string => sha.slice(0, 7);
 const repoName = (repo: string): string => (repo.split("/")[1] ?? repo).toLowerCase().replace(/[^a-z0-9.-]/g, "-");
 const prUrl = (repo: string, n: number): string => `https://github.com/${repo}/pull/${n}`;
 const sameRepo = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+
+/**
+ * Whether the review gate applies to `repo` (config `review.repos`, case-insensitive). The one switch every gate decision
+ * reads (merge approval in ci-follow.ts, the D11 close hold, review status lines and cap decisions): an unlisted repo's
+ * claimed green mergeable lane PR is merged directly, with no review job, hold or status line.
+ */
+export const reviewEnabledFor = (config: Pick<DoriConfig, "review">, repo: string): boolean =>
+  (config.review?.repos ?? []).some((listed) => sameRepo(listed, repo));
+
+/** The urgent REVIEW_STALLED event id of a PR head: stable, so the event store keeps exactly one per head. */
+const stalledId = (s: ReviewSnapshot): string => `review-stalled:${s.repo.toLowerCase()}#${s.prNumber}@${s.headSha}`;
 const oneLine = (s: string, max = 200): string => s.replace(/\s+/g, " ").trim().slice(0, max);
 
 /** The canonical criteria text: the common criteria, then the author lane's brief when it is readable. */
@@ -540,11 +552,8 @@ export class ReviewGate {
     const { record, created } = enqueue(this.jobs, now, { ...job, diffSha256: sha256(diff) }, attempt > 1 ? `attempt ${attempt}` : "queued");
     if (!created) return this.continueLive(record, lane, emit);
     const id = record.job.jobId;
-    const broken = (detail: string): EnsureResult => {
-      const failed = fail(this.jobs, this.now(), id, "input_unavailable", detail);
-      emit(`review-failed:${id}`, line("REVIEW_FAILED", failed, `code=input_unavailable attempt=${attempt}: ${oneLine(detail)}`));
-      return this.escalation(this.jobs.byKey(record.key).filter((j) => j.job.round === record.job.round), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail };
-    };
+    const broken = (detail: string): EnsureResult =>
+      this.failed(fail(this.jobs, this.now(), id, "input_unavailable", detail), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail };
     const root = io.worktreeRoot();
     if (!root) return broken("worktreeRoot is not set");
     if (!repoDir) return broken(`author lane ${lane.key} has no local checkout to snapshot (remote lanes are not reviewed on this host yet)`);
@@ -589,8 +598,7 @@ export class ReviewGate {
     if (existing && statusOf(existing) !== "closed") return this.started(r, emit);
     if (!r.snapshotPath || !existsSync(this.briefPath(r.job.reviewerLaneKey))) {
       const failed = fail(this.jobs, this.now(), id, "input_unavailable", "review inputs missing (interrupted start)");
-      emit(`review-failed:${id}`, line("REVIEW_FAILED", failed, "code=input_unavailable: review inputs missing (interrupted start)"));
-      return { kind: "failed", jobId: id, code: "input_unavailable", detail: "review inputs missing" };
+      return this.failed(failed, emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail: "review inputs missing" };
     }
     let result: ReviewLaunchResult;
     try {
@@ -611,9 +619,8 @@ export class ReviewGate {
       return { kind: "queued", jobId: id, reason: result.reason };
     }
     const failed = fail(this.jobs, this.now(), id, "input_unavailable", `launch refused: ${result.detail}`);
-    emit(`review-failed:${id}`, line("REVIEW_FAILED", failed, `code=input_unavailable: launch refused: ${oneLine(result.detail)}`));
     await this.release(failed);
-    return this.escalation(this.jobs.byKey(r.key).filter((j) => j.job.round === r.job.round), emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail: result.detail };
+    return this.failed(failed, emit) ?? { kind: "failed", jobId: id, code: "input_unavailable", detail: result.detail };
   }
 
   private started(r: ReviewJobRecord, emit: ReviewEmit): EnsureResult {
@@ -689,12 +696,19 @@ export class ReviewGate {
     await this.closeReviewer(lane, next, `review ${r.job.jobId} timed out`, false);
   }
 
-  /** REVIEW_FAILED for an error record, then the D8 escalation check of its key. */
-  private failed(r: ReviewJobRecord, emit: ReviewEmit): void {
-    if (r.execution.state !== "error") return;
+  /**
+   * Every review failure goes through here (timeout queued or running, runner_lost, input_unavailable including a refused
+   * launch or an unusable snapshot, invalid_output, a failed recovery). The first failure of a PR head raises urgent
+   * REVIEW_STALLED; its id ({@link stalledId}) makes the event store drop it for every later failure of that head, which
+   * stays digest REVIEW_FAILED until the D8 escalation check (run last; its result is returned) escalates it.
+   */
+  private failed(r: ReviewJobRecord, emit: ReviewEmit): EnsureResult | undefined {
+    if (r.execution.state !== "error") return undefined;
+    const s = r.job.snapshot, code = r.execution.code, detail = oneLine(r.execution.detail);
     const attempt = this.jobs.byKey(r.key).filter((j) => j.job.createdAt <= r.job.createdAt).length;
-    emit(`review-failed:${r.job.jobId}`, line("REVIEW_FAILED", r, `code=${r.execution.code} attempt=${attempt}: ${oneLine(r.execution.detail)}`));
-    this.escalation(this.jobs.byKey(r.key).filter((j) => j.job.round === r.job.round), emit);
+    emit(stalledId(s), line("REVIEW_STALLED", r, `head=${short(s.headSha)} code=${code}: ${detail}; the merge waits, the review is retried automatically and escalates if it fails again ${prUrl(s.repo, s.prNumber)}`));
+    emit(`review-failed:${r.job.jobId}`, line("REVIEW_FAILED", r, `code=${code} attempt=${attempt}: ${detail}`));
+    return this.escalation(this.jobs.byKey(r.key).filter((j) => j.job.round === r.job.round), emit);
   }
 
   /** D7: takes a claimed review lane's result in. Always ends with the reviewer closed and the snapshot released. */
@@ -809,6 +823,7 @@ export class ReviewGate {
   async holdsLane(lane: Lane): Promise<boolean> {
     await this.ready;
     for (const bound of lane.claim?.pulls ?? []) {
+      if (!reviewEnabledFor(this.deps.config, bound.repo)) continue;
       const records = this.recordsOf(bound.repo, bound.number).filter((r) => r.job.snapshot.headSha === bound.sha);
       const last = records.filter((r) => r.execution.state !== "stale").at(-1);
       if (last?.execution.state === "completed" && last.receipt?.result.verdict === "pass" && last.receipt.source === "reviewer") continue;

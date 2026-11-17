@@ -10,6 +10,7 @@ import { type LaneStatusTransport, laneStatusText, statusChannel, writeLaneStatu
 import { type DecisionContext, type DecisionSpec, openedLine, openOwnerDecision, refIds, taskOfLane } from "./owner-decisions.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import { EXEMPT_POLICY_VERSION, type ExemptDecision, type ExemptReceipt, type ReviewExemptions } from "./review-exempt.ts";
+import { reviewEnabledFor } from "./review-gate.ts";
 import {
   dismissalOf, noteCapDecision, openCap, type ReviewCap, type ReviewJobRecord, type ReviewJobs, sinceOwner,
 } from "./review-jobs.ts";
@@ -77,6 +78,8 @@ export type ReviewStatusInput = {
   readonly timeZone?: string | undefined;
   /** The merge pause in force (merge-pause.ts), read fresh with the rest; absent when merges run. */
   readonly mergePause?: MergePause | undefined;
+  /** Whether the review gate applies to a repo (review-gate.ts reviewEnabledFor); other repos' PRs get no line. */
+  readonly reviewed: (repo: string) => boolean;
 };
 
 const short = (sha: string): string => sha.slice(0, 7);
@@ -89,7 +92,7 @@ const minutes = (ms: number): string => `${Math.max(0, Math.floor(ms / 60_000))}
 const prsOf = (lane: Lane, input: ReviewStatusInput): { readonly repo: string; readonly number: number; readonly sha?: string }[] => {
   const out: { repo: string; number: number; sha?: string }[] = [];
   const add = (repo: string, number: number, sha?: string): void => {
-    if (!out.some((p) => sameRepo(p.repo, repo) && p.number === number)) out.push({ repo, number, ...(sha ? { sha } : {}) });
+    if (input.reviewed(repo) && !out.some((p) => sameRepo(p.repo, repo) && p.number === number)) out.push({ repo, number, ...(sha ? { sha } : {}) });
   };
   for (const p of lane.claim?.pulls ?? []) add(p.repo, p.number, p.sha);
   for (const r of input.records) if (r.job.authorLaneKey === lane.key) add(r.job.snapshot.repo, r.job.snapshot.prNumber);
@@ -183,6 +186,7 @@ export const readReviewStatus = async (deps: FlowDeps, stores: ReviewStores): Pr
   return {
     records, exemptions: stores.exemptions.list(), merges: stores.merges.merges(), reviewers, defaultModel: deps.config.defaultModel,
     now: deps.clock.now(), timeZone: deps.config.displayTimeZone, mergePause: readMergePause(deps.config.stateDir),
+    reviewed: (repo) => reviewEnabledFor(deps.config, repo),
   };
 };
 
@@ -247,8 +251,8 @@ export const reviewStatusTick = async (d: ReviewStatusTickDeps): Promise<string[
   const err = (e: unknown): string => flat(e instanceof Error ? e.message : String(e)).slice(0, 200);
   for (const r of stores.jobs.list()) {
     const cap = r.capReached;
-    if (!cap || cap.decisionId || cap.ownerDecision) continue;
     const s = r.job.snapshot;
+    if (!cap || cap.decisionId || cap.ownerDecision || !reviewEnabledFor(flow.config, s.repo)) continue;
     try {
       const author = await flow.registry.read(r.job.authorLaneKey);
       const pr = stores.jobs.list().filter((x) => sameRepo(x.job.snapshot.repo, s.repo) && x.job.snapshot.prNumber === s.prNumber);

@@ -74,7 +74,7 @@ const harness = async (nums: readonly number[] = [7]) => {
     }
     return base(argv, opts);
   };
-  const deps = { ...depsFor(world, clock, dir), run };
+  const deps = { ...depsFor(world, clock, dir, { review: { repos: ["acme/app", "Dubusoft/dori-mode"] } }), run };
   const launches: string[] = [];
   let hex = 0;
   const home = join(dir, "home");

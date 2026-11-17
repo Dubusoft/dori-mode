@@ -238,7 +238,8 @@ export const WARN_REPEAT_MS = 60 * 60_000;
 export const ARCHIVE_SWEEP_MS = 10 * 60_000;
 
 /**
- * The sweeps' deps: `deps` with the D11 close hold answered by the supervisor's one review gate, and while merges are
+ * The sweeps' deps: `deps` with the D11 close hold answered by the supervisor's one review gate (PRs of repos in config
+ * `review.repos` only; review-gate.ts reviewEnabledFor), and while merges are
  * paused (merge-pause.ts, read fresh each pass) also by the pause, so an approved lane waiting on its merge stays open.
  */
 export const withReviewHold = (deps: FlowDeps, review: Pick<ReviewGate, "holdsLane">): FlowDeps => ({
