@@ -142,7 +142,7 @@ for e in /*; do
   case "$e" in "$top" | /tmp | /proc | /dev) continue ;; esac
   if [ -L "$e" ]; then
     opts+=(--symlink "$(readlink "$e")" "$e")
-  elif [ "$e" = /data ]; then
+  elif [ "$e" = /data ] && [ "$review" = 0 ]; then
     opts+=(--bind-try "$e" "$e")
   else
     opts+=(--ro-bind "$e" "$e")
@@ -380,7 +380,10 @@ if [ -d "$H/.ssh" ]; then
   opts+=(--remount-ro "$H/.ssh")
   trees+=("$(readlink -f "$H/.ssh")")
 fi
-if [ -d "$H/.config/herdr" ]; then
+if [ "$review" = 1 ] && [ -d "$H/.config" ]; then
+  opts+=(--tmpfs "$H/.config" --remount-ro "$H/.config")
+  trees+=("$(readlink -f "$H/.config")")
+elif [ -d "$H/.config/herdr" ]; then
   # herdr's control socket drives the lead's panes.
   opts+=(--tmpfs "$H/.config/herdr")
   keep_agent "$H/.config/herdr"

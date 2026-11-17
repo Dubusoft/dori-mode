@@ -45,7 +45,7 @@ const writeMergePause = (stateDir: string, pause: MergePause): void => {
   replaceFileAtomic(path, `${JSON.stringify(pause)}\n`, 0o666);
 };
 
-/** The visible text of a pause: `merge paused: <reason>`, as the MERGE_PAUSED log line shows it. */
+/** The visible text of a pause: `merge paused: <reason>`, as status lines and log lines show it. */
 export const mergePausedText = (pause: MergePause): string => `merge paused: ${pause.reason.replace(/\s+/g, " ").trim()}`;
 
 const pauseDetail = (pause: MergePause): string => `${mergePausedText(pause)} (since ${pause.since}, by ${pause.who})`;

@@ -6,7 +6,8 @@ import { basename, join, resolve } from "node:path";
 import { claimGate } from "./ci-follow.ts";
 import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
 import type { OpenPull } from "./github-events.ts";
-import { briefBody, FILE_LIMITS } from "./lane-files.ts";
+import { briefBody } from "./lane-files.ts";
+import { FILE_LIMITS } from "./lane-file-contract.ts";
 import { machineRunner } from "./lane-ops.ts";
 import { type Lane, LANE_KEY, statusOf } from "./registry.ts";
 import {

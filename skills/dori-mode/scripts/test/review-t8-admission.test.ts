@@ -10,7 +10,7 @@ import { type LaunchSlot, precheckSlots } from "../src/launch-admission.ts";
 import type { LaunchInput } from "../src/launch.ts";
 import type { LaneOps } from "../src/lane-ops.ts";
 import { admitLaunch, type LaunchOutcome, placeLaunch } from "../src/launch-service.ts";
-import { JsonOperations } from "../src/operations.ts";
+import { openOperations } from "../src/operations.ts";
 import { checkMachine } from "../src/placement.ts";
 import { launchReviewLane } from "../src/review-lane.ts";
 import { launchQueue } from "../src/routing.ts";
@@ -75,7 +75,7 @@ type World = ReturnType<typeof world>;
 
 /** Real autopilot executor over the World: only Toodo, Discord threads, quota and the lock are faked. */
 const autopilot = (h: World, count: number) => {
-  const store = new JsonOperations(h.state.dir);
+  const store = openOperations({ stateDir: h.state.dir });
   cleanups.push(() => store.close());
   const worktrees = withState();
   cleanups.push(worktrees.done);

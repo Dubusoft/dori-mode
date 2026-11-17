@@ -5,8 +5,10 @@ import { join } from "node:path";
 import { CiFollowUp } from "../src/ci-follow.ts";
 import { claimDone, watchTick } from "../src/done-flow.ts";
 import type { OpenPull } from "../src/github-events.ts";
-import { openLaneReports, type LaneStatusTransport } from "../src/lane-reports.ts";
-import { type DecisionContext, type DecisionTransport, readDecisions } from "../src/owner-decisions.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
+import type { LaneStatusTransport } from "../src/lane-status.ts";
+import { readDecisions } from "../src/decision-store.ts";
+import { type DecisionContext, type DecisionTransport } from "../src/owner-decisions.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
 import { type PrInfo, REVIEW_POLICY_VERSION, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
 import type { ReviewJobRecord } from "../src/review-jobs.ts";
@@ -182,7 +184,7 @@ const mergeArgv = (n: number, head: string): string[] => ["gh", "pr", "merge", S
 const ownerSide = (h: Awaited<ReturnType<typeof harness>>) => {
   let m = 0;
   const decisionTransport: DecisionTransport = {
-    send: async () => `m${++m}`, edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
+    send: async () => `m${++m}`, editComponents: async () => {}, edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
     startThread: async () => ({ id: `900${++m}` }), setThread: async () => {}, threadState: async () => ({ archived: false, parent: "555" }), threadArchived: async () => true,
   };
   const status: LaneStatusTransport = {

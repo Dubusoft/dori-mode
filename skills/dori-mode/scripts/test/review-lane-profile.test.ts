@@ -87,10 +87,12 @@ test("review profile: only briefs/<key>.out, ~/.omo, ~/.cache and the private TM
   const ro = r.argv.flatMap((a, i) => (a === "--ro-bind" || a === "--ro-bind-try" ? [r.argv[i + 2] ?? ""] : []));
   for (const p of [f.snap, f.gitDir, f.worktrees, f.grantRo]) expect(ro).toContain(p);
   // No credential: gh and git config and the ssh agent socket are not in the argv at all (~/.config is hidden); the git
-  // config and git credentials, readable through the read-only $HOME otherwise, only as targets of a /dev/null bind.
+  // config and git credentials, readable through the read-only $HOME otherwise, only as targets of an empty data bind.
   for (const p of [".config/gh", ".config/git", ".config/herdr/agent"]) expect(r.argv).not.toContain(join(f.home, p));
   for (const p of [join(f.home, ".git-credentials"), join(f.home, ".gitconfig")]) {
-    expect(r.argv.flatMap((a, i) => (a === p ? [r.argv.slice(i - 2, i + 1).join(" ")] : []))).toEqual([`--ro-bind /dev/null ${p}`]);
+    const covers = r.argv.flatMap((a, i) => a === p ? [r.argv.slice(i - 2, i + 1)] : []);
+    expect(covers).toHaveLength(1);
+    expect(covers[0]).toEqual(["--ro-bind-data", expect.stringMatching(/^\d+$/), p]);
   }
   expect(pairs(r.argv, "--setenv")).toEqual(expect.arrayContaining(["GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"]));
   expect(singles(r.argv, "--unsetenv")).toEqual(expect.arrayContaining(["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK"]));
@@ -193,7 +195,7 @@ test("a review lane.start runs the sandbox check (even with sandbox: false) and 
   await lanes.start(start);
   expect(calls[0]).toEqual(["lane-sandbox", "--check"]);
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
-  expect(command).toContain("LANE_SANDBOX_PROFILE=review ");
+  expect(command).toMatch(/LANE_SANDBOX_PROFILE=review(?:[ ;])/);
   expect(command).toContain(" lane-sandbox omo ");
   for (const name of ["LANE_SANDBOX_REPOS", "LANE_SANDBOX_WORKTREES", "LANE_SANDBOX_RW"]) expect(command).not.toContain(name);
   // The unsandboxed branch's outside rules never apply to a review lane.

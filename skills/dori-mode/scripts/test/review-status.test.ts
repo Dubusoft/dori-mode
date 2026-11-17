@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
-import type { LaneStatusTransport } from "../src/lane-reports.ts";
-import { closeOwnerDecision, type DecisionContext, type DecisionTransport, readDecisions } from "../src/owner-decisions.ts";
+import type { LaneStatusTransport } from "../src/lane-status.ts";
+import { closeOwnerDecision, type DecisionContext, type DecisionTransport } from "../src/owner-decisions.ts";
 import type { Lane } from "../src/registry.ts";
 import { type PrInfo, ReviewGate } from "../src/review-gate.ts";
 import type { ExemptDecision } from "../src/review-exempt.ts";
@@ -10,7 +10,8 @@ import { type ReviewExecution, type ReviewJobRecord, ReviewJobs } from "../src/r
 import type { ReviewReceipt } from "../src/review-receipt.ts";
 import { reviewStatusLines, type ReviewStatusInput, reviewStatusTick, ReviewStatusStore, type ReviewStores } from "../src/review-status.ts";
 import { ReviewExemptions } from "../src/review-exempt.ts";
-import { openLaneReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
+import { readDecisions } from "../src/decision-store.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-11-14T12:00:00Z");
@@ -117,7 +118,7 @@ const world = async () => {
   let m = 0;
   const decisionTransport: DecisionTransport = {
     send: async () => { if (fail.decision) throw new Error("decisions channel down"); return `m${++m}`; },
-    edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
+    editComponents: async () => {}, edit: async () => {}, content: async () => "", deleteMessage: async () => {}, messagesAfter: async () => [],
     startThread: async () => { if (fail.decision) throw new Error("decisions channel down"); return { id: `900${++m}` }; },
     setThread: async () => {}, threadState: async () => ({ archived: false, parent: "555" }), threadArchived: async () => true,
   };

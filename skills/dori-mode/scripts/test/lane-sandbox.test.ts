@@ -272,7 +272,7 @@ test("a hidden path under ~/.dori is hidden too; inside a hidden subtree only a 
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === gcloud)).toBeGreaterThan(lastReadWrite(argv, home));
   // A review lane keeps no git config: the host's is covered, and neither gh nor git is bound back.
   const review = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", LANE_SANDBOX_PROFILE: "review" });
-  expect(review.findIndex((a, i) => a === "--ro-bind" && review[i + 1] === "/dev/null" && review[i + 2] === join(home, ".gitconfig"))).toBeGreaterThan(-1);
+  expect(review.findIndex((a, i) => a === "--ro-bind-data" && /^\d+$/.test(review[i + 1] ?? "") && review[i + 2] === join(home, ".gitconfig"))).toBeGreaterThan(-1);
   expect(review).not.toContain(gh);
 });
 

@@ -126,8 +126,6 @@ export type OwnerDecision = DecisionChoices & {
  * urgent DECISION_RELAY_FAILED once and sets `reportedAt`), or `skipped` (the owner's answer already reached the lane
  * directly, or the lane is closed).
  */
-export type ReviewCapDecision = { readonly jobId: string; readonly repo: string; readonly prNumber: number };
-
 export type DecisionRelay = {
   readonly state: "relayed" | "failed" | "skipped";
   readonly lane: string;
@@ -138,6 +136,9 @@ export type DecisionRelay = {
   readonly attempts?: number;
   readonly reportedAt?: number;
 };
+
+/** The capped review job answered by an owner decision. */
+export type ReviewCapDecision = { readonly jobId: string; readonly repo: string; readonly prNumber: number };
 
 /**
  * The lane session a lane decision belongs to: lane key, owning runner, session generation (lane-reports.ts
