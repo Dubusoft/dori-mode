@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { DEFAULT_MEMORY_LIMITS, type MemoryLimits } from "../src/config.ts";
@@ -186,9 +186,7 @@ test("the same findings are sent again only when human.md grew 1 KB since the la
 test("an oversized human.md is said once, then again only after 1 KB more", async () => {
   const { deps, memory } = await setup(`## Open\n- ${"x".repeat(2048)}\n`, 1);
   const file = join(memory, "system", "human.md");
-  // Over the limit is also over the size trigger: only the daily lines are under test here.
-  const daily = async (n: number): Promise<string[]> =>
-    (await memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test")).filter((line) => line.startsWith("MEMORY_CHECK"));
+  const daily = (n: number): Promise<string[]> => memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test");
   const first = await daily(0);
   expect(first[0]).toContain("over the 1.0KB limit");
   expect(await daily(1)).toEqual([]);
@@ -225,8 +223,7 @@ test("a memory repo git cannot read leaves system memory UNCHECKED, not zero", a
 
 test("the daily check names system memory over omo's advisory once, then again only after 1 KB more", async () => {
   const { deps, memory } = await setup("## Open\n", 15, { systemMaxTokens: 1_000, triggerPct: 100 });
-  const daily = async (n: number): Promise<string[]> =>
-    (await memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test")).filter((line) => line.startsWith("MEMORY_CHECK"));
+  const daily = (n: number): Promise<string[]> => memorySweep({ ...deps, clock: fakeClock(T0 + n * MEMORY_CHECK_EVERY_MS) }, "/home/test");
   expect(await daily(0)).toEqual([]);
   await commit(memory, { "system/big.md": "b".repeat(4_200) });
   const first = await daily(1);
@@ -237,6 +234,19 @@ test("the daily check names system memory over omo's advisory once, then again o
   expect(await daily(3)).toEqual([]);
   await commit(memory, { "system/big.md": "b".repeat(4_200 + MEMORY_CHECK_GROWTH_BYTES) });
   expect(await daily(4)).toHaveLength(1);
+  // A day git cannot size system/ is not a clean day: once git reads it again, the unchanged size stays quiet.
+  renameSync(join(memory, ".git"), join(memory, ".git-off"));
+  expect(await daily(5)).toEqual([]);
+  renameSync(join(memory, ".git-off"), join(memory, ".git"));
+  expect(await daily(6)).toEqual([]);
+  // The same holds when another finding is said on the unmeasured day.
+  writeFileSync(join(memory, "system", "human.md"), "## Open\n- acme/app#9 shipped\n");
+  renameSync(join(memory, ".git"), join(memory, ".git-off"));
+  const other = await daily(7);
+  expect(other).toHaveLength(1);
+  expect(other[0]).not.toContain("system memory");
+  renameSync(join(memory, ".git-off"), join(memory, ".git"));
+  expect(await daily(8)).toEqual([]);
 });
 
 test("the size trigger wakes the lead at once past triggerPct, and names the same size only after 1 KB more", async () => {
@@ -273,13 +283,21 @@ test("the size trigger wakes the lead at once past triggerPct, and names the sam
   expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-size.json"), "utf8"))).toEqual({ human: 12 * 1024 + head + 1, system: 3_208 });
 });
 
-test("the size trigger runs inside the supervisor's memory sweep, before the daily check is due", async () => {
+test("the size trigger is its own supervisor sweep: a failing daily check does not cost its line", async () => {
   const { deps, memory } = await setup("## Open\n", 15, { systemMaxTokens: 1_000 });
-  expect(await memorySweep(deps, "/home/test")).toEqual([]);
   await commit(memory, { "system/big.md": "b".repeat(4_000) });
-  const later = await memorySweep({ ...deps, clock: fakeClock(T0 + MIN) }, "/home/test");
-  expect(later).toHaveLength(1);
-  expect(later[0]).toStartWith("MEMORY_SIZE system memory ~");
+  // The daily check is due and its registry read fails in the round the threshold is crossed.
+  const broken: FlowDeps = { ...deps, registry: Object.assign(Object.create(deps.registry) as typeof deps.registry, { open: async () => { throw new Error("registry unreadable"); } }) };
+  const round = async (d: FlowDeps): Promise<string[]> => {
+    const queue: string[] = [];
+    await runSweeps(supervisorSweeps(d, "/home/test").filter(([name]) => name.startsWith("memory")), async (line) => { queue.push(line); }, d.clock.now, new Map(), () => {});
+    return queue;
+  };
+  const crossed = await round(broken);
+  expect(crossed.filter((line) => line.startsWith("MEMORY_SIZE system memory ~"))).toHaveLength(1);
+  expect(crossed).toContain("SWEEP_WARN memory registry unreadable");
+  // The next healthy round: the size line was delivered, so it is not repeated.
+  expect((await round({ ...deps, clock: fakeClock(T0 + MIN) })).filter((line) => line.startsWith("MEMORY_SIZE"))).toEqual([]);
 });
 
 test("a state written before the daily-only sweep does not repeat the line it already sent", async () => {
@@ -288,7 +306,7 @@ test("a state written before the daily-only sweep does not repeat the line it al
   writeFileSync(join(deps.config.stateDir, "memory-check.json"), JSON.stringify({ at: T0 - MEMORY_CHECK_EVERY_MS, closed: ["dori-ack"], pendingSince: T0 - MIN, sent: "0123456789abcdef" }));
   expect(await memorySweep({ ...deps, clock: fakeClock(T0 - MIN) }, "/home/test")).toEqual([]);
   expect(await memorySweep({ ...deps, clock: fakeClock(T0) }, "/home/test")).toEqual([]);
-  expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-check.json"), "utf8"))).toEqual({ at: T0, bytes: expect.any(Number), over: false, system: expect.any(Number), systemOver: false, stale: ["closed lane dori-ack", "closed lane hsj-dead", "merged PR acme/app#7", "merged PR acme/app#9"] });
+  expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-check.json"), "utf8"))).toEqual({ at: T0, bytes: expect.any(Number), over: false, stale: ["closed lane dori-ack", "closed lane hsj-dead", "merged PR acme/app#7", "merged PR acme/app#9"] });
 });
 
 test("a finding that comes back after a clean check is sent again", async () => {

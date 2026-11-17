@@ -251,25 +251,20 @@ const saveState = (path: string, state: SweepState): void => {
 };
 
 /**
- * The supervisor's memory sweep: the size trigger (memorySizeTrigger) every round, then the full check once every
- * MEMORY_CHECK_EVERY_MS.
+ * The supervisor's daily memory sweep (the size trigger, memorySizeTrigger, is its own sweep, so a failure here never
+ * costs its line): one check every MEMORY_CHECK_EVERY_MS. A finding becomes one MEMORY_CHECK line only when there was
+ * no earlier one, human.md or system/ grew by MEMORY_CHECK_GROWTH_BYTES or went over its limit since it, or a STALE
+ * reference it did not name appears. human.md and the Open items share one baseline, system/ keeps its own, and a
+ * day git cannot size system/ leaves that baseline as it was. State lives in <stateDir>/memory-check.json. The run is
+ * recorded before checking, so a failure waits for the next daily turn.
  */
-export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[]> => [
-  ...(await memorySizeTrigger(deps, home)),
-  ...(await dailyMemoryCheck(deps, home)),
-];
-
-/**
- * The daily check: a finding becomes one MEMORY_CHECK line only when there was no earlier one, human.md or system/ grew
- * by MEMORY_CHECK_GROWTH_BYTES or went over its limit since it, or a STALE reference it did not name appears. State
- * lives in <stateDir>/memory-check.json. The run is recorded before checking, so a failure waits for the next daily turn.
- */
-const dailyMemoryCheck = async (deps: FlowDeps, home: string): Promise<string[]> => {
+export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[]> => {
   const path = join(deps.config.stateDir, "memory-check.json");
   const now = deps.clock.now();
   const state: SweepState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as SweepState : {};
   if (now - (state.at ?? -Infinity) < MEMORY_CHECK_EVERY_MS) return [];
-  const base: SweepState = state.bytes === undefined ? {} : { bytes: state.bytes, over: state.over, system: state.system, systemOver: state.systemOver, stale: state.stale };
+  const kept: SweepState = state.systemOver ? { system: state.system, systemOver: true } : {};
+  const base: SweepState = state.bytes === undefined ? kept : { bytes: state.bytes, over: state.over, stale: state.stale, ...kept };
   saveState(path, { ...base, at: now });
   let report: MemoryReport;
   try { report = await checkMemory(deps, home); }
@@ -278,26 +273,26 @@ const dailyMemoryCheck = async (deps: FlowDeps, home: string): Promise<string[]>
     throw e;
   }
   const line = memoryEvent(report);
-  // A clean check forgets the last finding, so the same finding coming back later is said again.
-  if (!line) { saveState(path, { at: now }); return []; }
   const over = report.bytes > report.limitBytes;
-  const sysOver = systemOver(report);
-  const system = report.system?.bytes;
   const stale = [...new Set(report.stale.flatMap((s) => s.refs))].sort();
-  // An old state's fingerprint means a line went out already: take today's findings as its baseline.
-  const last: SweepState | undefined = base.bytes !== undefined ? base : state.sent !== undefined ? { bytes: report.bytes, over, system, systemOver: sysOver, stale } : undefined;
+  const system = report.system?.bytes;
+  const sysOver = systemOver(report);
+  // system/: said when newly over or grown 1 KB past what was said; unknown (git failed) keeps the baseline.
+  const sendSystem = sysOver && system !== undefined && (!kept.systemOver || system - (kept.system ?? 0) >= MEMORY_CHECK_GROWTH_BYTES);
+  const systemState: SweepState = system === undefined ? kept
+    : !sysOver ? {}
+    : sendSystem ? { system, systemOver: true } : { system: Math.min(kept.system ?? system, system), systemOver: true };
+  // human.md and Open items: a clean check forgets the last finding, so the same finding coming back later is said
+  // again. An old state's fingerprint means a line went out already: take today's findings as its baseline.
+  const found = over || stale.length > 0;
+  const last: SweepState | undefined = base.bytes !== undefined ? base : state.sent !== undefined ? { bytes: report.bytes, over, stale } : undefined;
   const said = new Set(last?.stale ?? []);
-  // A state from before system/ was measured has no system baseline: today's size is it.
-  const lastSystem = last?.system ?? system;
-  const systemGrew = sysOver && system !== undefined && lastSystem !== undefined && system - lastSystem >= MEMORY_CHECK_GROWTH_BYTES;
-  const send = !last || report.bytes - (last.bytes ?? 0) >= MEMORY_CHECK_GROWTH_BYTES || (over && !last.over) || (sysOver && !last.systemOver) || systemGrew || stale.some((ref) => !said.has(ref));
-  const lowest = (a: number | undefined, b: number | undefined): number | undefined => a === undefined ? b : b === undefined ? a : Math.min(a, b);
-  saveState(path, send
-    ? { at: now, bytes: report.bytes, over, system, systemOver: sysOver, stale }
-    : {
-      at: now, bytes: Math.min(last.bytes ?? report.bytes, report.bytes), over: over && last.over === true,
-      system: lowest(lastSystem, system), systemOver: sysOver && last.systemOver === true, stale: stale.filter((ref) => said.has(ref)),
-    });
+  const sendHuman = found && (!last || report.bytes - (last.bytes ?? 0) >= MEMORY_CHECK_GROWTH_BYTES || (over && !last.over) || stale.some((ref) => !said.has(ref)));
+  const send = line !== "" && (sendHuman || sendSystem);
+  const humanState: SweepState = !found ? {}
+    : send || !last ? { bytes: report.bytes, over, stale }
+    : { bytes: Math.min(last.bytes ?? report.bytes, report.bytes), over: over && last.over === true, stale: stale.filter((ref) => said.has(ref)) };
+  saveState(path, { at: now, ...humanState, ...systemState });
   return send ? [line] : [];
 };
 
