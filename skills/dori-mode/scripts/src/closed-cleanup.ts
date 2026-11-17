@@ -59,8 +59,11 @@ type QueuedWorktree = { readonly path: string; readonly root: string; readonly r
  * is the last reason a retry still waits on, so each reason is reported once.
  */
 type QueuedBranch = BranchTarget & { readonly settled?: string; readonly note?: string };
-/** The cleanup a close leaves to the watcher, in its receipt (`receipt.queue`). */
-export type CleanupQueue = { readonly worktrees: QueuedWorktree[]; readonly branches: QueuedBranch[] };
+/**
+ * The cleanup a close leaves to the watcher, in its receipt (`receipt.queue`). `held`: each worktree the last pass kept
+ * because it could not prove it safe to remove, with why, so a reason is reported once, not on every pass.
+ */
+export type CleanupQueue = { readonly worktrees: QueuedWorktree[]; readonly branches: QueuedBranch[]; readonly held?: Readonly<Record<string, string>> };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 const BRANCH_FIELDS = ["repo", "n", "base", "branch", "sha", "root", "remote"] as const;
@@ -70,9 +73,11 @@ const cleanupQueue = (lane: Lane): CleanupQueue => {
   const queue = isRecord(lane.receipt) ? lane.receipt.queue : undefined;
   if (!isRecord(queue)) return { worktrees: [], branches: [] };
   const list = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v.filter(isRecord) : []);
+  const held = isRecord(queue.held) ? Object.entries(queue.held).filter((e): e is [string, string] => typeof e[1] === "string") : [];
   return {
     worktrees: list(queue.worktrees).filter((w) => typeof w.path === "string" && typeof w.root === "string") as unknown as QueuedWorktree[],
     branches: list(queue.branches).filter((b) => BRANCH_FIELDS.every((k) => typeof b[k] === "string")) as unknown as QueuedBranch[],
+    ...(held.length ? { held: Object.fromEntries(held) } : {}),
   };
 };
 
@@ -95,6 +100,11 @@ export const cleanupPending = (deps: FlowDeps, lane: Lane): boolean => {
 export type PendingCleanup = { open?: ReadonlySet<string>; readonly keys: Set<string> };
 export const newPendingCleanup = (): PendingCleanup => ({ keys: new Set() });
 
+/** Why a path stays when git lists no worktree there. */
+const UNLISTED = "git lists no worktree there";
+/** The held-worktrees warning is cut to this many characters (the receipt keeps every reason whole). */
+const HELD_LINE_MAX = 600;
+
 /** A branch keep no later pass can change: the branch is protected, or it moved off the merged head it was bound to. */
 const FINAL_KEEP = /^protected|is not the merged head|at another commit than the merged head|moved off the merged head/;
 
@@ -112,6 +122,12 @@ const FINAL_KEEP = /^protected|is not the merged head|at another commit than the
  *   `remoteCwd`) and recorded worktrees are removed only under the lane's runner's reported worktree root, or (local
  *   lanes) `config.worktreeRoot` while that runner has reported none. One the close held with its branch
  *   (`branch-bound worktree ... kept`) stays.
+ * - A queued path git lists no worktree at any more (git removed or pruned it, and omo wrote its config back) is
+ *   removed under that root only while omo's own files are all it holds (`lane.git leftover-remove`); one holding
+ *   anything else, outside the root, or not queued stays.
+ * - What stays because it cannot be proven safe is one LANE_WATCH_WARN line per lane naming every such path and why,
+ *   sent only when a path is newly held or held for another reason than on the last pass (`receipt.queue.held`), never
+ *   again each hour.
  * - Every removal and delete is a recorded operation with a read-back (operations.ts), so a crash mid-sweep is resumed by
  *   the next pass without repeating an effect; what is done is marked in the receipt's queue, so an operation row pruned
  *   later never runs it again. A newly ambiguous operation is one OPERATION_AMBIGUOUS line.
@@ -152,24 +168,37 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
     const ambiguousOnce = (step: Step, before: OperationState | undefined) => {
       if (before !== "ambiguous") out.push(`OPERATION_AMBIGUOUS ${step.id} ${step.detail}`);
     };
-    /** The worktree's fact when it may go (clean, nothing unpushed); otherwise it stays, with a warning when unreadable. */
-    const removable = async (wt: string): Promise<boolean> => {
+    /** Worktrees kept this pass because they cannot be proven safe to remove, with why. */
+    const held = new Map<string, string>();
+    /** `clean`: it may go (clean, nothing unpushed); `unlisted`: git lists no worktree there; else it stays (held when unreadable). */
+    const verdict = async (wt: string): Promise<"clean" | "unlisted" | "stays"> => {
       const fact = await probeWorktree(deps, lane, wt);
-      if (fact && fact.error === undefined && fact.dirty === false && fact.ahead === 0) return true;
-      if (fact) staying.push(fact);
-      if (!fact || fact.error !== undefined || fact.dirty === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read git status of ${wt}: ${(fact?.error ?? "git lists no worktree there").slice(0, 160)}`);
-      else if (!fact.dirty && fact.ahead === undefined) out.push(`LANE_WATCH_WARN ${lane.key} cannot read unpushed commits of ${wt}, so it is kept`);
-      return false;
+      if (!fact) return "unlisted";
+      if (fact.error === undefined && fact.dirty === false && fact.ahead === 0) return "clean";
+      staying.push(fact);
+      if (fact.error !== undefined || fact.dirty === undefined) held.set(wt, `cannot read its git status: ${(fact.error ?? "no answer").slice(0, 120)}`);
+      else if (!fact.dirty && fact.ahead === undefined) held.set(wt, "cannot read its unpushed commits");
+      return "stays";
     };
+    const goneBack = (wt: string) => async () => ((await deps.ops.exists(lane.machine, [wt]))[0] ? "not-done" as const : "done" as const);
     const remove = async (wt: string, gitRoot: string, wasThere: boolean): Promise<void> => {
       const before = stateOf("worktree-remove", wt);
-      const step = await act("worktree-remove", wt, (cmdId) => deps.ops.git(lane, { op: "worktree-remove", root: gitRoot, path: wt }, { cmdId }),
-        async () => ((await deps.ops.exists(lane.machine, [wt]))[0] ? "not-done" : "done"));
+      const step = await act("worktree-remove", wt, (cmdId) => deps.ops.git(lane, { op: "worktree-remove", root: gitRoot, path: wt }, { cmdId }), goneBack(wt));
       if (step.state === "verified") {
         gone.add(wt);
         if (wasThere) removed.push(wt);
       } else if (step.state === "ambiguous") ambiguousOnce(step, before);
       else out.push(`LANE_WATCH_WARN ${lane.key} worktree ${wt} not removed: ${(step.err || step.out).slice(0, 160)}`);
+    };
+    /** A queued path git lists no worktree at: removed only while omo's files are all it holds (the runner checks). */
+    const removeLeftover = async (wt: string): Promise<void> => {
+      const before = stateOf("leftover-remove", wt);
+      const step = await act("leftover-remove", wt, (cmdId) => deps.ops.git(lane, { op: "leftover-remove", root: wt, path: wt }, { cmdId }), goneBack(wt));
+      if (step.state === "verified") {
+        gone.add(wt);
+        removed.push(wt);
+      } else if (step.state === "ambiguous") ambiguousOnce(step, before);
+      else held.set(wt, `${UNLISTED}, not removed: ${(step.err || step.out).replace(/\s+/g, " ").slice(0, 120)}`);
     };
     for (const w of queued) {
       if (busy.has(w.path)) {
@@ -180,12 +209,27 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
       }
       // A queued worktree already gone (removed by hand, or by a pass a crash cut short) only settles its operation.
       if (!there.get(w.path)) { await remove(w.path, w.path, false); continue; }
-      if (await removable(w.path)) await remove(w.path, there.get(w.root) && !gone.has(w.root) ? w.root : w.path, true);
+      const v = await verdict(w.path);
+      if (v === "clean") await remove(w.path, there.get(w.root) && !gone.has(w.root) ? w.root : w.path, true);
+      else if (v === "unlisted") {
+        if (under(root, w.path)) await removeLeftover(w.path);
+        else held.set(w.path, `${UNLISTED}, outside the worktree root`);
+      }
     }
     for (const wt of [...kept, ...own]) {
       if (!there.get(wt) || busy.has(wt)) continue;
       // A remote worktree, and one found from the lane's record, is removed from inside itself: its repository is not known here.
-      if (await removable(wt)) await remove(wt, lane.machine || own.includes(wt) ? wt : repo, true);
+      const v = await verdict(wt);
+      if (v === "clean") await remove(wt, lane.machine || own.includes(wt) ? wt : repo, true);
+      else if (v === "unlisted") held.set(wt, `${UNLISTED}, and the close did not queue it`);
+    }
+    const heldNow = Object.fromEntries(held);
+    const heldBefore = queue.held ?? {};
+    const heldChanged = !Bun.deepEquals(heldNow, heldBefore);
+    // Only a path newly held, or held for another reason, is news; one that left the set (removed, or now in use) is not.
+    if ([...held].some(([p, why]) => heldBefore[p] !== why)) {
+      const line = `LANE_WATCH_WARN ${lane.key} kept ${held.size} worktree${held.size > 1 ? "s" : ""} it cannot prove safe to remove: ${[...held].map(([p, why]) => `${p} (${why})`).join("; ")}`;
+      out.push(line.length > HELD_LINE_MAX ? `${line.slice(0, HELD_LINE_MAX - 1)}…` : line);
     }
     const settled = new Map<string, Pick<QueuedBranch, "settled" | "note">>();
     const cleaned: string[] = [];
@@ -214,13 +258,14 @@ export const closedWorktreeSweep = async (deps: FlowDeps, lane: Lane): Promise<s
         out.push(`LANE_WATCH_WARN ${lane.key} branch ${t.branch} not deleted yet: ${why}`);
       }
     }
-    if (queue.worktrees.some((w) => gone.has(w.path)) || settled.size) {
+    if (queue.worktrees.some((w) => gone.has(w.path)) || settled.size || heldChanged) {
       await deps.registry.patch(lane.key, (current) => {
         if (!isRecord(current.receipt)) return undefined;
         const now = cleanupQueue(current);
         return { receipt: { ...current.receipt, queue: {
           worktrees: now.worktrees.map((w) => (gone.has(w.path) ? { ...w, removed: true as const } : w)),
           branches: now.branches.map((b) => ({ ...b, ...settled.get(`${b.repo}#${b.n}@${b.sha}`) })),
+          ...(held.size ? { held: heldNow } : {}),
         } } };
       });
     }

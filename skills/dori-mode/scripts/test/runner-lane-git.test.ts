@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,44 @@ import { type Ran, run as realRun, type Runner } from "../src/run.ts";
 import {
   branchPresence, capOutput, discoverWorktrees, GIT_OUTPUT_CAP, gitFacts, gitOpArgv, LaneGitError, laneGit, laneGitEffect, listWorktrees, worktreeState,
 } from "../src/runner/lane-git.ts";
+
+test("leftover-remove deletes a directory holding only omo's files (or nothing) and refuses, deleting nothing, one holding anything else", async () => {
+  const base = mkdtempSync(join(tmpdir(), "leftover-"));
+  const unused = recording(() => undefined).run;
+  const dir = (name: string, files: Record<string, string> = {}): string => {
+    const path = join(base, name);
+    mkdirSync(path);
+    for (const [file, text] of Object.entries(files)) {
+      mkdirSync(join(path, file, ".."), { recursive: true });
+      writeFileSync(join(path, file), text);
+    }
+    return path;
+  };
+  try {
+    const omoOnly = dir("omo-only", { ".omo/omo.jsonc": "{}", ".omo/omo.jsonc.bak.1": "{}" });
+    const empty = dir("empty");
+    for (const path of [omoOnly, empty]) {
+      expect(await laneGit(unused, { key: "k", op: "leftover-remove", root: path, path })).toEqual({ code: 0, out: "", err: "" });
+      expect(existsSync(path)).toBe(false);
+    }
+    const report = dir("report", { ".omo/omo.jsonc": "{}", "report.md": "work" });
+    const checkout = dir("checkout", { ".git": "gitdir: /elsewhere" });
+    const omoExtra = dir("omo-extra", { ".omo/notes.md": "x" });
+    const linked = dir("linked");
+    symlinkSync(omoExtra, join(linked, ".omo"));
+    for (const [path, holds] of [[report, "report.md"], [checkout, ".git"], [omoExtra, ".omo/notes.md"], [linked, ".omo"]] as const) {
+      const r = await laneGit(unused, { key: "k", op: "leftover-remove", root: path, path });
+      expect(r.code).toBe(1);
+      expect(r.err).toBe(`RUNNER_LANE_GIT_REFUSED ${path} is no worktree and holds ${holds}`);
+    }
+    expect(readFileSync(join(report, "report.md"), "utf8")).toBe("work");
+    expect(existsSync(join(report, ".omo/omo.jsonc"))).toBe(true);
+    expect(existsSync(join(omoExtra, ".omo/notes.md"))).toBe(true);
+    expect((await laneGitEffect(unused, { key: "k", op: "leftover-remove", root: report, path: report })).detail).toBe(`git leftover-remove ${report} exit 1`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 
 type Script = (argv: readonly string[]) => Ran | undefined;
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });

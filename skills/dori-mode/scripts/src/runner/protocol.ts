@@ -142,7 +142,7 @@ export type LaneOutputFiles = LaneFileReceipt & {
 
 export type RunnerEventBodies = { readonly [T in keyof typeof EVENT_SCHEMAS]: StaticShape<(typeof EVENT_SCHEMAS)[T]> };
 
-export type LaneGitOp = "worktree-remove" | "branch-delete" | "remote-branch-delete" | "fetch-branch" | "worktree-add";
+export type LaneGitOp = "worktree-remove" | "branch-delete" | "remote-branch-delete" | "fetch-branch" | "worktree-add" | "leftover-remove";
 export type PauseStep = "goal" | "stop" | "both";
 export type SendMode = "verified" | "guarded";
 
@@ -505,9 +505,10 @@ const COMMAND_SCHEMAS = {
   /**
    * Since proto 3: one git cleanup step for a lane, run in `root` on the runner's host. `sha` (branch deletes only):
    * delete only while the branch is at that commit (`update-ref -d <ref> <sha>` / `push --force-with-lease=<ref>:<sha>`).
+   * `leftover-remove` (no git): deletes `path`, a directory git lists no worktree at, only while omo's files are all it holds.
    */
   "lane.git": cmd({
-    key: req("string"), op: req({ enum: ["worktree-remove", "branch-delete", "remote-branch-delete", "fetch-branch", "worktree-add"] }), root: req("string"),
+    key: req("string"), op: req({ enum: ["worktree-remove", "branch-delete", "remote-branch-delete", "fetch-branch", "worktree-add", "leftover-remove"] }), root: req("string"),
     path: opt("string"), branch: opt("string"), remote: opt("string"), sha: opt("string"), ref: opt("string"),
   }),
   "lane.close": cmd({ key: req("string"), worktreeChecks: req("bool") }),

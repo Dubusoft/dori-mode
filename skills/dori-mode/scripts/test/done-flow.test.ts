@@ -622,8 +622,40 @@ test("a local lane's kept worktree with commits no remote has stays, and one who
   world.inspection = { git: { worktrees: [{ path: KEPT_WT, exists: true, dirty: false, ahead: 2 }] } };
   expect(await watchTick(at(T0))).toEqual([]);
   world.inspection = { git: { worktrees: [{ path: KEPT_WT, exists: true, dirty: false }] } };
-  expect(await watchTick(at(T0))).toEqual([`LANE_WATCH_WARN demo-lane cannot read unpushed commits of ${KEPT_WT}, so it is kept`]);
+  expect(await watchTick(at(T0))).toEqual([`LANE_WATCH_WARN demo-lane kept 1 worktree it cannot prove safe to remove: ${KEPT_WT} (cannot read its unpushed commits)`]);
+  // Held for the same reason, it is not reported again on the next pass.
+  expect(await watchTick(at(T0))).toEqual([]);
   expect(removals()).toHaveLength(0);
+});
+
+test("a queued path git lists no worktree at goes under the root only while omo's files are all it holds; otherwise it is held with one line, again only when a reason changes", async () => {
+  const LEFT = "/data/repos/worktrees/demo-left";
+  const OUT = "/elsewhere/demo-out";
+  await at(T0).registry.write({ ...lane, done: "merged acme/app#1", status: "closed", closedAt: new Date(T0).toISOString(),
+    receipt: { cleanup: [], queue: { worktrees: [{ path: LEFT, root: "/repo" }, { path: OUT, root: "/repo" }], branches: [] } } });
+  world.inspection = { git: { worktrees: [] } };
+  const leftovers = () => world.ops.filter((e) => e.op === "git" && (e.args as { op: string }).op === "leftover-remove").map((e) => (e.args as { path: string }).path);
+  // An open lane working there keeps it untouched.
+  await at(T0).registry.write({ ...lane, key: "next-lane", pane: "w:p4", cwd: LEFT, status: "working" });
+  const outside = `${OUT} (git lists no worktree there, outside the worktree root)`;
+  expect(await watchTick(at(T0))).toEqual([`LANE_WATCH_WARN demo-lane kept 1 worktree it cannot prove safe to remove: ${outside}`]);
+  expect(leftovers()).toEqual([]);
+  await at(T0).registry.patch("next-lane", () => ({ status: "closed", cwd: "/repo", closedAt: new Date(T0).toISOString(), receipt: { cleanup: [] } }));
+  const base = at(T0);
+  let refusal = `RUNNER_LANE_GIT_REFUSED ${LEFT} is no worktree and holds report.md`;
+  const holding: FlowDeps = { ...base, ops: { ...base.ops, git: async (l, op, o) => (op.op === "leftover-remove" ? { code: 1, out: "", err: refusal } : base.ops.git(l, op, o)) } };
+  const warn = () => `LANE_WATCH_WARN demo-lane kept 2 worktrees it cannot prove safe to remove: ${LEFT} (git lists no worktree there, not removed: ${refusal}); ${outside}`;
+  expect(await watchTick(holding)).toEqual([warn()]);
+  expect(await watchTick(holding)).toEqual([]);
+  refusal = `RUNNER_LANE_GIT_REFUSED ${LEFT} is no worktree and holds report.md, notes.md`;
+  expect(await watchTick(holding)).toEqual([warn()]);
+  // Emptied of all but omo's files (the runner checks), it is removed through its recorded operation; the path outside stays, not reported again.
+  expect(await watchTick(at(T0))).toEqual([`WORKTREE_CLEANED demo-lane ${LEFT}`]);
+  expect(leftovers()).toEqual([LEFT]);
+  expect(removals()).toEqual([]);
+  const closed = (await at(T0).registry.read("demo-lane")) as Lane;
+  expect(closed.receipt).toMatchObject({ queue: { worktrees: [{ path: LEFT, removed: true }, { path: OUT }], held: { [OUT]: "git lists no worktree there, outside the worktree root" } } });
+  expect(await watchTick(at(T0))).toEqual([]);
 });
 
 test("working, not-done and paused lanes keep their worktrees even after their PR merged", async () => {

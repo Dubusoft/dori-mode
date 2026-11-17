@@ -285,7 +285,7 @@ export const fakeLaneOps = (w: World): LaneOps => {
     },
     git: async (lane, op, opts) => {
       record("git", lane.key, { ...op, ...(opts ? { opts } : {}) }); down(runnerOf(lane));
-      if (op.op === "worktree-remove" && !w.removed.includes(op.path)) w.removed.push(op.path);
+      if ((op.op === "worktree-remove" || op.op === "leftover-remove") && !w.removed.includes(op.path)) w.removed.push(op.path);
       return { code: 0, out: "", err: "" };
     },
     notify: async (lane, notice) => { record("notify", lane.key, notice); },
