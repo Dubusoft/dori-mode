@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
-import { type ObservedReview, prBudget, type PrInfo, REVIEW_TIMEOUT_MS, REVIEW_TOTAL_MS, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
+import { type ObservedReview, prBudget, type PrInfo, REVIEW_RUN_TIMEOUT_MS, REVIEW_TIMEOUT_MS, REVIEW_TOTAL_MS, ReviewGate, type ReviewGateIo } from "../src/review-gate.ts";
 import type { ReviewLaunchRequest, ReviewLaunchResult } from "../src/review-lane.ts";
 import { recordReviewDecision } from "../src/review-jobs.ts";
 import { responseFileName } from "../src/review-response.ts";
@@ -305,7 +305,7 @@ describe("review gate failures", () => {
   test("timeout fails the job, one retry starts, a second error escalates", async () => {
     const h = harness(), g = h.gate();
     const first = await running(h, g);
-    h.clock.at += REVIEW_TIMEOUT_MS + 1;
+    h.clock.at += REVIEW_RUN_TIMEOUT_MS + 1;
     await g.tick(h.emit);
     expect(g.jobs.get(first)?.execution).toMatchObject({ state: "error", code: "timeout" });
     expect(h.closed).toHaveLength(1);
@@ -313,7 +313,7 @@ describe("review gate failures", () => {
     expect(retry.kind).toBe("started");
     const second = (retry as { jobId: string }).jobId;
     expect(g.jobs.get(second)?.job.reviewerLaneKey).toBe(`review-app-7-${H7.slice(0, 7)}-2`);
-    h.clock.at += REVIEW_TIMEOUT_MS + 1;
+    h.clock.at += REVIEW_RUN_TIMEOUT_MS + 1;
     await g.tick(h.emit);
     expect(g.jobs.get(second)?.execution.state).toBe("escalated");
     expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
@@ -323,6 +323,18 @@ describe("review gate failures", () => {
     const stalled = h.events.filter(([, l]) => l.startsWith("REVIEW_STALLED ")).map(([id]) => id);
     expect([...new Set(stalled)]).toEqual([`review-stalled:${REPO.toLowerCase()}#7@${H7}`]);
     expect(await g.holdsLane(h.author())).toBe(true);
+  });
+
+  test("a running review past the queue limit still delivers its result", async () => {
+    const h = harness(), g = h.gate();
+    const id = await running(h, g);
+    h.clock.at += 17 * 60_000;
+    await g.tick(h.emit);
+    expect(g.jobs.get(id)?.execution.state).toBe("running");
+    await h.submit(g, id);
+    await g.tick(h.emit);
+    expect(g.jobs.get(id)?.execution.state).toBe("completed");
+    expect(h.kinds()).toEqual(["REVIEW_STARTED", "REVIEW_PASSED"]);
   });
 
   test("a queued job that never starts times out too", async () => {
