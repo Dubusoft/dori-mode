@@ -6,7 +6,7 @@ When your lane's `Done =` signals are live and every change is pushed, claim don
 
 A lane ends at its green PR. Once the PR is pushed, its CI is green and the `Done =` signals are live, claim and stop: never wait for the merge yourself, with no monitor, wait, sleep, polling loop or `gh pr checks --watch` on the PR or its merge. The supervisor has a claimed PR reviewed, then merges it into `dev` at the head your claim recorded, and the watcher closes the lane after that merge; the Dori follows it up, not you.
 
-A `merged <repo>#N` signal is the exception: the supervisor merges your PR only after your claim, so it cannot be live before you claim. Push everything, open the PR, and claim as soon as its CI is running or green; do not wait for the merge. The claim records the PR's head, and the supervisor merges exactly that head once its checks are green, GitHub calls it clean, and, for a repo in config `review.repos`, a review lane has passed that exact snapshot (head, base tip and criteria; see the review gate in scripts.md).
+A `merged <repo>#N` signal is the exception: the supervisor merges your PR only after your claim, so it cannot be live before you claim. Push everything, open the PR, and claim as soon as its CI is running or green; do not wait for the merge. The claim records the PR's head, and the supervisor merges exactly that head once its checks are green, GitHub calls it clean, and, for a repo in config `review.repos`, a review lane has passed that exact snapshot (head, merge base and criteria; see the review gate in scripts.md).
 
 If your footer says to report with `dori report`, claim done the same way:
 

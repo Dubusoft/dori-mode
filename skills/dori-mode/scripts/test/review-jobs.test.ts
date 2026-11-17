@@ -112,7 +112,7 @@ describe("review jobs", () => {
     expect(enqueue(store, 8, job("j4")).created).toBe(true);
   });
 
-  test("markStale on head change and on base sha change names the field", () => {
+  test("markStale on head change and on merge base change names the field; a base tip that only moved on keeps the job", () => {
     const store = new ReviewJobs(dir);
     enqueue(store, 1, job("j1"));
     const byHead = markStale(store, 2, snapshot({ headSha: sha("9") }));
@@ -120,8 +120,19 @@ describe("review jobs", () => {
     expect(store.get("j1")?.execution).toEqual({ state: "stale", reason: "snapshot changed: headSha" });
 
     enqueue(store, 3, job("j2"));
-    markStale(store, 4, snapshot({ baseSha: sha("8") }));
-    expect(store.get("j2")?.execution).toEqual({ state: "stale", reason: "snapshot changed: baseSha" });
+    expect(markStale(store, 4, snapshot({ baseSha: sha("8") }))).toEqual([]);
+    expect(store.get("j2")?.execution.state).toBe("queued");
+    markStale(store, 5, snapshot({ baseSha: sha("8"), mergeBaseSha: sha("7") }));
+    expect(store.get("j2")?.execution).toEqual({ state: "stale", reason: "snapshot changed: mergeBaseSha" });
+  });
+
+  test("a record stored under an older key format is read under the current key: not marked stale, still found by key", () => {
+    const store = new ReviewJobs(dir);
+    const { record } = enqueue(store, 1, job("old"));
+    store.transact((_records, put) => put({ ...record, key: `${record.key}+older-format` }));
+    expect(store.get("old")?.key).toBe(record.key);
+    expect(markStale(store, 2, snapshot({ baseSha: sha("8") }))).toEqual([]);
+    expect(store.byKey(record.key).map((r) => r.job.jobId)).toEqual(["old"]);
   });
 
   test("markStale leaves the matching key and other PRs alone", () => {

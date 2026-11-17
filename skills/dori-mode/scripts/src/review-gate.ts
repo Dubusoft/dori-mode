@@ -46,7 +46,7 @@ import { runnerWorktreeRoot } from "./runner/hub.ts";
 export const REVIEW_POLICY_VERSION = "t4-1";
 /** D8: a job queued this long without a start, or running this long without a result, fails with `timeout`. */
 export const REVIEW_TIMEOUT_MS = 15 * 60_000;
-/** Per PR: review runs that may go stale on a head or base change and be scheduled again; one more escalates. */
+/** Per PR: review runs that may go stale on a head or merge base change and be scheduled again; one more escalates. */
 export const REVIEW_STALE_RESCHEDULES = 2;
 /** Per PR: time from the first review request after which a needed new job escalates instead. */
 export const REVIEW_TOTAL_MS = 60 * 60_000;
@@ -222,7 +222,7 @@ export type PrBudget = { readonly findingsRounds: number; readonly staleReschedu
 
 /**
  * The PR's review budget: rounds that ended in findings (a findings record made stale by the fix push still counts),
- * runs that went stale without a findings receipt (re-scheduled on a head or base change), and the first request time.
+ * runs that went stale without a findings receipt (re-scheduled on a head or merge base change), and the first request time.
  */
 export const prBudget = (records: readonly ReviewJobRecord[]): PrBudget => {
   const created = records.map((r) => r.job.createdAt);
@@ -237,7 +237,7 @@ export const prBudget = (records: readonly ReviewJobRecord[]): PrBudget => {
 export const capReason = (budget: PrBudget, now: number): string | undefined => {
   if (budget.findingsRounds >= MAX_REVIEW_ROUNDS) return `${budget.findingsRounds} review rounds ended with findings (limit ${MAX_REVIEW_ROUNDS})`;
   if (budget.staleReschedules > REVIEW_STALE_RESCHEDULES) {
-    return `${budget.staleReschedules} review runs went stale on head or base changes (limit ${REVIEW_STALE_RESCHEDULES} re-schedules)`;
+    return `${budget.staleReschedules} review runs went stale on head or merge base changes (limit ${REVIEW_STALE_RESCHEDULES} re-schedules)`;
   }
   if (budget.firstRequestAt !== undefined && now - budget.firstRequestAt >= REVIEW_TOTAL_MS) {
     return `no approval within ${REVIEW_TOTAL_MS / 60_000} min of the first review request`;
@@ -843,8 +843,10 @@ export class ReviewGate {
   }
 
   /**
-   * D10: after a merge the supervisor made, compares the merge commit's first parent with the approved base. A difference
-   * is recorded on the approving job (`baseRace`) and emitted once as urgent REVIEW_BASE_RACE; nothing is reverted.
+   * D10: after a merge the supervisor made, checks the merge commit's first parent against the approved snapshot. A base
+   * that only moved on (its merge base with the head is still the approved one) is no race: the reviewed diff is what
+   * merged. Otherwise the difference is recorded on the approving job (`baseRace`) and emitted once as urgent
+   * REVIEW_BASE_RACE; nothing is reverted.
    */
   async recordBaseRace(lane: Lane, pull: ReviewPull & { readonly sha: string }, mergeSha: string, emit: ReviewEmit): Promise<BaseRaceResult> {
     await this.ready;
@@ -855,6 +857,9 @@ export class ReviewGate {
     const parent = await this.io.mergeParent(pull.repo, mergeSha);
     const approved = r.receipt.baseSha;
     if (parent === approved) return { raced: false, why: "merged onto the approved base" };
+    if (await this.io.mergeBase(pull.repo, parent, pull.sha) === r.receipt.mergeBaseSha) {
+      return { raced: false, why: "merged onto a newer base with the approved merge base" };
+    }
     const next = annotate(this.jobs, this.now(), r.job.jobId, { baseRace: { approvedBaseSha: approved, mergedOntoSha: parent, mergeSha, at: this.now() } });
     emit(`review-base-race:${pull.repo}#${pull.number}@${pull.sha}`,
       `REVIEW_BASE_RACE ${pull.repo}#${pull.number} lane=${lane.key} job=${next.job.jobId} approved-base=${short(approved)} merged-onto=${short(parent)} merge=${mergeSha} ${pull.url ?? prUrl(pull.repo, pull.number)}`);

@@ -223,7 +223,7 @@ describe("review gate intake and approval", () => {
     expect(await g.holdsLane(h.author())).toBe(false);
   });
 
-  test("head, base or policy change marks the job stale and approval false", async () => {
+  test("head, merge base or policy change marks the job stale and approval false; a base tip that only moved on keeps it", async () => {
     const h = harness(), g = h.gate();
     const id = await running(h, g);
     await h.submit(g, id);
@@ -236,12 +236,18 @@ describe("review gate intake and approval", () => {
     // Head.
     const moved = await g.observeSnapshot({ ...h.pull(), sha: sha("e") }, h.author());
     expect((await g.approval(h.author(), h.pull(), moved)).approved).toBe(false);
-    // Base: ensureJob marks the old record stale and starts a new job.
+    // Base tip only: other PRs landed on the base, the reviewed diff is the same; the approval stands.
     h.gh.baseTip = sha("f");
+    const tipOnly = await h.observe(g);
+    expect((await g.approval(h.author(), h.pull(), tipOnly)).approved).toBe(true);
+    expect(await g.ensureJob(h.author(), h.pull(), tipOnly, h.emit)).toEqual({ kind: "completed", jobId: id, verdict: "pass" });
+    expect(g.jobs.get(id)?.execution.state).toBe("completed");
+    // Merge base: ensureJob marks the old record stale and starts a new job.
+    h.gh.mergeBase = sha("9");
     const obs = await h.observe(g);
     expect((await g.approval(h.author(), h.pull(), obs)).approved).toBe(false);
     await g.ensureJob(h.author(), h.pull(), obs, h.emit);
-    expect(g.jobs.get(id)?.execution).toMatchObject({ state: "stale", reason: "snapshot changed: baseSha" });
+    expect(g.jobs.get(id)?.execution).toMatchObject({ state: "stale", reason: "snapshot changed: mergeBaseSha" });
     expect(h.kinds()).toContain("REVIEW_STALE");
     expect(g.jobs.list()).toHaveLength(2);
   });
@@ -250,7 +256,7 @@ describe("review gate intake and approval", () => {
     const h = harness(), g = h.gate();
     const id = await running(h, g);
     const oldKey = g.jobs.get(id)!.job.reviewerLaneKey;
-    h.gh.baseTip = sha("f");
+    h.gh.mergeBase = sha("f");
     h.plan.push("held");
     await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit);
     expect(g.jobs.get(id)?.execution.state).toBe("stale");
@@ -447,7 +453,10 @@ describe("review gate holds and base race", () => {
     await h.submit(g, id);
     await g.tick(h.emit);
     expect(await g.recordBaseRace(h.author(), h.pull(), sha("m"), h.emit)).toMatchObject({ raced: false });
+    // A newer base that kept the approved merge base is no race.
     h.gh.parent = sha("9");
+    expect(await g.recordBaseRace(h.author(), h.pull(), sha("m"), h.emit)).toMatchObject({ raced: false });
+    h.gh.mergeBase = sha("8");
     expect(await g.recordBaseRace(h.author(), h.pull(), sha("m"), h.emit)).toMatchObject({ raced: true, mergedOntoSha: sha("9") });
     expect(await g.recordBaseRace(h.author(), h.pull(), sha("m"), h.emit)).toMatchObject({ raced: true });
     const races = h.events.filter(([, l]) => l.startsWith("REVIEW_BASE_RACE"));
@@ -687,14 +696,14 @@ describe("review fix loop: per-PR limits", () => {
     await running(h, g);
     const results: string[] = [];
     for (const tip of ["d", "e", "f"]) {
-      h.gh.baseTip = sha(tip);
+      h.gh.mergeBase = sha(tip);
       results.push((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind);
     }
     expect(results).toEqual(["started", "started", "escalated"]);
     expect(g.jobs.list()).toHaveLength(3);
     expect(prBudget(g.jobs.list()).staleReschedules).toBe(3);
     expect(h.events.filter(([, l]) => l.startsWith("REVIEW_CAP_REACHED")).map(([, l]) => l))
-      .toEqual([expect.stringContaining("3 review runs went stale on head or base changes (limit 2 re-schedules)")]);
+      .toEqual([expect.stringContaining("3 review runs went stale on head or merge base changes (limit 2 re-schedules)")]);
     expect((await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).kind).toBe("escalated");
     expect(await g.holdsLane(h.author())).toBe(true);
   });
@@ -704,7 +713,7 @@ describe("review fix loop: per-PR limits", () => {
     const id = await running(h, g);
     h.clock.at += REVIEW_TOTAL_MS;
     expect(await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).toEqual({ kind: "running", jobId: id });
-    h.gh.baseTip = sha("d");
+    h.gh.mergeBase = sha("d");
     expect(await g.ensureJob(h.author(), h.pull(), await h.observe(g), h.emit)).toMatchObject({ kind: "escalated", reason: "no approval within 60 min of the first review request" });
     expect(g.jobs.list()).toHaveLength(1);
     expect(h.launches).toHaveLength(1);

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { receiptSnapshot, snapshotKey, type ReviewErrorCode, type ReviewJob, type ReviewReceipt, type ReviewSnapshot } from "./review-receipt.ts";
+import { receiptSnapshot, SNAPSHOT_IDENTITY_FIELDS, snapshotKey, type ReviewErrorCode, type ReviewJob, type ReviewReceipt, type ReviewSnapshot } from "./review-receipt.ts";
 import { saveJsonFile } from "./store.ts";
 import { withStateLockSync } from "./state-lock.ts";
 
@@ -149,8 +149,12 @@ export class ReviewJobs {
     this.path = join(stateDir, REVIEW_JOBS_FILE);
     this.lock = join(stateDir, REVIEW_JOBS_LOCK);
   }
+  /** The stored records, each `key` derived again from its snapshot so a record stored under an older key format matches. */
   private read(): Record<string, ReviewJobRecord> {
-    return existsSync(this.path) ? (JSON.parse(readFileSync(this.path, "utf8")) as { jobs: Record<string, ReviewJobRecord> }).jobs : {};
+    if (!existsSync(this.path)) return {};
+    const { jobs } = JSON.parse(readFileSync(this.path, "utf8")) as { jobs: Record<string, ReviewJobRecord> };
+    for (const [id, r] of Object.entries(jobs)) jobs[id] = { ...r, key: snapshotKey(r.job.snapshot) };
+    return jobs;
   }
   get(jobId: string): ReviewJobRecord | undefined { return this.read()[jobId]; }
   /** Every record of one snapshot key, oldest first. */
@@ -261,10 +265,6 @@ export const escalate = (store: ReviewJobs, now: number, jobId: string, reason: 
     return next;
   });
 
-const SNAPSHOT_FIELDS = [
-  "repo", "prNumber", "headSha", "baseRef", "baseSha", "mergeBaseSha", "policyVersion", "criteriaSha256",
-] as const satisfies readonly (keyof ReviewSnapshot)[];
-
 /**
  * Marks stale every queued, running or completed record of the observed PR whose key differs from the observed
  * snapshot's, with a reason naming the changed fields. Returns the records changed. A later {@link complete} for such a
@@ -277,7 +277,7 @@ export const markStale = (store: ReviewJobs, now: number, observed: ReviewSnapsh
     for (const r of Object.values(records).sort(byCreated)) {
       const s = r.job.snapshot;
       if (s.repo !== observed.repo || s.prNumber !== observed.prNumber || r.key === key || !LIVE_STATES.has(r.execution.state)) continue;
-      const fields = SNAPSHOT_FIELDS.filter((f) => s[f] !== observed[f]);
+      const fields = SNAPSHOT_IDENTITY_FIELDS.filter((f) => s[f] !== observed[f]);
       const next: ReviewJobRecord = { ...r, execution: { state: "stale", reason: `snapshot changed: ${fields.join(", ")}` }, updatedAt: now };
       put(next);
       changed.push(next);

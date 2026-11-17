@@ -110,7 +110,7 @@ describe("auditReviewHistory", () => {
 
   test("a merge whose head's pass went stale before the merge is reported", () => {
     review(job("j1", T0), "pass");
-    markStale(jobs, T0 + 200_000, snapshot({ baseSha: sha("5") }));
+    markStale(jobs, T0 + 200_000, snapshot({ mergeBaseSha: sha("5") }));
     merge(sha("a"), T0 + 300_000);
     expect(kinds(dir)).toEqual(["merge_on_stale", "merge_while_blocked"]);
   });
@@ -118,7 +118,7 @@ describe("auditReviewHistory", () => {
   test("a pass marked stale only after the merge still approves it", () => {
     review(job("j1", T0), "pass");
     merge(sha("a"), T0 + 100_000);
-    markStale(jobs, T0 + 200_000, snapshot({ baseSha: sha("5") }));
+    markStale(jobs, T0 + 200_000, snapshot({ mergeBaseSha: sha("5") }));
     expect(kinds(dir)).toEqual([]);
   });
 

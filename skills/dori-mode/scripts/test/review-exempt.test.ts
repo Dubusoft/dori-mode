@@ -145,14 +145,15 @@ const SNAP: ReviewSnapshot = {
   policyVersion: "t4-1", criteriaSha256: "d".repeat(64),
 };
 
-test("an exempt receipt is kind exempt, never a reviewer approval, and binds head, base and both policy versions", async () => {
+test("an exempt receipt is kind exempt, never a reviewer approval, and binds head, merge base and both policy versions", async () => {
   const c = await classifyExemption(fx(prose()).diff, fx(prose()).read);
   if (!c.exempt) throw new Error("not exempt");
   const r = exemptReceipt(SNAP, c, "e".repeat(64), Date.parse("2026-11-14T12:00:00Z"));
   expect(r).toMatchObject({ kind: "exempt", exemptPolicyVersion: EXEMPT_POLICY_VERSION, headSha: SNAP.headSha, baseSha: SNAP.baseSha, files: ["docs/guide.md"] });
   expect(r.receiptId).toMatch(/^rx_[0-9a-f]{32}$/);
   expect(isExemptFor(r, SNAP)).toBe(true);
-  for (const moved of [{ headSha: "9".repeat(40) }, { baseSha: "8".repeat(40) }, { mergeBaseSha: "7".repeat(40) }, { policyVersion: "t4-2" }, { criteriaSha256: "f".repeat(64) }]) {
+  expect(isExemptFor(r, { ...SNAP, baseSha: "8".repeat(40) })).toBe(true);
+  for (const moved of [{ headSha: "9".repeat(40) }, { mergeBaseSha: "7".repeat(40) }, { policyVersion: "t4-2" }, { criteriaSha256: "f".repeat(64) }]) {
     expect(isExemptFor(r, { ...SNAP, ...moved })).toBe(false);
   }
   expect(isExemptFor({ ...r, exemptPolicyVersion: "t6-0" }, SNAP)).toBe(false);

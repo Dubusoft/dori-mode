@@ -30,8 +30,9 @@ import { parseSignal, splitDone } from "./signals.ts";
  * - checks green and mergeable into `ciMergeBase`, claimed at its head: the supervisor merges it. A repo outside config
  *   `review.repos` (review-gate.ts reviewEnabledFor) merges directly; a listed one merges only with a reviewer `pass`
  *   receipt for the exact current snapshot (review-gate.ts; without one it starts the review job and waits), and
- *   only while the base it re-reads right before merging is the approved base (`--match-head-commit`, never `--admin`,
- *   never into main); it reads the merge SHA back and reports a merge that landed on another base (REVIEW_BASE_RACE);
+ *   only while the base it re-reads right before merging keeps the approved merge base (`--match-head-commit`, never
+ *   `--admin`, never into main); it reads the merge SHA back and reports a merge whose base lost the approved merge base
+ *   (REVIEW_BASE_RACE);
  *   while `dori merge pause` is in force (merge-pause.ts) it runs that whole gate but makes no merge (MERGE_PAUSED);
  * - conflicting: while the PR's own lane is live (laneDown) it gets one lane message asking it to rebase, and no merge
  *   lane starts; once that lane is closed, paused or dead, a new merge lane (its own detached worktree) resolves, pushes
@@ -592,10 +593,11 @@ export class CiFollowUp {
           await this.review.ensureJob(claimed, pull, observed, emit);
           return;
         }
-        // Final base re-read: a base that moved since the approval makes it stale; a later poll reviews the new base. An
-        // exemption is classified again by that poll instead of starting a review now (T6).
+        // Final base re-read: a base tip that only moved on keeps the approval (the reviewed diff is the same; GitHub's
+        // clean state above covers conflicts). A merge base that changed since the approval makes it stale; a later poll
+        // reviews the new snapshot. An exemption is classified again by that poll instead of starting a review now (T6).
         const now = await this.review.observeSnapshot(pull, fresh);
-        if (now.snapshot.baseSha !== ("exempt" in approval ? approval.exempt.baseSha : approval.receipt.baseSha)) {
+        if (now.snapshot.mergeBaseSha !== ("exempt" in approval ? approval.exempt.mergeBaseSha : approval.receipt.mergeBaseSha)) {
           if (!("exempt" in approval)) await this.review.ensureJob(claimed, pull, now, emit);
           return;
         }
@@ -623,7 +625,7 @@ export class CiFollowUp {
     try { this.review.recordMerge?.(lane, pull, sha); } catch (e) {
       console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} merge record: ${e instanceof Error ? e.message : String(e)}`);
     }
-    // D10: a merge that landed on another base than the approved one is reported once; never reverted.
+    // D10: a merge whose base no longer has the approved merge base with the head is reported once; never reverted.
     try { await this.review.recordBaseRace(claimant, pull, sha, emit); } catch (e) {
       console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} base race check: ${e instanceof Error ? e.message : String(e)}`);
     }
