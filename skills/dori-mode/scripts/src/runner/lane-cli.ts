@@ -2,7 +2,8 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
+import { acquireSlot, pidAlive } from "../heavy-slot.ts";
+import { watchSimulators } from "../heavy-simulators.ts";
 import { sampleLoad1 } from "../host-guard.ts";
 import { decisionChoicesProblem, inputRequestProblem, serializeDecisionText, serializeRequestText } from "./decision-text.ts";
 import { isReportKind } from "./report-kinds.ts";
@@ -203,15 +204,18 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
     if (!label || label === "--" || !cmd.length) { deps.err("usage: dori heavy <label> -- <command ...>"); return 2; }
     const slots = Number(deps.env.DORI_HEAVY_SLOTS ?? "1");
+    const dir = deps.heavyDir ?? heavyDirOf();
+    const platform = deps.platform ?? process.platform;
     const slot = await acquireSlot({
-      dir: deps.heavyDir ?? heavyDirOf(), slots: Number.isSafeInteger(slots) && slots > 0 ? slots : 1, maxLoad: heavyMaxLoad(deps.env.DORI_HEAVY_MAX_LOAD),
+      dir, slots: Number.isSafeInteger(slots) && slots > 0 ? slots : 1, maxLoad: heavyMaxLoad(deps.env.DORI_HEAVY_MAX_LOAD),
       clock, load: heavyLoad(deps.platform ?? process.platform, deps.run ?? realRun, deps.runnerDir), alive: pidAlive, pid: process.pid,
       ...(deps.platform ? { platform: deps.platform } : {}),
     }, `${own}:${label}`);
+    const finish = await watchSimulators({ run: deps.run ?? realRun, dir, platform, alive: (pid) => pidAlive(pid), now: clock.now, pid: process.pid, err: deps.err }, slot);
     try {
       return await (deps.spawn ?? (async (argv) => Bun.spawn([...argv], { stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd);
     } finally {
-      releaseSlot(slot);
+      await finish();
     }
   }
   if (sub === "lane") {
