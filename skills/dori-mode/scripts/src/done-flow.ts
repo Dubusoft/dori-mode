@@ -21,6 +21,7 @@ import type { Tunables } from "./tunables.ts";
 import { type Act, actRecorded, type LaneRead, probeWorktree, readLane, type Step, withOperations } from "./flow-io.ts";
 import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCleanup, QUEUED_WORKTREE, remoteWorktrees } from "./closed-cleanup.ts";
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
+import { OUTCOME_LINE_MAX } from "./lane-outcomes.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -97,7 +98,7 @@ const windowMs = (deps: FlowDeps): number => deps.tunables.closeAfterMin * 60_00
 
 /** Free text in an event line (evidence, reasons) is capped; the registry keeps it whole. */
 const EVENT_TEXT_MAX = 300;
-export const eventText = (text: string): string => text.length > EVENT_TEXT_MAX ? `${text.slice(0, EVENT_TEXT_MAX - 1)}…` : text;
+export const eventText = (text: string, max = EVENT_TEXT_MAX): string => text.length > max ? `${text.slice(0, max - 1)}…` : text;
 
 /** A GitHub pull request URL. */
 const PULL_URL = /https:\/\/\S+\/pull\/\d+/;
@@ -533,6 +534,72 @@ type WaitView = {
   readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
 };
 
+const failedChecks = (view: WaitView) =>
+  (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+const conflicting = (view: WaitView): boolean => view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY";
+
+/** The PR's checks in one word: a failed one wins, then one still running; a PR with no checks reads none, never green. */
+const checksWord = (view: WaitView): string => {
+  const rollup = view.statusCheckRollup ?? [];
+  if (failedChecks(view).length) return "failed";
+  if (rollup.some((c) => c.__typename === "StatusContext" ? c.state === "PENDING" || c.state === "EXPECTED" : c.status !== "COMPLETED")) return "pending";
+  return rollup.length ? "green" : "none";
+};
+
+/** At most this many bound PRs are spelled out in a claim's snapshot; the rest are counted. */
+const SNAPSHOT_PRS = 2;
+
+/**
+ * One read of a fresh claim before it wakes the lead: its worktrees and Done signals (through its runner) and each PR it
+ * bound (live from GitHub). `snapshot` is the `verified: ...` text the announcement carries, so the lead need not re-read
+ * the PR; `reasons` are the mechanical failures the supervisor objects to at once instead (work not pushed, a bound PR
+ * that conflicts, has a failed check or moved past the bound head). Running checks are not a failure, and anything that
+ * cannot be read is UNREAD, never green and never an objection: the settle at the window's end stays the judge.
+ */
+const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly snapshot: string; readonly reasons: string[] }> => {
+  const reasons: string[] = [];
+  const parts: string[] = [];
+  const pulls = lane.claim?.pulls ?? [];
+  for (const bound of pulls.slice(0, SNAPSHOT_PRS)) {
+    const ref = `${bound.repo}#${bound.number}`;
+    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
+    let view: WaitView | undefined;
+    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
+    if (!view) { parts.push(`pr=#${bound.number} head=${bound.sha.slice(0, 7)} checks=UNREAD conflict=UNREAD`); continue; }
+    const head = view.headRefOid ?? bound.sha;
+    if (view.state !== "OPEN") { parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} state=${view.state ?? "UNREAD"}`); continue; }
+    const checks = checksWord(view);
+    const conflict = conflicting(view) ? "yes" : view.mergeable === "MERGEABLE" ? "no" : "unknown";
+    parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} checks=${checks} conflict=${conflict}`);
+    if (head !== bound.sha) reasons.push(`${ref} head moved to ${head.slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
+    if (conflict === "yes") reasons.push(`${ref} conflicts with its base`);
+    if (checks === "failed") reasons.push(`${ref} has ${failedChecks(view).length} failed check(s)`);
+  }
+  if (pulls.length > SNAPSHOT_PRS) parts.push(`+${pulls.length - SNAPSHOT_PRS} pr`);
+  if (!pulls.length) parts.push("pr=none");
+  let sig = "UNREAD";
+  try {
+    const read = await readLane(deps, lane, { done: true });
+    // Only work read as unpushed is objected to here; a worktree whose git state is unreadable is left to the settle.
+    const unread = read.worktrees.some((wt) => wt.exists && (wt.error !== undefined || wt.dirty === undefined || wt.ahead === undefined));
+    reasons.unshift(...unpushedIn(read.worktrees.filter((wt) => wt.exists && wt.error === undefined && wt.dirty !== undefined && wt.ahead !== undefined)));
+    if (unread) parts.push("git=UNREAD");
+    const checks = read.checks;
+    if (checks) sig = !checks.length ? "none" : checks.every((c) => c.ok) ? "ok" : `${checks.filter((c) => c.ok).length}/${checks.length}`;
+  } catch (e) {
+    console.error(`CLAIM_PREVERIFY_UNREAD ${lane.key}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return { snapshot: `verified: ${parts.join(" ")} sig=${sig}`, reasons };
+};
+
+/** A claim's announcement: its evidence shortened so the snapshot after it stays inside one outcome line. */
+const claimLine = (kind: string, lane: Lane, evidence: string, snapshot?: string): string => {
+  const head = `${kind} ${lane.key} ${lane.pane ?? "-"}`;
+  if (!snapshot) return `${head} ${eventText(evidence)}`;
+  const room = Math.max(40, Math.min(EVENT_TEXT_MAX, OUTCOME_LINE_MAX - head.length - snapshot.length - 5));
+  return `${head} ${eventText(evidence, room)} | ${snapshot}`;
+};
+
 /**
  * Whether a settling claim is still waiting for the supervisor's merge instead of failing: every failing Done signal is a
  * `merged` PR the claim bound, still OPEN at exactly the bound head, not a draft, not conflicting, with no failed check
@@ -553,11 +620,11 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
     let view: WaitView | undefined;
     try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
     if (!view) continue;
-    const failed = (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+    const failed = failedChecks(view);
     if (view.state !== "OPEN") why.push(`${ref} is ${view.state ?? "unknown"}`);
     else if (view.headRefOid !== bound.sha) why.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
     else if (view.isDraft) why.push(`${ref} is a draft, which the supervisor never merges`);
-    else if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") why.push(`${ref} conflicts with its base`);
+    else if (conflicting(view)) why.push(`${ref} conflicts with its base`);
     else if (failed.length) why.push(`${ref} has ${failed.length} failed check(s)`);
   }
   if (why.length) return { waiting: false, why };
@@ -581,9 +648,8 @@ const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promis
     try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView & { readonly baseRefName?: string }) : undefined; } catch { view = undefined; }
     if (!view) return true;
     if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
-    if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") continue;
-    const failed = (view.statusCheckRollup ?? []).some((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
-    if (!failed) return true;
+    if (conflicting(view)) continue;
+    if (!failedChecks(view).length) return true;
   }
   return false;
 };
@@ -660,7 +726,13 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
     // Enqueued before the emitted mark is saved: a crash in between repeats the announcement instead of losing it
     // (under the same id, so the supervisor journals it once).
     const event = !machine ? claimEventId(lane.key, claim.at) : undefined;
-    await push(`${machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED"} ${lane.key} ${lane.pane ?? "-"} ${eventText(claim.evidence)}`, event, laneMeta(lane));
+    // A claim that wakes the lead is read once first: a mechanical failure is objected to without waking the lead for it.
+    const pre = machine ? undefined : await preverifyClaim(deps, lane);
+    if (pre?.reasons.length) {
+      await push(await objectDone(deps, lane, pre.reasons), undefined, laneMeta(lane));
+      return;
+    }
+    await push(claimLine(machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED", lane, claim.evidence, pre?.snapshot), event, laneMeta(lane));
     const announced = { emitted: true, ...(event ? { event } : {}) };
     claim = { ...claim, ...announced };
     lane = { ...lane, claim };
