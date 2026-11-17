@@ -47,7 +47,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
     };
   };
   if (sub === "open") {
-    const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]";
+    const usage = "usage: dori decision open --question TEXT --option TEXT --option TEXT [...] --recommend N --reason TEXT --waiting TEXT [--task N] [--lane KEY | --relay-to KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]\n       dori decision open --request --question \"<what is needed>\" --reason TEXT --waiting TEXT [--file PATH] [--task N] [--lane KEY | --relay-to KEY] [--thread REF | --no-origin] [--nonblocking] [--from-event EVENT_ID]";
     const refuse = (reason: string): never => {
       console.error(`DECISION_REFUSED ${reason}`);
       return die(usage, 2);
@@ -60,7 +60,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
             question: { type: "string" }, option: { type: "string", multiple: true }, recommend: { type: "string" }, reason: { type: "string" },
             waiting: { type: "string" }, task: { type: "string" }, lane: { type: "string" }, thread: { type: "string" },
             nonblocking: { type: "boolean" }, "from-event": { type: "string" }, request: { type: "boolean" }, file: { type: "string" },
-            "no-origin": { type: "boolean" },
+            "no-origin": { type: "boolean" }, "relay-to": { type: "string" },
           },
         });
       } catch (e) { return refuse(e instanceof Error ? e.message : String(e)); }
@@ -78,9 +78,13 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
       if (!/^[1-9]\d*$/.test(v.task.trim())) refuse(`--task must be a positive integer, got "${v.task}"`);
       task = Number(v.task.trim());
     }
-    const laneKey = v.lane?.trim() || undefined;
+    // --relay-to names the lane as --lane does and also types the close text into it (decision-relay.ts).
+    const relayTo = v["relay-to"]?.trim() || undefined;
+    if (v["relay-to"] !== undefined && !relayTo) refuse("--relay-to needs a lane key");
+    if (relayTo && v.lane?.trim() && v.lane.trim() !== relayTo) refuse(`--lane ${v.lane.trim()} and --relay-to ${relayTo} name different lanes`);
+    const laneKey = relayTo ?? (v.lane?.trim() || undefined);
     const found = laneKey === undefined ? undefined : await deps.registry.read(laneKey);
-    if (laneKey !== undefined && !found) refuse(`unknown --lane ${laneKey}: no registered lane has this key`);
+    if (laneKey !== undefined && !found) refuse(`unknown ${relayTo ? "--relay-to" : "--lane"} ${laneKey}: no registered lane has this key`);
     task ??= found?.task ?? od.taskOfLane(laneKey);
     const thread = v.thread?.trim();
     if (thread !== undefined && !od.refIds(thread)) refuse(`--thread ${thread} is not a thread ref such as discord:<channel>/<thread>`);
@@ -100,7 +104,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
         reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true };
     const opened = await od.openOwnerDecision(decisionContext(token), {
       ...asked, source: "lead",
-      ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(origin ? { origin } : {}),
+      ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(relayTo ? { relayTo } : {}), ...(origin ? { origin } : {}),
     }).catch((e: unknown) => {
       if (e instanceof ds.OwnerDecisionError) die(e.message, 1);
       throw e;

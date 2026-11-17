@@ -8,7 +8,7 @@ import { laneOps } from "../src/lane-ops.ts";
 import { ackLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
 import { openOperations, operationId, plan, settleOperation } from "../src/operations.ts";
 import { decisionTargetOf, DECISIONS_FILE, readDecisions } from "../src/decision-store.ts";
-import { relayDecisionClose, relayLine } from "../src/decision-relay.ts";
+import { relayDecisionClose, relayLine, retryDecisionRelays } from "../src/decision-relay.ts";
 import { answeredLine, ownerDecisionTick, type TickDeps } from "../src/owner-decisions.ts";
 import { sendVerified } from "../src/panes.ts";
 import type { Lane } from "../src/registry.ts";
@@ -248,24 +248,60 @@ test("a remote lane gets the close text through its machine's runner, with the r
   expect(d.relay?.state).toBe("relayed");
 });
 
-test("a close text the pane refuses is never typed later; the close prints DECISION_RELAY_FAILED and the tick wakes the lead once", async () => {
+test("a close text the pane keeps refusing is retried, never typed by the general pass, and wakes the lead once after the last attempt", async () => {
   const t = await setup();
   closedDecision(t.deps.config.stateDir, lane.key);
   const d = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
   expect(t.typed).toEqual([]);
-  expect(relayLine(d)).toStartWith(`DECISION_RELAY_FAILED demo-lane d1: send failed (pane w:p1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}`);
+  expect(relayLine(d)).toStartWith(`DECISION_RELAY_RETRYING demo-lane d1: send failed (pane w:p1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}; the supervisor tries again (attempt 1 of 3)`);
   expect(t.messages.get("decision-close-d1")?.state).toBe("superseded");
   const enqueued: string[] = [];
   await ownerDecisionTick(tickDeps(t, enqueued));
-  await ownerDecisionTick(tickDeps(t, enqueued));
-  expect(enqueued).toEqual([String(relayLine(d))]);
+  expect(enqueued).toEqual([]);
+  // Between attempts the message stays superseded, so the lane message pass does not type it on its own.
   t.control.pane = "take";
   t.clock.at += 30 * MIN;
   await t.pass();
   expect(t.typed).toEqual([]);
+
+  t.control.pane = "refuse";
+  const sends = t.cmdIds.length;
+  expect(await retryDecisionRelays(t.deps)).toHaveLength(1);
+  expect(await retryDecisionRelays(t.deps)).toEqual([]);
+  t.clock.at += MIN;
+  const [last] = await retryDecisionRelays(t.deps);
+  expect(last?.relay).toMatchObject({ state: "failed", attempts: 3 });
+  expect(t.cmdIds.length - sends).toBe(2);
+  t.clock.at += 30 * MIN;
+  expect(await retryDecisionRelays(t.deps)).toEqual([]);
+  await ownerDecisionTick(tickDeps(t, enqueued));
+  await ownerDecisionTick(tickDeps(t, enqueued));
+  expect(enqueued).toEqual([String(relayLine(last as never))]);
+  expect(enqueued[0]).toStartWith("DECISION_RELAY_FAILED demo-lane d1: send failed");
+  expect(enqueued[0]).toContain("after 3 attempts");
+  expect(t.typed).toEqual([]);
 });
 
-test("an answer that already reached the lane directly is not relayed again; a lead decision names the lane to relay to", async () => {
+test("a close text the pane refused once is typed once by the supervisor's retry, and no DECISION_RELAY_FAILED is raised", async () => {
+  const t = await setup();
+  closedDecision(t.deps.config.stateDir, lane.key);
+  await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
+  t.control.pane = "take";
+  t.clock.at += MIN;
+  const [d] = await retryDecisionRelays(t.deps);
+  expect(d?.relay).toMatchObject({ state: "relayed", attempts: 2, message: "decision-close-d1" });
+  expect(relayLine(d as never)).toStartWith("DECISION_RELAYED demo-lane d1 decision-close-d1");
+  expect(t.messages.get("decision-close-d1")?.state).toBe("delivered");
+  t.clock.at += 30 * MIN;
+  expect(await retryDecisionRelays(t.deps)).toEqual([]);
+  await t.pass();
+  const enqueued: string[] = [];
+  await ownerDecisionTick(tickDeps(t, enqueued));
+  expect(enqueued.filter((line) => line.startsWith("DECISION_RELAY"))).toEqual([]);
+  expect(t.typed).toEqual(["[LEAD] Answer to your question d1 (Which store?). Choice 2. json. Use json; keep the old file. Confirm you got this message: dori report ack decision-close-d1"]);
+});
+
+test("an answer that already reached the lane directly is not relayed again; a lead decision relays only with --relay-to", async () => {
   const t = await setup();
   t.control.pane = "take";
   const revision = { rev: 1, channel: "1000", message: "m1", edit: 0, hash: "h", choice: 2, target: decisionTargetOf(lane), at: T0, delivery: { id: "decision-d1-r1", state: "queued", updatedAt: T0 } };
@@ -284,8 +320,14 @@ test("an answer that already reached the lane directly is not relayed again; a l
 
   closedDecision(t.deps.config.stateDir, lane.key, { source: "lead" });
   const lead = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
-  expect(relayLine(lead)).toStartWith("DECISION_RELAY_SKIPPED demo-lane d1: the lead opened this decision");
+  expect(relayLine(lead)).toStartWith("DECISION_RELAY_SKIPPED demo-lane d1: the lead opened this decision without --relay-to");
   expect(t.typed).toEqual([]);
+
+  // Another decision: d1's close message is already delivered, and the same id is never typed again.
+  closedDecision(t.deps.config.stateDir, lane.key, { id: "d2", source: "lead", relayTo: lane.key });
+  const relayTo = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
+  expect(relayLine(relayTo)).toStartWith("DECISION_RELAYED demo-lane d2 decision-close-d2");
+  expect(t.typed).toEqual(["[LEAD] Answer to your question d2 (Which store?). Choice 2. json. Use json; keep the old file. Confirm you got this message: dori report ack decision-close-d2"]);
 });
 
 test("OWNER_DECISION_ANSWERED says the same thing for a lane's decision and request: the close types --text into the lane", () => {

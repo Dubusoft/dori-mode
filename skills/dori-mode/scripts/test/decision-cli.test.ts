@@ -68,6 +68,8 @@ test("decision open refuses bad input with DECISION_REFUSED and a usage line (ex
     [["--option", "a"], "DECISION_REFUSED needs 2-9 --option values, got 1"],
     [["--option", "a", "--option", "b", "--task", "x"], "DECISION_REFUSED --task must be a positive integer"],
     [["--option", "a", "--option", "b", "--lane", "nope"], "DECISION_REFUSED unknown --lane nope"],
+    [["--option", "a", "--option", "b", "--relay-to", "nope"], "DECISION_REFUSED unknown --relay-to nope"],
+    [["--option", "a", "--option", "b", "--lane", "ap-7-1", "--relay-to", "ap-8-1"], "DECISION_REFUSED --lane ap-7-1 and --relay-to ap-8-1 name different lanes"],
   ] as const) {
     const r = await cli([...base, ...extra]);
     expect(r.code).toBe(2);

@@ -75,6 +75,7 @@ import { criticalTick, errText, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_ST
 import { laneEventReader, openRunnerHub, readBackRunnerStarts, RUNNER_LANE_CURSOR_FILE, type RunnerHubHandle } from "./supervise-hub.ts";
 import { decisionDeliveryTick, reconcileDecisionsAtStart } from "./decision-delivery.ts";
 import { type DecisionContext, openLaneDecision, ownerDecisionTick } from "./owner-decisions.ts";
+import { relayLine, retryDecisionRelays } from "./decision-relay.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -812,6 +813,10 @@ export const supervise = async (
       // answer whose lane session went away is handed to the lead once.
       await isolate("DECISION_DELIVERY_ERROR", () => decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
         laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed")));
+      // A close text its lane did not take is tried again before the tick raises DECISION_RELAY_FAILED for it.
+      await isolate("DECISION_RELAY_RETRY_ERROR", async () => {
+        for (const d of await retryDecisionRelays(deps)) { const line = relayLine(d); if (line) console.error(line); }
+      });
       // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
       await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
       // A thread whose work is all finished and reported is closed (archived) once; the owner gets no button to press.
