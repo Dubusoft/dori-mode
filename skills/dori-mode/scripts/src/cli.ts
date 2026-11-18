@@ -133,6 +133,10 @@ const USAGE = `dori <command> [options]
                                        ap-<taskId>-<n> (planned ledger row; exit 1 with the verdict otherwise); a settle flag closes
                                        the reservation as launched, failed or ambiguous (never retried by itself); a reserve
                                        refuses while autopilot is paused
+  autopilot rearm <taskId> [--note TEXT]
+                                       lead-only, on the owner's word: the task's attempts so far stop refusing it already-attempted,
+                                       so once it judges LAUNCH again (its wait ended) it launches as attempt n+1; refused while
+                                       an attempt runs
   autopilot pause [--reason TEXT] | autopilot resume
                                        lead-only: stop new autopilot reservations and AUTOPILOT_READY wakes until resume (running
                                        lanes go on to claim); kept in <stateDir>/autopilot-pause.json

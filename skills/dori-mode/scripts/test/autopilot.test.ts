@@ -112,8 +112,28 @@ test("a live attempt holds lane-live instead; an ambiguous row refuses ledger-am
   const live = [attempt(12, 1, "verified", "lane-12")];
   expect(outcome(ctx([task(12)], { ledger: live, openLanes: new Set(["lane-12"]) }), 12)).toEqual(["HOLD", ["lane-live"]]);
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "attempted")] }), 12)).toEqual(["HOLD", ["lane-live"]]);
-  expect(ledgerState(live, 12, new Set(["lane-12"]))).toEqual({ attempts: 1, ambiguous: false, live: true });
+  expect(ledgerState(live, 12, new Set(["lane-12"]))).toEqual({ attempts: 1, last: 1, ambiguous: false, live: true });
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "ambiguous")] }), 12)).toEqual(["REFUSE", ["already-attempted", "ledger-ambiguous"]]);
+});
+
+const rearmed = (taskId: number, through: number): Operation => ({
+  id: `toodo:${taskId}/autopilot-rearm/${through}`, lane: `toodo:${taskId}`, action: "autopilot-rearm", target: String(through), state: "verified",
+  detail: "re-armed", data: "{}", attempts: 0, at: T0, updatedAt: T0,
+});
+
+test("a re-arm forgives the attempts it covers: the task judges afresh and its next attempt is n+1", () => {
+  for (const state of ["failed", "verified", "ambiguous"] as const) {
+    const ledger = [attempt(12, 1, state), rearmed(12, 1)];
+    expect(outcome(ctx([task(12)], { ledger }), 12)).toEqual(["LAUNCH", []]);
+    expect(ledgerState(ledger, 12, new Set())).toEqual({ attempts: 0, last: 1, ambiguous: false, live: false });
+  }
+  const wait = { until: Date.parse("2026-11-26T00:00:00Z") / 1000, status: "planned" };
+  expect(outcome(ctx([task(12, { wait })], { ledger: [attempt(12, 1, "failed"), rearmed(12, 1)] }), 12)).toEqual(["HOLD", ["waiting"]]);
+  // An attempt after the re-arm counts again; another task's re-arm forgives nothing here.
+  expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "failed"), rearmed(12, 1), attempt(12, 2, "failed")] }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
+  expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "failed"), rearmed(13, 1)] }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
+  // A covered attempt whose lane is still open holds.
+  expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "verified", "lane-12"), rearmed(12, 1)], openLanes: new Set(["lane-12"]) }), 12)).toEqual(["HOLD", ["lane-live"]]);
 });
 
 test("another task's live lane never holds this one: no autopilot WIP cap", () => {

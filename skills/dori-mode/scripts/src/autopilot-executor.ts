@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
-import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, OWNER_REF } from "./autopilot.ts";
+import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
 import { autopilotThreadChannelOf } from "./config.ts";
@@ -113,10 +113,8 @@ const save = (deps: ExecutorDeps, row: Operation, patch: Partial<Execution>): Ex
   return data;
 };
 
-/** The executor runs one attempt per task. */
-const ATTEMPT = 1;
-
-const prepare = async (deps: ExecutorDeps, taskId: number) => {
+/** `attempt`: the executor runs one attempt per task, attempt 1 unless the owner re-armed the task (rearmedThrough + 1). */
+const prepare = async (deps: ExecutorDeps, taskId: number, attempt: number) => {
   const reader = deps.toodo();
   const task = await reader.task(taskId);
   if (!task) return { kind: "review" as const, reasons: ["task-missing"] };
@@ -125,7 +123,7 @@ const prepare = async (deps: ExecutorDeps, taskId: number) => {
   ]);
   const planned = planTask({
     task, tasks: new Map(tasks.map((t) => [t.id, t])), guidelines, config: deps.config, workspaceRepository,
-    reportFile: laneReportFile(deps.stateDir, autopilotLaneKey(taskId, ATTEMPT)),
+    reportFile: laneReportFile(deps.stateDir, autopilotLaneKey(taskId, attempt)),
   });
   if (planned.kind === "review") return planned;
   const reasons: string[] = [];
@@ -189,7 +187,7 @@ const stop = (deps: ExecutorDeps, row: Operation, outcome: Terminal, reasons?: r
 
 const currentContract = async (deps: ExecutorDeps, row: Operation): Promise<readonly string[]> => {
   const data = dataOf(deps.store.get(row.id)!);
-  const fresh = await prepare(deps, data.taskId);
+  const fresh = await prepare(deps, data.taskId, Number(row.target));
   if (fresh.kind === "review") return fresh.reasons;
   if (fresh.contract.version !== data.contract.version || fresh.contract.base !== data.contract.base
     || fresh.contract.guidelines.hash !== data.contract.guidelines.hash) return ["contract-changed"];
@@ -340,20 +338,23 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
     if (!deps.config.executor) { results.push({ taskId, kind: "disabled" }); continue; }
     const release = await deps.lock();
     try {
-      const existing = deps.store.list({ lane: `toodo:${taskId}` }).find((op) => op.action === EXECUTE);
+      // Sequences and attempts a re-arm covers are the owner's to forget; the next one is attempt through + 1.
+      const ledger = ledgerRows(deps.store);
+      const through = rearmedThrough(ledger, taskId);
+      const existing = deps.store.list({ lane: `toodo:${taskId}` }).find((op) => op.action === EXECUTE && Number(op.target) > through);
       if (existing) {
         results.push(["planned", "attempted"].includes(existing.state) ? await resume(deps, existing) : resultOf(dataOf(existing), dataOf(existing).outcome!));
         continue;
       }
       if (readPause(deps.pauseFile)) { results.push({ taskId, kind: "paused" }); continue; }
-      if (ledgerRows(deps.store).some((op) => op.lane === `toodo:${taskId}`)) { results.push({ taskId, kind: "refused" }); continue; }
-      const ready = await prepare(deps, taskId);
+      if (ledgerState(ledger, taskId, new Set()).attempts > 0) { results.push({ taskId, kind: "refused" }); continue; }
+      const attempt = through + 1;
+      const ready = await prepare(deps, taskId, attempt);
       if (ready.kind === "review") {
         deps.out(`AUTOPILOT_EXECUTOR_REVIEW #${taskId} ${ready.reasons.join(", ")}`);
         results.push({ taskId, kind: "review", reasons: ready.reasons });
         continue;
       }
-      const attempt = ATTEMPT;
       const laneKey = autopilotLaneKey(taskId, attempt);
       const data: Execution = {
         taskId, laneKey, title: ready.task.title, contract: ready.contract, brief: ready.brief,
