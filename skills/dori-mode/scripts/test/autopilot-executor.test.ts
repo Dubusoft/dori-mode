@@ -3,12 +3,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { DEFAULT_AUTOPILOT, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
+import { autopilotLaneKey, DEFAULT_AUTOPILOT, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
 import { type ExecutorDeps, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
 import { type LaunchInput, SandboxRefusal } from "../src/launch.ts";
 import type { PlacedLaunch } from "../src/launch-service.ts";
 import type { ThreadMember } from "../src/messenger/discord.ts";
-import { SqliteOperations, type Observed, type Operation, type OperationStore, plan } from "../src/operations.ts";
+import { SqliteOperations, type Observed, type Operation, type OperationStore, plan, settleOperation } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue } from "../src/routing.ts";
 import type { ToodoGuideline, ToodoTaskRecord } from "../src/toodo-client.ts";
@@ -28,7 +28,7 @@ beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "dori-autopilot-executor-"))
 afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
 
 /** Only the store and world survive restart. Every dependency can stop at a completed step without timers or a server. */
-const harness = (initial = task()) => {
+const harness = (initial = task(), attempt = 1) => {
   let current = initial;
   let held = false;
   let remote = false;
@@ -77,7 +77,7 @@ const harness = (initial = task()) => {
     writer: {
       startTask: async (_id, opts) => {
         checkpoint(); calls.start++;
-        expect(ops.get(`toodo:12/autopilot-start-task/1`)?.state).toBe("attempted");
+        expect(ops.get(`toodo:12/autopilot-start-task/${attempt}`)?.state).toBe("attempted");
         current = { ...current, status: "in_progress", refs: [...current.refs, ...(opts?.refs ?? [])], ...(mutateOnStart ? { description: "Changed scope" } : {}) };
         return { wrote: true, task: record() };
       },
@@ -87,7 +87,7 @@ const harness = (initial = task()) => {
     parentChannel: "c",
     createThread: async (thread) => {
       checkpoint(); calls.thread++;
-      expect(ops.get("toodo:12/autopilot-thread/1")?.state).toBe("attempted");
+      expect(ops.get(`toodo:12/autopilot-thread/${attempt}`)?.state).toBe("attempted");
       threads.set(thread.title, "thread-12");
       return { id: "thread-12", member };
     },
@@ -108,9 +108,9 @@ const harness = (initial = task()) => {
     validate: async () => { checkpoint(); if (validationError) throw validationError; },
     admit: async (input, placed) => {
       checkpoint(); calls.admit++; inputs.push(input); placements.push(placed);
-      const row = ops.get(`toodo:12/autopilot-${placed.plan.check.verdict.ok ? "admit" : "hold"}/1`)!;
+      const row = ops.get(`toodo:12/autopilot-${placed.plan.check.verdict.ok ? "admit" : "hold"}/${attempt}`)!;
       expect(row.state).toBe("attempted");
-      expect(JSON.parse(row.data!).input.key).toBe(KEY);
+      expect(JSON.parse(row.data!).input.key).toBe(autopilotLaneKey(12, attempt));
       expect(JSON.parse(row.data!).base).toBe("dev");
       if (!placed.plan.check.verdict.ok) {
         const queue = enqueueLaunch(dir, { ...input, mode: undefined, queuedAt: new Date(T0).toISOString(), reasons: ["no room"] });
@@ -414,4 +414,16 @@ test("a CLI reservation is never adopted by the executor", async () => {
   plan(store, T0, { lane: "toodo:12", action: "autopilot-launch", target: "1", data: JSON.stringify({ laneKey: KEY }) });
   expect((await runExecutor(h.fresh(), [12]))[0]?.kind).toBe("refused");
   expect(h.calls.start).toBe(0);
+});
+
+test("a failed execution never runs again by itself; once the owner re-arms it, the next tick runs attempt 2", async () => {
+  const first = harness(); first.failValidation();
+  expect((await runExecutor(first.fresh(), [12]))[0]?.kind).toBe("failed");
+  expect((await runExecutor(first.fresh(), [12]))[0]?.kind).toBe("failed");
+  expect(first.calls.start).toBe(1);
+  settleOperation(store, T0, plan(store, T0, { lane: "toodo:12", action: "autopilot-rearm", target: "1", data: "{}" }).id, "verified", "re-armed");
+  const again = harness(task(), 2);
+  expect(await runExecutor(again.fresh(), [12])).toEqual([{ taskId: 12, laneKey: "ap-12-2", kind: "launched" }]);
+  expect(again.inputs[0]?.key).toBe("ap-12-2");
+  expect(ledgerRows(store).filter((op) => op.action === "autopilot-launch").map((op) => [op.target, op.state])).toEqual([["1", "failed"], ["2", "verified"]]);
 });

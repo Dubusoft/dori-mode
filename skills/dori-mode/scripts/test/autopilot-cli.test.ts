@@ -293,6 +293,24 @@ test("--failed and --ambiguous settle with the note and are never retried by its
   expect(await h.run("launch", "12", "--failed")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_NO_RESERVATION #12"] });
 });
 
+test("rearm on the owner's word lets a settled task reserve attempt n+1; refused while live, nothing to re-arm without an attempt", async () => {
+  await harness([task(12), task(13)]).run("launch", "12");
+  const h = harness([task(12), task(13)]);
+  expect(await h.run("rearm", "12")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_REARM_REFUSED #12 lane-live: an attempt is still running"] });
+  await h.run("launch", "12", "--failed");
+  expect((await h.run("launch", "12")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #12 REFUSE already-attempted"]);
+  expect(await h.run("rearm", "12", "--note", "owner: run it again")).toEqual({ code: 0, out: ["AUTOPILOT_REARMED #12 through=1 next=ap-12-2"], err: [] });
+  expect(await h.run("rearm", "12")).toEqual({ code: 0, out: ["AUTOPILOT_REARMED #12 through=1 next=ap-12-2 (already)"], err: [] });
+  expect(await h.run("rearm", "13")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_REARM_NOTHING #13: no launch attempt to re-arm"] });
+  expect(await h.run("launch", "12")).toEqual({ code: 0, out: ["AUTOPILOT_RESERVED #12 lane=ap-12-2 attempt=2"], err: [] });
+  expect(rows().map((r) => [r[0], r[1], r[3]])).toEqual([
+    ["toodo:12/autopilot-launch/1", "failed", "launch failed"],
+    ["toodo:12/autopilot-launch/2", "planned", "planned"],
+    ["toodo:12/autopilot-rearm/1", "verified", "re-armed: owner: run it again"],
+  ]);
+  expect(await h.run("rearm", "12", "--tasks", "1")).toMatchObject({ code: 2 });
+});
+
 test("another task's pending reservation takes a host slot; launch order and a held host refuse too", async () => {
   const tasks = [task(12), task(13), task(14, { autopilot: false })];
   // 12 comes first in launch order, so with one slot 13 waits.

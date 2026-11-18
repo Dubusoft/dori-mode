@@ -13,9 +13,13 @@ import { redactSecrets } from "./redact.ts";
  *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous. When its lane
  *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed). After the
  *   close the supervisor's Toodo follow-up adds `toodo` (markLaneToodo): what it recorded on the task, written once.
+ * - re-arm (written by `dori autopilot rearm` on the owner's word): lane `toodo:<taskId>`, action `autopilot-rearm`,
+ *   target `<the highest attempt number it covers>`, state verified, data `{ note? }`. Attempts it covers no longer refuse
+ *   the task, so its next launch is attempt n+1.
  */
 
 export const LAUNCH_ACTION = "autopilot-launch";
+export const REARM_ACTION = "autopilot-rearm";
 /** A task ref naming the owner's word that marked it, e.g. `owner:discord:<channel>/<message>`. */
 export const OWNER_REF = /^owner:\S+$/;
 
@@ -103,11 +107,19 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
 // ---------------------------------------------------------------------------------------------------------------------
 // Ledger
 
-export type LedgerState = { readonly attempts: number; readonly ambiguous: boolean; readonly live: boolean };
+/**
+ * `attempts` and `ambiguous` count only the attempts no re-arm covers; `live` counts every attempt; `last` is the highest
+ * attempt number taken or covered by a re-arm (0: none), so the next attempt is `last + 1`.
+ */
+export type LedgerState = { readonly attempts: number; readonly last: number; readonly ambiguous: boolean; readonly live: boolean };
 
-/** Every launch-attempt row in the store. */
+/** Every ledger row in the store: launch attempts and re-arms. */
 export const ledgerRows = (store: OperationStore): Operation[] =>
-  store.list().filter((op) => op.action === LAUNCH_ACTION && op.lane.startsWith("toodo:"));
+  store.list().filter((op) => (op.action === LAUNCH_ACTION || op.action === REARM_ACTION) && op.lane.startsWith("toodo:"));
+
+/** The highest attempt number a re-arm of `taskId` covers, 0 when it was never re-armed. */
+export const rearmedThrough = (rows: readonly Operation[], taskId: number): number =>
+  Math.max(0, ...rows.filter((op) => op.action === REARM_ACTION && op.lane === `toodo:${taskId}`).map((op) => Number(op.target)));
 
 const rowsOf = (rows: readonly Operation[], taskId: number): Operation[] =>
   rows.filter((op) => op.action === LAUNCH_ACTION && op.lane === `toodo:${taskId}`);
@@ -169,6 +181,7 @@ export const autopilotLocalStateKey = (store: OperationStore, openLanes: Readonl
     store.list({ states: OPEN_STATES })
       .filter((op) => op.action === LAUNCH_ACTION && op.lane.startsWith("toodo:"))
       .map((op) => `${op.id}:${op.state}`).sort(),
+    ledgerRows(store).filter((op) => op.action === REARM_ACTION).map((op) => op.id).sort(),
   ]);
 
 /**
@@ -190,7 +203,7 @@ const outcomeOf = (op: Operation): unknown => {
  * not start, was given up, or its Done can never hold) settles the row `failed`; any other close (every Done signal held,
  * its PR merged) marks it done. Returns the line for the lead, or undefined when no launch attempt names the lane (not an
  * autopilot lane), the row already has an outcome, or the launch itself was settled failed or ambiguous. Nothing is
- * relaunched: the predicate refuses the task `already-attempted` from now on.
+ * relaunched: the predicate refuses the task `already-attempted` from now on, until the owner re-arms it.
  */
 export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: string, failed?: string): string | undefined => {
   const op = ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
@@ -235,7 +248,12 @@ export const markLaneToodo = (store: OperationStore, now: number, laneKey: strin
 
 export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
   const mine = rowsOf(rows, taskId);
-  return { attempts: mine.length, ambiguous: mine.some((op) => op.state === "ambiguous"), live: mine.some((op) => rowLive(op, openLanes)) };
+  const through = rearmedThrough(rows, taskId);
+  const counted = mine.filter((op) => Number(op.target) > through);
+  return {
+    attempts: counted.length, last: Math.max(through, ...mine.map((op) => Number(op.target))),
+    ambiguous: counted.some((op) => op.state === "ambiguous"), live: mine.some((op) => rowLive(op, openLanes)),
+  };
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -337,7 +355,7 @@ const verdictOf = (taskId: number, found: ReadonlySet<Reason>): Verdict => {
 /**
  * Judges one task on its own (no slot assignment; judgeAll adds that). Every failing reason is collected; the verdict
  * is REFUSE if any reason is a refusal, else HOLD if any reason holds, else LAUNCH. Reasons come in REFUSE_REASONS then
- * HOLD_REASONS order. Any earlier launch attempt refuses: autopilot never retries by itself.
+ * HOLD_REASONS order. Any earlier launch attempt no re-arm covers refuses: autopilot never retries by itself.
  */
 export const judge = (input: JudgeInput): Verdict => {
   const { taskId, tasks, config } = input;

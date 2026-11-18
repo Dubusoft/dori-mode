@@ -5,7 +5,7 @@ import { parseArgs } from "node:util";
 import {
   type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, type Hosts, judgeAll,
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaAccount, quotaAccountText, quotaSplit,
-  type QuotaSummary, type ToodoTask,
+  type QuotaSummary, REARM_ACTION, rearmedThrough, type ToodoTask,
 } from "./autopilot.ts";
 import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from "./claude-quota.ts";
 import { sharedQuotaLookup } from "./quota-cache.ts";
@@ -19,7 +19,7 @@ import { replaceFileAtomic } from "./durable-write.ts";
 
 /**
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
- * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
+ * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows, rearm writes re-arm rows; the lead runs `start_task` and `dori launch` between the reservation and its
  * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every `autopilot.tickSec`.
  * Autopilot is always on: a reservation needs only no pause; `pause` / `resume` set and clear the pause file.
  * With `autopilot.executor` on, the supervisor's executor (autopilot-executor.ts) owns reserve, launch and settle: `launch`
@@ -29,6 +29,7 @@ import { replaceFileAtomic } from "./durable-write.ts";
 export const AUTOPILOT_USAGE = [
   "usage: dori autopilot candidates [--tasks 12,13] [--json]",
   "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
+  "       dori autopilot rearm <taskId> [--note TEXT]",
   "       dori autopilot pause [--reason TEXT]",
   "       dori autopilot resume",
 ].join("\n");
@@ -190,7 +191,7 @@ const FLAGS = {
   reason: { type: "string" },
 } as const;
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  candidates: ["json", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], pause: ["reason"], resume: [],
+  candidates: ["json", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], rearm: ["note"], pause: ["reason"], resume: [],
 };
 
 const taskIds = (value: string | undefined): number[] => {
@@ -284,7 +285,7 @@ export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Pro
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} ${verdict.verdict} ${verdict.reasons.join(", ")}`);
     return 1;
   }
-  const attempt = ledgerState(ledger, taskId, openLanes).attempts + 1;
+  const attempt = ledgerState(ledger, taskId, openLanes).last + 1;
   const laneKey = autopilotLaneKey(taskId, attempt);
   // A reservation on the default machine names none, as rows written before machines were recorded.
   const machine = verdict.machine !== undefined && verdict.machine !== found.defaultMachine ? verdict.machine : undefined;
@@ -341,6 +342,40 @@ const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Re
   }
 };
 
+/**
+ * `dori autopilot rearm <taskId>`, on the owner's word: the task's attempts so far (launch attempts and executor
+ * sequences) stop refusing it, so once it judges LAUNCH again (e.g. its wait ended) its next launch is attempt n+1.
+ * Writes one verified re-arm row covering the highest attempt number, under the launch lock; launches nothing and works
+ * while paused. Refuses while an attempt still runs; re-arming again with no attempt since changes nothing.
+ */
+const rearm = async (deps: AutopilotDeps, positionals: readonly string[], note: string | undefined): Promise<number> => {
+  const [id, ...more] = positionals;
+  if (id === undefined || more.length || !/^\d+$/.test(id)) throw new UsageError("autopilot rearm takes one toodo task id");
+  const taskId = Number(id);
+  const release = await deps.lock();
+  try {
+    const ledger = ledgerRows(deps.store);
+    const state = ledgerState(ledger, taskId, await deps.openLanes());
+    const executions = deps.store.list({ lane: `toodo:${taskId}` }).filter((op) => op.action === EXECUTE_ACTION);
+    if (state.live || executions.some((op) => OPEN_STATES.includes(op.state))) {
+      deps.err(`AUTOPILOT_REARM_REFUSED #${taskId} lane-live: an attempt is still running`);
+      return 1;
+    }
+    const last = Math.max(state.last, ...executions.map((op) => Number(op.target)));
+    if (last === 0) { deps.err(`AUTOPILOT_REARM_NOTHING #${taskId}: no launch attempt to re-arm`); return 1; }
+    const already = last <= rearmedThrough(ledger, taskId);
+    if (!already) {
+      const why = note?.trim();
+      const row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: REARM_ACTION, target: String(last), data: JSON.stringify(why ? { note: why } : {}) });
+      settleOperation(deps.store, deps.now(), row.id, "verified", why ? `re-armed: ${why}` : "re-armed");
+    }
+    deps.out(`AUTOPILOT_REARMED #${taskId} through=${last} next=${autopilotLaneKey(taskId, last + 1)}${already ? " (already)" : ""}`);
+    return 0;
+  } finally {
+    release();
+  }
+};
+
 /** `dori autopilot pause`: new reservations refuse until `resume`; running lanes go on. Pausing twice keeps the first. */
 const pause = (deps: AutopilotDeps, reason: string | undefined): number => {
   const current = readPause(deps.pauseFile);
@@ -372,6 +407,7 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     if (stray.length) throw new UsageError(`${stray.map((f) => `--${f}`).join(", ")} is not an option of autopilot ${sub}`);
     const v = parsed.values as Record<string, unknown>;
     if (sub === "launch") return await launch(deps, extra, v);
+    if (sub === "rearm") return await rearm(deps, extra, v.note as string | undefined);
     if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
     if (sub === "pause") return pause(deps, v.reason as string | undefined);
     if (sub === "resume") return resume(deps);
