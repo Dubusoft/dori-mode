@@ -1,97 +1,18 @@
-import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmSync, writeFileSync, type Stats } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
-import { LANE_KEY } from "../registry.ts";
+import { bytes, checkLaneFilesBody, compare, fileSize, hash, invalidFiles, LaneFileError, limit, portableComponent, portablePath, totalSize, treeDigest, validateFileKey, validateLaneTree } from "../lane-file-contract.ts";
 import { ensureRunnerSubdir, writeRunnerFile } from "./fs-safety.ts";
 import { currentUserSid, evaluateSddl, readSddl } from "./win-acl.ts";
-import type { LaneBriefFiles, LaneFile, LaneFileLimits, LaneFileRun, LaneFileTree, LaneOutputFiles, RunnerEventBodies } from "./protocol.ts";
+import type { LaneBriefFiles, LaneFile, LaneFileRun, LaneFileTree, LaneOutputFiles, RunnerEventBodies } from "./protocol.ts";
 
-export const FILE_LIMITS = {
-  fileBytes: 262144, totalBytes: 393216, files: 64, directories: 128, references: 256, depth: 16,
-  relativePathBytes: 240, componentBytes: 120, sourcePathBytes: 4096, briefBytes: 65536,
-  reportTextBytes: 65536, evidenceBytes: 16384, wireBodyBytes: 786432,
-} as const satisfies LaneFileLimits;
-const bytes = (s: string): number => Buffer.byteLength(s);
-const hash = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
-const compare = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
-export class LaneFileError extends Error {
-  constructor(readonly code: string, key: string, detail: string) {
-    super(`${code} ${key}: ${detail}`);
-    this.name = "LaneFileError";
-  }
-}
-export const invalidFiles = (key: string, reason: string): LaneFileError =>
-  new LaneFileError("LANE_FILES_INVALID", key, `invalid file payload (${reason}); regenerate the brief or report and retry`);
-export const portableComponent = (name: string): boolean =>
-  !!name && name !== "." && name !== ".." && name.normalize("NFC") === name
-  && !/[\\/\x00-\x1f\x7f<>:"|?*]/.test(name) && !/[. ]$/.test(name)
-  && !/^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(name);
-export const validateFileKey = (key: string): void => {
-  if (!LANE_KEY.test(key) || !portableComponent(key)) throw invalidFiles(key, "run-id");
-};
-const limit = (key: string, name: keyof LaneFileLimits, n: number, output = false): void => {
-  if (n > FILE_LIMITS[name]) throw new LaneFileError(output ? "LANE_REPORT_LIMIT" : "LANE_FILES_LIMIT", key,
-    `${name} is ${n}, above ${FILE_LIMITS[name]}; ${output ? "reduce DORI_LANE_OUT or the done text/evidence and claim done again" : "reduce the attachment tree or brief and launch again"}`);
-};
-export const checkFileBody = (key: string, body: unknown): void => {
-  const n = bytes(JSON.stringify(body));
-  if (n > FILE_LIMITS.wireBodyBytes) throw new LaneFileError("LANE_FILES_FRAME_TOO_LARGE", key,
-    `encoded lane files body is ${n} bytes; the limit is 786432 bytes; reduce the brief, attachments, or report and retry`);
-};
 const validRun = (run: LaneFileRun): boolean =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(run.id) && typeof run.requiredReport === "boolean";
-const checkPath = (key: string, path: string, output: boolean): void => {
-  const parts = path.split("/");
-  if (!parts.every(portableComponent) || parts[0]!.toLowerCase() === ".dori-lane-files.json") throw invalidFiles(key, "duplicate-path");
-  limit(key, "depth", parts.length, output);
-  limit(key, "relativePathBytes", bytes(path), output);
-  for (const part of parts) limit(key, "componentBytes", bytes(part), output);
-};
-export const treeDigest = (tree: LaneFileTree): string =>
-  hash(JSON.stringify([tree.directories, tree.files.map((f) => [f.path, f.bytes, f.sha256])]));
-const fileSize = (key: string, path: string, n: number, output: boolean): void => {
-  if (n > FILE_LIMITS.fileBytes) throw new LaneFileError(output ? "LANE_REPORT_TOO_LARGE" : "LANE_FILE_TOO_LARGE", key,
-    `${output ? "output file" : "attachment"} ${JSON.stringify(path)} is ${n} bytes; the limit is 262144 bytes; ${output ? "reduce it in DORI_LANE_OUT and claim done again" : "split or reduce it and launch again"}`);
-};
-const totalSize = (key: string, n: number, output: boolean): void => {
-  if (n > FILE_LIMITS.totalBytes) throw new LaneFileError(output ? "LANE_REPORTS_TOO_LARGE" : "LANE_FILES_TOO_LARGE", key,
-    `${output ? "DORI_LANE_OUT totals" : "attachments total"} ${n} bytes; the limit is 393216 bytes; ${output ? "remove or reduce files there and claim done again" : "remove or reduce attachments and launch again"}`);
-};
-export const validateTree = (key: string, tree: LaneFileTree, output = false): void => {
-  limit(key, "files", tree.files.length, output);
-  limit(key, "directories", tree.directories.length, output);
-  const dirs = new Set(tree.directories);
-  const names = new Set<string>();
-  for (const paths of [tree.directories, tree.files.map((f) => f.path)]) {
-    for (let i = 0; i < paths.length; i++) {
-      const p = paths[i]!;
-      checkPath(key, p, output);
-      if (i && compare(paths[i - 1]!, p) >= 0) throw invalidFiles(key, "tree-order");
-      const folded = p.toUpperCase().toLowerCase();
-      if (names.has(folded)) throw invalidFiles(key, dirs.has(p) && tree.files.some((f) => f.path === p) ? "file-directory-collision" : "duplicate-path");
-      names.add(folded);
-      if (p.includes("/") && !dirs.has(p.slice(0, p.lastIndexOf("/")))) throw invalidFiles(key, "missing-parent");
-    }
-  }
-  let total = 0;
-  for (const f of tree.files) {
-    if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) throw invalidFiles(key, "byte-count");
-    fileSize(key, f.path, f.bytes, output);
-    total += f.bytes;
-    totalSize(key, total, output);
-    if (f.base64.length > 4 * Math.ceil(FILE_LIMITS.fileBytes / 3)) throw invalidFiles(key, "base64");
-    const data = Buffer.from(f.base64, "base64");
-    if (data.toString("base64") !== f.base64) throw invalidFiles(key, "base64");
-    if (data.length !== f.bytes) throw invalidFiles(key, "byte-count");
-    if (!/^[a-f0-9]{64}$/.test(f.sha256) || hash(data) !== f.sha256) throw invalidFiles(key, "digest");
-  }
-};
 export const validateBriefFiles = (key: string, brief: string, files: LaneBriefFiles): void => {
   validateFileKey(key);
   if (!validRun(files.run)) throw invalidFiles(key, "run-id");
   // The generated footer is not part of the raw user-brief budget.
   limit(key, "briefBytes", bytes(brief.split("\n## Lane footer (written by dori launch)")[0]!));
-  validateTree(key, files.tree);
+  validateLaneTree(key, files.tree, false, true);
   limit(key, "references", files.references.length);
   let end = 0;
   const footer = brief.indexOf("\n## Lane footer (written by dori launch)");
@@ -112,11 +33,11 @@ export const checkManagedReport = (body: RunnerEventBodies["lane.report"]): void
   validateFileKey(key);
   if (!validRun(files.run)) throw invalidFiles(key, "run-id");
   if (!Number.isSafeInteger(files.revision) || files.revision < 1) throw invalidFiles(key, "revision");
-  validateTree(key, files.tree, true);
+  validateLaneTree(key, files.tree, true, true);
   if (treeDigest(files.tree) !== files.sha256) throw invalidFiles(key, "digest");
   limit(key, "reportTextBytes", bytes(body.text), true);
   limit(key, "evidenceBytes", bytes(body.evidence ?? ""), true);
-  checkFileBody(key, body);
+  checkLaneFilesBody(key, body);
 };
 export const laneFilePaths = (runnerDir: string, key: string) => {
   validateFileKey(key);
@@ -163,6 +84,50 @@ export const prepareInput = (runnerDir: string, key: string, brief: string, file
   }
 };
 
+/**
+ * Adds a lead's tree to a running lane's input directory under the next free `a<NNNN>` group and returns that group's
+ * path. The directory is written in place, never replaced: a Linux lane sandbox binds it by inode at start, so a renamed
+ * replacement would stay invisible to the lane. The combined input keeps the launch caps.
+ */
+export const addInput = (runnerDir: string, key: string, tree: LaneFileTree): string => {
+  validateFileKey(key);
+  validateLaneTree(key, tree, false, true);
+  const paths = laneFilePaths(runnerDir, key);
+  let st: Stats;
+  try { st = lstatSync(paths.input); } catch {
+    throw new LaneFileError("LANE_ATTACH_NO_INPUT", key, `the lane has no attachment directory ${JSON.stringify(paths.input)}; relaunch it from the lead`);
+  }
+  if (!st.isDirectory() || st.isSymbolicLink() || realpathSync(paths.input) !== resolve(paths.input)) {
+    throw new LaneFileError("LANE_ATTACH_NO_INPUT", key, `the attachment directory ${JSON.stringify(paths.input)} is not a plain directory; relaunch the lane from the lead`);
+  }
+  let files = 0, directories = 0, total = 0;
+  const count = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name), s = lstatSync(path);
+      if (s.isDirectory() && !s.isSymbolicLink()) { directories++; count(path); } else { files++; total += s.size; }
+    }
+  };
+  count(paths.input);
+  limit(key, "files", files + tree.files.length);
+  limit(key, "directories", directories + tree.directories.length + 1);
+  totalSize(key, tree.files.reduce((n, f) => n + f.bytes, total), false);
+  const taken = new Set(readdirSync(paths.input).map((name) => name.toLowerCase()));
+  let n = 1;
+  while (taken.has(`a${String(n).padStart(4, "0")}`)) n++;
+  const group = join(paths.input, `a${String(n).padStart(4, "0")}`);
+  try {
+    removeLaneTree(runnerDir, paths.stage);
+    mkdirSync(paths.stage, { mode: 0o700 });
+    for (const dir of tree.directories) mkdirSync(join(paths.stage, dir), { mode: 0o700 });
+    for (const f of tree.files) writeFileSync(join(paths.stage, f.path), Buffer.from(f.base64, "base64"), { flag: "wx", mode: 0o600 });
+    renameSync(paths.stage, group);
+  } catch {
+    removeLaneTree(runnerDir, paths.stage);
+    throw new LaneFileError("LANE_FILES_WRITE_FAILED", key, "cannot add the files to the lane's attachment directory; fix runner disk space and permissions, then retry");
+  }
+  return group;
+};
+
 export type FileReaders = {
   lstat: typeof lstatSync; readdir: (path: string) => string[]; realpath: (path: string) => string;
   open: (path: string, flags: number) => number; stat: (fd: number) => Stats;
@@ -201,7 +166,7 @@ export const captureOutput = (runnerDir: string, key: string, run: LaneFileRun, 
     for (const name of names) {
       const path = join(dir, name), target = rel ? `${rel}/${name}` : name;
       if (!portableComponent(name) || (!rel && name.toLowerCase() === ".dori-lane-files.json")) unsafe(path, "unsafe-name");
-      checkPath(key, target, true);
+      portablePath(key, target, true);
       const nameKey = target.toUpperCase().toLowerCase();
       if (folded.has(nameKey)) unsafe(path, "case-collision");
       folded.add(nameKey);
@@ -241,7 +206,7 @@ export const captureOutput = (runnerDir: string, key: string, run: LaneFileRun, 
     walk(root, "");
     directories.sort(compare); files.sort((a, b) => compare(a.path, b.path));
     const tree = { directories, files };
-    validateTree(key, tree, true);
+    validateLaneTree(key, tree, true, true);
     if (run.requiredReport && files.length === 0) throw new LaneFileError("LANE_REPORT_REQUIRED", key,
       `DORI_LANE_OUT is empty; write your report to ${JSON.stringify(join(root, "report.md"))}, then run ${remote ? "~/.dori/runner/bin/dori" : "dori"} report ${key} done --text "<one line>" --evidence "<summary>"`);
     return tree;

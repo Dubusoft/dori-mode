@@ -1,20 +1,21 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { LANE_KEY, type Lane } from "./registry.ts";
+import { bytes, checkLaneFilesBody, compare, FILE_LIMITS, hash, invalidFiles, LaneFileError, limit, MARKER, portableComponent, portablePath, treeDigest, validateFileKey, validateLaneTree } from "./lane-file-contract.ts";
+import type { Lane } from "./registry.ts";
 import { acquireStateLock, StateLockError } from "./state-lock.ts";
 import { saveJsonFile } from "./store.ts";
-import type { LaneBriefFiles, LaneFile, LaneFileLimits, LaneFileReceipt, LaneFileRun, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
+import type { LaneBriefFiles, LaneFile, LaneFileReceipt, LaneFileRun, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
 import { currentUserSid, evaluateSddl, readSddl } from "./runner/win-acl.ts";
 
 export const LEAD_ATTACHMENT_ROOTS = (stateDir: string): readonly string[] => [
   join(dirname(stateDir), "research"), join(stateDir, "briefs"),
 ];
 /**
- * The attachment sources a fresh launch shipped, pinned beside the research root rather than under stateDir: local
- * sandboxes mount stateDir (briefs and registry included) read-write, while the rest of the dori home stays read-only to
- * a lane. Recovery ships only references inside this set, so a lane that rewrites its own brief gains no new reads.
+ * The attachment sources a fresh launch shipped, pinned beside the research root rather than under stateDir: the lane
+ * sandboxes hide stateDir (briefs and registry included) from a lane and keep lane-attachments read-only, so
+ * a lane can read its pin but never change it. Recovery ships only references inside this set, so a lane that rewrites its own brief gains no new reads.
  */
 const attachmentPinPath = (stateDir: string, key: string): string => join(dirname(resolve(stateDir)), "lane-attachments", `${key}.json`);
 export const writeLaneAttachmentPin = (stateDir: string, key: string, sources: readonly string[]): void => {
@@ -34,16 +35,7 @@ export const readLaneAttachmentPin = (stateDir: string, key: string): readonly s
   if (pin.key !== key || !Array.isArray(pin.sources) || !pin.sources.every((s) => typeof s === "string" && isAbsolute(s))) return [];
   return pin.sources as string[];
 };
-export const FILE_LIMITS = {
-  fileBytes: 262144, totalBytes: 393216, files: 64, directories: 128, references: 256, depth: 16,
-  relativePathBytes: 240, componentBytes: 120, sourcePathBytes: 4096, briefBytes: 65536,
-  reportTextBytes: 65536, evidenceBytes: 16384, wireBodyBytes: 786432,
-} as const satisfies LaneFileLimits;
 export const FILE_FOOTER_HEADING = "\n## Lane footer (written by dori launch)";
-const MARKER = ".dori-lane-files.json";
-const bytes = (s: string): number => Buffer.byteLength(s);
-const hash = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
-const compare = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
 const inside = (root: string, path: string): boolean => {
   const r = relative(root, path);
   return r === "" || (!isAbsolute(r) && r !== ".." && !r.startsWith(`..${sep}`));
@@ -53,41 +45,8 @@ const absent = (path: string): Stats | undefined => {
   try { return lstatSync(path); } catch (e) { if (codeOf(e) === "ENOENT") return undefined; throw e; }
 };
 
-export class LaneFileError extends Error {
-  constructor(readonly code: string, key: string, detail: string, readonly transient = false) {
-    super(`${code} ${key}: ${detail}`);
-    this.name = "LaneFileError";
-  }
-}
-export const invalidFiles = (key: string, reason: string): LaneFileError =>
-  new LaneFileError("LANE_FILES_INVALID", key, `invalid file payload (${reason}); regenerate the brief or report and retry`);
-export const validateFileKey = (key: string): void => {
-  if (!LANE_KEY.test(key) || !portableComponent(key)) throw invalidFiles(key, "run-id");
-};
-const limit = (key: string, name: keyof LaneFileLimits, n: number, output = false): void => {
-  if (n > FILE_LIMITS[name]) throw new LaneFileError(output ? "LANE_REPORT_LIMIT" : "LANE_FILES_LIMIT", key,
-    `${name} is ${n}, above ${FILE_LIMITS[name]}; ${output ? "reduce DORI_LANE_OUT or the done text/evidence and claim done again" : "reduce the attachment tree or brief and launch again"}`);
-};
-export const checkLaneFilesBody = (key: string, body: unknown): void => {
-  const size = bytes(JSON.stringify(body));
-  if (size > FILE_LIMITS.wireBodyBytes) throw new LaneFileError("LANE_FILES_FRAME_TOO_LARGE", key,
-    `encoded lane files body is ${size} bytes; the limit is 786432 bytes; reduce the brief, attachments, or report and retry`);
-};
-export const portableComponent = (name: string): boolean =>
-  name.length > 0 && name !== "." && name !== ".." && name.normalize("NFC") === name
-  && !/[\\/\x00-\x1f\x7f<>:"|?*]/.test(name) && !/[. ]$/.test(name)
-  && !/^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(name);
-const portablePath = (key: string, path: string, output: boolean): void => {
-  const parts = path.split("/");
-  if (!parts.every(portableComponent) || parts[0]?.toLowerCase() === MARKER) throw invalidFiles(key, "duplicate-path");
-  limit(key, "depth", parts.length, output);
-  limit(key, "relativePathBytes", bytes(path), output);
-  for (const p of parts) limit(key, "componentBytes", bytes(p), output);
-};
 const runValid = (run: LaneFileRun): boolean =>
   typeof run?.id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(run.id) && typeof run.requiredReport === "boolean";
-export const treeDigest = (tree: LaneFileTree): string =>
-  hash(JSON.stringify([tree.directories, tree.files.map((f) => [f.path, f.bytes, f.sha256])]));
 
 /** Structural q.result guard; semantic errors remain permanent event refusals at the consumer. */
 export const isLaneOutputFiles = (v: unknown): v is LaneOutputFiles => {
@@ -99,38 +58,6 @@ export const isLaneOutputFiles = (v: unknown): v is LaneOutputFiles => {
     || !Array.isArray(v.tree.files)) return false;
   return v.tree.files.every((f) => obj(f) && keys(f, ["path", "bytes", "sha256", "base64"]) && typeof f.path === "string"
     && Number.isSafeInteger(f.bytes) && (f.bytes as number) >= 0 && typeof f.sha256 === "string" && typeof f.base64 === "string");
-};
-export const validateLaneTree = (key: string, tree: LaneFileTree, output = false): void => {
-  limit(key, "directories", tree.directories.length, output);
-  limit(key, "files", tree.files.length, output);
-  const names = new Map<string, string>();
-  const dirs = new Set(tree.directories);
-  for (const group of [tree.directories, tree.files.map((f) => f.path)]) {
-    for (let i = 0; i < group.length; i++) {
-      const path = group[i]!;
-      portablePath(key, path, output);
-      if (i && compare(group[i - 1]!, path) >= 0) throw invalidFiles(key, "tree-order");
-      const folded = path.normalize("NFC").toUpperCase().toLowerCase();
-      if (names.has(folded)) throw invalidFiles(key, dirs.has(path) && tree.files.some((f) => f.path === path) ? "file-directory-collision" : "duplicate-path");
-      names.set(folded, path);
-      const parent = path.slice(0, path.lastIndexOf("/"));
-      if (path.includes("/") && !dirs.has(parent)) throw invalidFiles(key, "missing-parent");
-    }
-  }
-  let total = 0;
-  for (const f of tree.files) {
-    if (!Number.isSafeInteger(f.bytes) || f.bytes < 0) throw invalidFiles(key, "byte-count");
-    if (f.bytes > FILE_LIMITS.fileBytes) throw new LaneFileError(output ? "LANE_REPORT_TOO_LARGE" : "LANE_FILE_TOO_LARGE", key,
-      `${output ? "output file" : "attachment"} ${JSON.stringify(f.path)} is ${f.bytes} bytes; the limit is 262144 bytes; ${output ? "reduce it in DORI_LANE_OUT and claim done again" : "split or reduce it and launch again"}`);
-    total += f.bytes;
-    if (f.base64.length > 4 * Math.ceil(FILE_LIMITS.fileBytes / 3)) throw invalidFiles(key, "base64");
-    const buf = Buffer.from(f.base64, "base64");
-    if (buf.toString("base64") !== f.base64) throw invalidFiles(key, "base64");
-    if (buf.length !== f.bytes) throw invalidFiles(key, "byte-count");
-    if (!/^[a-f0-9]{64}$/.test(f.sha256) || hash(buf) !== f.sha256) throw invalidFiles(key, "digest");
-  }
-  if (total > FILE_LIMITS.totalBytes) throw new LaneFileError(output ? "LANE_REPORTS_TOO_LARGE" : "LANE_FILES_TOO_LARGE", key,
-    `${output ? "DORI_LANE_OUT totals" : "attachments total"} ${total} bytes; the limit is 393216 bytes; ${output ? "remove or reduce files there and claim done again" : "remove or reduce attachments and launch again"}`);
 };
 export const validateLaneOutput = (key: string, files: LaneOutputFiles, expected: LaneFileRun): void => {
   if (!isLaneOutputFiles(files) || !runValid(files.run)) throw invalidFiles(key, "run-id");
@@ -221,8 +148,9 @@ export const prepareLaneBrief = (input: {
   const { key, stateDir, briefText, requiredReport } = input;
   validateFileKey(key);
   limit(key, "briefBytes", bytes(input.rawBriefText ?? briefBody(briefText)));
-  const roots = LEAD_ATTACHMENT_ROOTS(stateDir).flatMap((path) => {
-    try { return [{ path: resolve(path), real: realpathSync(path) }]; } catch (e) { if (codeOf(e) === "ENOENT") return []; throw e; }
+  // A root that does not exist still claims its paths, so a reference under it is reported missing rather than outside.
+  const roots = LEAD_ATTACHMENT_ROOTS(stateDir).map((path): { path: string; real?: string } => {
+    try { return { path: resolve(path), real: realpathSync(path) }; } catch (e) { if (codeOf(e) === "ENOENT") return { path: resolve(path) }; throw e; }
   });
   const research = resolve(LEAD_ATTACHMENT_ROOTS(stateDir)[0]!);
   const unsafe = (path: string, reason: string): never => { throw new LaneFileError("LANE_FILE_UNSAFE", key,
@@ -238,7 +166,7 @@ export const prepareLaneBrief = (input: {
   const occurrences = scanBriefPaths(briefText);
   for (const occurrence of occurrences) {
     const path = resolve(occurrence.path);
-    const root = roots.find((r) => inside(r.path, path) || inside(r.real, path));
+    const root = roots.find((r) => inside(r.path, path) || (r.real !== undefined && inside(r.real, path)));
     if (!root) {
       // Metadata only: do not resolve, open, enumerate, or charge outside-root paths.
       try { stat(path); if (!noted.has(occurrence.path)) { noted.add(occurrence.path); notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} is outside the attachment roots and stays literal`); } } catch {}
@@ -250,10 +178,21 @@ export const prepareLaneBrief = (input: {
       noted.add(occurrence.path);
       notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} was not attached at launch and stays literal`);
     };
+    const missingNote = (why: string): void => {
+      if (noted.has(occurrence.path)) return;
+      noted.add(occurrence.path);
+      notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} ${why} and stays literal`);
+    };
+    const rootReal = root.real;
+    if (rootReal === undefined) {
+      if (input.allowed && !input.allowed.some((a) => inside(a, path))) notPinned();
+      else missingNote(`does not exist (the attachment root ${JSON.stringify(root.path)} is missing)`);
+      continue;
+    }
     // Checked before any stat, so a reference the launch never attached can neither ship nor refuse the recovery.
-    if (!pinned(inside(root.path, path) ? join(root.real, relative(root.path, path)) : path)) { notPinned(); continue; }
+    if (!pinned(inside(root.path, path) ? join(rootReal, relative(root.path, path)) : path)) { notPinned(); continue; }
     limit(key, "sourcePathBytes", bytes(occurrence.path));
-    const base = inside(root.path, path) ? root.path : root.real;
+    const base = inside(root.path, path) ? root.path : rootReal;
     let cursor = base, missing = false;
     for (const component of relative(base, path).split(sep).filter(Boolean)) {
       cursor = join(cursor, component);
@@ -263,9 +202,9 @@ export const prepareLaneBrief = (input: {
       }
       catch (e) { if (codeOf(e) === "ENOENT") { missing = true; break; } if (e instanceof LaneFileError) throw e; throw new LaneFileError("LANE_FILE_READ_FAILED", key, `cannot read attachment ${JSON.stringify(path)}; make it readable or remove its reference and launch again`); }
     }
-    if (missing) continue;
+    if (missing) { missingNote(`does not exist (no ${JSON.stringify(cursor)})`); continue; }
     const real = realpathSync(path);
-    if (!inside(root.real, real)) unsafe(path, "outside-root");
+    if (!inside(rootReal, real)) unsafe(path, "outside-root");
     if (!pinned(real)) { notPinned(); continue; }
     source.set(occurrence.path, real);
   }
@@ -322,6 +261,33 @@ export const prepareLaneBrief = (input: {
   return result;
 };
 
+/**
+ * The tree `dori attach` adds to a running lane: the named lead paths under the same roots, safety checks and caps as a
+ * launch. A path that would stay literal in a brief (missing, outside the roots) refuses the whole attachment.
+ */
+export const prepareLaneAttachment = (input: {
+  readonly key: string; readonly stateDir: string; readonly paths: readonly string[]; readonly readers?: FileReaders;
+}): { readonly tree: LaneFileTree; readonly targets: readonly { readonly source: string; readonly target: string }[] } => {
+  const { key, paths } = input;
+  validateFileKey(key);
+  if (paths.length === 0) throw new LaneFileError("LANE_ATTACH_INVALID", key, "name at least one file or directory under the attachment roots");
+  for (const p of paths) {
+    if (!isAbsolute(p) || /[`\r\n]/.test(p)) throw new LaneFileError("LANE_ATTACH_INVALID", key, `${JSON.stringify(p)} must be an absolute path without backticks or line breaks`);
+  }
+  // Each path as one delimited brief token, so the launch scanner, roots and caps decide exactly as for a brief.
+  const briefText = paths.map((p) => `\`${p}\``).join("\n");
+  const prepared = prepareLaneBrief({ key, stateDir: input.stateDir, briefText, requiredReport: false, ...(input.readers ? { readers: input.readers } : {}) });
+  const targets = prepared.files.references.map((ref) => ({ source: briefText.slice(ref.start, ref.end), target: ref.target }));
+  const skipped = paths.filter((p) => !targets.some((t) => t.source === p));
+  if (prepared.notes.length || skipped.length) {
+    const roots = LEAD_ATTACHMENT_ROOTS(input.stateDir).map((r) => JSON.stringify(resolve(r))).join(" or ");
+    throw new LaneFileError("LANE_ATTACH_REFUSED", key, [...prepared.notes,
+      ...skipped.filter((p) => !prepared.notes.some((n) => n.includes(JSON.stringify(p)))).map((p) => `${JSON.stringify(p)} is not a file or directory under ${roots}`),
+    ].join("; "));
+  }
+  return { tree: prepared.files.tree, targets };
+};
+
 export type CollectionNote = { readonly id: string; readonly line: string };
 export type InstallOptions = {
   readonly now?: () => number;
@@ -340,6 +306,10 @@ type Intent = {
 const sameReceipt = (a: Receipt | undefined | null, b: Receipt | undefined | null): boolean =>
   Boolean(a && b && a.key === b.key && a.run.id === b.run.id && a.run.requiredReport === b.run.requiredReport && a.revision === b.revision && a.sha256 === b.sha256);
 const destination = (stateDir: string, key: string): string => join(dirname(resolve(stateDir)), "research", key);
+/** The report file a repo-less autopilot lane writes in DORI_LANE_OUT (autopilot-plan.ts). */
+export const LANE_REPORT_NAME = "report.md";
+/** Where a lane's `report.md` lands on the lead host once its claim's files are installed: the Done of a repo-less lane. */
+export const laneReportFile = (stateDir: string, key: string): string => join(destination(stateDir, key), LANE_REPORT_NAME);
 const unsafeDestination = (key: string, path: string): LaneFileError => new LaneFileError("LANE_REPORT_DESTINATION_UNSAFE", key,
   `collection destination ${JSON.stringify(path)} is not a safe dori-managed directory; move the conflicting path aside and retry the claim`);
 const ownerSafe = (path: string, st: Stats): boolean => {

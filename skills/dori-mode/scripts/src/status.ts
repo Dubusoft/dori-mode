@@ -9,7 +9,7 @@ import { readSourceStatus, SourceSpecs, type SourceView, sourceViews } from "./e
 import { type ScheduleRow, scheduleRow, type ScheduleSpec } from "./schedule.ts";
 import { githubSummary } from "./github-events.ts";
 import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-status.ts";
-import { type LaneReport, latestLaneReports } from "./lane-reports.ts";
+import { type LaneReport, latestLaneReports } from "./lane-report-store.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
 import { listPanes } from "./panes.ts";
@@ -60,6 +60,8 @@ export type Status = {
   readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
     readonly key: string; readonly model?: string; readonly ageMin: number; readonly progress?: string; readonly repo?: string; readonly pr?: number;
+    /** The Toodo task the lane works on (Lane.task); absent when none was named. */
+    readonly task?: number;
     /** The runner the lane runs on (its owning runner, else its machine, else "local"); absent in an older status reads as "local". */
     readonly machine?: string;
     /** recoveryPending: "exhausted" after every recovery attempt failed (LANE_RECOVERY_EXHAUSTED), else "pending". */
@@ -184,13 +186,8 @@ export const runnerViews = (rows: readonly RunnerRow[], now: number, opts: {
  * heartbeat time is the supervisor's own wall clock, written by the hub on this host.
  */
 /** Restarts the liveness monitor planned for `label` in the last hour (operations rows `runner:<label>/restart/...`). */
-const runnerRestarts = (config: Parameters<typeof openOperations>[0], label: string, now: number): number | undefined => {
-  try {
-    const ops = openOperations(config);
-    try { return ops.list({ lane: `runner:${label}` }).filter((op) => op.action === "restart" && now - op.at < 60 * 60_000).length; }
-    finally { ops.close(); }
-  } catch { return undefined; }
-};
+const runnerRestarts = (ops: ReturnType<typeof openOperations>, label: string, now: number): number | undefined =>
+  ops.list({ lane: `runner:${label}` }).filter((op) => op.action === "restart" && now - op.at < 60 * 60_000).length;
 
 /**
  * The open lanes on runner `label`'s machine, read from the registry so the count follows every launch and close: the
@@ -256,7 +253,6 @@ export const STATS_HOURS = 24;
 const eventStats = (config: DoriConfig, policy: EventPolicy, now: number): EventStats => {
   const since = now - STATS_HOURS * 3_600_000;
   const lines = readStoreView(config.stateDir, {
-    json: (journal) => (Array.isArray(journal.events) ? journal.events : []).filter((event) => (event.at ?? 0) >= since).map((event) => event.line),
     sqlite: (db) => (db.query("SELECT line FROM events WHERE at >= ?").all(since) as { line: string }[]).map((row) => row.line),
   }) ?? [];
   const kinds = new Map<string, { cls?: EventClass; events: number; wakes: number; measured: number; calls: number }>();
@@ -350,7 +346,6 @@ const readWaits = (stateDir: string): Status["waits"] => {
 };
 
 const readUnacked = (stateDir: string): number => readStoreView(stateDir, {
-  json: (journal) => Array.isArray(journal.awaitingAck) ? journal.awaitingAck.filter((entry: { reminded?: unknown }) => entry?.reminded === true).length : 0,
   sqlite: (db) => (db.query("SELECT count(*) AS n FROM owner_messages WHERE reminded = 1").get() as { n: number }).n,
 }) ?? 0;
 
@@ -360,7 +355,6 @@ const readUnreported = (stateDir: string): NonNullable<Status["unreported"]> => 
     .map((entry: { lane: string; since: number }) => ({ lane: entry.lane, since: new Date(entry.since).toISOString() }))
     .sort((a, b) => a.since.localeCompare(b.since));
   return readStoreView(stateDir, {
-    json: (journal) => owed(journal.outcomes),
     sqlite: (db) => {
       const row = db.query("SELECT outcomes FROM lead_state").get() as { outcomes?: string | null } | null;
       return owed(row?.outcomes ? JSON.parse(row.outcomes) : []);
@@ -395,7 +389,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   const reports = latestLaneReports(d.config);
   const decisions = openOwnerDecisions(d.config.stateDir);
   const lanes = open.filter((l) => statusOf(l) === "working").map((l) => ({
-    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l),
+    key: l.key, ...(l.model ? { model: l.model } : {}), ...laneRepoPr(l), ...(l.task !== undefined ? { task: l.task } : {}),
     ageMin: Math.max(0, Math.floor((now - Date.parse(l.openedAt)) / 60_000)),
     ...(l.lastProgressPost ? { progress: l.lastProgressPost } : {}),
     ...(l.recoveryPending ? { recovery: (l as RecoveryLane).recoveryExhausted ? "exhausted" as const : "pending" as const } : {}),
@@ -403,11 +397,17 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     // The same owner rule as runnerLaneCount: the owning runner, else the unowned lane's machine, else local.
     machine: l.runner ?? (l.machine || LOCAL_RUNNER),
   }));
-  const runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
-    restarts: (label) => runnerRestarts(d.config, label, now), lanes: (label) => runnerLaneCount(open, label),
-    unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
-    ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
-  });
+  const ops = openOperations(d.config);
+  let runners: RunnerView[];
+  try {
+    runners = runnerViews(readRunnerRows(d.config.stateDir), now, {
+      restarts: (label) => runnerRestarts(ops, label, now), lanes: (label) => runnerLaneCount(open, label),
+      unsandboxed: (label, os) => (label === LOCAL_RUNNER ? undefined : unsandboxedReason(d.config, label, os)),
+      ...(d.runnerDir ? { child: localChildState(d.runnerDir, now) } : {}),
+    });
+  } finally {
+    ops.close();
+  }
   return {
     at: new Date(now).toISOString(),
     timeZone: d.config.displayTimeZone,
@@ -667,10 +667,10 @@ const eventLines = (e: EventStats, max: number): string[] => {
 export const STATUS_MAX_CHARS = 1900;
 
 type Lanes = Status["lanes"];
-/** "- ops (27분 · opus-5-5 · dori-mode #55): Full run"; a lane in recovery starts with "[복구 포기]" or "[복구 대기]". */
+/** "- ops (27분 · opus-5-5 · dori-mode #55 · 태스크 #949): Full run"; a lane in recovery starts with "[복구 포기]" or "[복구 대기]". */
 const laneLine = (lane: Lanes[number], progress: number): string => {
   const where = [lane.repo, lane.pr !== undefined ? `#${lane.pr}` : ""].filter(Boolean).join(" ");
-  const facts = [dur(lane.ageMin), lane.model ? shortModel(lane.model) : "", where].filter(Boolean).join(" · ");
+  const facts = [dur(lane.ageMin), lane.model ? shortModel(lane.model) : "", where, lane.task !== undefined ? `태스크 #${lane.task}` : ""].filter(Boolean).join(" · ");
   const flag = lane.recovery ? `[복구 ${lane.recovery === "exhausted" ? "포기" : "대기"}] ` : "";
   return `- ${flag}${lane.key} (${facts})${lane.progress ? `: ${clip(lane.progress, progress)}` : ""}`;
 };

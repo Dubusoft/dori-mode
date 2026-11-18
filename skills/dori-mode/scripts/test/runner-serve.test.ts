@@ -10,11 +10,11 @@ import { HUB_FILE, readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { acceptRunners, drainRunnerAdmin, loadIdentity, type ObservedLane, queueRunnerAdmin, runnerAdminResult, serveRunner, trackedConnector } from "../src/runner/serve.ts";
 import { encodeFrame, MAX_FRAME_BYTES, runnerControl } from "../src/runner/protocol.ts";
-import { memoryNetwork } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
-import { openRunnerHub } from "../src/supervise-loop.ts";
+import { openRunnerHub } from "../src/supervise-hub.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -29,7 +29,7 @@ const waiter = <T>() => {
   };
 };
 
-test.each([5, 6])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
+test.each([8, 9])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
   const tmp = withState(); cleanups.push(tmp.done);
   const hub = new RunnerHub({ stateDir: tmp.dir, now: () => 1000, monotonic: () => 1000, epoch: 1, commit: () => true });
   cleanups.push(() => hub.close());
@@ -107,7 +107,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 6, gen: 1, heartbeatAgeSec: 0 });
+  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 9, gen: 1, heartbeatAgeSec: 0 });
   // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 

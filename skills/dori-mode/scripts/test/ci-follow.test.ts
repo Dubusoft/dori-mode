@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CiFollowUp, type CiIo, type CiReview, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -10,9 +10,10 @@ import type { OpenPull } from "../src/github-events.ts";
 import { briefIssue, LaunchError } from "../src/launch.ts";
 import { ackLaneMessage, LaneMessageError } from "../src/lane-messages.ts";
 import type { Lane } from "../src/registry.ts";
+import type { ReviewReceipt } from "../src/review-receipt.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, fakeRunner, newWorld, sent, TEST_STORE, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
 import { BUILT_IN } from "../src/tunables.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -65,15 +66,26 @@ let open: CiFollowUp[];
 const emit = (id: string, line: string): void => { events.push([id, line]); };
 const lines = (kind: string): string[] => [...new Map(events.filter(([, l]) => l.startsWith(kind))).values()];
 const io = (patch: Partial<CiIo> = {}): CiIo => ({ launch: async () => ({ ok: false, detail: "no launch in this test" }), ...patch });
+/** A review gate stub that approves every snapshot at one fixed base: these tests are about the gates before review. */
+const BASE = "b".repeat(40);
+const approving: CiReview = {
+  observeSnapshot: async (p) => ({
+    snapshot: { repo: p.repo, prNumber: p.number, headSha: p.sha ?? SHA, baseRef: "dev", baseSha: BASE, mergeBaseSha: BASE, policyVersion: "t4-1", criteriaSha256: "c" },
+    criteria: "", title: "", body: "", url: "",
+  }),
+  approval: async () => ({ approved: true, jobId: "rv-stub", receipt: { baseSha: BASE } as ReviewReceipt }),
+  ensureJob: async () => ({ kind: "refused", why: "stub" }),
+  recordBaseRace: async () => ({ raced: false, why: "stub" }),
+};
 const follow = (patch: Partial<CiIo> = {}): CiFollowUp => {
-  const ci = new CiFollowUp(deps, io(patch));
+  const ci = new CiFollowUp(deps, approving, io(patch));
   open.push(ci);
   return ci;
 };
 
 beforeEach(async () => {
   state = withState();
-  if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
+  new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
   world = newWorld();
   world.panes = [{ ...idle }];
   gh = { view: greenView(), viewCode: 0, mergeCode: 0, merges: [], issue: "OPEN", closes: [] };
@@ -227,6 +239,16 @@ test("a green, clean lane PR into dev is merged once with --match-head-commit an
   await open[0]?.tick([pull({ checks: "green" })], emit);
   await follow().tick([pull({ checks: "green" })], emit);
   expect(gh.merges).toHaveLength(1);
+});
+
+test("each merge the supervisor makes is handed to the merged hook with its base, once", async () => {
+  const merged: string[] = [];
+  const hook = { merged: async (p: OpenPull, base: string) => { merged.push(`${p.repo}#${p.number} ${base}`); } };
+  await follow(hook).tick([pull({ checks: "green" })], emit);
+  expect(merged).toEqual(["acme/app#7 dev"]);
+  gh.view = greenView();
+  await follow(hook).tick([pull({ checks: "failing" })], emit);
+  expect(merged).toHaveLength(1);
 });
 
 test("a green lane PR is merged only at the head its done claim recorded: no claim, an older claimed head or a claim without a head never merge", async () => {
@@ -555,7 +577,7 @@ test("an issue is not closed for a PR merged into main, nor commented on when so
 const mergedSeven = [{ repo: "acme/app", number: 7, url: "https://github.com/acme/app/pull/7", headRepo: "acme/app" }];
 const views = () => world.calls.filter((c) => c[0] === "gh" && c[2] === "view").length;
 
-test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED with its merge SHA; later polls and a restart read nothing", async () => {
+test("a merged PR of an open lane is read back once as engine-only MERGE_VERIFIED with its merge SHA; later polls and a restart read nothing", async () => {
   gh.view = greenView({ state: "MERGED", mergeCommit: { oid: "m3rge5ha" } });
   const ci = follow();
   await ci.tick([], emit, mergedSeven);
@@ -565,8 +587,8 @@ test("a merged PR of an open lane is read back once as digest MERGE_VERIFIED wit
     ["merge-verified:acme/app#7", "MERGE_VERIFIED acme/app#7 into dev lane=demo-lane merge=m3rge5ha https://github.com/acme/app/pull/7"],
   ]);
   expect(views()).toBe(1);
-  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-digest");
-  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.tunables.eventPolicy)).toBe("lead-digest");
+  expect(eventClass(lines("MERGE_VERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("engine-only");
+  expect(eventClass("GH_PR acme/app#7 merged sha=x u", deps.tunables.eventPolicy)).toBe("engine-only");
 });
 
 test("a PR the supervisor merged itself (CI_MERGED) is not read back again, and a PR of no open lane is never read", async () => {

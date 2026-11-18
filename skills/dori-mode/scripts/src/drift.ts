@@ -1,10 +1,12 @@
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { laneOwnerWait, type LaneOwnerWait, readDecisions } from "./decision-store.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 import type { DriftConfig } from "./config.ts";
 import type { Emit } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
-import type { LaneReport, LaneReportStore } from "./lane-reports.ts";
+import type { LaneReport, LaneReportStore } from "./lane-report-store.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import type { LaneOps } from "./lane-ops.ts";
 
@@ -12,7 +14,8 @@ import type { LaneOps } from "./lane-ops.ts";
  * Lane drift (urgent LANE_DRIFT): machine-detectable deviations of a working lane, raised by the supervisor itself. The
  * lead has no periodic obligation; it hears only when a lane drifts.
  * - milestone-overdue: no milestone report for `milestoneOverdueMin` since the last one (or the lane's open). Once per
- *   overdue stretch, once more at twice the interval, then quiet until a milestone arrives.
+ *   overdue stretch, once more at twice the interval, then quiet until a milestone arrives. A lane waiting on its own
+ *   blocking question or request is not overdue; the stretch restarts when that wait ends (decision-store.ts laneOwnerWait).
  * - ci-failing: the lane's PR failed its checks on `ciFailStreak` head SHAs in a row (no green between), once per streak.
  *   Read from the GitHub poll the supervisor already runs (GitHubEvents.openPulls); no extra GitHub call.
  */
@@ -40,17 +43,16 @@ export const loadDriftState = (stateDir: string): DriftState => {
 
 export const saveDriftState = (stateDir: string, state: DriftState): void => {
   const path = join(stateDir, DRIFT_STATE_FILE);
-  const tmp = `${path}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", 0o600);
-  try { writeFileSync(fd, JSON.stringify(state)); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(tmp, path);
+  replaceFileDurable(path, JSON.stringify(state), 0o600, `${path}.${process.pid}.tmp`);
 };
 
 type Out = { readonly id: string; readonly line: string };
 
+const NO_WAIT: LaneOwnerWait = { waiting: new Set(), resolvedAt: new Map() };
+
 /** Milestone drift over the working lanes; lanes no longer open drop out of the state, paused lanes keep theirs. */
 export const milestoneDrift = (
-  state: DriftState["lanes"], lanes: readonly Lane[], reports: readonly LaneReport[], overdueMin: number, now: number,
+  state: DriftState["lanes"], lanes: readonly Lane[], reports: readonly LaneReport[], overdueMin: number, now: number, owner: LaneOwnerWait = NO_WAIT,
 ): { readonly lanes: Record<string, MilestoneState>; readonly out: Out[] } => {
   const lastMilestone = new Map<string, number>();
   for (const r of reports) if (r.kind === "milestone") lastMilestone.set(r.lane, Math.max(lastMilestone.get(r.lane) ?? -Infinity, r.at));
@@ -59,11 +61,11 @@ export const milestoneDrift = (
   const out: Out[] = [];
   for (const lane of lanes) {
     const milestone = lastMilestone.get(lane.key);
-    const since = milestone ?? Date.parse(lane.openedAt);
+    const since = Math.max(milestone ?? Date.parse(lane.openedAt), owner.resolvedAt.get(lane.key) ?? -Infinity);
     if (!Number.isFinite(since)) continue;
     const prior = state[lane.key];
     let fired = prior && prior.since === since ? prior.fired : 0;
-    if (statusOf(lane) === "working") {
+    if (statusOf(lane) === "working" && !owner.waiting.has(lane.key)) {
       const elapsed = now - since;
       if ((fired === 0 && elapsed >= interval) || (fired === 1 && elapsed >= 2 * interval)) {
         fired += 1;
@@ -87,8 +89,9 @@ const pullKey = (pull: Pick<OpenPull, "repo" | "number">): string => `${pull.rep
 export const pullOwners = (ops: Pick<LaneOps, "inspect">): PullOwners => async (lanes, pulls) => {
   const owner = new Map<string, string>();
   const sorted = [...lanes].sort((a, b) => a.openedAt.localeCompare(b.openedAt) || a.key.localeCompare(b.key));
-  for (const lane of sorted) {
-    for (const [repo, targets] of await githubTargets([lane], ops)) {
+  const targetsByLane = await Promise.all(sorted.map(async (lane) => await githubTargets([lane], ops)));
+  for (const [index, lane] of sorted.entries()) {
+    for (const [repo, targets] of targetsByLane[index]!) {
       for (const pull of pulls) {
         if (pull.repo.toLowerCase() !== repo || !sameRepoHead(pull) || !(targets.numbers.has(pull.number) || targets.branches.has(pull.branch))) continue;
         if (!owner.has(pullKey(pull))) owner.set(pullKey(pull), lane.key);
@@ -149,7 +152,7 @@ export const driftTick = async (deps: DriftDeps, reports: LaneReportStore | unde
   const state = loadDriftState(deps.stateDir);
   const lanes = await deps.openLanes();
   const milestones = reports
-    ? milestoneDrift(state.lanes, lanes, reports.list(), deps.drift.milestoneOverdueMin, deps.now())
+    ? milestoneDrift(state.lanes, lanes, reports.list(), deps.drift.milestoneOverdueMin, deps.now(), laneOwnerWait(readDecisions(deps.stateDir).decisions, lanes))
     : { lanes: { ...state.lanes }, out: [] };
   const ci = await ciDrift(state.pulls, lanes, pulls, deps.drift.ciFailStreak, deps.owners);
   for (const { id, line } of [...milestones.out, ...ci.out]) await emit(line, id);

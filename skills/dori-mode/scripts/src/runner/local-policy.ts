@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DEFAULT_LANE_SANDBOX, type DoriConfig, withThinking } from "../config.ts";
-import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_FILE, RETIRED_POLICY_KEYS, type RunnerPolicy } from "./policy.ts";
+import { DEFAULT_POLICY, effectiveWorktreeRoot, loadPolicy, parsePolicy, POLICY_FILE, RETIRED_POLICY_KEYS, type RunnerPolicy, runtimeDirOption } from "./policy.ts";
 import { BUILT_IN } from "../tunables.ts";
 
 /**
@@ -11,9 +11,10 @@ import { BUILT_IN } from "../tunables.ts";
  *
  * - `agents.default`: `agentCommand` with `laneThinking` applied the way launch.ts applies it (only to a template with a
  *   `--model` or `--thinking` flag), its `{model}` and `{prompt}` slots left for the runner to fill.
- * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that, run with
- *   `LANE_SANDBOX_VERIFY=<leadCwd>/state/verify` so the lane can write its result files there (the lane's pane gets
- *   no environment from the runner beyond its own DORI_* variables).
+ * - `agents.sandboxed`: `laneSandbox.command` (default `lane-sandbox`) in front of that. A lane writes its results
+ *   only to its own `DORI_LANE_OUT`; no lead directory (such as `<leadCwd>/state/verify`) is made writable for it.
+ * - `agents.review`: the same argv as `agents.sandboxed`; the runner starts it with `LANE_SANDBOX_PROFILE=review`, so
+ *   the wrapper binds the snapshot worktree read-only and drops git and gh credentials (lanes.ts, lane-sandbox.sh).
  * - `sandboxCheck`: `<laneSandbox.command> --check`, so a sandboxed start on a host where the wrapper cannot sandbox is
  *   refused `sandbox-unavailable` before its pane opens. `sandbox` stays `optional`: lanes recorded unsandboxed must keep
  *   recovering, and the lead decides which new lanes need a sandbox.
@@ -38,7 +39,7 @@ export const localPolicy = (cfg: LocalPolicyConfig, env: { readonly home?: strin
   const roots = [env.home ?? homedir(), env.tmp ?? tmpdir(), dirname(cfg.leadCwd), worktreeRoot]
     .filter((r): r is string => typeof r === "string" && r !== "");
   return {
-    agents: { default: lane, sandboxed: ["env", `LANE_SANDBOX_VERIFY=${join(cfg.leadCwd, "state", "verify")}`, ...sandbox, ...lane] },
+    agents: { default: lane, sandboxed: [...sandbox, ...lane], review: [...sandbox, ...lane] },
     allowedRoots: [...new Set(roots)],
     sandbox: "optional",
     sandboxCheck: [...sandbox, "--check"],
@@ -62,9 +63,12 @@ export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolic
 /** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */
 export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot"];
 
+/** A key layered onto the derived local policy like PLACEMENT_ONLY_KEYS: the named path grants. */
+export const LAYERED_GRANT_KEY = "grants";
+
 /**
  * The local runner's policy when `<runnerDir>/runner-config.json` exists: a file that sets only PLACEMENT_ONLY_KEYS
- * layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
+ * (and `grants`) layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
  * with any other key is the whole policy, unchanged. A layered `reposRoot` and the effective worktree root join
  * allowedRoots, so the repos discovered there pass the root check. The file's effective worktree root (its
  * `worktreeRoot`, else `<reposRoot>/worktrees`) replaces the config's; without either the config's stays. Retired keys
@@ -74,9 +78,9 @@ export const localRunnerPolicy = (
   runnerDir: string, cfg: LocalPolicyConfig, env: { readonly home?: string; readonly tmp?: string; readonly warn?: (line: string) => void } = {},
 ): RunnerPolicy => {
   const raw: unknown = JSON.parse(readFileSync(join(runnerDir, POLICY_FILE), "utf8"));
-  const parsed = parsePolicy(raw, env.home ?? homedir(), tmpdir(), { runnerDir, ...(env.warn ? { warn: env.warn } : {}) });
+  const parsed = parsePolicy(raw, env.home ?? homedir(), tmpdir(), { runnerDir, ...(env.warn ? { warn: env.warn } : {}), ...runtimeDirOption() });
   const keys = typeof raw === "object" && raw !== null ? Object.keys(raw).filter((key) => !Object.hasOwn(RETIRED_POLICY_KEYS, key)) : [];
-  if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key))) return parsed;
+  if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key) || key === LAYERED_GRANT_KEY)) return parsed;
   const local = localPolicy(cfg, env);
   const worktreeRoot = effectiveWorktreeRoot(parsed);
   return {
@@ -86,5 +90,6 @@ export const localRunnerPolicy = (
     ...(parsed.detectWorkspaces !== undefined ? { detectWorkspaces: parsed.detectWorkspaces } : {}),
     ...(parsed.reposRoot !== undefined ? { reposRoot: parsed.reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
+    ...(parsed.grants ? { grants: parsed.grants } : {}),
   };
 };

@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { treeDigest } from "../src/lane-files.ts";
+import { treeDigest } from "../src/lane-file-contract.ts";
 import { join } from "node:path";
-import { openLaneReports, routeReports } from "../src/lane-reports.ts";
+import { routeReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import type { Lane } from "../src/registry.ts";
 import type { Ran } from "../src/run.ts";
 import { Database } from "bun:sqlite";
@@ -63,7 +64,7 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   await t.deps.registry.patch("lane-a", { fileRun: FILES.run });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES });
   const run = herdr.find((a) => a[2] === "run");
-  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")} omo --model m1 `);
+  expect(run?.[4]).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(lanes.tokenFor("lane-a", "lane-token-1")).toBe(true);
   expect(lanes.tokenFor("lane-a", "other")).toBe(false);
   const [type, started] = published[0] as [RunnerEventType, object];
@@ -177,7 +178,7 @@ test("an effect's {detail, result} goes out in cmd.result.result and the lanes h
   expect(t.emitted).toEqual([]);
 });
 
-test("the runner's effects table answers lane.start, lane.notify, lane.observe and guard.kill with their structured results", async () => {
+test("the runner's effects table answers lane.start, lane.notify, lane.observe, guard.kill and lane.attach with their structured results", async () => {
   const t = await setup();
   const runnerDir = join(t.s.dir, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
@@ -207,12 +208,16 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe a
   await send(2, "lane.notify", { cmdId: "lane.notify:lane-a:2:1", key: "lane-a", status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
   await send(3, "lane.observe", { cmdId: "lane.observe:lane-a:3:1", key: "lane-a" });
   await send(4, "guard.kill", { cmdId: "guard.kill:-:4:1", keys: ["lane-a"] });
+  const added = Buffer.from("added later");
+  await send(5, "lane.attach", { cmdId: "lane.attach:lane-a:5:1", key: "lane-a", tree: { directories: ["r0000"], files: [{ path: "r0000/more.md", bytes: added.length, sha256: createHash("sha256").update(added).digest("hex"), base64: added.toString("base64") }] } });
   expect(published.map(({ state: s, detail, result }) => ({ s, detail, result }))).toEqual([
     { s: "verified", detail: "started pane=p7 tab=t7", result: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/repo" } },
     { s: "verified", detail: "noted done-claimed", result: {} },
     { s: "verified", detail: "observed working", result: { status: "working" } },
     { s: "verified", detail: "killed 1", result: { killed: [{ pid: 40, comm: "qemu", rssKb: 9, lane: "lane-a" }] } },
+    { s: "verified", detail: `attached files=1 dir=${join(runnerDir, "briefs/lane-a.files/a0001")}`, result: { dir: join(runnerDir, "briefs/lane-a.files/a0001") } },
   ]);
+  expect(readFileSync(join(runnerDir, "briefs/lane-a.files/a0001/r0000/more.md"), "utf8")).toBe("added later");
   expect(lanes.notice("lane-a")).toEqual({ status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
 });
 
@@ -242,4 +247,41 @@ test("a lane.start without cwd creates <runnerDir>/lanes/<key>, opens its tab th
   expect(statSync(laneDir).isDirectory()).toBe(true);
   expect(statSync(laneDir).mode & 0o777).toBe(0o700);
   expect(calls.find((a) => a.slice(0, 3).join(" ") === "herdr tab create")).toContain(laneDir);
+});
+
+test.each([false, true])("POSIX launch selects its CLI, inherits secrets in shells, and continues after refusal (remote=%s)", async (remote) => {
+  const t = await setup();
+  const runnerDir = join(t.s.dir, "runner");
+  mkdirSync(join(runnerDir, "bin"), { recursive: true, mode: 0o700 });
+  const cli = join(runnerDir, "bin", "dori");
+  writeFileSync(cli, `#!/bin/sh
+[ "$1 $2" = "secret env" ] || exit 2
+[ -n "$DORI_LANE_KEY" ] && [ -r "$DORI_LANE_TOKEN_FILE" ] || exit 3
+if [ "$PULL_FAIL" = 1 ]; then printf 'RUNNER_SECRET_DENIED refused\\n' >&2; exit 1; fi
+printf "export SHARED='%s'\\n" "$PULL_VALUE"
+`);
+  chmodSync(cli, 0o700);
+  let command = "";
+  const lanes = new RunnerLanes({
+    instance: async () => "server-1", runnerDir, remote, clock: fakeClock(T0), token: () => "test-lane-token",
+    policy: { agents: { omo: ["sh", "-c", `sh -c 'printf "%s" "\${SHARED-unset}"'`] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    publish: () => {},
+    run: async (argv) => {
+      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" };
+      if (argv.slice(0, 3).join(" ") === "herdr pane run") command = argv[4]!;
+      return { code: 0, out: "", err: "" };
+    },
+  });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES, tabWorkspace: "w1" });
+  expect(command).toStartWith("export DORI_LANE_KEY=lane-a ");
+  expect(command).toContain(`eval "$(${remote ? cli : "dori"} secret env)";`);
+  if (!remote) expect(command).not.toContain(cli);
+  expect(command).not.toContain("launch-test-value");
+  for (const fail of [false, true]) {
+    const child = Bun.spawn(["sh", "-c", command], { env: { ...process.env, PATH: `${join(runnerDir, "bin")}:${process.env.PATH ?? ""}`, PULL_VALUE: "launch-test-value", PULL_FAIL: fail ? "1" : "0" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+    expect(code).toBe(0);
+    expect(out).toBe(fail ? "unset" : "launch-test-value");
+    expect(err).toBe(fail ? "RUNNER_SECRET_DENIED refused\n" : "");
+  }
 });

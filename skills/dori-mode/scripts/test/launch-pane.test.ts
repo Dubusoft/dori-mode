@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-import { footer, footerDoneRules, LaunchError, launchLane, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
+import { footer, footerDoneRules } from "../src/launch-footer.ts";
+import { LaunchError, launchLane, parseLaneTask, SandboxRefusal, STARTUP_POLL_MS, STARTUP_POLLS, startupLine, validateLaunch } from "../src/launch.ts";
 import { LaneOpsError, laneOps, type StartInput } from "../src/lane-ops.ts";
 import type { Lane } from "../src/registry.ts";
 import type { RunnerCall } from "../src/runner/call.ts";
@@ -105,6 +106,27 @@ test("--mode mass-ulw opens with massLaunchKeywords and records the mode; the de
   expect(plain.lane.mode).toBe("ulw");
 });
 
+test("--task records the Toodo task id on the lane; a launch without it records none", async () => {
+  await writeBrief();
+  const d = deps({});
+  const linked = await launchLane(d, { ...input({ pane: "w:p3" }), task: 949 });
+  expect(linked.lane.task).toBe(949);
+  expect((await d.registry.read("pane-lane"))?.task).toBe(949);
+  await d.registry.write({ ...linked.lane, closedAt: new Date(T0).toISOString() });
+  await launchLane(deps({}), input({ key: "pane-lane-2", pane: "w:p3" }));
+  expect(await d.registry.read("pane-lane-2")).not.toHaveProperty("task");
+});
+
+test("--task takes only a positive decimal integer, and launch refuses any other task id before registering", async () => {
+  expect(parseLaneTask("949")).toBe(949);
+  for (const bad of ["0", "-1", "abc", "1.5", "0x10", "1e3", "", "9007199254740993"]) expect(parseLaneTask(bad)).toBeUndefined();
+  await writeBrief();
+  for (const task of [0, -3, 1.5]) {
+    await expect(launchLane(deps({}), { ...input({ pane: "w:p3" }), task })).rejects.toThrow(/--task must be a positive integer/);
+  }
+  expect(starts()).toEqual([]);
+});
+
 test("the lane's model reaches the runner: defaultModel unless the launch names one; leadModel never does", async () => {
   await writeBrief();
   const base = deps({});
@@ -158,6 +180,10 @@ test("a remote lane is sandboxed by default; a machine opted in with runners.<la
   expect(starts()[1]).toMatchObject({ machine: "m2", sandbox: false });
   expect(r.lane.sandbox).toBeUndefined();
   expect(r.notes).toContain("SANDBOX_SKIPPED pane-lane-2: machine m2 is opted in with runners.m2.allowUnsandboxed; this lane runs WITHOUT a sandbox");
+  // The footer tells each lane which permissions it got: the sandbox's table, or none.
+  expect(starts()[0]!.briefText).toContain("- Sandbox permissions: writable = ");
+  expect(starts()[1]!.briefText).toContain("- Sandbox permissions: none.");
+  expect(starts()[1]!.briefText).not.toContain("- Sandbox permissions: writable = ");
 });
 
 test("a lane on a Windows runner runs without a sandbox and says so; a runner reporting another OS stays sandboxed", async () => {
@@ -378,4 +404,25 @@ test("a mass-ulw launch refuses keywords or a brief path that omo would not bind
   await expect(mass("/mass-ulw set goal and work?")).rejects.toThrow(LaunchError);
   await expect(mass("/mass-ulw set goal and work", { brief: join(state.dir, "what?.md") })).rejects.toThrow(LaunchError);
   await mass("/mass-ulw set goal and work");
+});
+
+test("--grant names travel on the start, the lane record and the footer; an old runner or an unknown name starts nothing and says why", async () => {
+  await writeBrief();
+  const base = deps({});
+  const r = await launchLane(base, { ...input({ machine: "m1", cwd: "/home/u/app" }), grants: ["blog-topic"] });
+  expect(starts()[0]).toMatchObject({ machine: "m1", sandbox: true, grants: ["blog-topic"] });
+  expect(starts()[0]!.briefText).toContain("- Path grants: blog-topic ");
+  expect(r.lane.grants).toEqual(["blog-topic"]);
+
+  const refusals: [string, string][] = [
+    ["lane.start RUNNER_CMD_REJECTED unknown-field", "LAUNCH_GRANT_UNSUPPORTED pane-lane-2: machine m1 predates --grant"],
+    ["lane.start RUNNER_CMD_REJECTED grant-unknown", "LAUNCH_GRANT_REFUSED pane-lane-2: machine m1 refused --grant blog-topic (RUNNER_CMD_REJECTED grant-unknown)"],
+  ];
+  for (const [detail, message] of refusals) {
+    const refusing = { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "m1", detail); } };
+    const attempt = launchLane({ ...base, ops: refusing }, { ...input({ key: "pane-lane-2", machine: "m1", cwd: "/home/u/app" }), grants: ["blog-topic"] });
+    await expect(attempt).rejects.toBeInstanceOf(LaunchError);
+    await expect(attempt).rejects.toThrow(message);
+    expect(await base.registry.read("pane-lane-2")).toBeNull();
+  }
 });

@@ -23,12 +23,12 @@ test("add, list, update and delete never print the value", async () => {
   const h = home();
   const added = await dori(h, ["add", "TEST_TOKEN"], `${VALUE}\n`);
   expect(added.code).toBe(0);
-  expect(added.out).toMatch(/^SECRET_ADDED TEST_TOKEN backend=(systemd-creds|plain)$/m);
+  expect(added.out).toMatch(/^SECRET_ADDED TEST_TOKEN backend=plain$/m);
   const again = await dori(h, ["add", "TEST_TOKEN"], VALUE);
   expect(again.code).toBe(1);
   expect(again.err).toContain("SECRET_EXISTS");
   const listed = await dori(h, ["list"]);
-  expect(listed.out).toMatch(/^TEST_TOKEN (systemd-creds|plain)$/m);
+  expect(listed.out).toMatch(/^TEST_TOKEN plain$/m);
   const json = JSON.parse((await dori(h, ["list", "--json"])).out) as { name: string; backend: string }[];
   expect(json.map((entry) => entry.name)).toEqual(["TEST_TOKEN"]);
   const updated = await dori(h, ["update", "TEST_TOKEN"], VALUE);
@@ -45,11 +45,12 @@ test("an empty value and a bad name are refused", async () => {
   expect((await dori(h, ["add", "bad-name"], VALUE)).err).toContain("SECRET_NAME_INVALID");
 });
 
-test("there is no get subcommand, and exec is lane-only", async () => {
+test("there is no get or show command and env is lane-only", async () => {
   const h = home();
   expect((await dori(h, ["get", "TEST_TOKEN"])).code).toBe(2);
   expect((await dori(h, ["show", "TEST_TOKEN"])).code).toBe(2);
-  const exec = await dori(h, ["exec", "TEST_TOKEN", "--", "true"]);
-  expect(exec.code).toBe(2);
-  expect(exec.err).toContain("SECRET_EXEC_LANE_ONLY");
+  const result = await dori(h, ["env"]);
+  expect(result.code).toBe(2);
+  expect(result.err).toContain("SECRET_ENV_LANE_ONLY");
+  expect(result.out).toBe("");
 });

@@ -8,28 +8,14 @@ import { SecretStore, SecretStoreError, secretsDir, type SecretStoreErrorCode } 
 const VALUE = "dori-test-throwaway-123";
 type Call = { readonly argv: readonly string[]; readonly stdin?: string };
 
-/** Emulates systemd-creds with base64; code 127 for every call when `missing`; encrypting to a file fails when `failEncrypt` (the probe still passes). */
-const fakeCreds = (opts: { missing?: boolean; failEncrypt?: boolean } = {}): { run: Runner; calls: Call[] } => {
+/** Only legacy decrypts may invoke systemd-creds. */
+const fakeCreds = (): { run: Runner; calls: Call[] } => {
   const calls: Call[] = [];
-  const run: Runner = async (argv, o) => {
-    calls.push({ argv: [...argv], ...(o?.stdin !== undefined ? { stdin: o.stdin } : {}) });
-    const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
-    if (opts.missing) return { code: 127, out: "", err: "not found" };
-    const [, sub] = argv;
-    if (sub === "--version") return ok("systemd 999");
-    if (sub === "encrypt") {
-      const target = argv[argv.length - 1] as string;
-      if (opts.failEncrypt && target !== "-") return { code: 1, out: "", err: "Failed to encrypt: no user manager" };
-      if (target !== "-") writeFileSync(target, Buffer.from(o?.stdin ?? "").toString("base64"));
-      return ok();
-    }
-    if (sub === "decrypt") {
-      const file = argv[argv.length - 2] as string;
-      return ok(Buffer.from(readFileSync(file, "utf8"), "base64").toString());
-    }
-    return { code: 2, out: "", err: "unknown" };
-  };
-  return { run, calls };
+  return { calls, run: async (argv) => {
+    calls.push({ argv: [...argv] });
+    if (argv[1] !== "decrypt") throw new Error("writes must never invoke systemd-creds");
+    return { code: 0, out: Buffer.from(readFileSync(argv[argv.length - 2] as string, "utf8"), "base64").toString(), err: "" };
+  } };
 };
 
 const codeOf = async (p: Promise<unknown> | (() => unknown)): Promise<SecretStoreErrorCode | undefined> => {
@@ -47,99 +33,42 @@ describe("secretsDir", () => {
   test("joins home/.dori/secrets", () => expect(secretsDir("/h")).toBe(join("/h", ".dori", "secrets")));
 });
 
-describe("systemd-creds backend", () => {
-  test("add, list, read, update, delete", async () => {
-    const fake = fakeCreds();
-    const store = new SecretStore({ dir, run: fake.run });
-    expect(await store.add("API_KEY", VALUE)).toEqual({ name: "API_KEY", backend: "systemd-creds" });
-    expect(existsSync(join(dir, "API_KEY.cred"))).toBe(true);
-    expect(readdirSync(dir)).toEqual(["API_KEY.cred"]);
-    expect(store.list()).toEqual([{ name: "API_KEY", backend: "systemd-creds" }]);
-    expect(await store.read("API_KEY")).toBe(VALUE);
-    await store.update("API_KEY", "dori-test-throwaway-456");
-    expect(await store.read("API_KEY")).toBe("dori-test-throwaway-456");
-    store.delete("API_KEY");
-    expect(store.list()).toEqual([]);
-  });
-
-  test("value only goes through stdin, never argv; files are 0600 and dir 0700", async () => {
-    const fake = fakeCreds();
-    const store = new SecretStore({ dir, run: fake.run });
-    await store.add("API_KEY", VALUE);
-    await store.read("API_KEY");
-    expect(fake.calls.some((c) => c.stdin === VALUE)).toBe(true);
-    for (const c of fake.calls) expect(c.argv.join(" ")).not.toContain(VALUE);
-    expect(mode(join(dir, "API_KEY.cred"))).toBe(0o600);
-    expect(mode(dir)).toBe(0o700);
-  });
-
-  test("encryptionAvailable probes once with a non-secret string", async () => {
-    const fake = fakeCreds();
-    const store = new SecretStore({ dir, run: fake.run });
-    expect(await store.encryptionAvailable()).toBe(true);
-    expect(await store.encryptionAvailable()).toBe(true);
-    expect(fake.calls).toEqual([
-      { argv: ["systemd-creds", "--version"] },
-      { argv: ["systemd-creds", "encrypt", "--user", "--name=dori-probe", "-", "-"], stdin: "dori-probe" },
-    ]);
-  });
-
-  test("failed encrypt is SECRET_ENCRYPT_FAILED and leaves no tmp file", async () => {
-    const store = new SecretStore({ dir, run: fakeCreds({ failEncrypt: true }).run });
-    let message = "";
-    try { await store.add("API_KEY", VALUE); } catch (e) { message = (e as Error).message; }
-    expect(message).toStartWith("SECRET_ENCRYPT_FAILED");
-    expect(message).toContain("no user manager");
-    expect(message).not.toContain(VALUE);
-    expect(readdirSync(dir)).toEqual([]);
-  });
-
-  test("failed decrypt is SECRET_DECRYPT_FAILED", async () => {
-    const fake = fakeCreds();
-    const store = new SecretStore({ dir, run: fake.run });
-    await store.add("API_KEY", VALUE);
-    const failing = new SecretStore({ dir, run: async () => ({ code: 1, out: "", err: "bad" }) });
-    expect(await codeOf(failing.read("API_KEY"))).toBe("SECRET_DECRYPT_FAILED");
-  });
-
-  test("update moves a plain secret to .cred", async () => {
-    const plain = new SecretStore({ dir, run: fakeCreds({ missing: true }).run });
-    await plain.add("API_KEY", VALUE);
-    const store = new SecretStore({ dir, run: fakeCreds().run });
-    expect(await store.update("API_KEY", VALUE)).toEqual({ name: "API_KEY", backend: "systemd-creds" });
-    expect(readdirSync(dir)).toEqual(["API_KEY.cred"]);
-  });
+test("writes always use plain with tight modes, without probing or encrypting", async () => {
+  const fake = fakeCreds();
+  const store = new SecretStore({ dir, run: fake.run });
+  expect(await store.add("API_KEY", VALUE)).toEqual({ name: "API_KEY", backend: "plain" });
+  expect(store.list()).toEqual([{ name: "API_KEY", backend: "plain" }]);
+  expect(await store.read("API_KEY")).toBe(VALUE);
+  expect(fake.calls).toEqual([]);
+  expect(mode(dir)).toBe(0o700);
+  expect(mode(join(dir, "API_KEY.plain"))).toBe(0o600);
+  await store.update("API_KEY", "changed\nsecond line");
+  expect(await store.read("API_KEY")).toBe("changed\nsecond line");
+  // A hand-written file (echo VALUE > NAME.plain) loses the one newline echo added.
+  writeFileSync(join(dir, "API_KEY.plain"), "typed\n", { mode: 0o600 });
+  expect(await store.read("API_KEY")).toBe("typed");
+  store.delete("API_KEY");
+  expect(store.list()).toEqual([]);
 });
 
-describe("plain backend", () => {
-  test("falls back when systemd-creds is missing (127)", async () => {
-    const fake = fakeCreds({ missing: true });
-    const store = new SecretStore({ dir, run: fake.run });
-    expect(await store.encryptionAvailable()).toBe(false);
-    expect(await store.add("API_KEY", VALUE)).toEqual({ name: "API_KEY", backend: "plain" });
-    expect(readdirSync(dir)).toEqual(["API_KEY.plain"]);
-    expect(mode(join(dir, "API_KEY.plain"))).toBe(0o600);
-    expect(mode(dir)).toBe(0o700);
-    expect(store.list()).toEqual([{ name: "API_KEY", backend: "plain" }]);
-    expect(await store.read("API_KEY")).toBe(VALUE);
-    await store.update("API_KEY", "dori-test-throwaway-456");
-    expect(await store.read("API_KEY")).toBe("dori-test-throwaway-456");
-    for (const c of fake.calls) expect(c.argv.join(" ")).not.toContain(VALUE);
-    store.delete("API_KEY");
-    expect(readdirSync(dir)).toEqual([]);
-  });
+test("legacy cred reads decrypt --user; updating replaces it with plain", async () => {
+  mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(join(dir, "API_KEY.cred"), Buffer.from(VALUE).toString("base64"), { mode: 0o600 });
+  const fake = fakeCreds();
+  const store = new SecretStore({ dir, run: fake.run });
+  expect(store.list()).toEqual([{ name: "API_KEY", backend: "cred" }]);
+  expect(await store.read("API_KEY")).toBe(VALUE);
+  expect(fake.calls).toEqual([{ argv: ["systemd-creds", "decrypt", "--user", "--name=API_KEY", join(dir, "API_KEY.cred"), "-"] }]);
+  await store.update("API_KEY", "replacement");
+  expect(readdirSync(dir)).toEqual(["API_KEY.plain"]);
+  expect(await store.read("API_KEY")).toBe("replacement");
+});
 
-  test("read strips one trailing newline", async () => {
-    const store = new SecretStore({ dir, run: fakeCreds({ missing: true }).run });
-    mkdirSync(dir, { mode: 0o700 });
-    writeFileSync(join(dir, "A.plain"), `${VALUE}\n\n`);
-    expect(await store.read("A")).toBe(`${VALUE}\n`);
-  });
-
-  test("probe failure after a working --version also falls back", async () => {
-    const run: Runner = async (argv) => ({ code: argv[1] === "--version" ? 0 : 1, out: "", err: "no manager" });
-    expect(await new SecretStore({ dir, run }).encryptionAvailable()).toBe(false);
-  });
+test("a failed legacy decrypt remains SECRET_DECRYPT_FAILED", async () => {
+  mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(join(dir, "A.cred"), "legacy");
+  const store = new SecretStore({ dir, run: async () => ({ code: 1, out: "", err: "bad" }) });
+  expect(await codeOf(store.read("A"))).toBe("SECRET_DECRYPT_FAILED");
 });
 
 describe("store rules", () => {
@@ -174,15 +103,15 @@ describe("store rules", () => {
     expect(store.list().map((e) => e.name)).toEqual(["ALPHA", "ZED"]);
   });
 
-  test("readAll skips entries that fail", async () => {
+  test("readAll skips unreadable entries for masking but rejects a strict lane pull", async () => {
     const store = new SecretStore({ dir, run: fakeCreds().run });
     await store.add("GOOD", VALUE);
     writeFileSync(join(dir, "BAD.cred"), "###");
     const failing: Runner = async (argv, o) => (argv[0] === "systemd-creds" && argv[1] === "decrypt" && String(argv[argv.length - 2]).endsWith("BAD.cred")
       ? { code: 1, out: "", err: "bad" }
       : fakeCreds().run(argv, o));
-    const all = await new SecretStore({ dir, run: failing }).readAll();
-    expect([...all]).toEqual([["GOOD", VALUE]]);
+    expect([...(await new SecretStore({ dir, run: failing }).readAll())]).toEqual([["GOOD", VALUE]]);
+    expect(await codeOf(new SecretStore({ dir, run: failing }).readAll(true))).toBe("SECRET_DECRYPT_FAILED");
   });
 
   test("an existing dir with group/other bits is refused and left alone", async () => {

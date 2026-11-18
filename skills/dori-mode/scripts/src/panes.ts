@@ -11,6 +11,8 @@ export type Pane = {
   readonly agent?: string;
   readonly agent_status?: string;
   readonly title?: string;
+  /** The name a `herdr pane rename` gave the pane. */
+  readonly label?: string;
   /** The title the program in the pane set for its terminal. */
   readonly terminal_title?: string;
   readonly cwd?: string;
@@ -182,3 +184,5 @@ export const sendVerified = async (
   if (status !== "working" && (await statusLookup(run, pane)).status === "working") return "delivered";
   return "unconfirmed";
 };
+
+export const quoteForPane = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);

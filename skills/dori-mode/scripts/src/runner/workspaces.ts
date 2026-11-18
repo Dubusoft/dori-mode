@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { checkCwd, effectiveWorktreeRoot, type RunnerPolicy } from "./policy.ts";
 import type { WorkspaceEntry } from "./protocol.ts";
+import { repoFromRemoteUrl } from "../git-remote.ts";
 
 /**
  * What a runner tells the supervisor about the repos on its host, sent in every hello:
@@ -24,11 +25,7 @@ export const DETECTED_MAX = 200;
 const DARWIN_PROTECTED = new Set(["Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public"]);
 const SKIP = new Set(["node_modules"]);
 
-/** owner/repo from a remote URL (`git@host:o/r.git`, `https://host/o/r`, `ssh://git@host/o/r.git`), else undefined. */
-export const repoFromRemote = (url: string): string | undefined => {
-  const m = /[:/]([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(url.trim());
-  return m ? `${m[1]}/${m[2]}` : undefined;
-};
+export const repoFromRemote = repoFromRemoteUrl;
 
 export const originUrl = (gitConfig: string): string | undefined => {
   let inOrigin = false;

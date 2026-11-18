@@ -1,5 +1,5 @@
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
-import { doneRepos } from "./launch.ts";
+import { doneRepos } from "./signals.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
 import { type SampleResult, UNSUPPORTED_SHELL } from "./remote-guard.ts";
 import { canLaunch, type LaunchVerdict } from "./routing.ts";
@@ -114,7 +114,11 @@ export const resolvePlacement = (input: PlacementInput, placement: PlacementConf
 };
 
 /** `freeSlots`: lanes the pane limit still allows; absent when the limit is off or the pane count is unknown. */
-export type MachineCheck = { readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number };
+export type MachineCheck = {
+  readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number;
+  /** Admission inputs from the same observation; absent for an unobservable or offline machine. */
+  readonly paneCap?: number; readonly paneCount?: number; readonly paneIds?: readonly string[];
+};
 
 const freeSlots = (panes: number, t: GuardThresholds): { freeSlots?: number } =>
   t.panesMax > 0 && panes >= 0 ? { freeSlots: Math.max(0, t.panesMax - panes) } : {};
@@ -167,14 +171,20 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
   }
   const s = seen.sample;
-  if (machine === LOCAL_MACHINE) return { machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard) };
+  if (machine === LOCAL_MACHINE) return {
+    machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard),
+    paneCap: config.guard.panesMax, paneCount: s.panes, paneIds: seen.panes.map((p) => p.pane_id),
+  };
   const panes = s.panes >= 0 ? seen.panes.length : -1;
   const result: SampleResult = {
     ok: true,
     sample: { os: seen.os, load1: s.load1, memFreePct: s.memFreePct, swapFreeGb: s.swapFreeGb, swapTotalGb: s.swapTotalGb, diskFreeGb: s.diskFreeGb },
   };
   const guard: GuardThresholds = { ...config.guard, ...seen.guard };
-  return { machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard) };
+  return {
+    machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard),
+    paneCap: guard.panesMax, paneCount: panes, paneIds: seen.panes.map((p) => p.pane_id),
+  };
 };
 
 /** Local keeps the legacy `CAN_LAUNCH` / `HOLD <reasons>`; a remote line names its machine. */
@@ -234,8 +244,7 @@ const offlineHold = (machine: string, repo: string | undefined): MachineCheck =>
  * (`p.machine`), with a HOLD line for every other candidate.
  */
 const planCandidates = async (p: Placement, candidates: readonly PlacementCandidate[], placement: PlacementConfig, check: (machine: string) => Promise<MachineCheck>): Promise<LaunchPlan> => {
-  const checks: { c: PlacementCandidate; check: MachineCheck }[] = [];
-  for (const c of candidates) if (c.online) checks.push({ c, check: await check(c.machine) });
+  const checks = await Promise.all(candidates.filter((c) => c.online).map(async (c) => ({ c, check: await check(c.machine) })));
   const pick = preferred(checks.filter((x) => x.check.verdict.ok).map((x) => ({ ...x, machine: x.c.machine })), placement);
   if (pick) {
     const placed: Placement = { ...p, machine: pick.c.machine, cwd: pick.c.cwd, online: true };
@@ -245,6 +254,20 @@ const planCandidates = async (p: Placement, candidates: readonly PlacementCandid
     .map((c) => { const x = checks.find((y) => y.c.machine === c.machine); return verdictLine(c.machine, (x?.check ?? offlineHold(c.machine, p.rule)).verdict); });
   const lead = checks.find((x) => x.c.machine === p.machine)!.check;
   return { placement: p, check: lead, lines: [placementLine(p), candidatesLine(p, "none"), ...held] };
+};
+
+/**
+ * The machines a launch placed at `p` may go to, in the order planLaunch tries them: none while its owning runner is
+ * offline, the online candidates (defaultMachine first) when several runners declare the repo, the placed machine then
+ * the `fallback` machines for a movable placement, else the placed machine alone.
+ */
+export const placementTargets = (p: Placement, placement: PlacementConfig): string[] => {
+  if (p.online === false) return [];
+  if (p.candidates) {
+    const online = p.candidates.filter((c) => c.online).map((c) => c.machine);
+    return online.includes(placement.defaultMachine) ? [placement.defaultMachine, ...online.filter((m) => m !== placement.defaultMachine)] : online;
+  }
+  return p.movable ? [p.machine, ...placement.fallback.filter((m) => m !== p.machine)] : [p.machine];
 };
 
 /**

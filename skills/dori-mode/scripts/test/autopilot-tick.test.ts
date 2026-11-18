@@ -13,7 +13,7 @@ const report = (verdicts: readonly Verdict[], slots: number | null = 1, paused =
   ({ paused, slots, verdicts });
 
 /** A tick over a settable clock and report; `lines` are the journaled events, `judged` counts judgments. */
-const harness = (initial: CandidatesReport | Error, tickMs = AUTOPILOT_TICK_MS, localState?: () => Promise<string>) => {
+const harness = (initial: CandidatesReport | Error, tickMs = AUTOPILOT_TICK_MS, localState?: () => Promise<string>, executor?: { on: boolean; execute: (ids: readonly number[]) => Promise<readonly { taskId: number; kind: string }[]> }) => {
   let now = T0;
   let next: CandidatesReport | Error = initial;
   const lines: string[] = [];
@@ -22,7 +22,7 @@ const harness = (initial: CandidatesReport | Error, tickMs = AUTOPILOT_TICK_MS, 
   const tick = new AutopilotTick({
     tickMs: () => tickMs,
     judge: async () => { judged++; if (next instanceof Error) throw next; return next; },
-    localState, enqueue: (_id, line) => { lines.push(line); }, now: () => now, log: (line) => { logs.push(line); },
+    localState, executorOn: executor && (() => executor.on), execute: executor?.execute, enqueue: (_id, line) => { lines.push(line); }, now: () => now, log: (line) => { logs.push(line); },
   });
   return {
     tick, lines, logs, judged: () => judged,
@@ -174,6 +174,44 @@ test("a pause judges but wakes no one, and lifting the pause announces the set",
   paused.set(report([launch(12)]));
   await paused.at(AUTOPILOT_RENOTIFY_MS + AUTOPILOT_TICK_MS);
   expect(paused.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
+});
+
+test("switch off: the lead is woken as before and execute is never called", async () => {
+  const calls: (readonly number[])[] = [];
+  const h = harness(report([launch(12), launch(15)]), AUTOPILOT_TICK_MS, undefined, { on: false, execute: async (ids) => { calls.push(ids); return []; } });
+  await h.at(0);
+  expect(h.lines).toEqual(["AUTOPILOT_READY #12,#15 slots=1"]);
+  expect(calls).toEqual([]);
+});
+
+test("switch on: execute gets the LAUNCH ids, and only ids it left to the lead are announced", async () => {
+  const calls: (readonly number[])[] = [];
+  const h = harness(report([launch(15), launch(12), launch(16), launch(17), hold(13)]), AUTOPILOT_TICK_MS, undefined, {
+    on: true,
+    execute: async (ids) => { calls.push(ids); return [{ taskId: 12, kind: "launched" }, { taskId: 15, kind: "review" }, { taskId: 16, kind: "failed" }]; },
+  });
+  await h.at(0);
+  expect(calls).toEqual([[12, 15, 16, 17]]);
+  expect(h.lines).toEqual(["AUTOPILOT_READY #15,#17 slots=1"]);
+  h.set(report([launch(12)]));
+  await h.at(AUTOPILOT_TICK_MS);
+  expect(h.lines).toHaveLength(1);
+});
+
+test("switch on: a pause and an empty set still call execute with no ids, and a throwing execute is logged once and wakes the lead", async () => {
+  const calls: (readonly number[])[] = [];
+  let fail = false;
+  const h = harness(report([launch(12)], 1, true), AUTOPILOT_TICK_MS, undefined, {
+    on: true, execute: async (ids) => { calls.push(ids); if (fail) throw new Error("toodo down"); return []; },
+  });
+  await h.at(0);
+  expect([calls, h.lines]).toEqual([[[]], []]);
+  fail = true;
+  h.set(report([launch(12)]));
+  await h.at(AUTOPILOT_TICK_MS);
+  await h.at(2 * AUTOPILOT_TICK_MS);
+  expect(h.logs).toEqual(["AUTOPILOT_EXECUTOR_ERROR toodo down"]);
+  expect(h.lines).toEqual(["AUTOPILOT_READY #12 slots=1"]);
 });
 
 test("the tick period is the configured tickMs", async () => {

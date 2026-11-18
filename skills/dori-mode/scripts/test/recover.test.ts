@@ -6,7 +6,7 @@ import { acceptLaneEvent, type LaneHubDeps } from "../src/runner/lanes-hub.ts";
 import type { LaneBriefFiles } from "../src/runner/protocol.ts";
 import { launchLane } from "../src/launch.ts";
 
-import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, resumeCommand, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
+import { recoverLanes, RECOVERY_LIMIT, type RecoveryLane, STARTUP_GRACE_MS, withRecoveryLock } from "../src/recover.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { type Lane, Registry } from "../src/registry.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
@@ -489,6 +489,58 @@ test("a sandboxed lane replaced on the wrong model is started sandboxed again, r
   expect((await deps.registry.read(lane.key))?.sandbox).toBe(true);
 });
 
+/**
+ * Runner ops whose lane.start and lane.recover report the profile's pinned model. `early` hands the run's lane.started to
+ * the hub before the result comes back, as a runner publishes it before its startup check.
+ */
+const pinnedOps = (deps: Deps, early: boolean): LaneOps => {
+  const hub: LaneHubDeps = { stateDir: state.dir, registry: deps.registry, reports: () => undefined,
+    now: deps.clock.now, emit: () => {}, prepareRecovery: async () => ({ cmdId: "unused", notes: [] }), recover: () => undefined };
+  let seq = 0;
+  const started = async (key: string, made: { readonly pane: string; readonly tab: string }, run: LaneBriefFiles["run"] | undefined) => {
+    if (early) await acceptLaneEvent(hub, "local", { v: 1, runner: "local", gen: 1, epoch: 1, seq: ++seq, type: "lane.started",
+      body: { key, pane: made.pane, tab: made.tab, session: "", ...(run ? { fileRun: run } : {}) } }, seq);
+  };
+  return { ...deps.ops,
+    start: async (input) => { const made = await deps.ops.start(input); await started(input.key, made, input.files?.run); return { ...made, model: "provider/pinned" }; },
+    recover: async (l, opts) => { const made = await deps.ops.recover(l, opts); await started(l.key, made, opts?.files?.run); return { ...made, model: "provider/pinned" }; },
+  };
+};
+
+test.each([false, true])("a live agent on the model its runner profile pins is replaced once, records that model and is left alone after (lane.started first: %p)", async (early) => {
+  const { deps, world, lane, control, clock } = await fixture();
+  clock.at = STARTUP_GRACE_MS;
+  control.live(true);
+  control.argv = ["omo", "--model", "provider/pinned"];
+  // The live agent on the wrong model is closed and started again (lane.start), which reports the profile's pinned model.
+  const pinned = { ...deps, ops: pinnedOps(deps, early) };
+  expect(await recoverLanes(pinned)).toEqual(["LANE_RECOVERED recover-lane new:p1 model-mismatch", "STARTUP_OK recover-lane new:p1", SKIP]);
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+  clock.at += STARTUP_GRACE_MS;
+  expect(await recoverLanes(pinned)).toEqual([]);
+  expect(opsOf(world, "start")).toHaveLength(1);
+});
+
+test.each([false, true])("a runner relaunch of a missing pane records the model its runner profile pins and is left alone after (lane.started first: %p)", async (early) => {
+  const { deps, world, lane, control, clock } = await fixture();
+  control.argv = ["omo", "--model", "provider/pinned"];
+  const pinned = { ...deps, ops: pinnedOps(deps, early) };
+  expect((await recoverLanes(pinned, lane.key))[0]).toStartWith("LANE_RECOVERED recover-lane new:p1 missing-pane");
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+  clock.at += STARTUP_GRACE_MS;
+  expect((await recoverLanes(pinned)).filter((line) => line.includes("model-mismatch"))).toEqual([]);
+  expect(opsOf(world, "recover", "start")).toHaveLength(1);
+});
+
+test.each([false, true])("a relaunch from the brief records the model its runner profile pins (lane.started first: %p)", async (early) => {
+  const { deps, lane } = await fixture();
+  const existing = { ...lane, runner: "local", fileRun: { id: "00000000-0000-4000-8000-0000000000ab", requiredReport: false } };
+  await deps.registry.write(existing);
+  const result = await launchLane({ ...deps, ops: pinnedOps(deps, early) }, { key: lane.key, title: lane.title, brief: lane.brief, done: lane.done, cwd: lane.cwd, model: "provider/expected" }, existing);
+  expect(result.lane.model).toBe("provider/pinned");
+  expect((await deps.registry.read(lane.key))?.model).toBe("provider/pinned");
+});
+
 test.each([
   { name: "missing", setup: (d: Deps) => ({ ...d, which: () => null }), event: "LANE_RECOVERY_ERROR recover-lane sandbox-missing: SANDBOX_MISSING recover-lane: " },
   { name: "broken", setup: (d: Deps, w: World) => { w.sandboxCheck = { code: 3, out: "", err: "lane-sandbox: bwrap not found" }; return d; }, event: "LANE_RECOVERY_ERROR recover-lane sandbox-broken: SANDBOX_BROKEN recover-lane: " },
@@ -525,15 +577,6 @@ test("item 7: a resume that does not start falls back to the brief on the next a
   expect(relaunches).toHaveLength(2);
   expect(relaunches[0]?.args).toMatchObject({ opts: { session: "gone-session" } });
   expect((relaunches[1]?.args as { session?: string }).session).toBeUndefined();
-});
-
-test("item 7: resumeCommand puts --session before the prompt, and declines when it cannot resume", () => {
-  expect(resumeCommand(["omo", "--model", "{model}", "{prompt}"], "abc")).toEqual(["omo", "--model", "{model}", "--session", "abc", "{prompt}"]);
-  expect(resumeCommand(["omo", "--model", "{model}", "{prompt}"], undefined)).toBeUndefined();
-  expect(resumeCommand(["omo", "--continue", "{prompt}"], "abc")).toBeUndefined();
-  expect(resumeCommand(["omo", "--model", "{model}"], "abc")).toBeUndefined();
-  expect(resumeCommand(["omo", "{prompt}"], "--evil")).toBeUndefined();
-  expect(resumeCommand(["omo", "{prompt}"], "a b")).toBeUndefined();
 });
 
 test.each([{ live: false, reason: "missing-pane" }, { live: true, reason: "missing-model" }])("never relaunches a lane whose PR is merged ($reason); the lane is closed instead", async ({ live, reason }) => {

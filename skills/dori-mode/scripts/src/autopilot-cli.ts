@@ -1,29 +1,35 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 import {
-  type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, judgeAll,
+  type AutopilotConfig, autopilotLaneKey, candidatesJson, type CandidatesReport, formatCandidates, type HostSummary, type Hosts, judgeAll,
   LAUNCH_ACTION, laneKeyOf, ledgerRows, ledgerState, pendingReservations, type QuotaAccount, quotaAccountText, quotaSplit,
-  type QuotaSummary, type ToodoTask,
+  type QuotaSummary, REARM_ACTION, rearmedThrough, type ToodoTask,
 } from "./autopilot.ts";
 import { type ClaudeSkip, type ClaudeUsage, quotaProvidersFor, readUsage } from "./claude-quota.ts";
-import { ageText, type QuotaCacheNote, sharedQuotaLookup } from "./quota-cache.ts";
+import { sharedQuotaLookup } from "./quota-cache.ts";
+import { ageText, type QuotaCacheNote } from "./quota-presentation.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { OPEN_STATES, type OperationState, type OperationStore, plan, settleOperation } from "./operations.ts";
+import { hostSummary, machineHosts } from "./launch-service.ts";
 import { checkMachine } from "./placement.ts";
 import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 
 /**
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
- * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows; the lead runs `start_task` and `dori launch` between the reservation and its
+ * launches a lane, writes to toodo or merges: candidates only reads, launch writes and settles launch-attempt rows, rearm writes re-arm rows; the lead runs `start_task` and `dori launch` between the reservation and its
  * settle. The supervisor's autopilot tick (autopilot-tick.ts) runs the candidates judgment every `autopilot.tickSec`.
  * Autopilot is always on: a reservation needs only no pause; `pause` / `resume` set and clear the pause file.
+ * With `autopilot.executor` on, the supervisor's executor (autopilot-executor.ts) owns reserve, launch and settle: `launch`
+ * refuses to reserve, and refuses to settle a reservation an executor sequence owns, so one task never has two launchers.
  */
 
 export const AUTOPILOT_USAGE = [
   "usage: dori autopilot candidates [--tasks 12,13] [--json]",
   "       dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]",
+  "       dori autopilot rearm <taskId> [--note TEXT]",
   "       dori autopilot pause [--reason TEXT]",
   "       dori autopilot resume",
 ].join("\n");
@@ -53,10 +59,11 @@ const pauseText = (p: Pause): string => `since ${p.since}${p.reason ? `: ${p.rea
 
 const writePause = (path: string, pause: Pause): void => {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(pause)}\n`);
-  renameSync(tmp, path);
+  replaceFileAtomic(path, `${JSON.stringify(pause)}\n`, 0o666);
 };
+
+/** The operation action of an executor sequence row (`toodo:<taskId>/autopilot-execute/<attempt>`). */
+export const EXECUTE_ACTION = "autopilot-execute";
 
 /** The hourly schedule job the supervisor's autopilot tick replaced; the supervisor removes it at startup. */
 export const RECONCILE_JOB = "autopilot-reconcile";
@@ -82,8 +89,15 @@ export type JudgeDeps = {
    * unreadable read is `{ readable: false }`).
    */
   readonly quota: () => Promise<QuotaSummary>;
-  /** The can-launch verdict and free slots of the default machine; must not throw. */
-  readonly host: () => Promise<HostSummary>;
+  /** Where the tasks would launch and each of those machines' can-launch verdict and free slots; must not throw. */
+  readonly hosts: (taskIds: readonly number[]) => Promise<TaskHosts>;
+};
+
+/** Each task's target machines (most preferred first; a task not named targets `defaultMachine`) and their summaries. */
+export type TaskHosts = {
+  readonly defaultMachine: string;
+  readonly machines: ReadonlyMap<string, HostSummary>;
+  readonly targets: ReadonlyMap<number, readonly string[]>;
 };
 
 export type AutopilotDeps = JudgeDeps & {
@@ -129,8 +143,10 @@ export const within = async <T>(ms: number, work: () => Promise<T>, fallback: (w
 const PROBE_MS = 15_000;
 
 /**
- * JudgeDeps over the live world: toodo-server, the registry's open lanes, the Claude quota and the default machine's
- * can-launch check (without recording a launch verdict). `dori autopilot` and the supervisor's tick share it.
+ * JudgeDeps over the live world: toodo-server, the registry's open lanes, the Claude quota and the can-launch check of
+ * every machine a task's launch may be placed on (launch-service's machineHosts, without recording a launch verdict).
+ * `dori autopilot` and the supervisor's tick share it. A task carries no repo or checkout, so it is placed like a launch
+ * without one: placement.defaultMachine, then the fallback machines.
  */
 export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry" | "tunables" | "clock">, store: OperationStore): JudgeDeps => ({
   config: flow.config.autopilot, store, pauseFile: autopilotPausePath(flow.config.stateDir),
@@ -140,12 +156,32 @@ export const liveJudgeDeps = (flow: Pick<FlowDeps, "ops" | "config" | "registry"
     const read = await readUsage(sharedQuotaLookup(flow.config), flow.clock.now(), AbortSignal.timeout(PROBE_MS), quotaProvidersFor(flow.config.defaultModel));
     return quotaSummary(read.usage, read.skipped, read.cache, flow.clock.now());
   }, () => ({ readable: false })),
-  host: () => within(PROBE_MS, async () => {
-    const c = await checkMachine(flow.ops, flow.config, flow.config.placement.defaultMachine);
-    const slots = c.freeSlots === undefined ? {} : { slots: c.freeSlots };
-    return c.verdict.ok ? { ok: true, ...slots } : { ok: false, reason: c.verdict.reasons.join(" | "), ...slots };
-  }, (why) => ({ ok: false, reason: why })),
+  hosts: async (taskIds) => {
+    const { defaultMachine } = flow.config.placement;
+    const probe = (machine: string) => within(PROBE_MS, async () => hostSummary(await checkMachine(flow.ops, flow.config, machine), flow.config.stateDir, flow.clock.now()), (why): HostSummary => ({ ok: false, reason: why }));
+    try {
+      const found = await machineHosts(flow, taskIds.map(() => ({ done: "" })), probe);
+      return { defaultMachine, machines: found.machines, targets: new Map(taskIds.map((id, i) => [id, found.targets[i]!])) };
+    } catch (e) {
+      return { defaultMachine, machines: new Map([[defaultMachine, { ok: false, reason: e instanceof Error ? e.message : String(e) }]]), targets: new Map() };
+    }
+  },
 });
+
+/** `found` with each machine's slots less the reservations waiting for it (pendingReservations). */
+const slotted = (found: TaskHosts, pending: ReadonlyMap<string, number>): Hosts => ({
+  machines: new Map([...found.machines].map(([m, h]) => [m, h.slots === undefined ? h : { ...h, slots: Math.max(0, h.slots - (pending.get(m) ?? 0)) }])),
+  targets: (taskId) => found.targets.get(taskId) ?? [found.defaultMachine],
+});
+
+/** The free slots of every machine not held, summed (null when one has no pane limit), and each machine's when several. */
+const slotsOf = (hosts: Hosts): Pick<CandidatesReport, "slots" | "machines"> => {
+  const all = [...hosts.machines];
+  const open = all.filter(([, h]) => h.ok);
+  const slots = open.some(([, h]) => h.slots === undefined) ? null : open.reduce((sum, [, h]) => sum + h.slots!, 0);
+  if (all.length < 2) return { slots };
+  return { slots, machines: all.map(([machine, h]) => ({ machine, slots: h.ok ? h.slots ?? null : "hold" as const })) };
+};
 
 class UsageError extends Error {}
 
@@ -155,7 +191,7 @@ const FLAGS = {
   reason: { type: "string" },
 } as const;
 const ALLOWED: Readonly<Record<string, readonly string[]>> = {
-  candidates: ["json", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], pause: ["reason"], resume: [],
+  candidates: ["json", "tasks"], launch: ["launched", "failed", "ambiguous", "note"], rearm: ["note"], pause: ["reason"], resume: [],
 };
 
 const taskIds = (value: string | undefined): number[] => {
@@ -198,14 +234,13 @@ export const judgeCandidates = async (deps: JudgeDeps, extraIds: readonly number
   const { tasks, ids } = await loadTasks(deps, extraIds);
   const paused = readPause(deps.pauseFile) !== undefined;
   if (!ids.length) return { paused, slots: null, verdicts: [] };
-  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
+  const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(ids)]);
   const ledger = ledgerRows(deps.store);
-  const pending = pendingReservations(ledger, openLanes);
-  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
-  const verdicts = judgeAll({ tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, ids);
+  const hosts = slotted(found, pendingReservations(ledger, new Set([...openLanes, ...[...found.machines.values()].flatMap((h) => h.reservedKeys ?? [])]), found.defaultMachine));
+  const verdicts = judgeAll({ tasks, ledger, openLanes, quota, hosts, config: deps.config }, ids);
   const { over, room } = quotaSplit(quota);
   return {
-    paused, slots: host.ok ? slotted.slots ?? null : 0, verdicts,
+    paused, ...slotsOf(hosts), verdicts,
     ...(quota.skipped?.length ? { quotaSkipped: quota.skipped } : {}),
     ...(quota.stale?.length ? { quotaStale: quota.stale } : {}),
     ...(over.length ? { quotaOver: over.map(quotaAccountText), quotaRoom: room.map(quotaAccountText) } : {}),
@@ -228,12 +263,12 @@ const candidates = async (deps: AutopilotDeps, json: boolean, extraIds: readonly
 };
 
 /**
- * Reserves the next launch attempt of `taskId` under the launch lock: re-reads toodo, the ledger, open lanes, quota and
+ * Reserves the next launch attempt of `taskId`; the caller must hold the launch lock. Re-reads toodo, the ledger, open lanes, quota and
  * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
  * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and before
  * reading anything when a pause is in force.
  */
-const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
+export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
   const pause = readPause(deps.pauseFile);
   if (pause) {
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
@@ -242,19 +277,20 @@ const reserve = async (deps: AutopilotDeps, taskId: number): Promise<number> => 
   const read = await readTasks(deps, [taskId]);
   if (!read) return 1;
   const ledger = ledgerRows(deps.store);
-  const [openLanes, quota, host] = await Promise.all([deps.openLanes(), deps.quota(), deps.host()]);
-  const pending = pendingReservations(ledger, openLanes, taskId);
-  const slotted: HostSummary = host.slots === undefined ? host : { ...host, slots: Math.max(0, host.slots - pending) };
-  const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, host: slotted, config: deps.config }, read.ids)
+  const [openLanes, quota, found] = await Promise.all([deps.openLanes(), deps.quota(), deps.hosts(read.ids)]);
+  const hosts = slotted(found, pendingReservations(ledger, new Set([...openLanes, ...[...found.machines.values()].flatMap((h) => h.reservedKeys ?? [])]), found.defaultMachine, taskId));
+  const verdict = judgeAll({ tasks: read.tasks, ledger, openLanes, quota, hosts, config: deps.config }, read.ids)
     .find((v) => v.taskId === taskId)!;
   if (verdict.verdict !== "LAUNCH") {
     deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} ${verdict.verdict} ${verdict.reasons.join(", ")}`);
     return 1;
   }
-  const attempt = ledgerState(ledger, taskId, openLanes).attempts + 1;
+  const attempt = ledgerState(ledger, taskId, openLanes).last + 1;
   const laneKey = autopilotLaneKey(taskId, attempt);
-  plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey }) });
-  deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}`);
+  // A reservation on the default machine names none, as rows written before machines were recorded.
+  const machine = verdict.machine !== undefined && verdict.machine !== found.defaultMachine ? verdict.machine : undefined;
+  plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey, ...(machine ? { machine } : {}) }) });
+  deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}${machine ? ` machine=${machine}` : ""}`);
   return 0;
 };
 
@@ -288,9 +324,53 @@ const launch = async (deps: AutopilotDeps, positionals: readonly string[], v: Re
   if (settles.length > 1) throw new UsageError("--launched, --failed and --ambiguous exclude each other");
   const note = v.note as string | undefined;
   if (note !== undefined && !settles.length) throw new UsageError("--note goes with --launched, --failed or --ambiguous");
+  const taskId = Number(id);
+  if (deps.config.executor && !settles.length) {
+    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} executor-on: the supervisor's executor reserves and launches marked tasks (autopilot.executor)`);
+    return 1;
+  }
   const release = await deps.lock();
   try {
-    return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserve(deps, Number(id));
+    // Checked under the lock: the executor opens its sequence row under the same lock before it reserves.
+    if (deps.config.executor && deps.store.list({ lane: `toodo:${taskId}` }).some((op) => op.action === EXECUTE_ACTION)) {
+      deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} executor-owned: the supervisor's executor settles this reservation`);
+      return 1;
+    }
+    return settles[0] ? settle(deps, Number(id), settles[0], note) : await reserveAutopilot(deps, Number(id));
+  } finally {
+    release();
+  }
+};
+
+/**
+ * `dori autopilot rearm <taskId>`, on the owner's word: the task's attempts so far (launch attempts and executor
+ * sequences) stop refusing it, so once it judges LAUNCH again (e.g. its wait ended) its next launch is attempt n+1.
+ * Writes one verified re-arm row covering the highest attempt number, under the launch lock; launches nothing and works
+ * while paused. Refuses while an attempt still runs; re-arming again with no attempt since changes nothing.
+ */
+const rearm = async (deps: AutopilotDeps, positionals: readonly string[], note: string | undefined): Promise<number> => {
+  const [id, ...more] = positionals;
+  if (id === undefined || more.length || !/^\d+$/.test(id)) throw new UsageError("autopilot rearm takes one toodo task id");
+  const taskId = Number(id);
+  const release = await deps.lock();
+  try {
+    const ledger = ledgerRows(deps.store);
+    const state = ledgerState(ledger, taskId, await deps.openLanes());
+    const executions = deps.store.list({ lane: `toodo:${taskId}` }).filter((op) => op.action === EXECUTE_ACTION);
+    if (state.live || executions.some((op) => OPEN_STATES.includes(op.state))) {
+      deps.err(`AUTOPILOT_REARM_REFUSED #${taskId} lane-live: an attempt is still running`);
+      return 1;
+    }
+    const last = Math.max(state.last, ...executions.map((op) => Number(op.target)));
+    if (last === 0) { deps.err(`AUTOPILOT_REARM_NOTHING #${taskId}: no launch attempt to re-arm`); return 1; }
+    const already = last <= rearmedThrough(ledger, taskId);
+    if (!already) {
+      const why = note?.trim();
+      const row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: REARM_ACTION, target: String(last), data: JSON.stringify(why ? { note: why } : {}) });
+      settleOperation(deps.store, deps.now(), row.id, "verified", why ? `re-armed: ${why}` : "re-armed");
+    }
+    deps.out(`AUTOPILOT_REARMED #${taskId} through=${last} next=${autopilotLaneKey(taskId, last + 1)}${already ? " (already)" : ""}`);
+    return 0;
   } finally {
     release();
   }
@@ -327,6 +407,7 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     if (stray.length) throw new UsageError(`${stray.map((f) => `--${f}`).join(", ")} is not an option of autopilot ${sub}`);
     const v = parsed.values as Record<string, unknown>;
     if (sub === "launch") return await launch(deps, extra, v);
+    if (sub === "rearm") return await rearm(deps, extra, v.note as string | undefined);
     if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
     if (sub === "pause") return pause(deps, v.reason as string | undefined);
     if (sub === "resume") return resume(deps);

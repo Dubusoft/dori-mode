@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import { chmodSync, existsSync, fstatSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readSync, readdirSync, rmSync, symlinkSync, writeFileSync, type Stats } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureOutput, checkFileBody, checkManagedReport, FILE_LIMITS, laneFilePaths, prepareInput, removeLaneTree, rewriteBrief, treeDigest, validateBriefFiles, validateFileKey, validateTree } from "../src/runner/lane-files.ts";
+import { addInput, captureOutput, checkManagedReport, laneFilePaths, prepareInput, removeLaneTree, rewriteBrief, validateBriefFiles } from "../src/runner/lane-files.ts";
+import { checkLaneFilesBody, FILE_LIMITS, treeDigest, validateFileKey, validateLaneTree } from "../src/lane-file-contract.ts";
 import type { LaneBriefFiles, LaneFileTree } from "../src/runner/protocol.ts";
 
 const roots: string[] = [];
@@ -54,7 +55,7 @@ test("snapshot binary, zero-byte and empty directories in raw byte order with st
 
 for (const name of ["../x", "/x", "C:/x", "\\\\server\\x", "a\\b", ".", "", "a.", "a ", "CON", "com¹.txt", "NUL.txt", "LPT9", "a:b", "a?b", "a\u0000b", "e\u0301", ".dori-lane-files.json"]) {
   test(`refuse unsafe manifest path ${JSON.stringify(name)}`, () => {
-    expect(() => validateTree("lane-a", { directories: [], files: [file(name)] })).toThrow("LANE_FILES_INVALID");
+    expect(() => validateLaneTree("lane-a", { directories: [], files: [file(name)] }, false, true)).toThrow("LANE_FILES_INVALID");
   });
 }
 for (const key of ["../x", "CON", "LPT¹", "bad.", "", "a/b"]) test(`refuse unsafe managed key ${JSON.stringify(key)}`, () => {
@@ -69,7 +70,7 @@ test("refuse unsorted, case collisions, absent parents, directory-file collision
     [{ directories: [], files: [{ ...file("a"), base64: "/w" }] }, "base64"],
     [{ directories: [], files: [{ ...file("a"), bytes: 3 }] }, "byte-count"],
     [{ directories: [], files: [{ ...file("a"), sha256: "0".repeat(64) }] }, "digest"],
-  ] as const) expect(() => validateTree("lane-a", tree)).toThrow(`(${reason})`);
+  ] as const) expect(() => validateLaneTree("lane-a", tree, false, true)).toThrow(`(${reason})`);
 });
 test("reference validation rejects overlap, bounds, invalid targets and run IDs", () => {
   const files = { ...empty(), tree: { directories: [], files: [file("a")] } };
@@ -81,14 +82,14 @@ test("reference validation rejects overlap, bounds, invalid targets and run IDs"
 });
 test("all byte and count limits admit equality and refuse the next item", () => {
   const tree: LaneFileTree = { directories: [], files: [file("a", Buffer.alloc(FILE_LIMITS.fileBytes)), file("b", Buffer.alloc(FILE_LIMITS.totalBytes - FILE_LIMITS.fileBytes))] };
-  validateTree("lane-a", tree);
-  expect(() => validateTree("lane-a", { ...tree, files: [file("a", Buffer.alloc(FILE_LIMITS.fileBytes + 1))] })).toThrow("LANE_FILE_TOO_LARGE");
-  expect(() => validateTree("lane-a", { ...tree, files: [...tree.files, file("c", Buffer.alloc(1))] })).toThrow("LANE_FILES_TOO_LARGE");
+  validateLaneTree("lane-a", tree, false, true);
+  expect(() => validateLaneTree("lane-a", { ...tree, files: [file("a", Buffer.alloc(FILE_LIMITS.fileBytes + 1))] }, false, true)).toThrow("LANE_FILE_TOO_LARGE");
+  expect(() => validateLaneTree("lane-a", { ...tree, files: [...tree.files, file("c", Buffer.alloc(1))] }, false, true)).toThrow("LANE_FILES_TOO_LARGE");
   for (const [count, name] of [[64, "files"], [128, "directories"]] as const) {
     const paths = Array.from({ length: count }, (_, i) => `p${String(i).padStart(3, "0")}`);
     const t = name === "files" ? { directories: [], files: paths.map((p) => file(p, Buffer.alloc(0))) } : { directories: paths, files: [] };
-    validateTree("lane-a", t);
-    expect(() => validateTree("lane-a", name === "files" ? { ...t, files: [...t.files, file("z")] } : { ...t, directories: [...t.directories, "z"] })).toThrow(`${name} is ${count + 1}`);
+    validateLaneTree("lane-a", t, false, true);
+    expect(() => validateLaneTree("lane-a", name === "files" ? { ...t, files: [...t.files, file("z")] } : { ...t, directories: [...t.directories, "z"] }, false, true)).toThrow(`${name} is ${count + 1}`);
   }
   validateBriefFiles("lane-a", "x".repeat(65536), empty());
   expect(() => validateBriefFiles("lane-a", "x".repeat(65537), empty())).toThrow("briefBytes");
@@ -99,17 +100,17 @@ test("all byte and count limits admit equality and refuse the next item", () => 
   validateBriefFiles("lane-a", source, { ...empty(), tree: { directories: ["a"], files: [] }, references: [{ start: 0, end: 4096, target: "a" }] });
   expect(() => validateBriefFiles("lane-a", source + "x", { ...empty(), references: [{ start: 0, end: 4097, target: "a" }] })).toThrow("sourcePathBytes");
   const paths = Array.from({ length: 16 }, (_, i) => Array(i + 1).fill("a").join("/"));
-  validateTree("lane-a", { directories: paths, files: [] });
-  expect(() => validateTree("lane-a", { directories: [...paths, paths.at(-1) + "/a"], files: [] })).toThrow("depth");
-  validateTree("lane-a", { directories: [], files: [file("a".repeat(120))] });
-  expect(() => validateTree("lane-a", { directories: [], files: [file("a".repeat(121))] })).toThrow("componentBytes");
+  validateLaneTree("lane-a", { directories: paths, files: [] }, false, true);
+  expect(() => validateLaneTree("lane-a", { directories: [...paths, paths.at(-1) + "/a"], files: [] }, false, true)).toThrow("depth");
+  validateLaneTree("lane-a", { directories: [], files: [file("a".repeat(120))] }, false, true);
+  expect(() => validateLaneTree("lane-a", { directories: [], files: [file("a".repeat(121))] }, false, true)).toThrow("componentBytes");
   const parent = "a".repeat(119), child = parent + "/" + "b".repeat(120);
-  validateTree("lane-a", { directories: [parent], files: [file(child)] });
-  expect(() => validateTree("lane-a", { directories: [parent + "a"], files: [file(parent + "a/" + "b".repeat(120))] })).toThrow("relativePathBytes");
+  validateLaneTree("lane-a", { directories: [parent], files: [file(child)] }, false, true);
+  expect(() => validateLaneTree("lane-a", { directories: [parent + "a"], files: [file(parent + "a/" + "b".repeat(120))] }, false, true)).toThrow("relativePathBytes");
   const body = { text: "" };
   body.text = "x".repeat(786432 - Buffer.byteLength(JSON.stringify(body)));
-  checkFileBody("lane-a", body);
-  expect(() => checkFileBody("lane-a", { text: body.text + "x" })).toThrow("LANE_FILES_FRAME_TOO_LARGE");
+  checkLaneFilesBody("lane-a", body);
+  expect(() => checkLaneFilesBody("lane-a", { text: body.text + "x" })).toThrow("LANE_FILES_FRAME_TOO_LARGE");
 });
 test("managed text/evidence are lossless at equality and refused above it; digest/revision/kind are checked", () => {
   const tree = empty().tree, files = { run, revision: 1, sha256: treeDigest(tree), tree };
@@ -174,4 +175,20 @@ test("failed manifest admission leaves previous inputs and brief untouched", () 
   expect(readFileSync(join(t.dir, "briefs/lane-a.md"), "utf8")).toBe("brief");
   expect(existsSync(t.stage)).toBe(false);
   expect(readdirSync(t.input)).toEqual([]);
+});
+
+test("added files land in place under the next free group and keep the combined caps", () => {
+  const t = setup(), before = lstatSync(t.input).ino;
+  const tree: LaneFileTree = { directories: ["r0000"], files: [file("r0000/notes.md")] };
+  expect(addInput(t.dir, "lane-a", tree)).toBe(join(t.input, "a0001"));
+  expect(addInput(t.dir, "lane-a", tree)).toBe(join(t.input, "a0002"));
+  // A sandbox binds the input directory at start: it must stay the same directory.
+  expect(lstatSync(t.input).ino).toBe(before);
+  expect(readFileSync(join(t.input, "a0002/r0000/notes.md"))).toEqual(Buffer.from([0, 255, 128, 1]));
+  expect(existsSync(t.stage)).toBe(false);
+  const many: LaneFileTree = { directories: [], files: Array.from({ length: FILE_LIMITS.files - 1 }, (_, i) => file(`f${String(i).padStart(3, "0")}`)) };
+  expect(() => addInput(t.dir, "lane-a", many)).toThrow("LANE_FILES_LIMIT lane-a: files is 65, above 64");
+  expect(readdirSync(t.input).sort()).toEqual(["a0001", "a0002"]);
+  rmSync(t.input, { recursive: true });
+  expect(() => addInput(t.dir, "lane-a", tree)).toThrow("LANE_ATTACH_NO_INPUT");
 });

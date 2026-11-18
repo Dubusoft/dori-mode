@@ -10,6 +10,7 @@ import { loadPolicy } from "../src/runner/policy.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { enrollOverStdio, RunnerAuth, SupervisorAuth } from "../src/runner/auth.ts";
 import { readRunnerEndpoints } from "../src/runner/endpoints.ts";
+import { FORBIDDEN, walk } from "../src/runner/graph-check.ts";
 
 const CODE = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo";
 const FINGERPRINT = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
@@ -102,7 +103,7 @@ const fakeHost = () => {
     chmodSync(join(bin, name), 0o755);
   };
   tool("uname", "echo Linux");
-  tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
+  tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; [ "$3" = omo-profile ] && exit 0; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
   tool("loginctl", "exit 0");
   // The herdr unit is inactive and no herdr answers, unless a test says otherwise.
   tool("systemctl", `[ "$2" = is-active ] && exit 3; exit 0`);
@@ -373,11 +374,13 @@ test("on Darwin the script installs the seatbelt lane-sandbox and a starter poli
   });
   expect(loadPolicy(join(host.home, ".dori/runner"))).toMatchObject({ sandbox: "required", sandboxCheck: [wrapperPath, "--check"] });
   expect(readFileSync(wrapperPath, "utf8")).toBe(readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"));
-  expect(readFileSync(wrapperPath, "utf8")).toContain('r "$H/.dori/runner/briefs/$key.files"');
+  expect(readFileSync(wrapperPath, "utf8")).toContain('o "$H/.dori/runner/briefs/$key.files"');
   expect(readFileSync(wrapperPath, "utf8")).toContain('w "$H/.dori/runner/briefs/$key.out"');
   expect(readFileSync(wrapperPath, "utf8")).toContain('echo "DORI_LANE_FILES=1"');
   expect(statSync(wrapperPath).mode & 0o777).toBe(0o700);
   expect(result.out).not.toContain("RUNNER_CONFIG_SANDBOX_MISSING");
+  // The installed bundle adds the omo profile those lanes run under; a Linux host has no nested sandbox to avoid.
+  expect(readFileSync(host.log, "utf8")).toContain(`bun ${join(host.home, ".dori/runner/bin/dori.js")} runner omo-profile\n`);
   // A reinstall over an operator's file names every key it lacks for sandboxed lanes, and leaves the file alone.
   writeFileSync(policyFile, '{"agents":{"default":["claude"]}}\n', { mode: 0o600 });
   const again = await runDarwin(host, darwinScript());
@@ -390,11 +393,12 @@ test("a Linux reinstall over a complete sandbox policy prints no missing-key lin
   const host = fakeHost();
   expect((await runScript(host, linuxScript())).code).toBe(0);
   const wrapper = readFileSync(join(host.home, ".dori/runner/bin/lane-sandbox"), "utf8");
-  expect(wrapper).toContain('--ro-bind "$H/.dori/runner/briefs/$key.files"');
-  expect(wrapper).toContain('--bind "$H/.dori/runner/briefs/$key.out"');
+  expect(wrapper).toContain('keep --ro-bind "$R/briefs/$key.files"');
+  expect(wrapper).toContain('keep --bind "$R/briefs/$key.out"');
   expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
   const again = await runScript(host, linuxScript());
   expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\n" });
+  expect(readFileSync(host.log, "utf8")).not.toContain("omo-profile");
   const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });
   const [code, err] = await Promise.all([p.exited, new Response(p.stderr).text()]);
   expect({ code, err }).toEqual({ code: 0, err: "" });
@@ -459,6 +463,24 @@ console.log((await runnerVersion(run, import.meta.dir)) ?? "-");\n`);
   const ran = await realRun(["bun", out], { timeoutMs: 30_000, cwd: dir });
   expect(ran.out.trim()).toBe(sha as string);
 }, 60_000);
+
+test("the runner entry bundles to a single file that holds no supervisor or store-conversion module", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "dori-runner-graph-"));
+  dirs.push(dir);
+  const meta = join(dir, "meta.json");
+  const ran = await realRun(["bun", "build", "src/runner/bin.ts", "--target=bun", `--outfile=${join(dir, "dori.js")}`, `--metafile=${meta}`], { timeoutMs: 60_000, cwd: join(import.meta.dir, "..") });
+  expect(ran.err).not.toContain("cannot write multiple output files");
+  expect(ran.code).toBe(0);
+  const inputs = Object.keys(JSON.parse(readFileSync(meta, "utf8")).inputs);
+  expect(inputs.filter((file) => /src\/(store-import|supervise[^/]*|claude-quota)\.ts$/.test(file))).toEqual([]);
+}, 90_000);
+
+test("the runner import graph, dynamic imports included, reaches the runner and no supervisor or store-conversion module", () => {
+  const srcRoot = join(import.meta.dir, "../src");
+  const reached = [...walk(join(srcRoot, "runner/bin.ts"), srcRoot).keys()];
+  expect(reached).toContain(join(srcRoot, "runner/main.ts"));
+  expect(reached.filter((file) => FORBIDDEN.test(file))).toEqual([]);
+});
 
 const herdrUnitPath = (home: string) => join(home, ".config/systemd/user/herdr-server.service");
 const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);

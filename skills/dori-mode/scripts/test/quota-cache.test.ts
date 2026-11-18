@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { quotaSummary } from "../src/autopilot-cli.ts";
-import { DEFAULT_AUTOPILOT, judge, type ToodoTask } from "../src/autopilot.ts";
-import { type QuotaResult, readUsage, skippedClaudeAccounts, type UsageLookup } from "../src/claude-quota.ts";
-import { cachedQuotaLookup, cacheNoteLines, DEFAULT_BACKOFF_SEC, STALE_READ_MAX_MS } from "../src/quota-cache.ts";
+import { DEFAULT_AUTOPILOT, judge, singleHost, type ToodoTask } from "../src/autopilot.ts";
+import { type QuotaResult, classifyClaude, readUsage, type UsageLookup } from "../src/claude-quota.ts";
+import { cachedQuotaLookup, DEFAULT_BACKOFF_SEC, STALE_READ_MAX_MS } from "../src/quota-cache.ts";
+import { cacheNoteLines } from "../src/quota-presentation.ts";
 
 const T0 = Date.parse("2026-11-12T03:00:00.000Z");
 const TTL = 90_000;
@@ -103,14 +104,14 @@ test("the judge counts a stale read with its age as readable, and holds quota-un
   now = T0 + STALE_READ_MAX_MS + 1;
   const expired = await readUsage(cached(), now, SIGNAL);
   expect(calls).toBe(2);
-  expect(skippedClaudeAccounts((await cached()(SIGNAL)).results)).toEqual([{ name: "a", reason: "stale-read" }]);
+  expect(classifyClaude((await cached()(SIGNAL)).results, now).skipped).toEqual([{ name: "a", reason: "stale-read" }]);
   const unreadable = quotaSummary(expired.usage, expired.skipped, expired.cache, now);
   expect(unreadable).toEqual({ readable: false, skipped: ["a (stale-read)"] });
   const task: ToodoTask = {
     id: 1, workspaceId: 1, title: "t", description: "d", status: "planned", resolution: null, dependsOn: [], refs: ["owner:x"],
-    criteria: [{ text: "c", kind: "manual" }], wait: null, autopilot: true, dueDate: null,
+    criteria: [{ text: "c", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
   };
-  const ctx = { tasks: new Map([[1, task]]), ledger: [], openLanes: new Set<string>(), host: { ok: true }, config: DEFAULT_AUTOPILOT };
+  const ctx = { tasks: new Map([[1, task]]), ledger: [], openLanes: new Set<string>(), hosts: singleHost({ ok: true }), config: DEFAULT_AUTOPILOT };
   expect(judge({ ...ctx, taskId: 1, quota: summary }).verdict).toBe("LAUNCH");
   expect(judge({ ...ctx, taskId: 1, quota: unreadable }).reasons).toContain("quota-unreadable");
 });

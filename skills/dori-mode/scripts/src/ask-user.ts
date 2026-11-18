@@ -5,7 +5,9 @@ import { redactSecrets } from "./redact.ts";
  * on-screen question UI (omo's ask-user) wakes nobody and sits there until someone looks at its pane. The lane's runner
  * reads each lane's pane for such a prompt with `screenQuestion` and publishes one `lane.asking` per question
  * (runner/lanes.ts), which the supervisor raises as urgent `LANE_ASKING` (`askingLine`); the supervisor never reads
- * the screen itself (design D21). This module is the shared parser.
+ * the screen itself (design D21). This module is the shared parser. Besides the question UI it reads omo's selection list,
+ * which carries every other prompt that stops a lane: a permission prompt ("Permission required: <permission>") and an
+ * extension's select or confirm, its own or one a subagent raised.
  */
 
 /** A question prompt on screen: the current question's header, text and options, and how many questions it holds. */
@@ -29,6 +31,12 @@ const WIDGET_HEAD = /^\? (?:Question pending \((\d+) unanswered\)|(\d+) question
 /** The widget's option chips: "[ seoul ]  [ tokyo ]  [ own answer… ]". */
 const CHIP = /\[ (.+?) \]/g;
 const CHIP_LINE = /\[ .+? \]/;
+/** omo's selection list (ctx.ui.select, confirm, permission prompts) ends on this key-hint line. */
+const SELECT_HINT = /^\s*↑↓ navigate\s+\S+ select\s+\S+ cancel\s*$/;
+const SELECTED_ROW = /^\s*→\s+/;
+const SCROLL_ROW = /^\s*… \d+ more (?:above|below)\s*$/;
+/** The rules framing the list (and omo's editor). */
+const RULE = /^\s*─{8,}\s*$/;
 
 const clean = (s: string): string => s.replace(/\s+/g, " ").trim();
 const nonEmptyAfter = (lines: readonly string[], i: number): number => lines.slice(i + 1).filter((l) => l.trim()).length;
@@ -87,10 +95,28 @@ const widget = (lines: readonly string[]): ScreenQuestion | null => {
   return { ...(split?.[1] ? { header: split[1] } : {}), question: clean(question), options, pending };
 };
 
-/** The question prompt waiting at the bottom of `screen`, or null when there is none. */
+/**
+ * The selection list: a rule, its title (a permission prompt adds its path or tool and patterns), the options with "→" on
+ * the selected one, then the key hints. Its whole title is the question.
+ */
+const selection = (lines: readonly string[]): ScreenQuestion | null => {
+  const hint = lines.findLastIndex((l) => SELECT_HINT.test(l));
+  if (hint < 0 || nonEmptyAfter(lines, hint) > BELOW_MAX) return null;
+  let i = hint - 1;
+  while (i >= 0 && !lines[i]?.trim()) i--;
+  const rows: string[] = [];
+  for (; i >= 0 && lines[i]?.trim() && !RULE.test(lines[i] ?? ""); i--) rows.unshift(lines[i] ?? "");
+  const top = lines.slice(0, i + 1).findLastIndex((l) => RULE.test(l));
+  if (!rows.some((r) => SELECTED_ROW.test(r)) || top < 0) return null;
+  const question = clean(lines.slice(top + 1, i + 1).join(" "));
+  if (!question) return null;
+  return { question, options: rows.filter((r) => !SCROLL_ROW.test(r)).map((r) => clean(r.replace(SELECTED_ROW, ""))), pending: 1 };
+};
+
+/** The prompt waiting at the bottom of `screen` (a question or a selection list), or null when there is none. */
 export const screenQuestion = (screen: string): ScreenQuestion | null => {
   const lines = screen.split("\n").slice(-ASK_SCREEN_LINES).map((l) => l.trimEnd());
-  return dialog(lines) ?? widget(lines);
+  return dialog(lines) ?? widget(lines) ?? selection(lines);
 };
 
 /** The urgent event line for `key`'s on-screen question, one line, secrets redacted. */

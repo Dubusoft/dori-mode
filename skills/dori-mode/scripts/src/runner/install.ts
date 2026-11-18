@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
-import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../lane-sandbox-install.ts";
+import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "../lane-sandbox-install.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
 import { WIN_KILL_RUNNER, WIN_TASK_NAME, WIN_TASK_PATH } from "./service.ts";
 import { gitVersion, RUNNER_VERSION_DEFINE } from "./version.ts";
@@ -161,8 +161,8 @@ export const installScript = (
   plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, listenAddress),
   agentCommand: readonly string[] = [],
   herdr: HerdrTemplates = herdrTemplates(),
-  laneSandbox: string = readFileSync(LANE_SANDBOX_TEMPLATE, "utf8"),
-  laneSandboxMacos: string = readFileSync(LANE_SANDBOX_MACOS_TEMPLATE, "utf8"),
+  laneSandbox: string = laneSandboxScript(LANE_SANDBOX_TEMPLATE),
+  laneSandboxMacos: string = laneSandboxScript(LANE_SANDBOX_MACOS_TEMPLATE),
 ): string => {
   for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, laneSandbox, laneSandboxMacos]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
@@ -253,6 +253,10 @@ export const installScript = (
     // The `dori` a runner lane runs (its footer names this path): the bundle in lane mode.
     `printf '#!/bin/sh\\nexec "%s" "$HOME/.dori/runner/bin/dori.js" "$@"\\n' "$BUN" > "$R/bin/dori" || exit 1`,
     'chmod 700 "$R/bin/dori" || exit 1',
+    // A Mac's lanes run omo under the dori-lane profile (the wrapper sets OMO_PROFILE), which keeps omo's memory
+    // reflection from nesting a sandbox-exec inside the lane's; the profile goes into ~/.omo/omo.jsonc. A failure is
+    // printed and does not stop the install: lanes then run as before, with reflection failing.
+    `if [ "$OS" = Darwin ]; then "$BUN" "$R/bin/dori.js" runner omo-profile </dev/null || printf 'OMO_LANE_PROFILE_FAILED %s\\n' "$HOME/.omo/omo.jsonc"; fi`,
     'if [ "$OS" = Linux ]; then',
     `cat > "$R/dori-runner.service.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(unit)}${HEREDOC}`,

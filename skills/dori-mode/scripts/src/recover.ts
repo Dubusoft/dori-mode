@@ -2,19 +2,22 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { Database, SQLiteError } from "bun:sqlite";
 
-import { type ArgvTemplate, fillHook } from "./config.ts";
+import { fillHook } from "./config.ts";
 import { isLaneOutcomeLine, laneOutcomeEventId } from "./autopilot.ts";
-import { closeLane, closeRunning, type FlowDeps, finishedReason } from "./done-flow.ts";
+import { finishedOutcome } from "./task-finish.ts";
+import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReason } from "./done-flow.ts";
 import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
-import { checkLaneFilesBody } from "./lane-files.ts";
+import { resumeArgv } from "./runner/lane-control.ts";
+import { argvModel } from "./runner/lane-launch.ts";
+import { checkLaneFilesBody } from "./lane-file-contract.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
 import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
 import { postSandboxNotice, postSkippedNotices } from "./sandbox-notice.ts";
-import { discordStatusTransport } from "./lane-reports.ts";
+import { discordStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
@@ -77,20 +80,6 @@ const turnInterrupted = async (deps: FlowDeps, lane: RecoveryLane, pane: Pane, e
   return event && !enqueue ? [event] : [];
 };
 
-/** omo's flag that continues an existing session file or id (`omo --session <path|id>`). */
-export const RESUME_FLAG = "--session";
-
-/**
- * The agent command that resumes `session` instead of starting fresh: `--session <id>` before the prompt. Undefined
- * when it cannot (no {prompt} slot, the template already picks a session, or an id that is not a plain token).
- */
-export const resumeCommand = (template: ArgvTemplate, session: string | undefined): string[] | undefined => {
-  if (!session || !/^[\w.:/-]+$/.test(session) || session.startsWith("-")) return undefined;
-  if (template.some((part) => /^--(?:session|session-id|resume|continue|fork)(?:=|$)|^-[rc]$/.test(part))) return undefined;
-  const at = template.findIndex((part) => part.includes("{prompt}"));
-  return at < 1 ? undefined : [...template.slice(0, at), RESUME_FLAG, session, ...template.slice(at)];
-};
-
 const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 /** SQLite releases this exclusion even when the recovering process dies. */
@@ -123,8 +112,7 @@ const liveModel = (raw: unknown): { readonly omo: boolean; readonly model?: stri
     if (typeof proc !== "object" || proc === null || !("argv" in proc) || !Array.isArray(proc.argv)) continue;
     const argv: string[] = proc.argv.filter((arg: unknown): arg is string => typeof arg === "string");
     if (!argv.slice(0, 2).some((arg) => /(?:^|[/\\])omo(?:\.[cm]?[jt]s)?$|[/\\]senpi[/\\]dist[/\\]bundle[/\\]cli\.js$/.test(arg))) continue;
-    const at = argv.indexOf("--model");
-    const model = at >= 0 ? argv[at + 1] : argv.find((arg) => arg.startsWith("--model="))?.slice(8);
+    const model = argvModel(argv);
     if (model) return { omo: true, model };
     omo = true;
   }
@@ -201,6 +189,7 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
     ...(lane.mode ? { mode: lane.mode } : {}),
     ...(cwd ? { cwd } : {}), ...(lane.machine ? { machine: lane.machine } : {}),
     ...(lane.sandbox ? { sandbox: true as const } : {}),
+    ...(lane.grants?.length ? { grants: lane.grants } : {}),
     ...(session !== undefined ? { session } : {}),
   }, stored);
   return { lane: launched.lane, startup: launched.startup, ok: launched.startup.startsWith("STARTUP_OK "), resumed: session !== undefined,
@@ -232,8 +221,14 @@ const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, s
     throw error;
   }
   const moved = await deps.registry.update(lane.key, (current) => {
-    if (!current || current.closedAt || current.pendingFileRun?.id !== prepared.files.run.id) return undefined;
-    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}),
+    if (!current || current.closedAt) return undefined;
+    // A runner profile that pins its own model runs that one: the lane is judged against it from now on.
+    const model = r.relaunched && r.model && r.model !== current.model ? { model: r.model } : undefined;
+    if (current.pendingFileRun?.id !== prepared.files.run.id) {
+      // The run's lane.started landed first and confirmed it (pane and fileRun): only the model is left to record.
+      return model && current.fileRun?.id === prepared.files.run.id && !current.pendingFileRun ? { ...current, ...model } : undefined;
+    }
+    return { ...current, pane: r.pane, ...(r.tab ? { tab: r.tab } : {}), ...model,
       fileRun: r.relaunched ? prepared.files.run : current.fileRun, pendingFileRun: undefined, fileProposal: undefined };
   });
   const next: Lane = moved ?? await deps.registry.read(lane.key) ?? stored;
@@ -287,11 +282,16 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     const closed = await closeLane(deps, current, `recovery: ${finished}; not relaunched`);
     const event = `LANE_RECOVERY_SKIPPED ${lane.key} ${lane.pane ?? "-"} ${reason}: ${finished}; ${closed.closed ? "lane closed" : `not relaunched, left for dori close (${closed.lines.at(-1) ?? "refused"})`}`;
     // An autopilot lane's close also settles its launch attempt (AUTOPILOT_LANE_DONE).
-    const outcomes = closed.lines.filter(isLaneOutcomeLine);
-    if (!enqueue) return [event, ...outcomes];
+    // The supervisor finishes the closed lane's Toodo task as after a done claim (TOODO_TASK_COMPLETED / _NOT_COMPLETED);
+    // an AUTOPILOT_LANE_DONE whose task it completed is then digest (toodo=done).
+    const finish = closed.closed ? await finishClosedTask(deps, current) : undefined;
+    const outcomes = closed.lines.filter(isLaneOutcomeLine).map((line) => finishedOutcome(line, finish));
+    const taskLines = finish?.lines ?? [];
+    if (!enqueue) return [event, ...outcomes, ...taskLines];
     // A refused close leaves the lane for the next sweep: the same lane, generation and reason is said once.
     await enqueue(event, `recovery-skipped:${JSON.stringify([lane.key, lane.openedAt, current.lastRecoveryAt ?? null, reason, finished, closed.closed])}`);
     for (const line of outcomes) await enqueue(line, laneOutcomeEventId(lane.key));
+    for (const line of taskLines) await enqueue(line, `task-finish:${lane.key}:${lane.openedAt}`);
     return [];
   }
   const noticeId = (kind: string, detail = ""): string =>
@@ -307,7 +307,7 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
   }
   const now = deps.clock.now();
   // Resume the lane's own session when the registry has one, so it continues its work instead of restarting from the brief.
-  const session = current.recoveryResumeFailed !== current.session && resumeCommand(deps.config.agentCommand, current.session) ? current.session : undefined;
+  const session = current.recoveryResumeFailed !== current.session && resumeArgv(deps.config.agentCommand, current.session) ? current.session : undefined;
   const prepared = await prepareLeadLaneBrief(deps, current, undefined, true);
   const cmdId = `recover:${lane.key}:${now}`;
   checkLaneFilesBody(lane.key, { cmdId, key: lane.key, briefText: prepared.briefText, files: prepared.files, ...(session ? { session } : {}) });

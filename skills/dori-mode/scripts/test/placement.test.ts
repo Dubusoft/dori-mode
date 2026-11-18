@@ -72,14 +72,20 @@ test("checkMachine local asks the local runner and applies canLaunch to its samp
   const asked: (string | undefined)[] = [];
   const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ memFreePct: 50, diskFreeGb: 100, panes: T.panesMax }), panes: listed(T.panesMax) }), asked), cfg, "local");
   expect(asked).toEqual([undefined]);
-  expect(c).toEqual({ machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}`, freeSlots: 0 });
+  expect(c).toEqual({
+    machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}`, freeSlots: 0,
+    paneCap: T.panesMax, paneCount: T.panesMax, paneIds: listed(T.panesMax).map((p) => p.pane_id),
+  });
 });
 
 test("checkMachine remote asks that machine's runner and counts the panes it lists", async () => {
   const asked: (string | undefined)[] = [];
   const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host(), panes: listed(2) }), asked), cfg, "big");
   expect(asked).toEqual(["big"]);
-  expect(c).toEqual({ machine: "big", verdict: { ok: true, reasons: [] }, summary: "memory free 60%, disk free 200 GB, panes 2", freeSlots: cfg.guard.panesMax - 2 });
+  expect(c).toEqual({
+    machine: "big", verdict: { ok: true, reasons: [] }, summary: "memory free 60%, disk free 200 GB, panes 2", freeSlots: cfg.guard.panesMax - 2,
+    paneCap: cfg.guard.panesMax, paneCount: 2, paneIds: ["p0", "p1"],
+  });
 });
 
 test("checkMachine remote: unreadable memory and disk never hold, CPU load never holds, a pane list the runner could not read holds", async () => {

@@ -7,12 +7,14 @@ import { join, win32 } from "node:path";
 import type { Pane } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { laneCliMain } from "../src/runner/lane-cli.ts";
-import { agentArgv, outsideDenyRules, RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
+import { agentArgv, outsideDenyRules } from "../src/runner/lane-launch.ts";
+import { RunnerLanes, type RunnerLanesDeps, serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerPolicy } from "../src/runner/policy.ts";
 import { acceptLaneEvent, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { type RunnerEventType, runnerEvent, type TurnEvidence } from "../src/runner/protocol.ts";
 import { STARTUP_GRACE_MS } from "../src/runner/serve.ts";
-import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
+import type { Connector, Transport } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { fakeClock } from "./fakes.ts";
 import { writeRunnerFile } from "../src/runner/fs-safety.ts";
 
@@ -390,7 +392,7 @@ test("lane.asking: an owned lane's on-screen question is published once, and aga
   expect(t.published).toHaveLength(2);
 });
 
-test("observe answers dead but publishes no lane.state dead for a lane still in its startup window", async () => {
+test("observe answers dead but leaves publishing a dead agent to the serve loop, which holds it through its grace windows", async () => {
   const clock = fakeClock(T0);
   const t = setup({ clock });
   await t.lanes.start(START);
@@ -403,11 +405,29 @@ test("observe answers dead but publishes no lane.state dead for a lane still in 
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" }];
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "working" });
   expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working", pane: "p1" }]]);
-  // Once the window is over a dead agent is published as before.
+  // Past the startup window too: answered, not published.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   clock.at = started + STARTUP_GRACE_MS;
-  await t.lanes.observe("lane-a");
-  expect(t.published.at(-1)).toEqual(["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]);
+  expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "dead" });
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "working", pane: "p1" }]]);
+});
+
+test("observe and recover keep a lane whose agent process still runs though herdr no longer detects it", async () => {
+  const clock = fakeClock(T0);
+  const t = setup({ clock });
+  await t.lanes.start(START);
+  t.published.length = 0;
+  clock.at = (t.lanes.records()["lane-a"]?.startedAt ?? 0) + STARTUP_GRACE_MS;
+  t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent_status: "unknown" }];
+  t.world.processInfo.p1 = { shell_pid: 10, foreground_processes: [{ pid: 11, argv: ["omo", `Read and execute the lane brief at ${t.lanes.briefPath("lane-a")} in full.`] }] };
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed idle");
+  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "idle", pane: "p1" }]]);
+  const calls = t.calls.length;
+  expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("alive pane=p1");
+  expect(t.calls.slice(calls).filter((c) => c[1] === "tab" && (c[2] === "close" || c[2] === "create"))).toEqual([]);
+  // The agent exited: only the shell is left, and the lane is dead.
+  t.world.processInfo.p1 = { shell_pid: 10, foreground_processes: [{ pid: 10, argv: ["sh"] }] };
+  expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
 });
 
 test("recover leaves a lane still in its startup window alone instead of closing its tab and starting it again", async () => {
@@ -436,7 +456,7 @@ test("alive criteria: observe and recover use paneAlive (agent_status), not the 
   // herdr still names the agent, but its status is not an alive one: the supervisor's laneStatus calls this dead.
   t.world.panes = [{ pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "unknown" }];
   expect((await t.lanes.observe("lane-a")).detail).toBe("observed dead");
-  expect(t.published).toEqual([["lane.state", { key: "lane-a", status: "dead", pane: "p1", reason: "agent-gone" }]]);
+  expect(t.published).toEqual([]);
   expect((await t.lanes.recover("lane-a", undefined, undefined, "# fresh brief\n", FILES)).detail).toBe("started pane=p2 tab=t2");
   // An alive status without an agent field is alive, as paneAlive says.
   t.world.panes = [{ pane_id: "p2", workspace_id: "w", tab_id: "t2", agent_status: "blocked" }];
@@ -449,7 +469,7 @@ test("the lane token is never on the herdr command line; the lane CLI authentica
   await t.lanes.start(START);
   const run = t.calls.find((a) => a[2] === "run");
   const file = t.lanes.tokenPath("lane-a");
-  expect(run?.[4]).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} omo --model m1 `);
+  expect(run?.[4]).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(t.calls.flat().join("\n")).not.toContain("tok-1");
   expect(readFileSync(file, "utf8")).toBe("tok-1");
   expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -505,6 +525,8 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
   const t = setup();
   const runnerDir = join(t.runnerDir, "space in runner");
   mkdirSync(runnerDir, { mode: 0o700 });
+  mkdirSync(join(runnerDir, "bin"), { mode: 0o700 });
+  writeFileSync(join(runnerDir, "bin", "dori"), "#!/bin/sh\n[ \"$1 $2\" = \"secret env\" ]\n", { mode: 0o700 });
   let command = "";
   const lanes = new RunnerLanes({
     instance: async () => "server-1",
@@ -519,7 +541,7 @@ test("B3: the launch command runs under /bin/sh when the runner directory has a 
     },
   });
   await lanes.start(START);
-  const proc = Bun.spawn(["/bin/sh", "-c", command], { env: { PATH: process.env.PATH ?? "" }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["/bin/sh", "-c", command], { env: { PATH: `${join(runnerDir, "bin")}:${process.env.PATH ?? ""}` }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   expect({ code, err }).toEqual({ code: 0, err: "" });
   expect(out).toContain(`DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")}`);
@@ -534,25 +556,26 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(started.detail).toBe("started pane=p1 tab=t1");
   expect(started.result.startup.verdict).toBe("unconfirmed");
   const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  expect(first).toStartWith(`DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access 'ulw set goal and work. Read and execute`);
+  expect(first).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute`);
   t.world.panes = [];
   const recovered = await t.lanes.recover("lane-a", "ses_123", undefined, "# fresh brief\n", FILES);
   expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });
   const second = t.calls.filter((a) => a[2] === "run").at(-1)?.[4] ?? "";
-  expect(second).toContain("DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40 omo --model m1 --permission-preset full-access --session ses_123 'ulw set goal and work.");
+  expect(second).toContain(`DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access --no-ask-user=true --session ses_123 'ulw set goal and work.`);
 });
 
-test("agentArgv runs every lane under omo's full-access preset unless its profile already names a preset", () => {
+test("agentArgv runs every lane under omo's full-access preset unless its profile already names a preset, and without omo's question tool", () => {
   const values = { prompt: "go", model: "m1", brief: "/b.md" };
   const policy = (template: readonly string[]) => ({ agents: { p: template }, allowedRoots: [], sandbox: "optional", jobs: "allow" }) as unknown as RunnerPolicy;
   const sandboxed = ["env", "V=1", "lane-sandbox", "omo", "--model", "{model}", "{prompt}"];
-  expect(agentArgv(policy(sandboxed), "p", values)).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "go"]);
-  expect(agentArgv(policy(sandboxed), "p", values, "ses_1")).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "--session", "ses_1", "go"]);
-  expect(agentArgv(policy(["omo", "--permission-preset", "workspace", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset", "workspace", "go"]);
-  expect(agentArgv(policy(["omo", "--permission-preset=ask", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset=ask", "go"]);
+  expect(agentArgv(policy(sandboxed), "p", values)).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "--no-ask-user=true", "go"]);
+  expect(agentArgv(policy(sandboxed), "p", values, "ses_1")).toEqual(["env", "V=1", "lane-sandbox", "omo", "--model", "m1", "--permission-preset", "full-access", "--no-ask-user=true", "--session", "ses_1", "go"]);
+  expect(agentArgv(policy(["omo", "--permission-preset", "workspace", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset", "workspace", "--no-ask-user=true", "go"]);
+  expect(agentArgv(policy(["omo", "--permission-preset=ask", "{prompt}"]), "p", values)).toEqual(["omo", "--permission-preset=ask", "--no-ask-user=true", "go"]);
+  expect(agentArgv(policy(["omo", "--no-ask-user=true", "{prompt}"]), "p", values)).toEqual(["omo", "--no-ask-user=true", "--permission-preset", "full-access", "go"]);
   expect(agentArgv(policy(["omo", "--model", "{model}"]), "p", values)).toEqual(["omo", "--model", "m1"]);
   // A lane without a sandbox also gets the rules that refuse every outside path but the allowed ones.
-  expect(agentArgv(policy(["omo", "{prompt}"]), "p", values, undefined, "external_directory=deny")).toEqual(["omo", "--permission-preset", "full-access", "--permission", "external_directory=deny", "go"]);
+  expect(agentArgv(policy(["omo", "{prompt}"]), "p", values, undefined, "external_directory=deny")).toEqual(["omo", "--permission-preset", "full-access", "--permission", "external_directory=deny", "--no-ask-user=true", "go"]);
   expect(outsideDenyRules(["C:\\Users\\u\\.dori\\runner", "C:\\a,b", "C:\\x=y", "", "C:\\Users\\u\\.dori\\runner"], win32.join))
     .toBe("external_directory=deny,external_directory:C:\\Users\\u\\.dori\\runner=allow,external_directory:C:\\Users\\u\\.dori\\runner\\*=allow");
 });
@@ -564,20 +587,20 @@ test("a lane.start without a sandbox refuses outside paths but its cwd, the runn
   const line = bare.calls.find((a) => a[2] === "run")?.[4] ?? "";
   const rules = [START.cwd, bare.runnerDir, "/srv/repos", "/srv/repos/worktrees", tmpdir(), join(homedir(), ".omo")]
     .flatMap((dir) => [`external_directory:${dir}=allow`, `external_directory:${dir}/*=allow`]);
-  expect(line).toContain(` omo --permission-preset full-access --permission '${["external_directory=deny", ...rules].join(",")}' 'ulw`);
+  expect(line).toContain(` omo --permission-preset full-access --permission '${["external_directory=deny", ...rules].join(",")}' --no-ask-user=true 'ulw`);
   const boxed = setup({ policy });
   await boxed.lanes.start(START);
-  expect(boxed.calls.find((a) => a[2] === "run")?.[4]).toContain(" omo --permission-preset full-access 'ulw");
+  expect(boxed.calls.find((a) => a[2] === "run")?.[4]).toContain(" omo --permission-preset full-access --no-ask-user=true 'ulw");
 });
 
 test("lane.start hands the policy's repos and worktree roots to the lane sandbox, the worktree root defaulting under the repos root", async () => {
   const policy = { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] } as const;
   const both = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos", worktreeRoot: "/Users/u/work/worktrees" } });
   await both.lanes.start(START);
-  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees omo --model m1 ");
+  expect(both.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/worktrees; eval "$(dori secret env)"; omo --model m1 `);
   const repos = setup({ policy: { ...policy, reposRoot: "/Users/u/work/repos" } });
   await repos.lanes.start(START);
-  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(" LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees omo --model m1 ");
+  expect(repos.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_REPOS=/Users/u/work/repos LANE_SANDBOX_WORKTREES=/Users/u/work/repos/worktrees; eval "$(dori secret env)"; omo --model m1 `);
 });
 
 test("lane.start with a target runs in that idle shell pane, leaves it open on a failed run, and refuses a pane another lane holds", async () => {
@@ -736,4 +759,35 @@ test("a lane still in its startup window records no stopped turn", async () => {
   expect((await t.lanes.observe("lane-a")).result).toEqual({ status: "idle" });
   t.world.screen = ABORTED;
   expect((await t.lanes.observe("lane-a")).result).toMatchObject({ turn: { stop: 1, cause: "aborted" } });
+});
+
+test("lane.start hands a lane's grants to the sandbox as LANE_SANDBOX_RW/RO and keeps the names for a relaunch; a name the table lacks opens no tab", async () => {
+  const policy = {
+    agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"],
+    grants: { "blog-topic": { write: ["/srv/blog-writer/runs"], read: ["/srv/notes", "/srv/more"] } },
+  } as const;
+  const granted = setup({ policy });
+  await granted.lanes.start({ ...START, grants: ["blog-topic"] });
+  expect(granted.calls.find((a) => a[2] === "run")?.[4]).toContain(` LANE_SANDBOX_RW=/srv/blog-writer/runs LANE_SANDBOX_RO=/srv/notes:/srv/more; eval "$(dori secret env)"; omo --model m1 `);
+  expect(granted.lanes.records()["lane-a"]?.grants).toEqual(["blog-topic"]);
+
+  const plain = setup({ policy });
+  await plain.lanes.start(START);
+  expect(plain.calls.find((a) => a[2] === "run")?.[4]).not.toContain("LANE_SANDBOX_R");
+
+  const gone = setup({ policy: { ...policy, grants: {} } });
+  await expect(gone.lanes.start({ ...START, grants: ["blog-topic"] })).rejects.toThrow("RUNNER_CMD_REJECTED grant-unknown blog-topic");
+  expect(gone.calls.some((a) => a[1] === "tab" && a[2] === "create")).toBe(false);
+});
+
+test("lane.start and a relaunching lane.recover report the model the agent argv runs: the one a profile pins over the requested one", async () => {
+  const t = setup({ policy: {
+    agents: { omo: ["omo", "--model", "{model}", "{prompt}"], pinned: ["omo", "--model=pinned/sonnet", "{prompt}"], bare: ["omo", "{prompt}"] },
+    allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"],
+  } });
+  expect((await t.lanes.start(START)).result).toMatchObject({ model: "m1" });
+  expect((await t.lanes.start({ ...START, cmdId: "c2", key: "lane-b", agentProfile: "pinned" })).result).toMatchObject({ model: "pinned/sonnet" });
+  expect((await t.lanes.start({ ...START, cmdId: "c3", key: "lane-c", agentProfile: "bare" })).result).not.toHaveProperty("model");
+  const next = { ...FILES, run: { ...FILES.run, id: "00000000-0000-4000-8000-000000000002" } };
+  expect((await t.lanes.recover("lane-b", undefined, undefined, "new brief", next)).result).toMatchObject({ relaunched: true, model: "pinned/sonnet" });
 });

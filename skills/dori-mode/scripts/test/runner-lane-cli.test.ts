@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { heavyDirOf, laneCliMain } from "../src/runner/lane-cli.ts";
 import { serveLaneSocket } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
-import { type Connector, memoryNetwork, type Transport } from "../src/runner/transport.ts";
+import type { Connector, Transport } from "../src/runner/transport.ts";
+import { memoryNetwork } from "./support/memory-transport.ts";
 import { connectUnix, listenUnix } from "../src/runner/unix-transport.ts";
 import { parseDecisionText, parseRequestText } from "../src/runner/decision-text.ts";
-import { LaneFileError, treeDigest } from "../src/runner/lane-files.ts";
+import { LaneFileError, treeDigest } from "../src/lane-file-contract.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 const dirs: string[] = [];
@@ -127,7 +128,7 @@ test("--help prints each lane command's usage with exit 0 and sends nothing; aft
     [["claim-done", "--help"], "usage: dori claim-done <key>"],
     [["lane", "status", "--help"], "usage: dori lane status"],
     [["heavy", "--help"], "usage: dori heavy <label>"],
-    [["secret", "exec", "--help"], "usage: dori secret exec"],
+    [["secret", "env", "--help"], "usage: dori secret env"],
   ] as const) {
     const r = io();
     expect(await laneCliMain([...args], { env, connect: sock.connect, ...r.deps })).toBe(0);

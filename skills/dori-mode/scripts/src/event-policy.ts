@@ -2,8 +2,8 @@
  * The event policy table (design 1.7): every event kind is delivered by class. `lead-urgent` wakes the lead,
  * `lead-digest` waits for the next urgent delivery (or `digestMaxDelayMin`), `engine-only` is journaled for the engine and
  * the counts only. The supervisor never posts an event to the owner itself: everything the owner hears goes through the lead,
- * except the close-thread button and failed-delivery notices, owner decision threads (a lane question with choices becomes
- * a decision thread), and the daily 09:00 reminder of waiting decisions.
+ * except failed-delivery notices and owner decision threads (a lane question with choices becomes
+ * a decision thread).
  * The removed `owner-only` class still loads from an old config, as `lead-digest`, with one warning per process.
  *
  * A kind is the event line's first word, optionally followed by more words that must match the line's next words in
@@ -58,22 +58,39 @@ const URGENT_KINDS = [
   // The restart cap refused to restart a lead that does not take its events (supervise-lead-lifecycle.ts capRefuses).
   "LEAD_UNRESPONSIVE",
   "WAIT_FAILED", "WAITS_CORRUPT",
+  // The lead's memory is close to omo's advisory or human.md to its limit (memory-check.ts memorySizeTrigger): condense
+  // now, before every prompt pays for it. The daily MEMORY_CHECK digest stays digest (the default).
+  "MEMORY_SIZE",
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
   // A merged lane PR whose merge the supervisor could not read back, and an open one it has been unable to merge.
   "MERGE_UNVERIFIED", "MERGE_STALLED",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
-  "LANE_DONE_CLAIMED",
+  // A clean claim the supervisor reports to the owner itself is digest LANE_DONE_AUTO_REPORTED (below); a failed auto
+  // report wakes the lead, with the claim, so it reports the lane itself.
+  "LANE_DONE_CLAIMED", "LANE_AUTO_REPORT_FAILED",
   // A lane that ended is news the lead acts on: report to the owner, free the slot, finish its Toodo task. That holds for
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
-  // waits on the close itself, so it must not sit in the digest.
-  "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED",
-  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched), a done one
-  // has its Toodo task completed by the lead.
+  // waits on the close itself, so it must not sit in the digest. Only a seen-claim close with no task left to finish
+  // (`toodo=done` or `toodo=no-task`, below) is digest; a task it could not finish is TOODO_TASK_NOT_COMPLETED.
+  "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED", "TOODO_TASK_NOT_COMPLETED",
+  // The automatic `dori update --dev` after a merge of dori's own repo failed (update.ts AutoUpdate); its success is digest.
+  "AUTO_UPDATE_FAILED",
+  // A lane that has held the automatic update back for updateBlockerStaleMin and could not be closed safely (update-blocker.ts).
+  "AUTO_UPDATE_BLOCKER_STALE",
+  // An autopilot lane's close settled its launch attempt: a failed one goes to the owner (never relaunched; the supervisor
+  // records the task's blocker), a done one whose task the supervisor could not complete is completed by the lead.
   "AUTOPILOT_LANE_FAILED", "AUTOPILOT_LANE_DONE",
   // Owner decision answers, stuck posts, and missing threads require the lead to act or check state.
   "OWNER_DECISION_ANSWERED", "OWNER_DECISION_STUCK", "OWNER_DECISION_THREAD_GONE",
+  // A direct decision answer whose lane session is gone: the lead takes the answer over (owner-decisions.ts).
+  "DECISION_ANSWER_UNDELIVERED",
+  // A direct answer changed or withdrawn after an older revision may have reached the lane, or a different answer button
+  // pressed on a question whose answer the lead holds (decision-inbound.ts).
+  "DECISION_ANSWER_CORRECTED",
+  // A `dori decision close` whose text could not be typed into the lane that asked (decision-relay.ts): the lead hands it over.
+  "DECISION_RELAY_FAILED",
   // A report from a closed or unregistered lane: question, blocked and done still need the lead; the rest is digest.
   "LANE_REPORT_LATE * question", "LANE_REPORT_LATE * blocked", "LANE_REPORT_LATE * done",
   "GH_PR * closed", "GH_PR * review", "GH_PR * comment",
@@ -83,25 +100,72 @@ const URGENT_KINDS = [
   "TOODO_TASK_READY",
   // The supervisor's autopilot tick found a new set of tasks it may launch, or the same set still waiting after 30 min.
   "AUTOPILOT_READY",
+  // Review gate (review-gate.ts): review runs that failed until the lead decides, a merge that landed on another base than
+  // the one the review approved, and an owner decision for a reached review limit that could not be opened (review-status.ts).
+  "REVIEW_ESCALATED", "REVIEW_BASE_RACE", "REVIEW_DECISION_FAILED",
+  // The first failure of a PR head's review (timeout queued or running, lost runner, unusable inputs, refused launch,
+  // invalid output): once per head (id review-stalled:<repo>#<n>@<head>), so a failing or stalled review never waits
+  // silently in the digest; later failures of that head stay digest REVIEW_FAILED until REVIEW_ESCALATED.
+  "REVIEW_STALLED",
 ] as const;
 
 /**
  * Kinds that stay digest whatever `default` says. The lane hears about its PR first (CI follow-up messages it and merges
  * or opens a merge lane), and a lane's milestone and progress reports wait for the next urgent delivery. The supervisor
  * settles the rest itself: a done claim (urgent LANE_DONE_CLAIMED) is re-checked live (then closed, or objected to,
- * LANE_NOT_DONE, which is urgent), and a merged lane PR has its merge read back (MERGE_VERIFIED, or urgent MERGE_UNVERIFIED).
+ * LANE_NOT_DONE, which is urgent).
  */
 const DIGEST_KINDS = [
-  "GH_PR * checks_failing", "GH_PR * conflicting", "GH_PR * merged", "LANE_REPORT * milestone", "LANE_REPORT * progress",
+  "GH_PR * checks_failing", "GH_PR * conflicting", "LANE_REPORT * milestone", "LANE_REPORT * progress",
   "LANE_REPORT_LATE * milestone", "LANE_REPORT_LATE * progress",
-  "MERGE_VERIFIED",
+  // A nudge that could not be typed is the one nudge outcome the lead hears about (the lane may be stuck).
+  "NUDGED * * min silent, delivery failed;",
   "TOODO_TASK_STATUS", "TOODO_TASK_RESYNC",
   // OWNER_DECISION_OPENED is digest: opening a thread needs no immediate lead action.
   "OWNER_DECISION_OPENED",
+  // A lane's nonblocking input request (lane-reports.ts): the lane went ahead, so it is news for the lead, not the owner.
+  "LANE_REQUEST_NONBLOCKING",
+  // An owner answer routed straight to the lane that asked (decision-inbound.ts): no INBOUND reaches the lead for it.
+  "DECISION_ANSWER_DIRECT",
+  // The lane confirmed a direct answer and the supervisor closes its decision (owner-decisions.ts decisionDeliveryTick).
+  "DECISION_ANSWER_ACKED",
+  // A pane no registered lane owns (dead-panes.ts) is told once and never wakes the lead; a lane's own pane stays urgent.
+  "UNRECOGNISED_PANE * unregistered",
+  // A met wait registered with --on-success digest (waits.ts): news for the next wake, not a decision.
+  "WAIT_DONE_DIGEST",
+  // The automatic `dori update --dev` finished (update.ts AutoUpdate).
+  "AUTO_UPDATE_DONE",
+  // A close after a claim the lead already took, whose Toodo task the supervisor completed and whose report it appended
+  // the merge to (task-finish.ts), or whose lane has no Toodo task: nothing is left for the lead. The report the claim
+  // opened is still owed and comes back as urgent UNREPORTED (lane-outcomes.ts).
+  "LANE_CLOSED * closed seen-claim toodo=done", "LANE_CLOSED * closed seen-claim toodo=no-task", "TOODO_TASK_COMPLETED",
+  // A clean done claim the supervisor posted to the owner as the lane's report (config autoReport, auto-report.ts): the
+  // lead checks it at its next wake and corrects it with dori reported --append or dori object-done if it must.
+  "LANE_DONE_AUTO_REPORTED",
+  // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
+  "AUTOPILOT_LANE_DONE * * * toodo=done:",
+  // Review gate progress the supervisor settles itself (review-gate.ts): a review started, held, passed or went stale,
+  // findings went back to the author lane, one failed run is retried, and a reached limit is asked of the owner (its
+  // decision is opened by review-status.ts; the answer wakes the lead as OWNER_DECISION_ANSWERED).
+  "REVIEW_STARTED", "REVIEW_QUEUED", "REVIEW_PASSED", "REVIEW_STALE", "REVIEW_FINDINGS", "REVIEW_FAILED", "REVIEW_CAP_REACHED",
 ] as const;
 
-/** Kept only for old journals: LANE_FINISH_NOTICE events of the removed lane-finish line must never reach the lead. */
-const ENGINE_KINDS = ["LANE_FINISH_NOTICE"] as const;
+/**
+ * Kinds the supervisor settles or that need no lead action: journaled and counted, never delivered. A lane PR's routine
+ * states (the lane and CI follow-up act on them; a merged one is read back as MERGE_VERIFIED, or urgent MERGE_UNVERIFIED),
+ * runner link states (a runner owning open lanes wakes the lead as urgent HOST_GUARD OFFLINE or LANE_RUNNER_LOST), a
+ * nudge that reached the lane, the owner's own thread close, and the Toodo moves that only queue or start a task (the
+ * lead makes most of them itself). LANE_FINISH_NOTICE is kept only for old journals of the removed lane-finish line.
+ */
+const ENGINE_KINDS = [
+  "GH_PR * opened", "GH_PR * updated", "GH_PR * checks_green", "GH_PR * merged", "MERGE_VERIFIED",
+  "RUNNER_STALE", "RUNNER_UNREACHABLE", "RUNNER_UNAVAILABLE", "RUNNER_OFFLINE",
+  "NUDGED", "THREAD_CLOSED_BY_OWNER", "GOAL_RESUMED",
+  "TOODO_TASK_STATUS * new->planned", "TOODO_TASK_STATUS * planned->in_progress",
+  "LANE_FINISH_NOTICE",
+  // A met wait registered with --on-success silent (waits.ts).
+  "WAIT_DONE_SILENT",
+] as const;
 
 /** The actionable kinds wake the lead, every other line is digest. */
 export const DEFAULT_EVENT_POLICY: EventPolicy = {

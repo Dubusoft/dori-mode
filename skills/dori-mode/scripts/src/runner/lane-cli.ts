@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, loadavg, tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { acquireSlot, pidAlive, releaseSlot } from "../heavy-slot.ts";
+import { acquireSlot, pidAlive } from "../heavy-slot.ts";
+import { watchSimulators } from "../heavy-simulators.ts";
 import { sampleLoad1 } from "../host-guard.ts";
 import { decisionChoicesProblem, inputRequestProblem, serializeDecisionText, serializeRequestText } from "./decision-text.ts";
 import { isReportKind } from "./report-kinds.ts";
@@ -12,14 +13,14 @@ import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The `dori` a lane runs on a worker machine (design 3.4): the runner bundle in lane mode, set by `DORI_LANE_KEY`. It
- * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret exec` and `secret run`, and only for the lane's own
+ * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret env` and `secret run` (alias `host <op>`), and only for the lane's own
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
  * the same ones `dori heavy` on the host takes, so every footer on a machine shares one slot count.
  */
 
-export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret"] as const;
+export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret", "host"] as const;
 
 /** How long a request keeps retrying a missing or refusing lane socket (a supervisor/runner restart), and how often. */
 export const LANE_SOCKET_RETRY_MS = 60_000;
@@ -35,11 +36,7 @@ export type LaneCliDeps = {
   readonly heavyDir?: string;
   readonly clock?: Clock;
   readonly spawn?: (argv: readonly string[]) => Promise<number>;
-  /** Runs a command with exactly this environment and resolves to its exit code; default Bun.spawn with inherited stdio. */
-  readonly spawnWithEnv?: (argv: readonly string[], env: Record<string, string>) => Promise<number>;
   readonly readFile?: (path: string) => string;
-  /** Directory under which ssh-key secret files get their private temp dir; default `os.tmpdir()`. */
-  readonly tempRoot?: string;
   /** The runner directory holding `briefs/<key>.token`; default `~/.dori/runner`. */
   readonly runnerDir?: string;
   /** The lane's own key when it is not in `DORI_LANE_KEY` (a lane found through the socket's whoami). */
@@ -74,7 +71,7 @@ type Reply = { ok: boolean; code?: string; detail?: string; [k: string]: unknown
 
 /** The heavy admission load: the sampler's load1 on win32 (`loadavg()` is all zeros there), else the 1-minute load average. */
 export const heavyLoad = (platform: string, run: Runner, runnerDir?: string): (() => Promise<number>) =>
-  platform === "win32" ? () => sampleLoad1(platform, run, runnerDir) : async () => loadavg()[0] ?? 0;
+  () => sampleLoad1(platform, run, runnerDir);
 
 export const retryable = (error: unknown): boolean => {
   const code = (error as { code?: unknown } | null)?.code;
@@ -113,7 +110,7 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret exec and secret run";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret env and secret run (alias host <op>)";
 
 const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
@@ -132,7 +129,18 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
   "claim-done": CLAIM_DONE_USAGE,
   lane: "usage: dori lane status [<key>]",
   heavy: "usage: dori heavy <label> -- <command ...>",
-  secret: "usage: dori secret exec NAME [NAME...] -- <command ...>\nusage: dori secret run <op>",
+  secret: [
+    "usage: dori secret env",
+    "usage: dori secret run <op>",
+    "  every stored secret arrives in the lane environment at launch; GH_TOKEN supplies GitHub access directly",
+    "  production deploys and host work use dori secret run <op> or dori host <op>",
+  ].join("\n"),
+  host: [
+    "usage: dori host <op>",
+    "  same as dori secret run <op>: the supervisor host runs the registered command config secretCommands.<op> (a sandbox",
+    "  probe, systemctl --user daemon-reload) outside the lane and prints its redacted output, exiting with its code.",
+    "  A refused op lists the ops this lane may run.",
+  ].join("\n"),
 };
 
 /** `text` as one single-quoted POSIX shell word. */
@@ -144,7 +152,7 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     deps.err(`DORI_CLI_LANE_ONLY ${sub === "lane" ? `lane ${rest[0] ?? ""}`.trim() : sub || "(none)"}: ${LANE_ONLY_TEXT}`);
     return 2;
   }
-  // `--help` before a `--` (after it, the arguments belong to the command heavy or secret exec runs) prints the usage.
+  // `--help` before a `--` (after it, the arguments belong to the command heavy runs) prints the usage.
   const sep = rest.indexOf("--");
   if ((sep >= 0 ? rest.slice(0, sep) : rest).some((arg) => arg === "--help" || arg === "-h")) {
     deps.out(LANE_HELP[sub as (typeof LANE_CLI_COMMANDS)[number]]);
@@ -159,16 +167,17 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (!token) { deps.err("RUNNER_LANE_AUTH_FAILED no lane token: DORI_LANE_TOKEN_FILE unreadable or empty, no DORI_LANE_TOKEN, and no briefs/<key>.token"); return 1; }
     let reply: Reply;
     try { reply = await request(deps.connect, { ...verb, key: own, token }, clock); } catch (error) {
-      deps.err(error instanceof Error ? error.message : String(error));
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.err(sub === "secret" && rest[0] === "env" && !/^RUNNER_[A-Z_]+ /.test(detail) ? `RUNNER_SECRET_FAILED ${detail}` : detail);
       return 1;
     }
     if (!reply.ok) { deps.err(`${reply.code ?? "RUNNER_LANE_REFUSED"} ${reply.detail ?? ""}`.trim()); return 1; }
     done(reply);
     return 0;
   };
-  if (sub === "secret" && rest[0] === "run") {
-    const [, op, ...extra] = rest;
-    if (!op || extra.length || !/^[a-z][a-z0-9-]{0,63}$/.test(op)) { deps.err("usage: dori secret run <op>"); return 2; }
+  if ((sub === "secret" && rest[0] === "run") || sub === "host") {
+    const [op, ...extra] = sub === "host" ? rest : rest.slice(1);
+    if (!op || extra.length || !/^[a-z][a-z0-9-]{0,63}$/.test(op)) { deps.err(sub === "host" ? "usage: dori host <op>" : "usage: dori secret run <op>"); return 2; }
     let result: Reply = { ok: true };
     const code = await send({ kind: "secret-run", op }, (reply) => { result = reply; });
     if (code !== 0) return code;
@@ -179,42 +188,15 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     return typeof result.exitCode === "number" && Number.isInteger(result.exitCode) ? result.exitCode : 1;
   }
   if (sub === "secret") {
-    const sep = rest.indexOf("--");
-    const names = sep >= 0 ? rest.slice(1, sep) : rest.slice(1);
-    const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
-    if (rest[0] !== "exec") { deps.err(`DORI_CLI_LANE_ONLY ${`secret ${rest[0] ?? ""}`.trim()}: ${LANE_ONLY_TEXT}`); return 2; }
-    if (!names.length || sep < 0 || !cmd.length || !names.every((n) => SECRET_NAME.test(n))) {
-      deps.err("usage: dori secret exec NAME [NAME...] -- <command ...>");
-      return 2;
-    }
-    let values: Record<string, string> = {};
-    let kinds: Record<string, string> = {};
-    const code = await send({ kind: "secret", names }, (reply) => {
-      values = (reply.values ?? {}) as Record<string, string>;
-      kinds = (reply.kinds ?? {}) as Record<string, string>;
-    });
+    if (rest.length !== 1 || rest[0] !== "env") { deps.err("usage: dori secret env | dori secret run <op>"); return 2; }
+    let values: unknown;
+    const code = await send({ kind: "secret" }, (reply) => { values = reply.values; });
     if (code !== 0) return code;
-    const base: Record<string, string> = {};
-    for (const [k, v] of Object.entries(deps.env)) if (typeof v === "string") base[k] = v;
-    const childEnv: Record<string, string> = { ...base, ...values };
-    // An ssh-key secret goes to a 0600 file in a private 0700 dir; the env carries the path, never the key.
-    const keyNames = Object.keys(values).filter((n) => kinds[n] === "ssh-key");
-    let dir: string | undefined;
-    try {
-      if (keyNames.length) {
-        dir = mkdtempSync(join(deps.tempRoot ?? tmpdir(), "dori-secret-"));
-        for (const name of keyNames) {
-          const path = join(dir, name);
-          const value = values[name] as string;
-          writeFileSync(path, value.endsWith("\n") ? value : `${value}\n`, { mode: 0o600 });
-          childEnv[name] = path;
-        }
-        if (keyNames.length === 1) childEnv.GIT_SSH_COMMAND = `ssh -i ${shellQuote(childEnv[keyNames[0] as string] as string)} -o IdentitiesOnly=yes -o IdentityAgent=none`;
-      }
-      return await (deps.spawnWithEnv ?? (async (argv, env) => Bun.spawn([...argv], { env, stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd, childEnv);
-    } finally {
-      if (dir) rmSync(dir, { recursive: true, force: true });
+    if (typeof values !== "object" || values === null || Array.isArray(values) || !Object.entries(values).every(([name, value]) => SECRET_NAME.test(name) && typeof value === "string")) {
+      deps.err("RUNNER_SECRET_FAILED the runner's grant is not a map of secret names to values"); return 1;
     }
+    for (const [name, value] of Object.entries(values)) deps.out(`export ${name}=${shellQuote(value as string)}`);
+    return 0;
   }
   if (sub === "heavy") {
     const sep = rest.indexOf("--");
@@ -222,15 +204,18 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     const cmd = sep >= 0 ? rest.slice(sep + 1) : [];
     if (!label || label === "--" || !cmd.length) { deps.err("usage: dori heavy <label> -- <command ...>"); return 2; }
     const slots = Number(deps.env.DORI_HEAVY_SLOTS ?? "1");
+    const dir = deps.heavyDir ?? heavyDirOf();
+    const platform = deps.platform ?? process.platform;
     const slot = await acquireSlot({
-      dir: deps.heavyDir ?? heavyDirOf(), slots: Number.isSafeInteger(slots) && slots > 0 ? slots : 1, maxLoad: heavyMaxLoad(deps.env.DORI_HEAVY_MAX_LOAD),
+      dir, slots: Number.isSafeInteger(slots) && slots > 0 ? slots : 1, maxLoad: heavyMaxLoad(deps.env.DORI_HEAVY_MAX_LOAD),
       clock, load: heavyLoad(deps.platform ?? process.platform, deps.run ?? realRun, deps.runnerDir), alive: pidAlive, pid: process.pid,
       ...(deps.platform ? { platform: deps.platform } : {}),
     }, `${own}:${label}`);
+    const finish = await watchSimulators({ run: deps.run ?? realRun, dir, platform, alive: (pid) => pidAlive(pid), now: clock.now, pid: process.pid, err: deps.err }, slot);
     try {
       return await (deps.spawn ?? (async (argv) => Bun.spawn([...argv], { stdout: "inherit", stderr: "inherit", stdin: "inherit" }).exited))(cmd);
     } finally {
-      releaseSlot(slot);
+      await finish();
     }
   }
   if (sub === "lane") {

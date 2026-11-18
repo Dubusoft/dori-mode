@@ -29,16 +29,7 @@ test("an encrypted store with tight modes is OK", async () => {
   put(store(h), "A_TOKEN.cred", 0o600);
   const c = await check(h);
   expect(c.level).toBe("OK");
-  expect(c.detail).toBe("1 secrets, encrypted (systemd-creds)");
-});
-
-test("a plain entry warns", async () => {
-  const h = home();
-  put(store(h), "A_TOKEN.plain", 0o600);
-  const c = await check(h);
-  expect(c.level).toBe("WARN");
-  expect(c.detail).toContain("A_TOKEN");
-  expect(c.fix).toContain("dori secret update NAME");
+  expect(c.detail).toBe("1 secrets");
 });
 
 test("a 0644 file warns with a chmod fix", async () => {
@@ -49,17 +40,8 @@ test("a 0644 file warns with a chmod fix", async () => {
   expect(c.fix).toContain("chmod 600");
 });
 
-test("missing encryption on a non-empty store warns", async () => {
+test("plain entries with tight modes need no encryption backend", async () => {
   const h = home();
-  put(store(h), "A_TOKEN.cred", 0o600);
-  expect((await check(h, false)).detail).toContain("systemd-creds --user is unavailable");
-});
-
-test("config secrets absent from the store warn", async () => {
-  const h = home();
-  put(store(h), "A_TOKEN.cred", 0o600);
-  const c = await check(h, true, { ...defaultConfig(), secrets: { A_TOKEN: {}, B_TOKEN: {} } });
-  expect(c.level).toBe("WARN");
-  expect(c.detail).toContain("B_TOKEN");
-  expect(c.detail).not.toContain("not in the store: A_TOKEN");
+  put(store(h), "A_TOKEN.plain", 0o600);
+  expect((await check(h, false)).level).toBe("OK");
 });

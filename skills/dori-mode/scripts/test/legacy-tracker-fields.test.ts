@@ -5,7 +5,7 @@ import { closeLane, type FlowDeps, watchTick } from "../src/done-flow.ts";
 import { openOperations, type OperationStore, plan } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, TEST_STORE, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withState, type World } from "./fakes.ts";
 
 // dori-mode once bound lanes to a task tracker (`toodoTask` on the lane, `toodo-reconcile` operation rows). State
 // written by those versions must keep working: the field and the rows are inert and never block a close or a pass.
@@ -16,8 +16,8 @@ let store: OperationStore;
 
 beforeEach(() => {
   state = withState();
-  if (TEST_STORE === "sqlite") new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
-  store = openOperations({ stateDir: state.dir, store: TEST_STORE });
+  new SqliteStore(join(state.dir, SQLITE_FILE), { create: true }).close();
+  store = openOperations({ stateDir: state.dir });
 });
 afterEach(() => { store.close(); state.done(); });
 

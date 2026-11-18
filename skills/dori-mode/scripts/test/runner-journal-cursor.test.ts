@@ -1,15 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { treeDigest } from "../src/lane-files.ts";
+import { treeDigest } from "../src/lane-file-contract.ts";
 import { join } from "node:path";
-import { openLaneReports, type NewReport } from "../src/lane-reports.ts";
+import { openLaneReports, type NewReport } from "../src/lane-report-store.ts";
 import type { Lane } from "../src/registry.ts";
 import { eventLine, HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { laneEventsAfter, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { PROTO, runnerControl, runnerEvent } from "../src/runner/protocol.ts";
 import { openRunnerJournal, RUNNER_JOURNAL_RETENTION_MS } from "../src/runner/serve.ts";
-import { laneEventReader, RUNNER_LANE_CURSOR_FILE } from "../src/supervise-loop.ts";
+import { laneEventReader, RUNNER_LANE_CURSOR_FILE } from "../src/supervise-hub.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];

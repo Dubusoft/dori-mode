@@ -3,22 +3,27 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
-import { type AutopilotDeps, autopilotMain, quotaSummary } from "../src/autopilot-cli.ts";
+import { type AutopilotConfig, DEFAULT_AUTOPILOT, type HostSummary, ledgerRows, type QuotaSummary, type ToodoTask } from "../src/autopilot.ts";
+import { type AutopilotDeps, autopilotMain, EXECUTE_ACTION, judgeCandidates, liveJudgeDeps, quotaSummary, type TaskHosts } from "../src/autopilot-cli.ts";
+import { defaultConfig } from "../src/config.ts";
+import type { HostSample } from "../src/host-guard.ts";
+import type { LaneOps } from "../src/lane-ops.ts";
+import type { MachineObservation } from "../src/runner/protocol.ts";
 import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
-import { JsonOperations } from "../src/operations.ts";
+import { SqliteOperations, plan } from "../src/operations.ts";
 import { acquireStateLock } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
+import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const WS = 7;
 
 let dir: string;
-let store: JsonOperations;
+let store: SqliteOperations;
 let tokenFile: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "dori-autopilot-cli-"));
-  store = new JsonOperations(dir);
+  store = new SqliteOperations(storePath(dir));
   tokenFile = join(dir, "web-token");
   writeFileSync(tokenFile, "tok-1\n");
 });
@@ -26,7 +31,7 @@ afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); 
 
 const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
   id, workspaceId: WS, title: `task ${id}`, description: `do ${id}`, status: "planned", resolution: null, dependsOn: [],
-  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, ...over,
+  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null, ...over,
 });
 
 /** toodo-server's JSON for a task: extra fields, criteria with a null target. */
@@ -47,6 +52,22 @@ test("list_tasks posts the ids with the bearer token and returns the predicate's
   expect(calls.map((c) => [c.url, c.init.method, (c.init.headers as Record<string, string>).authorization, c.init.body])).toEqual([
     ["http://toodo.test/api/rpc/list_tasks", "POST", "Bearer tok-1", JSON.stringify({ filter: { ids: [12, 3] } })],
   ]);
+});
+
+test("a task's latest pause comes from its milestones and its latest wait from the wait notes toodo records", async () => {
+  const body = {
+    ...wire(task(12)), milestones: { startedAt: 100, pausedAt: 300, pauseCount: 1 },
+    notes: [
+      { kind: "progress", body: "Waiting until 2026-11-26T00:00:00Z: stage 1 first", at: 50 },
+      { kind: "progress", body: "Wait changed: waiting until 2026-11-27T00:00:00Z", at: 400 },
+      { kind: "decision", body: "Waiting until the owner answers", at: 500 },
+      { kind: "progress", body: "Wait ended early: owner said go", at: 600 },
+    ],
+  };
+  const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [body]) });
+  expect(await client.tasksByIds([12])).toEqual([task(12, { pausedAt: 300, waitSetAt: 400 })]);
+  const bad = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [{ ...body, milestones: { pausedAt: "soon" } }]) });
+  await expect(bad.tasksByIds([12])).rejects.toThrow("unreadable milestones.pausedAt (#12)");
 });
 
 test("flaggedTasks reads every planned task of every workspace and keeps the marked ones; an old server reads unmarked", async () => {
@@ -94,12 +115,13 @@ type Run = { code: number; out: string[]; err: string[] };
 const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
   quota: QuotaSummary = { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
+  machines?: (ids: readonly number[]) => TaskHosts, config: AutopilotConfig = DEFAULT_AUTOPILOT,
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
   const unreadable = () => { throw new ToodoUnreadable("toodo-server list_tasks answered HTTP 401"); };
   const deps = (out: string[], err: string[]): AutopilotDeps => ({
-    config: DEFAULT_AUTOPILOT, store, pauseFile: join(dir, "autopilot-pause.json"),
+    config, store, pauseFile: join(dir, "autopilot-pause.json"),
     toodo: () => ({
       flaggedTasks: async () => {
         reads.push("flagged");
@@ -112,7 +134,7 @@ const harness = (
     }),
     openLanes: async () => openLanes,
     quota: async () => { probes.quota++; return quota; },
-    host: async () => { probes.host++; return host; },
+    hosts: async (ids) => { probes.host++; return machines ? machines(ids) : { defaultMachine: "local", machines: new Map([["local", host]]), targets: new Map() }; },
     lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
     now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
   });
@@ -287,6 +309,24 @@ test("--failed and --ambiguous settle with the note and are never retried by its
   expect(await h.run("launch", "12", "--failed")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_NO_RESERVATION #12"] });
 });
 
+test("rearm on the owner's word lets a settled task reserve attempt n+1; refused while live, nothing to re-arm without an attempt", async () => {
+  await harness([task(12), task(13)]).run("launch", "12");
+  const h = harness([task(12), task(13)]);
+  expect(await h.run("rearm", "12")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_REARM_REFUSED #12 lane-live: an attempt is still running"] });
+  await h.run("launch", "12", "--failed");
+  expect((await h.run("launch", "12")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #12 REFUSE already-attempted"]);
+  expect(await h.run("rearm", "12", "--note", "owner: run it again")).toEqual({ code: 0, out: ["AUTOPILOT_REARMED #12 through=1 next=ap-12-2"], err: [] });
+  expect(await h.run("rearm", "12")).toEqual({ code: 0, out: ["AUTOPILOT_REARMED #12 through=1 next=ap-12-2 (already)"], err: [] });
+  expect(await h.run("rearm", "13")).toEqual({ code: 1, out: [], err: ["AUTOPILOT_REARM_NOTHING #13: no launch attempt to re-arm"] });
+  expect(await h.run("launch", "12")).toEqual({ code: 0, out: ["AUTOPILOT_RESERVED #12 lane=ap-12-2 attempt=2"], err: [] });
+  expect(rows().map((r) => [r[0], r[1], r[3]])).toEqual([
+    ["toodo:12/autopilot-launch/1", "failed", "launch failed"],
+    ["toodo:12/autopilot-launch/2", "planned", "planned"],
+    ["toodo:12/autopilot-rearm/1", "verified", "re-armed: owner: run it again"],
+  ]);
+  expect(await h.run("rearm", "12", "--tasks", "1")).toMatchObject({ code: 2 });
+});
+
 test("another task's pending reservation takes a host slot; launch order and a held host refuse too", async () => {
   const tasks = [task(12), task(13), task(14, { autopilot: false })];
   // 12 comes first in launch order, so with one slot 13 waits.
@@ -314,6 +354,30 @@ test("launch usage errors exit 2 and write nothing", async () => {
     expect(r.err.join("\n")).toContain("dori autopilot launch <taskId>");
   }
   expect([h.reads, rows()]).toEqual([[], []]);
+});
+
+test("with autopilot.executor on, launch refuses to reserve before reading anything and writes no row", async () => {
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, { ...DEFAULT_AUTOPILOT, executor: true });
+  expect(await h.run("launch", "12")).toEqual({ code: 1, out: [], err: [
+    "AUTOPILOT_LAUNCH_REFUSED #12 executor-on: the supervisor's executor reserves and launches marked tasks (autopilot.executor)",
+  ] });
+  expect([h.reads, h.probes, rows()]).toEqual([[], { quota: 0, host: 0 }, []]);
+});
+
+test("with autopilot.executor on, an executor-owned reservation refuses a settle; the lead's own earlier reservation still settles", async () => {
+  const on = { ...DEFAULT_AUTOPILOT, executor: true };
+  const tasks = [task(12), task(13)];
+  // 12: the lead reserved it before the switch. 13: the executor opened its sequence, then reserved under the same lock.
+  await harness(tasks).run("launch", "12");
+  plan(store, T0, { lane: "toodo:13", action: EXECUTE_ACTION, target: "1", data: "{}" });
+  await harness(tasks).run("launch", "13");
+  const owned = await harness(tasks, { ok: true }, T0 + 60_000, new Set(), undefined, undefined, on).run("launch", "13", "--failed");
+  expect(owned).toEqual({ code: 1, out: [], err: ["AUTOPILOT_LAUNCH_REFUSED #13 executor-owned: the supervisor's executor settles this reservation"] });
+  expect((await harness(tasks, { ok: true }, T0 + 60_000, new Set(), undefined, undefined, on).run("launch", "12", "--launched", "ap-12-1")).out)
+    .toEqual(["AUTOPILOT_SETTLED #12 attempt=1 verified lane=ap-12-1"]);
+  expect(rows().map((r) => [r[0], r[1]])).toEqual([["toodo:12/autopilot-launch/1", "verified"], ["toodo:13/autopilot-launch/1", "planned"]]);
+  // Switched off again, the stopped executor resumes nothing, so the lead settles what it left open.
+  expect((await harness(tasks).run("launch", "13", "--failed")).out).toEqual(["AUTOPILOT_SETTLED #13 attempt=1 failed lane=ap-13-1"]);
 });
 
 // pause
@@ -351,4 +415,64 @@ test("usage errors exit 2 with the usage; the removed bundle and schedule subcom
     expect(r.err.join("\n")).toContain("usage: dori autopilot candidates");
   }
   expect(h.reads).toEqual([]);
+});
+
+// slots per target machine
+
+/** local and mac-mini with these summaries; every task targets `targets` (local first, then the fallback mac-mini). */
+const twoMachines = (local: HostSummary, mini: HostSummary, targets: readonly string[] = ["local", "mac-mini"]) => (ids: readonly number[]): TaskHosts => ({
+  defaultMachine: "local", machines: new Map([["local", local], ["mac-mini", mini]]), targets: new Map(ids.map((id) => [id, targets])),
+});
+
+test("a full local machine does not hold a task whose fallback mac-mini has room; the reservation names mac-mini and takes its slot", async () => {
+  const machines = twoMachines({ ok: false, reason: "panes 4 >= 4", slots: 0 }, { ok: true, slots: 1 });
+  const h = harness([task(12), task(13)], { ok: true }, T0 + 60_000, new Set(), undefined, machines);
+  expect((await h.run("candidates")).out).toEqual([
+    "AUTOPILOT slots=1 machines=local:hold,mac-mini:1 candidates=2",
+    "AUTOPILOT_CANDIDATE #12 LAUNCH would-launch machine=mac-mini",
+    "AUTOPILOT_CANDIDATE #13 HOLD no-slot",
+  ]);
+  expect(JSON.parse((await h.run("candidates", "--json")).out.join("\n")).candidates[0]).toEqual({ taskId: 12, verdict: "LAUNCH", reasons: [], machine: "mac-mini" });
+  expect(await h.run("launch", "12")).toEqual({ code: 0, out: ["AUTOPILOT_RESERVED #12 lane=ap-12-1 attempt=1 machine=mac-mini"], err: [] });
+  expect(rows()).toEqual([["toodo:12/autopilot-launch/1", "planned", JSON.stringify({ laneKey: "ap-12-1", machine: "mac-mini" }), "planned"]]);
+  // 12's reservation has no pane yet: it takes mac-mini's one slot, and local is still full.
+  expect((await h.run("launch", "13")).err).toEqual(["AUTOPILOT_LAUNCH_REFUSED #13 HOLD no-slot"]);
+  // Every target held: host-hold.
+  const held = twoMachines({ ok: false, reason: "panes 4 >= 4", slots: 0 }, { ok: false, reason: "memory free 5% < 20%" });
+  expect((await harness([task(14)], { ok: true }, T0, new Set(), undefined, held).run("candidates")).out)
+    .toEqual(["AUTOPILOT slots=0 machines=local:hold,mac-mini:hold candidates=1", "AUTOPILOT_CANDIDATE #14 HOLD host-hold"]);
+});
+
+test("a reservation waiting on mac-mini takes no local slot; one that names no machine counts on the default machine", async () => {
+  const pending = (id: number, data: Record<string, string>) => store.put({
+    id: `toodo:${id}/autopilot-launch/1`, lane: `toodo:${id}`, action: "autopilot-launch", target: "1", state: "planned",
+    detail: "planned", data: JSON.stringify(data), attempts: 1, at: T0, updatedAt: T0,
+  });
+  const machines = twoMachines({ ok: true, slots: 1 }, { ok: true, slots: 1 }, ["local"]);
+  pending(98, { laneKey: "ap-98-1", machine: "mac-mini" });
+  const h = harness([task(13)], { ok: true }, T0 + 60_000, new Set(), undefined, machines);
+  expect((await h.run("candidates")).out).toEqual(["AUTOPILOT slots=1 machines=local:1,mac-mini:0 candidates=1", "AUTOPILOT_CANDIDATE #13 LAUNCH would-launch machine=local"]);
+  pending(99, { laneKey: "ap-99-1" });
+  expect((await h.run("candidates")).out).toEqual(["AUTOPILOT slots=0 machines=local:0,mac-mini:0 candidates=1", "AUTOPILOT_CANDIDATE #13 HOLD no-slot"]);
+});
+
+test("the live judge deps the CLI and the supervisor's tick share check every machine a task may be placed on", async () => {
+  const sample = (panes: number): HostSample => ({ load1: 1, memFreePct: 60, diskFreeGb: 200, swapFreeGb: 4, swapTotalGb: 8, panes });
+  const base = defaultConfig("/home/test");
+  const max = base.guard.panesMax;
+  const asked: (string | undefined)[] = [];
+  const ops = { observeMachine: async (machine?: string): Promise<MachineObservation> => {
+    asked.push(machine);
+    const panes = machine === undefined ? max : 1;
+    return { os: "linux", sampledAt: 0, sample: sample(panes), panes: Array.from({ length: panes }, (_, i) => ({ pane_id: `p${i}`, workspace_id: "w" })) };
+  } } as unknown as LaneOps;
+  const config = { ...base, stateDir: dir, placement: { defaultMachine: "local", fallback: ["mac-mini"] } };
+  const flow = { ops, config, registry: { open: async () => [] }, tunables: { toodoEvents: { url: "http://toodo.test", tokenFile } }, clock: { now: () => T0 } };
+  const live = liveJudgeDeps(flow as unknown as Parameters<typeof liveJudgeDeps>[0], store);
+  const found = await live.hosts([12]);
+  expect(asked.sort()).toEqual(["mac-mini", undefined]);
+  expect([found.defaultMachine, found.targets.get(12), found.machines.get("local")?.ok, found.machines.get("mac-mini")]).toEqual(["local", ["local", "mac-mini"], false, { ok: true, slots: max - 1 }]);
+  const toodo = { flaggedTasks: async () => [task(12)], tasksByIds: async () => [] };
+  const report = await judgeCandidates({ ...live, pauseFile: join(dir, "autopilot-pause.json"), toodo: () => toodo, quota: async () => ({ readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] }) });
+  expect(report.verdicts).toEqual([{ taskId: 12, verdict: "LAUNCH", reasons: [], machine: "mac-mini" }]);
 });

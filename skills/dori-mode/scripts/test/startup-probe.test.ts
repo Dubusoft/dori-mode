@@ -134,11 +134,11 @@ test("a normal start logs one STARTUP_TIMINGS line for the steps up to READY=1 a
   const label = (name: string) => lines.find((line) => line.startsWith(`STARTUP_TIMINGS ${name} `));
   expect(lines.map((line) => line.split(" ")[1]).sort()).toEqual([...FIRSTS, "ready"].sort());
   expect(lines[0]?.startsWith("STARTUP_TIMINGS ready ")).toBe(true);
-  expect(steps(label("ready"))).toEqual(["lock", "gateway-lock", "supervisor", "schedules", "waits", "github", "ci-follow", "inbound", "lane-reports", "runners", "ready"]);
+  expect(steps(label("ready"))).toEqual(["lock", "gateway-lock", "supervisor", "schedules", "waits", "github", "review-gate", "ci-follow", "inbound", "lane-reports", "runners", "ready"]);
   for (const task of ["inbound", "delivery", "polling", "runners"]) expect(steps(label(`first-${task}`))).toEqual([`task:${task}`]);
   expect(steps(label("first-sweep"))).toEqual([
-    "loop:sweep:snapshot", "loop:sweep:watch", "loop:sweep:guard", "loop:sweep:dead-panes", "loop:sweep:recover", "loop:sweep:freshness",
-    "loop:sweep:drift", "loop:sweep:memory", "loop:sweep:machine-guard",
+    "loop:sweep:snapshot", "loop:sweep:watch", "loop:sweep:guard", "loop:sweep:dead-panes", "loop:sweep:recover", "loop:sweep:decision-resume", "loop:sweep:freshness",
+    "loop:sweep:drift", "loop:sweep:memory-size", "loop:sweep:memory", "loop:sweep:auto-update", "loop:sweep:machine-guard",
   ]);
   expect(lines.every((line) => /^STARTUP_TIMINGS \S+ \d+ms( \S+=\d+ms)+$/.test(line))).toBe(true);
   expect(notified[0]).toBe("READY=1");

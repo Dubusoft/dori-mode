@@ -6,9 +6,8 @@ import { isReportKind } from "./report-kinds.ts";
 import type { LaneNotice } from "./lanes.ts";
 import type { RunnerEventBodies, RunnerEventType } from "./protocol.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
-import { LaneFileError } from "./lane-files.ts";
+import { LaneFileError } from "../lane-file-contract.ts";
 import type { LaneOutputFiles } from "./protocol.ts";
-import { SECRET_NAME } from "../secret-name.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 
 /**
@@ -20,8 +19,7 @@ import type { SecretRunResult } from "./secret-run.ts";
  * - `{kind: "ack", key, token, id}`: publishes `lane.ack {key, id}`; `{ok}`.
  * - `{kind: "whoami", pane}`: the key of the lane whose record holds `pane` (`{ok, key?}`), no token needed. The CLI
  *   uses it only to tell lane mode from lead mode.
- * - `{kind: "secret", key, token, names}`: asks the runner for the named secrets; `{ok, values, kinds?}` on a grant (`kinds` only names that are ssh-key), `{ok:false,
- *   code, detail}` on a refusal. Nothing is published and neither the values nor the reply are logged.
+ * - `{kind: "secret", key, token}`: every store value as `{ok, values}`, or `{ok:false, code, detail}`.
  * - `{kind: "secret-run", key, token, op}`: has the host run config `secretCommands.<op>` for the lane (secret-run.ts);
  *   `{ok, exitCode, stdout, stderr, truncated}` or a refusal. The token is checked before `op`; the output is never logged.
  * Every verb but `whoami` needs the key's own token (`RUNNER_LANE_AUTH_FAILED`). A failure is `{ok:false, code, detail}`.
@@ -39,36 +37,17 @@ export const LANE_SOCKET_DIR = "lane.d";
 /** `<runnerDir>/sock/lane.d/lane`, where the runner serves the lane socket. */
 export const laneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET_DIR, LANE_SOCKET);
 
-/**
- * `<runnerDir>/sock/lane`, where runners before `lane.d` served it. The runner serves it too, for lanes whose sandbox
- * was set up for that path (a macOS profile that allows only it, or a lane started before the update).
- */
-export const legacyLaneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET);
+/** Whether the lane socket path exists as seen from here (inside a lane: through its sandbox). */
+export const laneSocketExists = (runnerDir: string): boolean => existsSync(laneSocketPath(runnerDir));
 
-/** Whether either lane socket path exists as seen from here (inside a lane: through its sandbox). */
-export const laneSocketExists = (runnerDir: string): boolean =>
-  existsSync(laneSocketPath(runnerDir)) || existsSync(legacyLaneSocketPath(runnerDir));
-
-/**
- * How a lane's `dori` dials the lane socket: the `lane.d` path, and when that connect fails the legacy path. Existence
- * does not decide it: an older macOS profile lets a lane stat `lane.d` but refuses the connect. Rejects with the
- * `lane.d` error when neither connects.
- */
-export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => {
-  const current = connect(laneSocketPath(runnerDir));
-  const legacy = connect(legacyLaneSocketPath(runnerDir));
-  return async () => {
-    try { return await current(); } catch (error) {
-      try { return await legacy(); } catch { throw error; }
-    }
-  };
-};
+/** How a lane's `dori` dials the lane socket: the `lane.d` path. */
+export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => connect(laneSocketPath(runnerDir));
 
 type Publish = <T extends RunnerEventType>(type: T, body: RunnerEventBodies[T]) => void;
 
 /** The runner's answer to a `secret` request: the values by name, or a refusal. */
 export type SecretGrant =
-  | { readonly ok: true; readonly values: Readonly<Record<string, string>>; readonly kinds?: Readonly<Record<string, "env" | "ssh-key">> }
+  | { readonly ok: true; readonly values: Readonly<Record<string, string>> }
   | { readonly ok: false; readonly code: string; readonly detail: string };
 
 export type LaneRequest = { readonly key: string; readonly token: string; readonly kind: string; readonly text: string; readonly evidence?: string };
@@ -83,7 +62,7 @@ export type LaneSocketLanes = {
   readonly notice?: (key: string) => LaneNotice | undefined;
   readonly keyForPane?: (pane: string) => string | undefined;
   /** Hands out secret values to a lane; absent on a runner that does not support them. */
-  readonly secrets?: (key: string, names: readonly string[]) => Promise<SecretGrant>;
+  readonly secrets?: (key: string) => Promise<SecretGrant>;
   /** Runs a configured secret command for a lane; absent on a runner that does not support them. */
   readonly secretRun?: (key: string, op: string) => Promise<SecretRunResult>;
 };
@@ -137,13 +116,8 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
         return;
       }
       if (req.kind === "secret") {
-        const names = req.names;
-        if (!Array.isArray(names) || !names.length || names.length > 32 || !names.every((n) => str(n) && SECRET_NAME.test(n)) || new Set(names).size !== names.length) {
-          bad("secret needs names: 1 to 32 unique secret names");
-          return;
-        }
         if (!lanes.tokenFor(req.key, req.token)) {
-          log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=secret names=${names.join(",")}`);
+          log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=secret`);
           reply({ ok: false, code: "RUNNER_LANE_AUTH_FAILED", detail: `not ${req.key}'s lane token` });
           return;
         }
@@ -151,8 +125,8 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
         const grant = lanes.secrets;
         const key = req.key;
         // The values stay out of the log and the outbox; only the reply line carries them.
-        void Promise.resolve().then(() => grant(key, names as string[])).then(
-          (result) => { reply(result.ok ? { ok: true, values: result.values, ...(result.kinds ? { kinds: result.kinds } : {}) } : { ok: false, code: result.code, detail: result.detail }); },
+        void Promise.resolve().then(() => grant(key)).then(
+          (result) => { reply(result.ok ? { ok: true, values: result.values } : { ok: false, code: result.code, detail: result.detail }); },
           (error: unknown) => { reply({ ok: false, code: "RUNNER_SECRET_FAILED", detail: error instanceof Error ? error.message : String(error) }); },
         );
         return;

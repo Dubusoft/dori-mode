@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Ran } from "../src/run.ts";
 import { paneShell } from "../src/runner/lane-control.ts";
-import { powershellLaunchLine, RunnerLanes } from "../src/runner/lanes.ts";
+import { powershellLaunchLine } from "../src/runner/lane-launch.ts";
+import { RunnerLanes } from "../src/runner/lanes.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
@@ -92,11 +93,11 @@ test("Windows PowerShell 5.1 refuses a double quote in argv, pwsh allows it", as
   expect(t.lanes.records()["lane-a"]).toBeUndefined();
 });
 
-test("a POSIX pane keeps the unchanged KEY=value line and a cmd pane is refused", async () => {
+test("a POSIX pane exports its environment and pulls secrets while a cmd pane is refused", async () => {
   const posix = setup("zsh");
   await posix.lanes.start(START);
-  expect(typed(posix.calls)).toStartWith("DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=");
-  expect(typed(posix.calls)).toContain(" omo --model m1 ");
+  expect(typed(posix.calls)).toStartWith("export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=");
+  expect(typed(posix.calls)).toContain(" secret env)\"; omo --model m1 ");
   const cmd = setup("cmd.exe");
   await expect(cmd.lanes.start(START)).rejects.toThrow("RUNNER_LANE_TARGET_INVALID");
   expect(typed(cmd.calls)).toBe("");

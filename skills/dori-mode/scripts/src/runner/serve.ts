@@ -12,14 +12,14 @@ import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
   decodeFrame, encodeFrame, LABEL_PATTERN, MAX_FRAME_BYTES, ProtocolError, supervisorCommand, supervisorControl,
-  type AnyRunnerEvent, type AnySupervisorCommand, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
+  type AnyRunnerEvent, type AnySupervisorCommand, type ClosedLaneBody, type CommandResults, type Frame, type FrameHead, type InventoryLane, type JsonValue, type LaneStatus,
   type QueryBodies, type QueryType, type RejectCode, type RunnerControl, type RunnerEventBodies, type SupervisorCommandBodies,
   type SupervisorCommandType, type SupervisorControlBodies,
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
 import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
-import { checkLaneFilesBody } from "../lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
  * The P1 wiring between the runner modules and the product: the runner's identity file, the supervisor epoch, the hub's
@@ -36,6 +36,11 @@ export const OBSERVE_MS = 30_000;
  * pane `unknown` until the agent's integration first reports, so a just-launched lane reads dead for its first seconds.
  */
 export const STARTUP_GRACE_MS = 120_000;
+/**
+ * How long a lane whose agent was seen alive must read `dead` without a break before the runner publishes it. Any alive
+ * read inside the window ends it, so a lane that only blinks out of herdr's agent detection raises nothing.
+ */
+export const LANE_DEAD_GRACE_MS = 90_000;
 /** Committed runner events are kept this long in the hub's journal table. */
 export const RUNNER_JOURNAL_RETENTION_MS = 7 * 24 * 60 * 60_000;
 
@@ -121,8 +126,11 @@ export const openRunnerJournal = (stateDir: string, now: () => number): RunnerJo
   };
 };
 
-/** A runner's request for secrets (`secret.get`) or for a proxy-executed secret command (`secret.run`). */
+/** A runner's request for secrets (`secret.get`), for a proxy-executed secret command (`secret.run`). */
 export type SecretFrame = RunnerControl<"secret.get"> | RunnerControl<"secret.run">;
+
+/** The answer type of each secret frame. */
+export const SECRET_ANSWER_TYPE = { "secret.get": "secret.value", "secret.run": "secret.run.result" } as const;
 
 /** What `HubHooks.onSecret` gets to answer a secret frame on the connection it came in on. */
 export type SecretReplyContext = {
@@ -151,6 +159,8 @@ export type HubHooks = {
    * `ok:false RUNNER_SECRET_UNSUPPORTED`.
    */
   readonly onSecret?: (label: string, frame: SecretFrame, ctx: SecretReplyContext) => void;
+  /** Every admitted `lanes.closed`: the label's closed lanes. Absent, or when it throws, the answer is `ok:false`. */
+  readonly onClosedLanes?: (label: string) => Promise<readonly ClosedLaneBody[]>;
   /** The label's admitted connection closed (not called for a connection a newer one replaced). */
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
@@ -350,13 +360,22 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
         }
         if (frame.type === "secret.get" || frame.type === "secret.run") {
           const secret = frame as SecretFrame;
-          const answer = secret.type === "secret.get" ? "secret.value" : "secret.run.result";
+          const answer = SECRET_ANSWER_TYPE[secret.type];
           const ctx: SecretReplyContext = {
             session, proto, head: head(label, frame.gen),
             reply: (type, body) => { reply(supervisorControl(ctx.head, type, body) as Frame); },
           };
           if (hooks.onSecret) hooks.onSecret(label, secret, ctx);
           else ctx.reply(answer, { rid: secret.body.rid, ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this supervisor does not serve secrets" });
+          return;
+        }
+        if (frame.type === "lanes.closed") {
+          const rid = (frame as RunnerControl<"lanes.closed">).body.rid;
+          const answerHead = head(label, frame.gen);
+          const answer = (body: SupervisorControlBodies["lanes.closed.result"]): void => { reply(supervisorControl(answerHead, "lanes.closed.result", body) as Frame); };
+          if (!hooks.onClosedLanes) answer({ rid, ok: false, detail: "this supervisor does not list closed lanes" });
+          else hooks.onClosedLanes(label).then((lanes) => { answer({ rid, ok: true, lanes }); },
+            (e: unknown) => { answer({ rid, ok: false, detail: (e instanceof Error ? e.message : String(e)).slice(0, 200) }); });
           return;
         }
         reply(hub.handle(frame));
@@ -538,13 +557,15 @@ export type ServeDeps = {
  * latest list as the hello inventory, and publishes `lane.state {key, status, pane}` for each lane whose status or pane
  * changed (published through the outbox, so nothing is lost while disconnected). A lane no longer observed is
  * forgotten, so it is published again if it comes back. A `dead` lane whose agent was never seen alive on its pane is
- * not published until STARTUP_GRACE_MS after that pane was first observed, so a lane still starting is not called dead.
- * It changes nothing on the host.
+ * not published until STARTUP_GRACE_MS after that pane was first observed, so a lane still starting is not called dead;
+ * one seen alive there is published only once it has read dead for LANE_DEAD_GRACE_MS without an alive read between.
+ * A published dead carries `reason: agent-gone` (the observation lists only lanes whose pane is there). It changes
+ * nothing on the host.
  */
 export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise<void> => {
   const published = new Map<string, string>();
   // Per lane: the pane it is on, when that pane was first observed, and whether its agent was seen alive there since.
-  const tracked = new Map<string, { pane: string; since: number; alive: boolean }>();
+  const tracked = new Map<string, { pane: string; since: number; alive: boolean; deadSince?: number }>();
   const observeOnce = async (): Promise<void> => {
     if (!deps.observe) return;
     try {
@@ -554,13 +575,17 @@ export const serveRunner = async (deps: ServeDeps, signal: AbortSignal): Promise
       for (const lane of observed) {
         let track = tracked.get(lane.key);
         if (!track || track.pane !== lane.pane) tracked.set(lane.key, track = { pane: lane.pane, since: deps.clock.now(), alive: false });
-        if (lane.status !== "dead") track.alive = true;
-        // A pane whose agent was never seen alive is still starting until the grace ends: its dead is held back.
-        const starting = lane.status === "dead" && !track.alive && deps.clock.now() - track.since < STARTUP_GRACE_MS;
+        const now = deps.clock.now();
+        if (lane.status !== "dead") { track.alive = true; track.deadSince = undefined; }
+        else track.deadSince ??= now;
+        // A pane whose agent was never seen alive is still starting until the grace ends; one seen alive gets
+        // LANE_DEAD_GRACE_MS of dead reads in a row. Either way its dead is held back until then.
+        const held = lane.status === "dead"
+          && (track.alive ? now - (track.deadSince ?? now) < LANE_DEAD_GRACE_MS : now - track.since < STARTUP_GRACE_MS);
         const seen = JSON.stringify([lane.status, lane.pane]);
-        if (!starting && published.get(lane.key) !== seen) {
+        if (!held && published.get(lane.key) !== seen) {
           published.set(lane.key, seen);
-          deps.client.publish("lane.state", { key: lane.key, status: lane.status, pane: lane.pane });
+          deps.client.publish("lane.state", { key: lane.key, status: lane.status, pane: lane.pane, ...(lane.status === "dead" ? { reason: "agent-gone" as const } : {}) });
         }
       }
     } catch (error) {

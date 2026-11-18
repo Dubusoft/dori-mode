@@ -4,8 +4,6 @@ import { join } from "node:path";
 
 import { leadModels, qualifiedModel, type DoriConfig, type LeadModel } from "./config.ts";
 
-export class LeadRestartError extends Error {}
-
 export type LeadRestartRequest = {
   readonly id: string;
   readonly at: number;

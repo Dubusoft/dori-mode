@@ -11,9 +11,8 @@ import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
 import { pendingLeadRestart } from "../src/lead-restart.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Registry } from "../src/registry.ts";
-import { WAKES_FILE } from "../src/store.ts";
 import type { Ran } from "../src/run.ts";
-import { fakeClock, withState } from "./fakes.ts";
+import { fakeClock, withSqliteStore, withState, writeWakes } from "./fakes.ts";
 
 const TOKEN = "secret-token-xyz";
 const PATH = process.env.PATH;
@@ -54,6 +53,8 @@ const happyHttp: Record<string, ReturnType<typeof resp>> = {
 type Patch = { run?: Record<string, Ran>; http?: Record<string, ReturnType<typeof resp>>; gateway?: "live" | "none" | "stale" | "nocontent" | "down"; free?: number; deps?: Partial<DoctorDeps> };
 const fixture = (patch: Patch = {}) => {
   const state = withState();
+  // A healthy machine's supervisor has created its store.
+  withSqliteStore(state.dir);
   cleanups.push(state.done);
   mkdirSync(join(state.dir, ".dori", "runner"), { recursive: true });
   chmodSync(join(state.dir, ".dori", "runner"), 0o700);
@@ -62,7 +63,7 @@ const fixture = (patch: Patch = {}) => {
   const wrapper = join(state.dir, ".local", "bin", "lane-sandbox");
   mkdirSync(join(state.dir, ".local", "bin"), { recursive: true });
   copyFileSync(LANE_SANDBOX_TEMPLATE, wrapper);
-  const table = { ...happyRun, [`${wrapper} --check`]: checked(), ...patch.run };
+  const table = { ...happyRun, [`${wrapper} --check`]: checked(), [`env DORI_LANE_KEY=doctor-probe ${wrapper} --explain`]: ok("rw /tmp\n"), ...patch.run };
   const routes = { ...happyHttp, ...patch.http };
   const calls: string[] = [];
   const requests: HttpRequest[] = [];
@@ -126,6 +127,127 @@ test("doctor warns when the installed lane sandbox differs from the template", a
   const check = find(await runDoctor({ ...f.deps, run: async (argv) => (argv[1] === "--check" ? checked() : f.deps.run(argv, {})) }), "lane sandbox");
   expect(check).toMatchObject({ level: "WARN" });
   expect(check.detail).toContain("LANE_SANDBOX_OUTDATED");
+});
+
+test("doctor names the sensitive host paths a lane can read, probed through the installed wrapper", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  const wrapper = join(home, ".local", "bin", "lane-sandbox");
+  // A wrapper that hides nothing: the probe runs on the host as is.
+  writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexec "$@"\n');
+  chmodSync(wrapper, 0o755);
+  for (const d of [".aws", ".ssh", ".config/gh", ".kube"]) mkdirSync(join(home, d), { recursive: true });
+  for (const p of [".aws/credentials", ".ssh/id_rsa", ".ssh/id_rsa.pub", ".config/gh/hosts.yml"]) writeFileSync(join(home, p), "x");
+  writeFileSync(join(home, ".netrc"), "");
+  const backups = join(home, "backups");
+  mkdirSync(backups);
+  writeFileSync(join(backups, "snap"), "x");
+  // Glob entries are probed match by match: the shared list's history files, the hide list's keys.
+  writeFileSync(join(home, ".node_repl_history"), "x");
+  mkdirSync(join(home, "keys"));
+  writeFileSync(join(home, "keys", "a.pem"), "x");
+  writeFileSync(join(home, "keys", "c.txt"), "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# backups\n${backups}\n${join(home, "keys", "*.pem")}\n`);
+  const argvs: string[][] = [];
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env") return f.deps.run(argv, {});
+    argvs.push([...argv]);
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const check = find(await runDoctor({ ...f.deps, run: real }), "lane exposure");
+  expect(argvs[0]?.slice(0, 3)).toEqual(["env", "DORI_LANE_KEY=doctor-probe", wrapper]);
+  expect(check).toMatchObject({ level: "WARN", fix: expect.stringContaining("lane-sandbox-hide") });
+  expect(check.detail).toContain("~/.aws");
+  expect(check.detail).toContain("~/.ssh/id_rsa");
+  expect(check.detail).toContain("~/backups");
+  expect(check.detail).toContain("~/.node_repl_history");
+  expect(check.detail).toContain("~/keys/a.pem");
+  expect(check.detail).not.toContain("~/keys/c.txt");
+  // gh's login file is no longer bound on purpose: a wrapper that hides nothing exposes it like any credential.
+  expect(check.detail).toContain("~/.config/gh/hosts.yml");
+  expect(check.detail).not.toContain("bound on purpose: ~/.config/gh");
+  // Empty on the host (an empty file, an empty dir) or a public key: not probed.
+  for (const no of ["~/.netrc", "~/.kube", "id_rsa.pub"]) expect(check.detail).not.toContain(no);
+
+  // A wrapper under which the probe reads nothing: OK.
+  writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexit 0\n');
+  expect(find(await runDoctor({ ...f.deps, run: real }), "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
+});
+
+test("doctor probes lane exposure through the shipped Linux template, whose lane input and output binds need existing sources", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  copyFileSync(LANE_SANDBOX_TEMPLATE, join(home, ".local", "bin", "lane-sandbox"));
+  chmodSync(join(home, ".local", "bin", "lane-sandbox"), 0o755);
+  // Like bwrap, a --ro-bind or --bind whose source is missing fails the run; the command itself reads nothing.
+  const bin = join(home, "fake-bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "bwrap"), '#!/bin/sh\nprev=\nfor a do [ "$a" = -- ] && exit 0; case "$prev" in --ro-bind|--bind) [ -e "$a" ] || { echo "bwrap: Can\'t find source path $a: No such file or directory" >&2; exit 1; } ;; esac; prev=$a; done\nexit 0\n');
+  chmodSync(join(bin, "bwrap"), 0o755);
+  process.env.PATH = `${bin}:${PATH}`;
+  mkdirSync(join(home, ".aws"));
+  writeFileSync(join(home, ".aws", "credentials"), "x");
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env" && argv[1] !== "--check") return f.deps.run(argv, {});
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, env: { ...process.env, HOME: home }, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const checks = await runDoctor({ ...f.deps, run: real });
+  expect(find(checks, "lane sandbox")).toMatchObject({ level: "OK" });
+  expect(find(checks, "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
+  // The probe lane's directories do not outlive the run.
+  for (const n of ["doctor-probe.files", "doctor-probe.out"]) expect(existsSync(join(defaultRunnerDir(home), "briefs", n))).toBe(false);
+});
+
+test("doctor shows what a lane may write and what it cannot see, read off the installed wrapper's --explain", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  const wrapper = join(home, ".local", "bin", "lane-sandbox");
+  const backups = join(home, "backups");
+  mkdirSync(join(backups, "granted"), { recursive: true });
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `${backups}\n`);
+  const argvs: string[][] = [];
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env") return f.deps.run(argv, {});
+    argvs.push([...argv]);
+    // A runner grant under a hidden path: the table binds it, then hides it again.
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, env: { PATH: process.env.PATH, HOME: home, LANE_SANDBOX_RW: join(backups, "granted") }, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  const check = find(await runDoctor({ ...f.deps, run: real }), "lane permissions");
+  expect(argvs).toContainEqual(["env", "DORI_LANE_KEY=doctor-probe", wrapper, "--explain"]);
+  expect(check.level).toBe("OK");
+  expect(check.detail).toMatch(/^writable: [^;]*~\/\.cache[^;]*; hidden: [^;]*~\/\.dori\/runner[^;]*~\/backups[^;]*; each lane adds /);
+  // Hidden after it is bound, so not writable.
+  expect(check.detail).not.toContain("~/backups/granted");
+  expect(check.detail).toContain(`${wrapper} --explain`);
+
+  const failing = async (argv: readonly string[]): Promise<Ran> => (argv.at(-1) === "--explain" ? { code: 2, out: "", err: "usage: lane-sandbox\n" } : f.deps.run(argv, {}));
+  expect(find(await runDoctor({ ...f.deps, run: failing }), "lane permissions")).toMatchObject({ level: "WARN", detail: `${wrapper} --explain failed: usage: lane-sandbox` });
+});
+
+test("doctor warns about $HOME dot entries and ~/.dori entries a lane can read that dori does not know, unless hidden", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  expect(find(await runDoctor(f.deps), "lane home entries")).toMatchObject({ level: "OK" });
+
+  // Known: a shell file, a credential store (hidden by the sandbox), dori's own entries and its credential stores.
+  for (const d of [".aws", ".config/gcloud", ".dori/research", ".dori/state", ".dori/lead"]) mkdirSync(join(home, d), { recursive: true });
+  for (const p of [".zshrc", ".netrc", ".dori/env", ".dori/config.json"]) writeFileSync(join(home, p), "x");
+  expect(find(await runDoctor(f.deps), "lane home entries")).toMatchObject({ level: "OK" });
+
+  // Unknown: a new tool's dot dir, a stray file next to dori's env, and a hidden entry only once it is in the hide list.
+  mkdirSync(join(home, ".newtool"), { recursive: true });
+  mkdirSync(join(home, ".private"), { recursive: true });
+  for (const p of [".dori/env.bak", ".dori/notes", "plain-file"]) writeFileSync(join(home, p), "x");
+  writeFileSync(join(home, ".dori", "lane-sandbox-hide"), `# owner's list\n${join(home, ".private")}\n`);
+  const check = find(await runDoctor(f.deps), "lane home entries");
+  expect(check).toMatchObject({ level: "WARN", detail: "a lane can read ~/.dori/env.bak, ~/.dori/notes, ~/.newtool, which dori does not know; check that none holds a credential", fix: expect.stringContaining("~/.dori/lane-sandbox-hide") });
+  expect(doctorExit(await runDoctor(f.deps))).toBe(0);
+
+  // No lane sandbox on Windows, so nothing to check there.
+  expect((await runDoctor({ ...f.deps, platform: "win32" })).find((c) => c.id === "lane home entries")).toBeUndefined();
 });
 
 test("doctor fails a wrapper whose --check passes without the lane-files marker: the runner refuses its sandboxed lanes", async () => {
@@ -202,18 +324,6 @@ test("doctor warns when the obsolete local runner unit is enabled", async () => 
   expect(find(await runDoctor(f.deps), "runner unit")).toMatchObject({ level: "WARN", detail: expect.stringContaining("supervisor runs the local runner itself") });
 });
 
-test("doctor warns only when standalone guard agent files remain", async () => {
-  const f = fixture();
-  expect((await runDoctor(f.deps)).find((c) => c.id === "guard agent")).toBeUndefined();
-  const path = join(f.deps.home, ".dori", "guard-agent.sh");
-  writeFileSync(path, "legacy");
-  expect(find(await runDoctor(f.deps), "guard agent")).toMatchObject({
-    level: "WARN",
-    detail: expect.stringContaining("guard-agent.sh left from the old standalone guard agent; the runner reports this host now"),
-    fix: "the runner removes them when it starts (dori update on the lead restarts runners); or delete them",
-  });
-});
-
 test("doctor warns when a lead restart is pending without consuming it or touching the warm lead", async () => {
   const f = fixture();
   const request = { id: "restart-doctor-177", at: NOW, models: [{ model: "qa/lead", thinking: "high" }, { model: "qa/fallback" }] };
@@ -230,11 +340,11 @@ test("doctor warns when a lead restart is pending without consuming it or touchi
 
 test("doctor warns when lead wakes not from owner messages exceed the 24-hour threshold, naming their top trigger", async () => {
   const f = fixture();
-  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => JSON.stringify({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
-  const path = join(f.deps.config.stateDir, WAKES_FILE);
-  writeFileSync(path, wakes(["INBOUND"], 25, 0).join("\n"));
+  const wakes = (trigger: string[], n: number, from: number) => Array.from({ length: n }, (_, i) => ({ at: NOW - from - i, session: "lead", trigger, kinds: {} }));
+  const dir = f.deps.config.stateDir;
+  writeWakes(dir, wakes(["INBOUND"], 25, 0));
   expect((await runDoctor(f.deps)).some((check) => check.id === "lead wakes")).toBe(false);
-  writeFileSync(path, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)].join("\n"));
+  writeWakes(dir, [...wakes(["INBOUND"], 25, 0), ...wakes(["HOST_GUARD OFFLINE"], 15, 100), ...wakes(["LANE_REPORT"], 6, 200)]);
   const check = find(await runDoctor(f.deps), "lead wakes");
   expect(check).toMatchObject({
     level: "WARN", detail: "21 lead wakes not from owner messages in the last 24 hours (threshold 20; lane 6, noise 15); most from HOST_GUARD OFFLINE (15)",
@@ -386,7 +496,7 @@ test("tokenFrom reads the env file forms and gatewayView ages with the injected 
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
 });
 
-test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is found", async () => {
+test("memory check: omo's repo for leadCwd, WARN over humanMaxKb or when nothing is found", async () => {
   const f = fixture();
   const real = { ...f.deps, exists: existsSync };
   expect(find(await runDoctor(real), "memory check").level).toBe("OK");
@@ -400,7 +510,7 @@ test("memory check: omo's repo for leadCwd, WARN over maxKb or when nothing is f
   const over = find(await runDoctor(discovered), "memory check");
   expect(over.level).toBe("WARN");
   expect(over.detail).toContain(agent);
-  expect(over.detail).toContain("over memoryCheck.maxKb 15");
+  expect(over.detail).toContain("over memoryLimits.humanMaxKb 15");
 });
 
 test("item 6: doctor fails on lanes whose recovery is exhausted and warns on lanes still pending recovery", async () => {
@@ -430,7 +540,6 @@ test("doctor names each config value's source: file, default, env or derived, an
   expect(find(checks, "config.stateDir").detail).toStartWith("env DORI_STATE_DIR: ");
   expect(find(checks, "config.alertsChannel").detail).toBe('derived from discordChannels[0]: "500"');
   expect(find(checks, "config.decisionsChannel")).toMatchObject({ level: "WARN", detail: "decisionsChannel: unset (decisions go to the requesting channel)" });
-  expect(find(checks, "config.store").detail).toStartWith("derived from ");
   expect(find(checks, "config.leadThinking").detail).toBe("unset: (none)");
   expect(find(checks, "config ignored keys")).toMatchObject({ level: "WARN", detail: expect.stringContaining("laneThinking") });
 });

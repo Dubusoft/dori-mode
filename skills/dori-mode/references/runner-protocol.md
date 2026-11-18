@@ -66,7 +66,7 @@ Protocol 3 adds, all optional on existing frames:
 
 | Frame | Addition |
 |---|---|
-| `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane |
+| `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane; an `agent-gone` dead is published only by the runner's observe loop, after 90 s of dead reads with no alive one between (a lane agent process still running in the pane counts as alive), and the hub raises one `RUNNER_LANE_DEAD` per lane and pane |
 | `lane.ack {key, id}` | new event: the lane confirmed the supervisor's lane message `id` |
 | `guard.sample` | `panes` (herdr's pane count, -1 when the runner could not read herdr) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
 | `cmd.result` | `result`: the effect's structured result (any JSON value; below) |
@@ -81,17 +81,23 @@ Protocol 3 adds, all optional on existing frames:
 Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung|elevated, instance?: string, since: number}`,
 `herdr.state {state, instance?, detail}` on transitions, and `herdr.start {ok, detail}` for managed-unit start
 outcomes. `since` is the runner's wall time; the supervisor records its own receipt time for shared state.
-The supervisor continues to infer outages from `panes: -1` for protocol 3 runners. Protocol 4 samples without
+Samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
 verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action. A protocol 3
 runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
 
+Protocol 7 adds the command `lane.attach {key, tree}` (`dori attach`): the runner validates `tree` like a `lane.start`
+input tree, writes it into the running lane's existing `briefs/<key>.files` directory under the next free `a<NNNN>`
+group (in place, so a sandbox that bound that directory at start sees it; the combined directory keeps the launch caps),
+and answers `{dir}`, that group's path. A lane without a file run (adopted, or started before lane files) refuses it
+with `LANE_ATTACH_UNMANAGED`. A protocol 6 runner is never sent it (`RUNNER_UNAVAILABLE ... outdated`).
+
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
 `lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal, execution?}` (`/goal resume`, then `/resume` when the pane shows omo's Esc-paused footer, then the turn read back: `running` or `held`),
-`lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
+`lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.attach` `{dir}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
 `lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
 managed, paused}`. A runner effect that only returns a
 detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
@@ -203,6 +209,7 @@ or validate keeps the last good policy: `RUNNER_CONFIG_INVALID <why>` (state `in
 | `worktreeRoot` | where lanes on this host create their git worktrees, absolute or `~/...`; reported in the hello | `<reposRoot>/worktrees` when `reposRoot` is set, else none |
 | `workspaces` | overrides for discovered repos: `{"owner/repo": "<checkout path>"}`, absolute or `~/...`; an entry replaces the discovered path of that repo (case-insensitive) or adds a repo not under `reposRoot` | none |
 | `detectWorkspaces` | `false` turns off the scan of `allowedRoots` for checkouts (`detected`); `dori runner setup` does not ask it (`--set detectWorkspaces=false`) | `true` |
+| `grants` | named path grants a sandboxed lane gets only when its launch asks for them by name (`dori launch --grant NAME`, `lane.start.grants`): `{"<name>": {"write": [dirs], "read": [dirs]}}`, absolute or `~/...`; see [Path grants](#path-grants) | none |
 
 A `lane.start` without `cwd` (`dori launch --machine M` with no `--cwd`) starts in its own directory `<runnerDir>/lanes/<key>`
 (`~/.dori/runner/lanes/<key>`, `%USERPROFILE%\.dori\runner\lanes\<key>` on Windows). The runner fills it before the
@@ -212,13 +219,49 @@ it); the runner-directory safety check audits each `lanes/<key>` directory itsel
 A key that cannot name a directory is refused `cwd-missing`. The lane sandbox (Linux and macOS) lets such a lane read
 and write its own directory; update the wrapper (`dori runner update`) on a host that still has an older one.
 
+### Review lane profile
+
+A `lane.start` with `agentProfile: "review"` (the runner policy's `agents.review`, the same argv as `agents.sandboxed`; every runner-config that takes review lanes needs it)
+always runs sandboxed: the runner runs `sandboxCheck` first even without `sandbox: true`, refuses it on a PowerShell pane
+(`RUNNER_LANE_REVIEW_UNSANDBOXED`), and launches it with `LANE_SANDBOX_PROFILE=review` and without `LANE_SANDBOX_REPOS`,
+`LANE_SANDBOX_WORKTREES` and `LANE_SANDBOX_RW`. The Linux wrapper then binds the cwd (the review snapshot worktree), its
+git common dir, the worktree root and the repos' `.git` read-only, ignores write grants, gives `/tmp` a private tmpfs
+and leaves only `briefs/<key>.out`, the lane TMPDIR, `~/.omo` and `~/.cache` writable; `~/.gitconfig`, `~/.config/gh` (its `hosts.yml` included),
+`~/.config/git` and the ssh agent socket are not bound, GitHub tokens are unset and git reads no global or system
+config. Any other non-empty `LANE_SANDBOX_PROFILE` exits 2, and the macOS wrapper refuses every profile (review lanes run
+on Linux only). `lane-sandbox --explain` names the profile in its header.
+
+### Path grants
+
+The owner keeps a named table of narrow paths in runner-config.json `grants`; the lead picks names from it per lane
+(`dori launch --grant NAME`, repeatable) and never edits the table. A grant's `write` directories reach the lane
+sandbox as `LANE_SANDBOX_RW` (read-write) and its `read` directories as `LANE_SANDBOX_RO` (read-only, bound before every
+read-write path, so a cwd under one stays writable); the wrapper takes only these two lists. Both wrappers apply
+`~/.dori/lane-sandbox-hide` after every grant, so a hidden path stays hidden whatever a grant names. A lane without
+`--grant` gets neither list, as before.
+
+The table may not name, and parsing refuses (`RUNNER_CONFIG_INVALID`): a relative path or one holding `:`; `/`, the home
+directory or anything above it; anything that holds or lies under `~/.dori`, `~/.config` or the user runtime directory
+(`/run/user`, `XDG_RUNTIME_DIR`: the D-Bus session bus and the systemd user manager). At each start and relaunch the
+runner resolves every granted path (`realpath`) and checks the real form again, and refuses a write grant that is a git
+checkout (it holds `.git`): the host runs that checkout's scripts, so grant a data directory inside it instead (for
+example `/data/dori/blog-writer/runs`, never `/data/dori/blog-writer`). A refused or unknown name starts nothing
+(`RUNNER_CMD_REJECTED grant-path|grant-unknown ...`), and the lane record keeps the names, so a relaunch resolves them
+against the table as it is then. On the local runner a runner-config.json holding only placement keys and `grants`
+layers them onto the policy derived from config.json.
+
+`lane.start.grants` is sent only when non-empty and needs no protocol bump: a runner older than it refuses that start
+`RUNNER_CMD_REJECTED unknown-field` (the lead reports `LAUNCH_GRANT_UNSUPPORTED`; `dori runner update` there), and
+every other start is unchanged.
+
 The former `defaultCwd` key is retired. A runner-config.json that still holds it loads as before, the key is ignored
 and each load logs one `RUNNER_CONFIG_KEY_IGNORED defaultCwd: ...` line; `dori runner setup` removes it.
 
 A refusal is `RUNNER_CMD_REJECTED <rule>` with one of these rules: a schema rule from frame validation (such as
 `unknown-field` or `unknown-type`), `agent-profile`, `cwd-missing` (the path does not resolve), `cwd-outside-roots`
 (compared by path segment after resolving symlinks on both sides, so `/data/repos-evil` is not under `/data/repos`),
-`sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings) or `jobs-denied`.
+`sandbox-required`, `sandbox-unavailable` (the `sandboxCheck` failed; it arrives inside a `RUNNER_CMD_FAILED` detail), `command-not-argv` (a `job.run` command that is not an array of strings), `jobs-denied`,
+`grant-unknown` (a `grants` name the table lacks), `grant-unsandboxed` (grants on a start with `sandbox: false`) or `grant-path` (a granted path refused at start, see [Path grants](#path-grants)).
 `guard.kill` accepts only lane keys. Every `cwd` (`lane.start`, `lane.adopt`, `job.run`, `wait.check`) and
 `lane.git.root` is checked the same way: absolute, resolving, under `allowedRoots`.
 
@@ -286,7 +329,7 @@ existing and under `allowedRoots`.
 
 - `wait.check` runs the `Done =` signal once in `cwd`, bounded by 10 s. A met check also publishes
   `wait.result {waitId, outcome: WAIT_DONE, detail}` (detail at most 500 characters), which the supervisor settles as
-  the same `WAIT_DONE` a local check gives; an unmet or failed check publishes nothing. A check that throws answers
+  the same success line a local check gives (`WAIT_DONE`, or the wait's `--on-success` line); an unmet or failed check publishes nothing. A check that throws answers
   `{met: false, error}`. The supervisor allows 20 s past the check's bound.
 - `job.run` runs the argv in `cwd`, killed after `timeoutSec`, and publishes one `job.result {opKey, state:
   verified|failed, exitCode, output}` per run (journal only). `output` is capped at 64 KiB and `err` at 4 KiB, cut on
@@ -415,6 +458,13 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
   keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
   the Mac still sleeps. When `caffeinate` cannot start or exits, the runner logs `RUNNER_AWAKE_FAILED` and keeps serving.
+  Before each `lane.start` a macOS runner also checks BrowserSkill once, outside the lane sandbox and without holding
+  the start up (`runner/browser-window.ts`): the extension connects bsk only while a Chrome window is open, so when
+  `bsk browsers` shows none it runs `open -b com.google.Chrome` (no URL) and rechecks for 10 s. It logs one line:
+  `RUNNER_BSK_OK`, `RUNNER_BSK_WINDOW_OPENED`, `RUNNER_BSK_UNAVAILABLE` (bsk did not answer; nothing opened),
+  `RUNNER_BSK_OPEN_FAILED`, `RUNNER_BSK_STILL_NONE`, or `RUNNER_BSK_PROFILE_PROBLEM` (still none and no Chrome
+  `--extension-process`: Chrome's sign-in or the extension needs the owner). Starts that overlap share one check, and
+  Chrome is never killed or scripted.
 - Then, on Linux, linger is turned on and the unit is enabled and restarted. On macOS the agent is loaded into
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.
@@ -535,9 +585,6 @@ machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane o
 killed, but it kills nothing over ssh. A machine whose runner sent no fresh sample is skipped that round, and a machine
 without a runner isn't guarded.
 
-When it starts, a runner deletes the old guard agent files on its host (`~/.dori/guard-agent.sh`,
-`guard-agent.ps1`, `guard-agent.version`) and logs `RUNNER_GUARD_AGENT_REMOVED <files>`.
-
 ## herdr outages
 
 Each runner, including the local runner, watches herdr on the existing 30 s guard sampling timer. A readable pane
@@ -584,13 +631,8 @@ pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
 with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
 for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the elevated-server fix above for
-`elevated`, not a restart. For protocol 3 runners:
+`elevated`, not a restart. A runner's first `up` is saved and says nothing.
 
-- Two committed samples in a row with `panes: -1` mark the machine's herdr `down`: `HERDR_DOWN machine=<label> ...`
-  (urgent), once. Protocol 3 cannot tell a stopped herdr from a hung one, and -1 also covers a pane list that timed
-  out or did not parse. One unreadable sample between readable ones changes nothing.
-- The next sample with a pane count marks it `up` again: `HERDR_UP machine=<label> ... after <n> s down` (digest), once.
-  A runner's first readable sample is saved as `up` and says nothing. A sample without `panes` changes nothing.
 - The state and the time it was entered are saved on the runner's row in `runners.sqlite` (`herdr`, `herdrSince`),
   so they survive a supervisor restart and other `dori` processes read them.
 - While a machine's herdr is down or hung the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
@@ -644,7 +686,7 @@ code stay the runner's alone.
 ## Cleanup sweep
 
 Every runner (local, remote, Windows) sweeps its own host once a day (`src/runner/cleanup.ts`); there is no per-machine
-cron or tmpfiles rule and no dry-run mode. The first check runs 10 minutes after start and then hourly; a sweep runs when
+cron or tmpfiles rule. The first check runs 10 minutes after start and then hourly; a sweep runs when
 the last one recorded in `~/.dori/runner/logs/cleanup.json` is at least 24 hours old, so restarts neither skip nor repeat
 a day.
 
@@ -659,6 +701,15 @@ a day.
 | empty artifact dirs | empty `*-artifacts` session dirs, empty dirs under `~/.dori/runner/evidence` | removed after a day |
 | memory agents | `~/.omo/memory/agents/<slug>-<hash>` | removed when untouched for 30 days |
 | worktree records | every workspace repo the runner reports | `git worktree prune` |
+| closed lanes' `node_modules` | `<worktree>/node_modules` of each worktree (cwd and recorded worktrees) of a lane the registry records as closed | removed once the lane's last activity (its close, the worktree's `HEAD`, index and `HEAD` log) is 3 days old and nothing in the worktree, its `.git` or its `node_modules` changed for 6 hours; `report` by default |
+| closed lanes' build output | in the same worktrees and their direct subdirectories: `android/build`, `android/<module>/build` and `android/.gradle` (closedAndroidBuild), `.expo` (closedExpo), `ios/Pods` (closedPods), a `target` holding cargo's `CACHEDIR.TAG` (closedCargoTarget) | removed once the lane's last activity is 7 days old (14 for `.expo`; for `target` also its newest file), with the same keeps as `node_modules`, never when git tracks anything in it (`tracked`), and not that day while Gradle, Metro/Expo, Xcode/xcodebuild/Simulator/pod or cargo/rustc/rust-analyzer runs on the host (`skip:toolRunning`); `report` by default |
+| Metro caches | `metro-*` directly in a temp root (`metro-cache`, `metro-file-map-*`) | removed when nothing in them changed for 3 days and no Metro or Expo dev server runs (metroCache); the system temp sweep leaves them to this target; `report` by default |
+| Xcode DerivedData (`xcodeDerivedData`) | macOS only: `~/Library/Developer/Xcode/DerivedData/<folder>` | a folder in which nothing changed (mtime or ctime) for 14 days is removed; `report` by default |
+| iOS DeviceSupport (`xcodeDeviceSupport`) | macOS only: `~/Library/Developer/Xcode/iOS DeviceSupport/<version>` | same, 60 days; `report` by default |
+| unavailable simulators (`simulatorsUnavailable`) | macOS only | `xcrun simctl delete unavailable` when `xcrun simctl list --json devices unavailable` lists any; `report` by default |
+| bun cache (`bunCache`) | the dir `bun pm cache` prints | `bun pm cache rm` (it empties the cache), at most every 30 days; `report` by default |
+| npm cache (`npmCache`) | `<npm config get cache>/_cacache` | `npm cache verify`; `report` by default |
+| pnpm store (`pnpmStore`) | the dir `pnpm store path` prints | `pnpm store prune`, after the `node_modules` target so it frees what nothing links to any more; `report` by default |
 
 Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The sweep never removes: an open lane's
 sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
@@ -668,14 +719,97 @@ sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the
 that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
 targets and reports `inUse=failed`.
 
+The closed lanes' `node_modules` target only looks at worktrees of lanes the registry records as closed; a worktree the
+registry does not know (a lane being opened may not be registered yet) is never touched. It also keeps a worktree that
+an open lane uses as its cwd, one whose directory name carries an open or observed lane's key (the key itself,
+`<key>-...` or `<repo>-<key>`), and one under which a process holds a file open or runs (only paths inside the worktree
+count, not a shell whose cwd is a directory above it). The registry is read again right before removing, and a lane
+that is no longer closed by then keeps its worktree (`reopened`). The registry lives with the supervisor, so the runner asks it over
+the link at each sweep: the runner control frame `lanes.closed {rid}` (proto 9) is answered with `lanes.closed.result
+{rid, ok, detail?, lanes?}`, each lane `{key, closedAt, worktrees}` (closedAt in ms; worktrees are its cwd and recorded
+worktrees), only the asking runner's lanes (local lanes for `local`, a remote runner's by its label). Nothing in it is
+secret, so it is not sealed. Without a registry to ask the target is skipped (`noRegistry`); when the supervisor
+refuses, is older than proto 9 or does not answer within 60 seconds, it is skipped (`registryFailed`).
+
+The developer-cache targets (`src/runner/cleanup-dev-caches.ts`) never remove files of the global package caches
+themselves: only the tools' own commands above run, in a scratch directory (bun's need a `package.json`). Xcode Archives
+(dSYMs cannot be rebuilt), `~/.expo` (login state) and CoreSimulator `Devices` (only simctl removes a simulator) are no
+target. Each target first reads the host's process list (`ps -A -o pid=,args=`) and is skipped (`busy`) while a process
+that uses its cache runs: Xcode, Simulator or xcodebuild for the three Xcode targets; `bunx` or bun's package commands
+(`install`, `add`, `remove`, `update`, `pm`, `x`, ...) for bun; any npm/npx or pnpm/pnpx. When the list cannot be read
+they are all skipped (`processesFailed`). An Xcode folder a process holds a file open in or runs in is kept (`shielded`;
+only paths inside the folder count), symlinks and other users' folders too, and the two folder targets are skipped
+when the in-use listing fails. The Xcode targets are skipped on Linux and Windows (`platform`), the package caches on
+Windows; a tool that is not installed is skipped (`notInstalled`). In `report` the folders and unavailable simulators
+count with their size, bun's cache with its whole size, npm's and pnpm's with 0 bytes (what they collect is known only
+once they run). When a tool target runs its command, the report records the time under `lastRuns.<target>`; the next
+sweep reads it from `cleanup.json`, and `bunCache` is skipped (`notDue`) until 30 days after its last run.
+
+Each target runs in one of three modes: `on` removes (sessions are moved), `report` only counts what it would remove
+and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
+Every target defaults to `on` except `closedNodeModules`, the build-output targets, `metroCache` and the developer-cache targets, which start at `report`; a target added later starts at
+`report` until its reports have been read. The runner's
+environment sets them, read at each sweep:
+
+| Variable | Effect |
+|---|---|
+| `DORI_CLEANUP_DRY_RUN=1` | every target that is not `off` runs in `report` (empty, `0`, `false`, `no` and `off` leave it unset) |
+| `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` | `<target>=<on\|report\|off>` entries, split by commas or spaces; targets `sandbox`, `omoTmp`, `bunChrome`, `temp`, `varTmp`, `sessionsArchived`, `emptyArtifactDirs`, `memoryAgents`, `worktreePrune`, `closedNodeModules`, `closedAndroidBuild`, `closedExpo`, `closedPods`, `closedCargoTarget`, `metroCache`, `xcodeDerivedData`, `xcodeDeviceSupport`, `simulatorsUnavailable`, `bunCache`, `npmCache`, `pnpmStore` |
+
+An entry that is not understood is ignored and logged as a `RUNNER_CLEANUP_ERROR`.
+
 Each sweep logs one line and rewrites the status file with the full report:
 
 ```text
-RUNNER_CLEANUP at=<iso> sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> worktreePrune=<ok>/<repos> freedBytes=<n> kept=<n> inUse=ok errors=<n> ms=<n>
+RUNNER_CLEANUP at=<iso> [dryRun=1] sandbox=<n> omoTmp=<n> bunChrome=<n> temp=<n> varTmp=<n> sessionsArchived=<n> emptyArtifactDirs=<n> memoryAgents=<n> closedNodeModules=<n> closedAndroidBuild=<n> closedExpo=<n> closedPods=<n> closedCargoTarget=<n> metroCache=<n> worktreePrune=<ok>/<repos> freedBytes=<n> [wouldFreeBytes=<n>] kept=<n> inUse=ok errors=<n> [skipped=<target>.<reason>:<n>,...] ms=<n>
 ```
+
+A target's value is the number removed in `on`, `report:<candidates>/<bytes>B` in `report` (`worktreePrune=report:<records>`),
+`off`, `skip:inUseFailed` when the in-use listing failed, (closed-lane targets) `skip:noRegistry` / `skip:registryFailed`,
+(build output and Metro) `skip:procsFailed` when the process listing (Linux `/proc/*/cmdline`, macOS `ps`; none on Windows)
+failed and `skip:toolRunning` when a process of the target's tool runs, or (developer caches) `skip:platform` / `skip:busy` /
+`skip:processesFailed` / `skip:notInstalled` / `skip:notDue`. `wouldFreeBytes` sums the `report` targets' bytes. `skipped`
+counts the entries left and why: `shielded` (an open lane's, in use, or a secret store), `checkout`, `lock`, `otherUser`,
+`excluded` (a live-session temp name), `archived` (already in the archive), `unsafeRoot`, `recent` (a closed lane's worktree
+active within 3 days or changed within 6 hours, build output within its age, or an Xcode folder changed within its age),
+`reopened` (the lane is open again) and `tracked` (build output git tracks). In `cleanup.json` each
+target carries `mode`, `removed`, `bytes`, `candidates`, `candidateBytes`, `kept`, `errors`, `skipped` and, when it did
+not run, `skip`; the report has `dryRun` and `worktreePrune.{mode,ok,failed,candidates}`. Bytes of a removed browser
+profile or memory agent are its files' total size.
 
 To check a host, read `~/.dori/runner/logs/cleanup.json` there (`at` is the last sweep) or find the `RUNNER_CLEANUP`
 line in the runner's log.
+
+## Closed-lane worktree cleanup
+
+Lane worktrees are not the daily sweep's: the supervisor removes them in two stages, through the lane's runner
+(`lane.git`), the same way for local and remote lanes.
+
+1. **Close (queue).** A lane's close removes nothing. A local close still refuses uncommitted, untracked or unpushed
+   work (unless `--force`), then writes the worktrees it may drop into the closed lane's receipt (`receipt.queue`):
+   each worktree's path and the checkout its `git worktree remove` runs in, and each SHA-bound branch target
+   (repository, PR number, base, branch, merged head SHA, the checkout and remote to delete it from). A remote close
+   queues its worktrees under the runner's reported root, each removed from inside itself (it skips the unpushed check,
+   D10).
+2. **Watcher (remove).** The watcher's closed-lane pass reads each queued worktree again and removes it only when it is
+   clean and has no commit that no remote has (a worktree whose unpushed commits cannot be read stays, with a
+   warning). Then it deletes each queued branch, remote first with a lease on the merged head, then local with a
+   compare-and-delete, both only while the branch is still at that SHA, and also when the worktree was already gone.
+   A branch still checked out in a queued worktree that stays waits for it.
+
+Outside the root: a local lane's queued worktree is removed wherever it is, because its close found it as the lane's
+(named by its key, or recorded) and checked it. Everything else is removed only under the lane's runner's reported
+worktree root (a local lane uses `worktreeRoot` while its runner has reported none): a remote lane's queued
+worktrees, a worktree an older close listed as kept, and the lane's own directory (`cwd`; for a remote lane
+`remoteCwd`) and recorded worktrees that the close never found. A path an open lane uses (`cwd`, `remoteCwd`,
+`worktrees`), the lead's cwd and a worktree the close held with its branch are never removed.
+
+Every removal and delete is an operation row with a read-back, so a supervisor killed anywhere between the queue write
+and the last branch delete finishes on a later pass without repeating an effect. What is done is marked in the queue,
+so it is never repeated after its operation row is pruned. The pass prints `WORKTREE_CLEANED <key> <paths>` and
+`BRANCH_CLEANED <key> <receipt lines>`; a branch that can never be deleted on its binding (protected, or moved off
+the merged head) is one `LANE_WATCH_WARN` and is settled, and one that only has to wait (another open lane names its
+PR, a ref that cannot be read) is one `LANE_WATCH_WARN` for each new reason and is tried again on every pass.
 
 ## Shadow mode (removed)
 
@@ -698,11 +832,15 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 6, so a supervisor accepts runners at 6 and 5. Protocol 6 adds the four secret control frames
+The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 added `secret.put` (since removed; the protocol number stays); protocol 9 adds
+`lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
+that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
 (see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
-**Upgrade the supervisor before its runners**: a proto 5 runner still connects to a proto 6 supervisor, but a proto 6
-runner is refused by a proto 5 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
-nullable `commands.result_json` column in protocol 3; an older file gets it on open and its rows read with no result.
+Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
+warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).
+**Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
+runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
+nullable `commands.result_json` column in protocol 3.
 
 ## Liveness and restarts
 
@@ -711,8 +849,8 @@ never used. A supervisor start counts as the last time it saw each runner it kno
 
 | Silent for | What happens |
 |---|---|
-| 60 s | `RUNNER_STALE machine=<label>` (digest), once |
-| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (digest), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes |
+| 60 s | `RUNNER_STALE machine=<label>` (engine-only), once |
+| 180 s | `RUNNER_OFFLINE machine=<label> runner heartbeat missing ...` (engine-only), and restart decisions start; `HOST_GUARD OFFLINE machine=<label> ...` (urgent) instead when the runner owns open lanes and has sent a heartbeat or hello since the supervisor started (one still reconnecting after a supervisor restart waits for the next row) |
 | 10 min offline, or the probe finds it dead | `HOST_GUARD OFFLINE machine=<label> ...` (urgent), once per disconnect |
 | 30 min offline, or the restart circuit open | the runner is lost: `LANE_RUNNER_LOST <key> runner=<label>` (urgent) once for each open lane it owns; nothing is moved |
 
@@ -722,7 +860,7 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
 - **Unreachable** (ssh fails or times out after 20 s, the machine is unknown, or there is no probe answer): no
   restart; the next decision waits 2 min, doubling to 30 min.
 - **Alive** (`healthy` or `stalled`): the runner is fine and only its connection is down, so it is not restarted.
-  `RUNNER_UNREACHABLE machine=<label>` (digest) is said once per outage.
+  `RUNNER_UNREACHABLE machine=<label>` (engine-only) is said once per outage.
 - **Dead**: a restart is planned as operations row `runner:<label>/restart/<epoch>-<n>`, and then
   the runner's service is restarted on that host (`systemctl --user restart dori-runner.service`, or
   `launchctl kickstart -k` on the recorded launchd domain on macOS). A hello with a higher gen within 2 minutes
@@ -730,7 +868,9 @@ Each decision runs `dori runner probe --json` on the runner's host: over ssh for
   follows the backoff.
 
 The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello ends a disconnect, with
-`HOST_GUARD ONLINE machine=<label>` when it had woken the lead with `HOST_GUARD OFFLINE`.
+`HOST_GUARD ONLINE machine=<label>` when it had woken the lead with `HOST_GUARD OFFLINE`. Each such
+`HOST_GUARD OFFLINE` and `HOST_GUARD ONLINE` is also posted as a system notice to the alerts channel (config
+`alertsChannel`, else the first `discordChannels` entry).
 
 Outages have hysteresis per machine: an outage ends only once the runner has stayed connected for 10 minutes. A
 disconnect before then folds into the same outage: no new `RUNNER_STALE` or `RUNNER_OFFLINE`, and owned lanes do not
@@ -748,8 +888,8 @@ that fails logs `RUNNER_UPGRADE_FAILED runner=<label> ...` (urgent) and keeps it
 the next runner.
 
 The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_FAILED`, `RUNNER_FORGED_EVENT`, `RUNNER_AUTH_FAILED`,
-`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_ONLINE`, `RUNNER_UNREACHABLE`, `RUNNER_RESTARTED`,
-`RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest.
+`RUNNER_OUTBOX_LARGE` and `RUNNER_UPGRADE_FAILED`. `RUNNER_ONLINE`, `RUNNER_RESTARTED`, `RUNNER_RESTART_FAILED`, `RUNNER_PROTO_MISMATCH` and `RUNNER_CONFLICT` are digest;
+`RUNNER_STALE`, `RUNNER_OFFLINE`, `RUNNER_UNREACHABLE` and `RUNNER_UNAVAILABLE` are engine-only (journaled, never delivered).
 
 ## Command durability
 
@@ -814,16 +954,47 @@ for the bundle). In a lane that CLI takes only `report`, `claim-done` and `heavy
 other command exits 2 with `DORI_CLI_UNSUPPORTED_ON_RUNNER <cmd>`. A report goes over `~/.dori/runner/sock/lane.d/lane`
 with the lane's token. The socket has a directory of its own so the Linux lane sandbox can bind the directory rather
 than the socket file: a restarted runner binds a new socket at the same path, and a lane started before the restart
-reaches it. The runner also serves the older `~/.dori/runner/sock/lane`, and a lane's CLI falls back to it when the
-`lane.d` connect fails (a sandbox set up before the move). The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
+reaches it. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
 
-**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>", "names": ["NPM_TOKEN"]}`,
-sent by the lane's `dori secret exec NAME... -- <cmd>`. `names` holds 1 to 32 unique secret names (else
-`RUNNER_LANE_BAD_REQUEST`), and the token is checked first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "..."}}`;
-a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_MISSING`,
-`RUNNER_SECRET_FAILED`). The local runner grants from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
+**Agent state in herdr.** The lane sandbox keeps herdr's control socket out of reach, so omo's herdr extension in a
+sandboxed lane cannot report its state there itself. On Linux and macOS the runner serves each lane its own socket,
+`~/.dori/runner/sock/herdr.d/<key>/herdr` (opened before the lane's command runs, removed by `lane.close`), and the lane
+sandbox makes only that lane's one reachable and points `HERDR_SOCKET_PATH` at it. A line there is herdr's own socket
+request. The runner checks it against a closed list of methods and parameters, forwards it to herdr's socket
+(`HERDR_SOCKET_PATH`, else `<XDG_CONFIG_HOME or ~/.config>/herdr/herdr.sock`) and relays herdr's reply. Below, the own
+pane is the one the runner records for the lane, the own tab is the tab herdr reports for that pane (asked of herdr,
+never taken from the lane), and lane panes are the panes this runner split off for the lane. That set lives in the
+runner's memory: a pane leaves it on a successful `pane.close`, and the whole set goes when the lane's socket closes.
+
+- `ping` with no parameters, so the herdr CLI works inside a lane.
+- `pane.report_agent`, `pane.release_agent` and `pane.report_agent_session` for the own pane; `pane.report_metadata`
+  for the own pane or a lane pane (no workspace metadata). `resume_argv`, a command herdr would run outside the
+  sandbox, is refused.
+- `pane.get` and `pane.read` for a pane in the own tab; `pane.list` and `pane.layout`, with the reply cut down to the
+  own tab.
+- `pane.split` of the own pane or a lane pane, with only `target_pane_id`, `direction`, `ratio`, `cwd`, `focus` and
+  `right_click` (no env, no command). The new pane joins the lane panes.
+- `pane.rename`, `pane.close`, `pane.resize` and `pane.zoom` for a lane pane only, never the own pane.
+- `pane.send_input` (herdr's `pane run`) to a lane pane, once per pane, with `keys` absent or `["Enter"]`. A split pane
+  starts herdr's shell outside the sandbox, so the runner rewrites the text to
+  `exec <prefix> /bin/sh -c '<original text>'`. The prefix is the one the lane's own agent was started behind (the
+  lane env and the sandbox wrapper), kept as `sandboxPrefix` in the lane record, so the command gets the lane's
+  sandbox and the pane ends with it. A lane started unsandboxed gets its text through unchanged. A sandboxed lane
+  whose record predates `sandboxPrefix` is refused until it's relaunched. After that first command,
+  `pane.send_text` and `pane.send_keys` may reach the pane.
+
+This is what omo's DAG pane needs: it splits a pane beside the lane, runs its viewer there, and the viewer closes its
+own pane when done. Any other method, a pane outside these rules or an unknown field gets herdr's error reply shape
+(`{"id", "error": {"code": "forbidden" | "invalid_request", "message"}}`) and logs `HERDR_REPORT_REFUSED`; nothing
+reaches herdr. Windows has no lane herdr socket.
+
+**Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>"}`,
+sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked
+first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "...", ...}}`;
+a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_FAILED`). The
+local runner answers from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
 a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
 logged or put in the outbox. See [secrets.md](secrets.md).
 
@@ -831,6 +1002,8 @@ logged or put in the outbox. See [secrets.md](secrets.md).
 
 Protocol 6. A remote runner sends `secret.get {rid, key, names, repo?}` (`rid`: 32 random hex chars; `repo`: the lane's
 `owner/repo` read from its worktree) and the supervisor answers `secret.value {rid, ok, code?, detail?, sealed?}`.
+Current runners send an empty `names` and get every store value; a non-empty list from an older runner gets just those
+names. There's no allowlist: the supervisor checks only the link, lane ownership and `allowUnsandboxed`.
 `secret.run {rid, key, op, repo?}` asks the supervisor host to run the configured command `op`; the answer is
 `secret.run.result`, shaped like `secret.value`. A refusal carries `ok: false` and a `RUNNER_SECRET_*` code
 (`DENIED`, `MISSING`, `FAILED`, `UNSUPPORTED`, `OUTDATED` when either side speaks protocol < 6, `TIMEOUT` when the runner
@@ -861,7 +1034,7 @@ so an event acked just before a crash is still stored.
 
 **Sweeps without a runner.** The supervisor's watch, dead-panes and freshness sweeps read a machine only through an
 admitted connection. While a runner has none (after a supervisor restart, before its hello, or while it is gone) its
-lanes are skipped without a line per lane, and the sweeps say `RUNNER_UNAVAILABLE runner=<label>` (digest) once per
+lanes are skipped without a line per lane, and the sweeps say `RUNNER_UNAVAILABLE runner=<label>` (engine-only) once per
 outage; the archive's worktree cleanup runs right after the local runner's hello.
 
 **Evacuate.** `dori runner evacuate <label>` is the forced rollback for a runner that cannot be used. In order:

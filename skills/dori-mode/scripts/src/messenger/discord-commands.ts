@@ -1,5 +1,6 @@
 import { type ArgvTemplate, type DiscordConfig, fill } from "../config.ts";
 import { disabledRows, type HookInteraction, hookInteraction, type HookSpawner, spawnButtonHook } from "./discord-buttons.ts";
+import { type DecideInteraction, decideInteraction } from "./decision-buttons.ts";
 import type { Http } from "./http.ts";
 import { MessengerError } from "./http.ts";
 
@@ -28,23 +29,34 @@ type Interaction = {
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 
-/** The close-thread button's custom_id carries the thread id, so a click works after a restart with no stored state. */
+/**
+ * The close-thread button's custom_id carries the thread id, so a click works after a restart with no stored state. No
+ * button is posted any more (`dori supervise` closes a finished thread itself); clicks on buttons posted before still work.
+ */
 const CLOSE_THREAD = /^dori:close-thread:(\d+)$/;
 const closeRow = (threadId: string, closed: boolean) => [{
   type: 1,
   components: [{ type: 2, style: 2, label: closed ? "닫았습니다" : "스레드 닫기", custom_id: `dori:close-thread:${threadId}`, ...(closed ? { disabled: true } : {}) }],
 }];
-/** The action row `dori reported` attaches to a lane's finish report in its thread. */
-export const closeThreadButton = (threadId: string): unknown[] => closeRow(threadId, false);
 /** Called after the owner's click archived `threadId`; `interactionId` is unique per click. */
 export type ThreadClosed = (threadId: string, interactionId: string) => Promise<void>;
 /** Called after the owner's button click started hook `name`; `channel` is the message's channel or thread. */
 export type ButtonClicked = (name: string, arg: string, channel: string, interactionId: string) => Promise<void>;
+/**
+ * Routes the owner's answer-button click on option `choice` of `decision`, made in `channel` (`late`: past Discord's
+ * answer window); resolves to the owner's reply (none when the thread's `[System]` notice confirms the answer) and the
+ * buttons as they should now show (decision-inbound.ts routeDecisionClick).
+ */
+export type DecisionClicked = (click: {
+  readonly decision: string; readonly choice: number; readonly channel: string; readonly interaction: string; readonly late: boolean;
+}) => Promise<{ readonly content?: string; readonly components?: readonly unknown[] }>;
 export type ButtonHookOptions = {
   /** config `buttonHooks`: hook name -> argv template. */
   readonly hooks?: Readonly<Record<string, ArgvTemplate>>;
   readonly spawn?: HookSpawner;
   readonly clicked?: ButtonClicked;
+  /** Answer buttons (`dori:decide:`); without it every such click gets the unknown-button reply. */
+  readonly decide?: DecisionClicked;
 };
 
 type CloseInteraction = {
@@ -197,9 +209,60 @@ export class DiscordCommands {
       .catch(() => { console.error(`Discord button ${interaction.name} event failed`); });
   }
 
+  /**
+   * An answer-button click: a non-owner (or a foreign application or guild) and a click with no router get an ephemeral
+   * reply. The owner's click is acknowledged at once (deferred, nothing shown yet), then routed (`decide` checks the
+   * thread, the decision's state and whether the lane can take it); its buttons are updated to show the choice and the
+   * reply, when the router gives one, follows as an ephemeral message (a first direct answer has none: the thread's
+   * `[System]` notice is its one visible confirmation). A failed route records nothing the router did not record and tells the owner
+   * to type the number.
+   *
+   * A click whose acknowledgement fails is still routed, as `late`: made while the supervisor was restarting, it reaches
+   * the next process when it resumes the gateway session, past Discord's 3 s answer window, so the interaction can no
+   * longer answer. Then the buttons are updated with the bot's own token and the reply is posted in the thread, where the
+   * owner sees it.
+   */
+  private async decideButton(interaction: DecideInteraction): Promise<void> {
+    const callback = `/interactions/${interaction.id}/${interaction.token}/callback`;
+    const refuse = (content: string) => this.request("POST", callback, { type: 4, data: { flags: 64, content } })
+      .catch(() => { console.error(`Discord decision button ${interaction.decision} acknowledgement failed`); });
+    if (interaction.application_id !== this.config.applicationId || interaction.guild_id !== this.config.guildId || interaction.userId !== this.config.ownerId) {
+      return refuse("이 버튼은 오너만 누를 수 있습니다.");
+    }
+    if (!this.buttons.decide) return refuse("알 수 없는 버튼입니다.");
+    let late = false;
+    try { await this.request("POST", callback, { type: 6 }); }
+    catch {
+      late = true;
+      console.error(`Discord decision button ${interaction.decision} acknowledgement failed; routing it late`);
+    }
+    let result: { readonly content?: string; readonly components?: readonly unknown[] };
+    try {
+      result = await this.buttons.decide({ decision: interaction.decision, choice: interaction.choice, channel: interaction.channel, interaction: interaction.id, late });
+    } catch {
+      console.error(`Discord decision button ${interaction.decision} routing failed`);
+      result = { content: "답을 기록하지 못했습니다. 번호를 스레드에 적어 주세요." };
+    }
+    const webhook = `/webhooks/${interaction.application_id}/${interaction.token}`;
+    const message = late
+      ? interaction.message ? `/channels/${interaction.channel}/messages/${interaction.message}` : undefined
+      : `${webhook}/messages/@original`;
+    if (result.components && message) {
+      await this.request("PATCH", message, { components: result.components }, late)
+        .catch(() => { console.error(`Discord decision button ${interaction.decision} update failed`); });
+    }
+    if (result.content === undefined) return;
+    const reply = late
+      ? this.request("POST", `/channels/${interaction.channel}/messages`, { content: `[System] 재시작 중에 누른 버튼(${interaction.decision} ${interaction.choice}번)입니다. ${result.content}`, allowed_mentions: { parse: [] } }, true)
+      : this.request("POST", webhook, { content: result.content, flags: 64 });
+    await reply.catch(() => { console.error(`Discord decision button ${interaction.decision} reply failed`); });
+  }
+
   async handle(value: unknown): Promise<void> {
     const close = closeInteraction(value);
     if (close) return this.closeThread(close);
+    const decide = decideInteraction(value);
+    if (decide) return this.decideButton(decide);
     const hook = hookInteraction(value);
     if (hook) return this.hookButton(hook);
     const interaction = commandInteraction(value);

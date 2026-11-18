@@ -2,7 +2,7 @@ import type {
   AnyRunnerEvent, CommandResults, CommandStatusState, DurableCommandType, QueryBodies, QueryResults, QueryType, RunnerControl, SupervisorCommandBodies,
 } from "./protocol.ts";
 import type { RunnerAccept } from "./serve.ts";
-import { checkLaneFilesBody } from "../lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
  * The supervisor's awaitable runner calls (design D6): durable effects await their `cmd.result` by `cmdId`, read-only
@@ -55,6 +55,7 @@ export const NEEDS_PROTO: Partial<Record<DurableCommandType | QueryType, number>
   "q.panes": 3, "q.screen": 3, "q.process": 3, "q.stat": 3, "q.lane.inspect": 3, "q.machine.observe": 3,
   "host.herdr": 4,
   "wait.check": 5, "job.run": 5,
+  "lane.attach": 7,
 };
 export const isFileOperation = (type: string): type is "lane.start" | "lane.recover" | "q.lane.files" =>
   type === "lane.start" || type === "lane.recover" || type === "q.lane.files";
@@ -121,13 +122,26 @@ const LATE_REMEMBERED = 1000;
 
 export class RunnerCalls implements RunnerCall {
   private readonly cmdWaiters = new Map<string, Set<Waiter<CmdResultBody>>>();
-  private readonly queryWaiters = new Map<string, Waiter<QueryAnswer>>();
+  private readonly queryWaiters = new Map<string, Set<Waiter<QueryAnswer>>>();
   /** `cmd.status` waiters by `<label> <cmdId>`. */
   private readonly statusWaiters = new Map<string, Set<Waiter<CommandStatusState>>>();
   private readonly late = new Set<string>();
   private n = 0;
 
   constructor(private readonly deps: RunnerCallsDeps) {}
+
+  private wait<V>(map: Map<string, Set<Waiter<V>>>, key: string, label: string, timeoutMs: number, timeout: () => Error): Promise<V> {
+    return new Promise<V>((resolve, reject) => {
+      const waiter: Waiter<V> = { label, resolve, reject, timer: undefined };
+      const waiters = map.get(key) ?? new Set<Waiter<V>>();
+      waiters.add(waiter);
+      map.set(key, waiters);
+      waiter.timer = this.deps.timers.set(() => {
+        this.dropWaiter(map, key, waiter);
+        reject(timeout());
+      }, timeoutMs);
+    });
+  }
 
   connected(label: string): boolean {
     return this.deps.accept.connected(label);
@@ -151,16 +165,8 @@ export class RunnerCalls implements RunnerCall {
     const cmdId = opts.cmdId ?? newCmdId(type, (body as { key?: string }).key, this.deps.now(), this.n);
     if (type === "lane.start" || type === "lane.recover") checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
     const timeoutMs = opts.timeoutMs ?? COMMAND_TIMEOUTS[type] ?? CALL_TIMEOUT_MS;
-    const answer = new Promise<CmdResultBody>((resolve, reject) => {
-      const waiter: Waiter<CmdResultBody> = { label, resolve, reject, timer: undefined };
-      const set = this.cmdWaiters.get(cmdId) ?? new Set<Waiter<CmdResultBody>>();
-      set.add(waiter);
-      this.cmdWaiters.set(cmdId, set);
-      waiter.timer = this.deps.timers.set(() => {
-        this.dropCmdWaiter(cmdId, waiter);
-        reject(new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
-      }, timeoutMs);
-    });
+    const answer = this.wait(this.cmdWaiters, cmdId, label, timeoutMs,
+      () => new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
     const key = (body as { key?: string }).key;
     const recorded = ATTEMPT_TYPES.has(type) && this.deps.attempts !== undefined;
     if (recorded) this.deps.attempts?.record(label, type, cmdId, key, body);
@@ -186,25 +192,16 @@ export class RunnerCalls implements RunnerCall {
     this.n += 1;
     const qid = `q:${this.deps.now()}:${this.n}`;
     const timeoutMs = opts.timeoutMs ?? QUERY_TIMEOUT_MS;
-    const answer = new Promise<QueryAnswer>((resolve, reject) => {
-      const waiter: Waiter<QueryAnswer> = { label, resolve, reject, timer: undefined };
-      this.queryWaiters.set(qid, waiter);
-      waiter.timer = this.deps.timers.set(() => {
-        if (this.queryWaiters.get(qid) !== waiter) return;
-        this.queryWaiters.delete(qid);
-        reject(new RunnerUnavailable(label, "timeout", `no q.result for ${type} ${qid} within ${timeoutMs} ms`));
-      }, timeoutMs);
-    });
+    const answer = this.wait(this.queryWaiters, qid, label, timeoutMs,
+      () => new RunnerUnavailable(label, "timeout", `no q.result for ${type} ${qid} within ${timeoutMs} ms`));
     let sent;
     try { sent = this.deps.accept.control(label, type, { ...body, qid } as QueryBodies[T]); }
     catch (e) {
-      const waiter = this.queryWaiters.get(qid);
-      if (waiter) { this.deps.timers.clear(waiter.timer); this.queryWaiters.delete(qid); }
+      for (const waiter of [...(this.queryWaiters.get(qid) ?? [])]) this.dropWaiter(this.queryWaiters, qid, waiter);
       throw e;
     }
     if (!sent) {
-      const waiter = this.queryWaiters.get(qid);
-      if (waiter) { this.deps.timers.clear(waiter.timer); this.queryWaiters.delete(qid); }
+      for (const waiter of [...(this.queryWaiters.get(qid) ?? [])]) this.dropWaiter(this.queryWaiters, qid, waiter);
       answer.catch(() => undefined);
       throw new RunnerUnavailable(label, "disconnected", `${type} was not sent`);
     }
@@ -220,18 +217,10 @@ export class RunnerCalls implements RunnerCall {
   async status(label: string, cmdId: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<CommandStatusState> {
     if (!this.deps.accept.connected(label) || !this.deps.accept.status) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for cmd.status ${cmdId}`);
     const id = `${label} ${cmdId}`;
-    const answer = new Promise<CommandStatusState>((resolve, reject) => {
-      const waiter: Waiter<CommandStatusState> = { label, resolve, reject, timer: undefined };
-      const set = this.statusWaiters.get(id) ?? new Set<Waiter<CommandStatusState>>();
-      set.add(waiter);
-      this.statusWaiters.set(id, set);
-      waiter.timer = this.deps.timers.set(() => {
-        this.dropStatusWaiter(id, waiter);
-        reject(new RunnerUnavailable(label, "timeout", `no cmd.status.result for ${cmdId} within ${timeoutMs} ms`));
-      }, timeoutMs);
-    });
+    const answer = this.wait(this.statusWaiters, id, label, timeoutMs,
+      () => new RunnerUnavailable(label, "timeout", `no cmd.status.result for ${cmdId} within ${timeoutMs} ms`));
     if (!this.deps.accept.status(label, cmdId)) {
-      for (const waiter of [...(this.statusWaiters.get(id) ?? [])]) this.dropStatusWaiter(id, waiter);
+      for (const waiter of [...(this.statusWaiters.get(id) ?? [])]) this.dropWaiter(this.statusWaiters, id, waiter);
       answer.catch(() => undefined);
       throw new RunnerUnavailable(label, "disconnected", `cmd.status ${cmdId} was not sent`);
     }
@@ -244,7 +233,7 @@ export class RunnerCalls implements RunnerCall {
     const waiters = [...(this.statusWaiters.get(id) ?? [])];
     if (!waiters.length) return this.noteLate(`status=${frame.body.cmdId}`, label);
     for (const waiter of waiters) {
-      this.dropStatusWaiter(id, waiter);
+      this.dropWaiter(this.statusWaiters, id, waiter);
       waiter.resolve(frame.body.state);
     }
   }
@@ -260,32 +249,34 @@ export class RunnerCalls implements RunnerCall {
     const waiters = [...(this.cmdWaiters.get(body.cmdId) ?? [])].filter((w) => w.label === label);
     if (!waiters.length) return this.noteLate(`cmdId=${body.cmdId}`, label);
     for (const waiter of waiters) {
-      this.dropCmdWaiter(body.cmdId, waiter);
+      this.dropWaiter(this.cmdWaiters, body.cmdId, waiter);
       waiter.resolve(body);
     }
   }
 
   /** Hub hook: a received `q.result`. */
   onControl(label: string, frame: RunnerControl<"q.result">): void {
-    const waiter = this.queryWaiters.get(frame.body.qid);
-    if (!waiter || waiter.label !== label) return this.noteLate(`qid=${frame.body.qid}`, label);
-    this.queryWaiters.delete(frame.body.qid);
-    this.deps.timers.clear(waiter.timer);
-    waiter.resolve(frame.body);
+    const waiters = [...(this.queryWaiters.get(frame.body.qid) ?? [])].filter((waiter) => waiter.label === label);
+    if (!waiters.length) return this.noteLate(`qid=${frame.body.qid}`, label);
+    for (const waiter of waiters) {
+      this.dropWaiter(this.queryWaiters, frame.body.qid, waiter);
+      waiter.resolve(frame.body);
+    }
   }
 
   /** Rejects every pending query of `label`; pending calls keep waiting for the replayed result until their timeout. */
   disconnected(label: string): void {
-    for (const [qid, waiter] of [...this.queryWaiters]) {
-      if (waiter.label !== label) continue;
-      this.queryWaiters.delete(qid);
-      this.deps.timers.clear(waiter.timer);
-      waiter.reject(new RunnerUnavailable(label, "disconnected", "connection lost before q.result"));
+    for (const [qid, waiters] of [...this.queryWaiters]) {
+      for (const waiter of [...waiters]) {
+        if (waiter.label !== label) continue;
+        this.dropWaiter(this.queryWaiters, qid, waiter);
+        waiter.reject(new RunnerUnavailable(label, "disconnected", "connection lost before q.result"));
+      }
     }
     for (const [id, set] of [...this.statusWaiters]) {
       for (const waiter of [...set]) {
         if (waiter.label !== label) continue;
-        this.dropStatusWaiter(id, waiter);
+        this.dropWaiter(this.statusWaiters, id, waiter);
         waiter.reject(new RunnerUnavailable(label, "disconnected", "connection lost before cmd.status.result"));
       }
     }
@@ -298,26 +289,18 @@ export class RunnerCalls implements RunnerCall {
     return n;
   }
 
-  private dropCmdWaiter(cmdId: string, waiter: Waiter<CmdResultBody>): void {
+  private dropWaiter<V>(map: Map<string, Set<Waiter<V>>>, key: string, waiter: Waiter<V>): void {
     this.deps.timers.clear(waiter.timer);
-    const set = this.cmdWaiters.get(cmdId);
+    const set = map.get(key);
     if (!set) return;
     set.delete(waiter);
-    if (!set.size) this.cmdWaiters.delete(cmdId);
-  }
-
-  private dropStatusWaiter(id: string, waiter: Waiter<CommandStatusState>): void {
-    this.deps.timers.clear(waiter.timer);
-    const set = this.statusWaiters.get(id);
-    if (!set) return;
-    set.delete(waiter);
-    if (!set.size) this.statusWaiters.delete(id);
+    if (!set.size) map.delete(key);
   }
 
   private rejectCmd(cmdId: string, label: string, error: Error): void {
     for (const waiter of [...(this.cmdWaiters.get(cmdId) ?? [])]) {
       if (waiter.label !== label) continue;
-      this.dropCmdWaiter(cmdId, waiter);
+      this.dropWaiter(this.cmdWaiters, cmdId, waiter);
       waiter.reject(error);
     }
   }

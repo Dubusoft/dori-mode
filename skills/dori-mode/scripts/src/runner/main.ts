@@ -4,35 +4,40 @@ import { join } from "node:path";
 import { laneCliMain } from "./lane-cli.ts";
 import { type Observation, pruneCommandRecords, resolveInterrupted } from "./durability.ts";
 import { RunnerLanes } from "./lanes.ts";
-import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, legacyLaneSocketPath, serveLaneSocket } from "./lane-socket.ts";
-import { appendSecretAudit, laneRepoOf, secretAuditPath, secretGranter } from "./secret-grant.ts";
+import { browserWindowCheck } from "./browser-window.ts";
+import { HerdrReportSockets } from "./herdr-report.ts";
+import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
+import { laneRepoOf, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
 import { laneGitEffect } from "./lane-git.ts";
+import { ensureOmoLaneProfile } from "./omo-profile.ts";
 import { runnerPolicy } from "./local-policy.ts";
 import { policyReloader } from "./policy-reload.ts";
 import { watchConfigFiles } from "../config-watch.ts";
 import { workspaceReport, type WorkspaceReport } from "./workspaces.ts";
 import { queryDispatcher } from "./queries.ts";
-import { checkFileBody } from "./lane-files.ts";
+import { checkLaneFilesBody } from "../lane-file-contract.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS } from "./fs-safety.ts";
 import { connectUnix as connectLane, listenUnix } from "./unix-transport.ts";
 import { diskGuardPath, readWinSample, runnerSampleArgv, sampleHost, winSampleSource } from "../host-guard.ts";
 import { sampleProcs } from "../lane-memory.ts";
 import type { Pane } from "../panes.ts";
+import { listPanes } from "../panes.ts";
 import { parseArgs } from "node:util";
 import { configPath, loadConfig } from "../config.ts";
 import { realClock, run, type Runner, setDefaultRunTimeout } from "../run.ts";
 import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
-import { removeLegacyGuardAgent } from "./legacy-guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
-import { HerdrWatch } from "./herdr-watch.ts";
+import { HerdrWatch, herdrProcess } from "./herdr-watch.ts";
 import { selectPlatform } from "./platform.ts";
-import { CLEANUP_STATUS_FILE, cleanupPaths, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
+import { processCommands } from "./cleanup-artifacts.ts";
+import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
+import { processList, readLastRuns } from "./cleanup-dev-caches.ts";
 import { herdrPaused, hostHerdr } from "./herdr-control.ts";
 import type { HerdrAction } from "./protocol.ts";
 import { HEARTBEAT_MS, RunnerClient } from "./client.ts";
@@ -52,7 +57,7 @@ import { acceptWs } from "./ws-transport.ts";
  * the CLI. Returns the process exit code.
  */
 
-export const RUNNER_HOST_USAGE = "usage: runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | runner probe [--json]";
+export const RUNNER_HOST_USAGE = "usage: runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | runner probe [--json] | runner omo-profile";
 
 class Exit extends Error {
   constructor(readonly code: number, message: string) { super(message); }
@@ -92,9 +97,10 @@ export const runnerEffects = (deps: {
   "lane.pause": async (command) => deps.lanes.pause(command.body.key, command.body.step),
   "lane.resume": async (command) => deps.lanes.resume(command.body.key),
   "lane.notify": async (command) => deps.lanes.notify(command.body),
+  "lane.attach": async (command) => deps.lanes.attach(command.body),
   "lane.git": async (command) => laneGitEffect(deps.run, command.body),
   "lane.recover": async (command) => {
-    if (command.body.files) checkFileBody(command.body.key, command.body);
+    if (command.body.files) checkLaneFilesBody(command.body.key, command.body);
     return deps.lanes.recover(command.body.key, command.body.session, command.body.tabWorkspace, command.body.briefText, command.body.files);
   },
   "lane.observe": async (command) => deps.lanes.observe(command.body.key),
@@ -162,22 +168,27 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       return [...owned, ...observedOnly.filter((l) => !owned.some((o) => o.key === l.key))];
     };
     // The lanes this runner started are attributed from its own records, whatever runs in their panes now.
-    const ownedPanes = async (panes: readonly Pane[]): Promise<Map<string, string>> => {
+    const ownedPanes = async (panes: readonly Pane[], instance: string): Promise<Map<string, string>> => {
       const owned = new Map<string, string>();
       for (const record of Object.values(runnerLanes.records())) {
-        const pane = await runnerLanes.currentPane(record, panes);
+        const pane = await runnerLanes.currentPane(record, panes, instance);
         if (pane) owned.set(pane.pane_id, record.key);
       }
       return owned;
     };
-    const observedLanes = () => observeHost({ run, owned: ownedPanes, ...(winSample ? { procs: hostProcs } : {}) });
+    const observedLanes = async () => {
+      const [panes, process] = await Promise.all([listPanes(run), herdrProcess(run)]);
+      const instance = process.instance ?? "";
+      const owned = await ownedPanes(panes, instance);
+      return { lanes: await observeHost({ run, panes, owned: async () => owned, ...(winSample ? { procs: hostProcs } : {}) }), panes, instance };
+    };
     const observe = async () => {
-      const lanes = await observedLanes();
+      const { lanes, panes, instance } = await observedLanes();
       const observed = lanes.map(({ status: _status, ...lane }) => lane);
       // The lanes this runner started come first; the rest are lanes it only observes on its host.
       observedOnly = observed;
       // An owned lane waiting on an on-screen question goes out as one lane.asking per question.
-      await runnerLanes.askTick().catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
+      await runnerLanes.askTick(panes, instance).catch((e: unknown) => { log(`RUNNER_LANE_ASK_FAILED ${e instanceof Error ? e.message : String(e)}`); });
       return lanes;
     };
     const version = await runnerVersion(run, import.meta.dir);
@@ -197,7 +208,16 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       client.publish(type, body);
     };
     // Every runner owns its host's lanes: the local runner on the lead host as well as a worker's.
-    const runnerLanes = new RunnerLanes({ runnerDir, run, clock: realClock, policy, publish, remote, ...(winSample ? { procs: hostProcs } : {}) });
+    // A sandboxed lane reports its agent state to herdr through a socket of its own (herdr-report.ts); Windows has no lane sandbox.
+    let lanesForReports: RunnerLanes | undefined;
+    const herdrReports = process.platform === "win32" ? undefined
+      : new HerdrReportSockets({ runnerDir, log, laneOf: (key) => lanesForReports?.records()[key] });
+    const browserCheck = browserWindowCheck(platform.os, { run, clock: realClock, log });
+    const runnerLanes = new RunnerLanes({
+      runnerDir, run, clock: realClock, policy, publish, remote,
+      ...(winSample ? { procs: hostProcs } : {}), ...(herdrReports ? { herdrReports } : {}), ...(browserCheck ? { browserCheck } : {}),
+    });
+    lanesForReports = runnerLanes;
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
     const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir), platform: process.platform });
@@ -210,12 +230,6 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       kill: { clock: realClock, alive: platform.pidAlive, signal: platform.signal },
       publish: (type, body) => { client?.publish(type, body); },
     });
-    try {
-      const removed = removeLegacyGuardAgent(homedir());
-      if (removed.length) log(`RUNNER_GUARD_AGENT_REMOVED ${removed.join(",")}`);
-    } catch (error) {
-      log(`RUNNER_GUARD_AGENT_REMOVE_FAILED ${error instanceof Error ? error.message : String(error)}`);
-    }
     const dispatch = commandDispatcher({
       state, policy, realpath: realpathSync, runnerDir, log,
       publish: (body) => { client?.publish("cmd.result", body); },
@@ -299,8 +313,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     guardTick();
     const stopGuard = realEvery(GUARD_SAMPLE_MS, guardTick);
     // The daily cleanup sweep of this host's caches and temp (cleanup.ts); `logs/cleanup.json` holds the last report.
+    const cleanupStatus = join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE);
     const stopCleanup = startCleanup({
-      statusFile: join(ensureRunnerSubdir(runnerDir, RUNNER_PATHS.logs), CLEANUP_STATUS_FILE),
+      statusFile: cleanupStatus,
       now: realClock.now, every: realEvery, log,
       delay: (ms, fn) => { const timer = setTimeout(fn, ms); return () => { clearTimeout(timer); }; },
       sweep: () => {
@@ -311,7 +326,16 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
           openLanes: [...owned, ...observedOnly.map((l) => ({ key: l.key }))],
           keepAgents: [cfg.leadCwd],
           inUse: () => inUsePaths(process.platform, run, process.getuid?.()),
+          procs: () => processCommands(process.platform, run),
           uid: process.getuid?.(),
+          settings: cleanupSettings(process.env),
+          // The supervisor's registry knows which lanes closed (lanes.closed, proto 9); an older supervisor refuses, and the target is skipped.
+          closedLanes: async () => {
+            if (!client) throw new Error("runner client is not initialized");
+            return client.closedLanes();
+          },
+          processes: () => processList(run, process.pid),
+          lastRuns: readLastRuns(cleanupStatus),
         });
       },
     });
@@ -319,7 +343,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     // A lane.start without cwd is checked against `lanes/` (an allowed root) before its own directory exists.
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
-    const laneListeners = [listenUnix(laneSocketPath(runnerDir)), listenUnix(legacyLaneSocketPath(runnerDir))];
+    const laneListeners = [listenUnix(laneSocketPath(runnerDir))];
+    for (const key of Object.keys(runnerLanes.records())) herdrReports?.open(key);
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {
@@ -336,14 +361,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
       };
     } else {
-      const auditFile = appendSecretAudit(secretAuditPath(cfg.stateDir), log);
       const secretStore = new SecretStore();
       const runOp = secretCommandRunner({
         store: secretStore,
         commands: async () => (await loadConfig()).secretCommands,
-        rules: async () => (await loadConfig()).secrets,
         laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-        audit: auditFile, log, runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
+        log, onGranted: addKnownSecrets,
       });
       laneSocketLanes = {
         tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
@@ -351,16 +374,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secretRun: (key, op) => runOp(key, op),
-        secrets: secretGranter({
-          store: secretStore,
-          rules: async () => (await loadConfig()).secrets,
-          laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)),
-          audit: (entry) => {
-            auditFile(entry);
-            log(`${entry.allowed ? "RUNNER_SECRET_GRANTED" : "RUNNER_SECRET_DENIED"} lane=${entry.lane} names=${entry.names.join(",")}${entry.reason ? ` reason=${entry.reason}` : ""}`);
-          },
-          runner: identity.label, now: realClock.now, onGranted: addKnownSecrets,
-        }),
+        secrets: secretGranter({ store: secretStore, onGranted: addKnownSecrets }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
       void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});
@@ -396,6 +410,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       clearTimeout(reposDebounce);
       unwatchRepos();
       stopLaneSocket();
+      herdrReports?.stop();
       stopGuard();
       stopCleanup();
       stopPrune();
@@ -429,6 +444,12 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
     const [sub, ...extra] = parsed.positionals;
     if (extra.length) fail(RUNNER_HOST_USAGE, 2);
     if (sub === "probe") return probeMain(parsed.values.json === true);
+    if (sub === "omo-profile") {
+      // For `dori runner install` on a Mac: the omo profile its sandboxed lanes run under (omo-profile.ts).
+      const line = ensureOmoLaneProfile(homedir());
+      if (line) console.log(line);
+      return 0;
+    }
     if (sub === "export-outbox") {
       // For `dori runner evacuate` over ssh: every event this runner has not had acked, as the frames it would send.
       const runnerDir = defaultRunnerDir();

@@ -147,29 +147,27 @@ test("health schemas are strict throughout the supported protocol window", () =>
   expect(() => decodeFrame(encodeFrame(runnerEvent(head, 2, "guard.sample", { ...event.body, herdr: { state: "down", since: -1 } } as never)), "runner")).toThrow();
 });
 
-test("supervisor uses explicit proto 4 health, keeps proto 3 inference, and routes start outcomes", () => {
+test("supervisor uses explicit proto 4 health and routes start outcomes", () => {
   const store = new Map<string, HerdrRecord>();
   const infer = new HerdrDownInference({ read: (k) => store.get(k), save: (k, v) => { store.set(k, v); } }, () => 100);
   const head = { runner: "lab", gen: 1, epoch: 1 };
   const unreadable = runnerEvent(head, 1, "guard.sample", { level: "ok", reasons: [], sampledAt: 0, panes: -1 });
-  expect(infer.event("lab", unreadable, 4)).toBeUndefined();
-  expect(infer.event("lab", unreadable, 4)).toBeUndefined();
+  expect(infer.event("lab", unreadable)).toBeUndefined();
+  expect(infer.event("lab", unreadable)).toBeUndefined();
   expect(store.has("lab")).toBe(false);
-  expect(infer.event("old", unreadable, 3)).toBeUndefined();
-  expect(infer.event("old", unreadable, 3)?.line).toStartWith("HERDR_DOWN");
   const hung = runnerEvent(head, 2, "herdr.state", { state: "hung", detail: "running" });
-  expect(infer.event("lab", hung, 4)?.line).toStartWith("HERDR_HUNG machine=lab");
-  expect(infer.event("lab", hung, 4)).toBeUndefined();
+  expect(infer.event("lab", hung)?.line).toStartWith("HERDR_HUNG machine=lab");
+  expect(infer.event("lab", hung)).toBeUndefined();
   expect(store.get("lab")?.state).toBe("hung");
   const up = runnerEvent(head, 3, "guard.sample", { level: "ok", reasons: [], sampledAt: 1, panes: -1, herdr: { state: "up", since: 0, instance: "server-2" } });
-  expect(infer.event("lab", up, 4)?.line).toContain("HERDR_UP machine=lab server=server-2");
-  expect(infer.event("lab", runnerEvent(head, 4, "herdr.state", { state: "up", instance: "server-3", detail: "replaced" }), 4)?.line).toContain("HERDR_UP machine=lab server=server-3");
-  expect(infer.event("lab", runnerEvent(head, 5, "herdr.state", { state: "up", instance: "server-3", detail: "same" }), 4)).toBeUndefined();
-  expect(infer.event("lab", runnerEvent(head, 4, "herdr.start", { ok: false, detail: "unit failed" }), 4)?.line).toBe("HERDR_START machine=lab failed unit failed");
+  expect(infer.event("lab", up)?.line).toContain("HERDR_UP machine=lab server=server-2");
+  expect(infer.event("lab", runnerEvent(head, 4, "herdr.state", { state: "up", instance: "server-3", detail: "replaced" }))?.line).toContain("HERDR_UP machine=lab server=server-3");
+  expect(infer.event("lab", runnerEvent(head, 5, "herdr.state", { state: "up", instance: "server-3", detail: "same" }))).toBeUndefined();
+  expect(infer.event("lab", runnerEvent(head, 4, "herdr.start", { ok: false, detail: "unit failed" }))?.line).toBe("HERDR_START machine=lab failed unit failed");
   expect(eventClass("HERDR_HUNG machine=lab")).toBe("lead-urgent");
   const elevated = runnerEvent(head, 6, "herdr.state", { state: "elevated", detail: "refused" });
   expect(decodeFrame(encodeFrame(elevated), "runner")).toEqual(elevated);
-  expect(infer.event("lab", elevated, 4)?.line).toStartWith("HERDR_ELEVATED machine=lab lane recovery on this machine is held");
+  expect(infer.event("lab", elevated)?.line).toStartWith("HERDR_ELEVATED machine=lab lane recovery on this machine is held");
   expect(store.get("lab")?.state).toBe("elevated");
   expect(eventClass("HERDR_ELEVATED machine=lab")).toBe("lead-urgent");
 });

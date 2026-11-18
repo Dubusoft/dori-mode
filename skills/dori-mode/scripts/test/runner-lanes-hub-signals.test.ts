@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { askingLine } from "../src/ask-user.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { openLaneReports } from "../src/lane-reports.ts";
+import { openLaneReports } from "../src/lane-report-store.ts";
 import type { RecoveryLane } from "../src/recover.ts";
 import type { Lane } from "../src/registry.ts";
 import { queueLaneMessage, openLaneMessages } from "../src/lane-messages.ts";
@@ -181,6 +181,29 @@ test.each([
   const t = await setup(extra as Partial<Lane>);
   await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "dead", pane, reason: "agent-gone" }));
   expect(t.emitted).toEqual([]);
+});
+
+test("RUNNER_LANE_DEAD is raised once per lane and pane until the lane is seen alive there or starts again", async () => {
+  const t = await setup();
+  const dead = (pane: string) => t.event("lane.state", { key: "lane-a", status: "dead", pane, reason: "agent-gone" });
+  await acceptLaneEvent(t.hub, "worker-a", dead("p1"));
+  await acceptLaneEvent(t.hub, "worker-a", dead("p1"));
+  expect(t.emitted.map(([id]) => id)).toEqual(["runner-lane-dead:worker-a:1"]);
+  expect((await t.read())?.deadAlertPane).toBe("p1");
+  // missing is not alive: the alert stays held.
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "missing", pane: "p1", reason: "pane-missing" }));
+  await acceptLaneEvent(t.hub, "worker-a", dead("p1"));
+  expect(t.emitted).toHaveLength(1);
+  // Alive again on p1, then dead: a new alert.
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.state", { key: "lane-a", status: "idle", pane: "p1" }));
+  expect((await t.read())?.deadAlertPane).toBeUndefined();
+  await acceptLaneEvent(t.hub, "worker-a", dead("p1"));
+  expect(t.emitted.map(([id]) => id)).toEqual(["runner-lane-dead:worker-a:1", "runner-lane-dead:worker-a:6"]);
+  // A fresh start clears it too, and its pane's dead is raised.
+  await acceptLaneEvent(t.hub, "worker-a", t.event("lane.started", { key: "lane-a", pane: "p1", tab: "t1", session: "" }));
+  expect((await t.read())?.deadAlertPane).toBeUndefined();
+  await acceptLaneEvent(t.hub, "worker-a", dead("p1"));
+  expect(t.emitted).toHaveLength(3);
 });
 
 test("the owner's lane.state dead carries the runner's reason into RUNNER_LANE_DEAD", async () => {

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,43 +8,50 @@ import { Registry } from "../src/registry.ts";
 import type { Clock, Ran, Runner } from "../src/run.ts";
 import { Database } from "bun:sqlite";
 
-import { GITHUB_FILE, loadGithub } from "../src/github-events.ts";
+import { loadGithub } from "../src/github-events.ts";
 import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
 import type { CommandResults, LaneInspection, TurnEvidence, LaneOutputFiles } from "../src/runner/protocol.ts";
 import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
-import { JOURNAL_FILE, SQLITE_FILE, SqliteStore, type StoreKind } from "../src/store.ts";
+import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import type { Journal } from "../src/supervise.ts";
+import type { Wake } from "../src/lead-wakes.ts";
 import { BUILT_IN, builtInTunables, type Tunables } from "../src/tunables.ts";
 
-/** The journal store the suite runs against: DORI_TEST_STORE=sqlite runs every supervisor test on supervisor.sqlite. */
-export const TEST_STORE: StoreKind = process.env.DORI_TEST_STORE === "sqlite" ? "sqlite" : "json";
-
-/** The supervisor journal as stored, whichever store the suite runs on. */
+/** The supervisor journal as stored. */
 export const readJournal = (stateDir: string): any => {
-  if (TEST_STORE === "json") return JSON.parse(readFileSync(join(stateDir, JOURNAL_FILE), "utf8"));
   const store = new SqliteStore(join(stateDir, SQLITE_FILE));
   try { return store.read(false); } finally { store.close(); }
 };
 
-/** The GitHub poll state as stored, whichever store the suite runs on. */
+/** The GitHub poll state as stored. */
 export const readGithub = (stateDir: string): any => {
-  if (TEST_STORE === "json") return JSON.parse(readFileSync(join(stateDir, GITHUB_FILE), "utf8"));
   const db = new Database(join(stateDir, SQLITE_FILE), { readonly: true });
   try { return loadGithub(db); } finally { db.close(); }
 };
 
 /** Seeds the journal a supervisor will start from, replacing any stored one. */
 export const writeJournal = (stateDir: string, journal: unknown): void => {
-  if (TEST_STORE === "json") { writeFileSync(join(stateDir, JOURNAL_FILE), JSON.stringify(journal)); return; }
   for (const suffix of ["", "-wal", "-shm"]) rmSync(join(stateDir, `${SQLITE_FILE}${suffix}`), { force: true });
   const store = new SqliteStore(join(stateDir, SQLITE_FILE), { create: true });
   try { store.save(journal as Journal, "normal"); } finally { store.close(); }
 };
 
-/** Every byte the journal store holds on disk (for the sqlite store: the database and its WAL). */
-export const journalBytes = (stateDir: string): string => (TEST_STORE === "json" ? [JOURNAL_FILE] : [SQLITE_FILE, `${SQLITE_FILE}-wal`])
+/** Replaces the lead wakes stored in the state dir with `wakes`, in order (each closed one with its calls). */
+export const writeWakes = (stateDir: string, wakes: readonly Wake[]): void => {
+  const store = new SqliteStore(join(stateDir, SQLITE_FILE), { create: true });
+  try {
+    store.database.exec("DELETE FROM lead_wakes");
+    for (const wake of wakes) {
+      store.recordWake({ at: wake.at, session: wake.session, trigger: wake.trigger, kinds: wake.kinds });
+      if (wake.closed) store.closeWake(wake.at, wake.calls);
+    }
+  } finally { store.close(); }
+};
+
+/** Every byte the journal store holds on disk: the database and its WAL. */
+export const journalBytes = (stateDir: string): string => [SQLITE_FILE, `${SQLITE_FILE}-wal`]
   .filter((name) => existsSync(join(stateDir, name))).map((name) => readFileSync(join(stateDir, name), "latin1")).join("");
 
 export type World = {
@@ -56,7 +63,7 @@ export type World = {
   aheadCount: string;
   dirty: string;
   screen: string;
-  panes: { pane_id: string; workspace_id: string; tab_id?: string; agent?: string; agent_status?: string; title?: string; terminal_title?: string; cwd?: string }[];
+  panes: { pane_id: string; workspace_id: string; tab_id?: string; agent?: string; agent_status?: string; title?: string; label?: string; terminal_title?: string; cwd?: string }[];
   /** agent_status the target pane moves to when Enter is pressed (models a lane picking up the message). */
   onEnterStatus?: string;
   /** agent_status the target pane moves to when Escape is pressed (models a running turn stopping). */
@@ -162,11 +169,17 @@ export const manualPause = (): { pause: (ms: number, signal: AbortSignal) => Pro
 };
 
 /**
- * On the sqlite test store, creates the state dir's database as `dori store import` does on a real host: closes, the
- * watcher and recovery keep their operation rows there and refuse a sqlite store without it (STORE_MISSING).
+ * Creates the state dir's database as the supervisor's first start does on a real host: closes, the watcher and
+ * recovery keep their operation rows there and refuse a state dir without it (STORE_MISSING).
  */
 export const withSqliteStore = (stateDir: string): void => {
-  if (TEST_STORE === "sqlite" && !existsSync(join(stateDir, SQLITE_FILE))) new SqliteStore(join(stateDir, SQLITE_FILE), { create: true }).close();
+  if (!existsSync(join(stateDir, SQLITE_FILE))) new SqliteStore(join(stateDir, SQLITE_FILE), { create: true }).close();
+};
+
+/** The state dir's supervisor.sqlite, created first when missing (the Sqlite* stores refuse a state dir without it). */
+export const storePath = (stateDir: string): string => {
+  withSqliteStore(stateDir);
+  return join(stateDir, SQLITE_FILE);
 };
 
 export const withState = (root = tmpdir()): { dir: string; done: () => void } => {
@@ -272,10 +285,11 @@ export const fakeLaneOps = (w: World): LaneOps => {
     },
     git: async (lane, op, opts) => {
       record("git", lane.key, { ...op, ...(opts ? { opts } : {}) }); down(runnerOf(lane));
-      if (op.op === "worktree-remove" && !w.removed.includes(op.path)) w.removed.push(op.path);
+      if ((op.op === "worktree-remove" || op.op === "leftover-remove") && !w.removed.includes(op.path)) w.removed.push(op.path);
       return { code: 0, out: "", err: "" };
     },
     notify: async (lane, notice) => { record("notify", lane.key, notice); },
+    attach: async (lane, tree) => { record("attach", lane.key, tree); down(runnerOf(lane)); return { dir: `/runner/briefs/${lane.key}.files/a0001` }; },
     kill: async (machine, keys) => { record("kill", undefined, { machine, keys }); down(machineRunner(machine)); return []; },
     observe: async (lane) => { record("observe", lane.key, {}); down(runnerOf(lane)); return statusOf(lane); },
     turn: async (lane) => { record("turn", lane.key, {}); down(runnerOf(lane)); return w.turn; },
@@ -303,7 +317,7 @@ export const splitTunables = (patch: Partial<DoriConfig & Tunables>): { readonly
 
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig & Tunables> = {}): FlowDeps & { readonly ops: LaneOps } => {
   const split = splitTunables(patch);
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", store: TEST_STORE, ...split.config };
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", ...split.config };
   const tunables = testTunables(split.tunables);
   // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
   return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, tunables, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),

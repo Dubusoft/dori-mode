@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -7,7 +8,6 @@ import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
 import { SECRET_NAME } from "./secret-name.ts";
-import { type StoreKind, storeOnDisk } from "./store.ts";
 
 export type ArgvTemplate = readonly string[];
 
@@ -32,8 +32,38 @@ export type GuardThresholds = {
 export type MemoryCheckConfig = {
   /** The lead's omo memory repo (holds system/human.md); blank finds omo's repo for `leadCwd` under ~/.omo/memory/agents. */
   readonly repo: string;
+};
+
+/** The config's `memoryLimits`: the sizes `dori memory check`, its daily sweep and the size trigger judge the lead's memory by. */
+export type MemoryLimits = {
   /** human.md above this many KB (1024 bytes) needs condensing. */
-  readonly maxKb: number;
+  readonly humanMaxKb: number;
+  /** omo's advisory for the whole system/ projection (its memory.compile_warn_tokens), in omo's bytes/4 tokens. */
+  readonly systemMaxTokens: number;
+  /** Percent of `humanMaxKb` or `systemMaxTokens` past which the supervisor wakes the lead at once (urgent MEMORY_SIZE). */
+  readonly triggerPct: number;
+};
+
+export const DEFAULT_MEMORY_LIMITS: MemoryLimits = { humanMaxKb: 15, systemMaxTokens: 30_000, triggerPct: 80 };
+
+const MEMORY_LIMIT_KEYS = Object.keys(DEFAULT_MEMORY_LIMITS) as readonly (keyof MemoryLimits)[];
+
+/**
+ * The config's `memoryLimits`: absent keeps the defaults; otherwise `{ "humanMaxKb"?, "systemMaxTokens"?, "triggerPct"? }`,
+ * positive numbers with triggerPct at most 100 (an absent key keeps its default), else TypeError.
+ */
+const memoryLimits = (raw: unknown): MemoryLimits => {
+  const base = DEFAULT_MEMORY_LIMITS;
+  if (raw == null) return base;
+  const bad = new TypeError(`memoryLimits must be { "humanMaxKb"?: KB, "systemMaxTokens"?: tokens, "triggerPct"?: 1-100 } with positive numbers, not ${JSON.stringify(raw)}`);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => !(MEMORY_LIMIT_KEYS as readonly string[]).includes(key))) throw bad;
+  const num = (key: keyof MemoryLimits, fallback: number): number => {
+    const v = raw[key];
+    if (v === undefined) return fallback;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || (key === "triggerPct" && v > 100)) throw bad;
+    return v;
+  };
+  return { humanMaxKb: num("humanMaxKb", base.humanMaxKb), systemMaxTokens: num("systemMaxTokens", base.systemMaxTokens), triggerPct: num("triggerPct", base.triggerPct) };
 };
 
 /**
@@ -168,8 +198,6 @@ export type DoriConfig = {
   readonly displayTimeZone: string;
   /** Owner policy lines every new lane footer carries (merge policy, CI policy, ...); absent or empty adds none. */
   readonly laneRules?: readonly string[];
-  /** Store secrets a lane may receive, by name; a secret with no rule (or an empty one) goes to no lane. */
-  readonly secrets: Readonly<Record<string, SecretRule>>;
   /** Proxy-execution ops (`dori secret run <op>`): the supervisor host runs argv with the listed secrets in its env, outside any lane. */
   readonly secretCommands: Readonly<Record<string, SecretCommand>>;
   /**
@@ -190,6 +218,7 @@ export type DoriConfig = {
   readonly guardMachines: Readonly<Record<string, string>>;
   readonly guard: GuardThresholds;
   readonly memoryCheck: MemoryCheckConfig;
+  readonly memoryLimits: MemoryLimits;
   readonly hooks: Hooks;
   /** Default limit in ms for every external call (herdr, git, df, ...) that sets none itself; 0 turns it off. */
   readonly runTimeoutMs: number;
@@ -201,17 +230,35 @@ export type DoriConfig = {
    * 60 is kept: a deferred lead still gets its events in place, and push-ladder and stuck restarts never wait for it.
    */
   readonly leadChildWaitMaxMin: number;
-  /** Where the supervisor journal lives: "json" (supervisor.json) or "sqlite" (supervisor.sqlite, after `dori store import`); read from `stateDir` (storeOnDisk). */
-  readonly store: StoreKind;
   /** The only base branch the supervisor merges lane PRs into; `main` is refused whatever this says. */
   readonly ciMergeBase: string;
   /** Which machine a launch runs on. */
   readonly placement: PlacementConfig;
   /** Lane drift signals (LANE_DRIFT). */
   readonly drift: DriftConfig;
-  /** `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (always on; `dori autopilot pause` stops it). */
+  /**
+   * `dori autopilot`: which owner-approved toodo tasks may run unattended, and its limits (always on; `dori autopilot pause` stops it).
+   * `executor` (default false) moves reserve, launch and settle from the lead to the supervisor; while it is on the CLI refuses to reserve.
+   */
   readonly autopilot: AutopilotConfig;
+  /**
+   * The PR review gate (review-gate.ts reviewEnabledFor): `repos` lists the owner/repo names (case-insensitive) whose lane
+   * PRs are reviewed before the supervisor merges them. Absent or empty: the gate is off and every claimed green
+   * mergeable lane PR is merged directly.
+   */
+  readonly review?: ReviewConfig;
+  /**
+   * Whose clean done claims the supervisor reports to the owner itself (done-flow.ts, auto-report.ts): `autopilot` (the
+   * default) the lanes an autopilot launch attempt names, `all` every lane but review lanes, `off` none, so every claim
+   * wakes the lead as LANE_DONE_CLAIMED and the lead reports it.
+   */
+  readonly autoReport: AutoReportScope;
 };
+
+export type ReviewConfig = { readonly repos?: readonly string[] };
+
+export const AUTO_REPORT_SCOPES = ["off", "autopilot", "all"] as const;
+export type AutoReportScope = (typeof AUTO_REPORT_SCOPES)[number];
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
 export const LEAD_DIET_EXCLUDED_TOOLS: readonly string[] = [
@@ -245,7 +292,6 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   leadArgs: [],
   discordChannels: [],
   githubIssueAuthors: [],
-  secrets: {},
   secretCommands: {},
   worktreeRoot: "",
   heavySlots: 1,
@@ -253,23 +299,42 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   heavyMaxLoad: 80,
   guardMachines: {},
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, memFreeCritPct: 5, swapFreeCritPct: 5, diskFreeMinGb: 50, panesMax: 20 },
-  memoryCheck: { repo: "", maxKb: 15 },
+  memoryCheck: { repo: "" },
+  memoryLimits: DEFAULT_MEMORY_LIMITS,
   hooks: {},
   runTimeoutMs: 60_000,
   leadStuckRestartMin: 30,
   leadChildWaitMaxMin: 60,
-  store: "json",
   ciMergeBase: "dev",
   displayTimeZone: DEFAULT_DISPLAY_TIME_ZONE,
   placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
   autopilot: DEFAULT_AUTOPILOT,
+  autoReport: "autopilot",
 });
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
   const language = typeof ownerLanguage === "string" ? ownerLanguage.trim() : "";
   return language ? `Write every dori report text and every todo item in ${language}; code, commands, commit messages and PR text follow the repo convention.` : "";
+};
+
+/** The config's `review`: absent is no gated repo; otherwise `{ "repos"?: ["owner/repo", ...] }`, else TypeError. */
+const reviewConfig = (raw: unknown): ReviewConfig => {
+  if (raw == null) return {};
+  const bad = new TypeError(`review must be { "repos"?: ["owner/repo", ...] }, not ${JSON.stringify(raw)}`);
+  if (!isRecord(raw) || Object.keys(raw).some((key) => key !== "repos")) throw bad;
+  if (raw.repos == null) return {};
+  if (!Array.isArray(raw.repos) || raw.repos.some((repo) => typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim()))) throw bad;
+  return { repos: (raw.repos as string[]).map((repo) => repo.trim()) };
+};
+
+/** The config's `autoReport`, trimmed; absent is `autopilot`. Throws TypeError unless it is one of AUTO_REPORT_SCOPES. */
+const autoReport = (raw: unknown): AutoReportScope => {
+  if (raw == null) return "autopilot";
+  const value = typeof raw === "string" ? raw.trim() : raw;
+  if (!AUTO_REPORT_SCOPES.some((scope) => scope === value)) throw new TypeError(`autoReport must be one of ${AUTO_REPORT_SCOPES.join("|")}, not ${JSON.stringify(raw)}`);
+  return value as AutoReportScope;
 };
 
 /** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
@@ -281,25 +346,6 @@ const laneRules = (raw: unknown): readonly string[] => {
 
 export type LaneSandbox = { readonly command: readonly string[] };
 
-/** A GitHub App installation token minted per lane repo instead of a stored value; `keySecret` names the App private key (PEM) in the store. */
-export type GithubAppMint = {
-  readonly kind: "github-app";
-  readonly appId: string;
-  readonly installationId: string;
-  readonly keySecret: string;
-  readonly permissions: Readonly<Record<string, "read" | "write">>;
-};
-
-/** Which lanes (exact key or `prefix-*`) and repos may receive one store secret; both lists empty grants nothing. `as` absent means env; `mint` replaces the stored value with a minted token. */
-export type SecretRule = {
-  readonly lanes: readonly string[];
-  readonly repos: readonly string[];
-  readonly as?: "env" | "ssh-key";
-  readonly mint?: GithubAppMint;
-};
-
-const RULE_SHAPE = `{ "lanes": [strings], "repos": [strings], "as"?: "env" | "ssh-key", "mint"?: { "kind": "github-app", "appId", "installationId", "keySecret", "permissions" } }`;
-
 /** A list-of-strings field; absent is empty, anything else throws `bad(path)`. */
 const stringList = (value: unknown, bad: (what: string) => TypeError, path: string): readonly string[] => {
   if (value === undefined) return [];
@@ -307,35 +353,10 @@ const stringList = (value: unknown, bad: (what: string) => TypeError, path: stri
   return value as string[];
 };
 
-/** The config's `secrets` allowlist; throws TypeError unless absent or { <SECRET_NAME>: { lanes?, repos?, as?, mint? } } (see RULE_SHAPE). */
-const secrets = (raw: unknown): Readonly<Record<string, SecretRule>> => {
-  if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secrets${what} must be { "<SECRET_NAME>": ${RULE_SHAPE} }; \`as: "ssh-key"\` and \`mint\` are exclusive`);
-  if (!isRecord(raw)) throw bad("");
-  const mintOf = (value: unknown, path: string): GithubAppMint => {
-    const nonEmpty = (v: unknown) => typeof v === "string" && v.trim() !== "";
-    if (!isRecord(value) || Object.keys(value).some((key) => !["kind", "appId", "installationId", "keySecret", "permissions"].includes(key))) throw bad(path);
-    const { kind, appId, installationId, keySecret, permissions } = value;
-    if (kind !== "github-app" || !nonEmpty(appId) || !nonEmpty(installationId) || typeof keySecret !== "string" || !SECRET_NAME.test(keySecret)) throw bad(path);
-    if (!isRecord(permissions) || Object.keys(permissions).length === 0) throw bad(`${path}.permissions`);
-    for (const [perm, level] of Object.entries(permissions)) if (!/^[a-z_]+$/.test(perm) || (level !== "read" && level !== "write")) throw bad(`${path}.permissions.${perm}`);
-    return { kind, appId: appId as string, installationId: installationId as string, keySecret, permissions: permissions as Record<string, "read" | "write"> };
-  };
-  return Object.fromEntries(Object.entries(raw).map(([name, rule]) => {
-    if (!SECRET_NAME.test(name) || !isRecord(rule) || Object.keys(rule).some((key) => !["lanes", "repos", "as", "mint"].includes(key))) throw bad(`.${name}`);
-    const { as, mint } = rule;
-    if (as !== undefined && as !== "env" && as !== "ssh-key") throw bad(`.${name}.as`);
-    if (mint !== undefined && as === "ssh-key") throw bad(`.${name}.mint`);
-    return [name, {
-      lanes: stringList(rule.lanes, bad, `.${name}.lanes`),
-      repos: stringList(rule.repos, bad, `.${name}.repos`),
-      ...(as !== undefined ? { as } : {}),
-      ...(mint !== undefined ? { mint: mintOf(mint, `.${name}.mint`) } : {}),
-    }];
-  }));
-};
+/** The longest `secretCommands.<op>.timeoutSec` may be; the op is killed then, so its answer comes no later. */
+export const SECRET_COMMAND_MAX_TIMEOUT_SEC = 3600;
 
-/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match (same rules as `secrets`). */
+/** One proxy-execution op: argv runs on the supervisor host with `secrets` in env for lanes/repos that match. */
 export type SecretCommand = {
   readonly argv: readonly string[];
   readonly secrets: readonly string[];
@@ -359,7 +380,7 @@ const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> =
     const names = stringList(rule.secrets, bad, `.${op}.secrets`);
     if (names.some((name) => !SECRET_NAME.test(name))) throw bad(`.${op}.secrets`);
     const { timeoutSec, cwd } = rule;
-    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600)) throw bad(`.${op}.timeoutSec`);
+    if (timeoutSec !== undefined && (typeof timeoutSec !== "number" || !Number.isInteger(timeoutSec) || timeoutSec < 1 || timeoutSec > SECRET_COMMAND_MAX_TIMEOUT_SEC)) throw bad(`.${op}.timeoutSec`);
     if (cwd !== undefined && (typeof cwd !== "string" || !isAbsolute(cwd))) throw bad(`.${op}.cwd`);
     return [op, {
       argv, secrets: names, lanes: stringList(rule.lanes, bad, `.${op}.lanes`), repos: stringList(rule.repos, bad, `.${op}.repos`),
@@ -464,7 +485,8 @@ const placement = (raw: unknown): PlacementConfig => {
 export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
-  "runners", "secrets", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot",
+  "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
+  "memoryLimits", "autoReport",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -475,26 +497,23 @@ const displayTimeZone = (raw: unknown): string => {
 };
 
 /** The config's `alertsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
-const alertsChannel = (raw: unknown): string | undefined => {
+const optionalChannel = (name: string, raw: unknown): string | undefined => {
   if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") throw new TypeError("alertsChannel must be a Discord channel id string");
-  return raw.trim() || undefined;
-};
-
-/** The config's `decisionsChannel`: a trimmed channel id, undefined when absent or blank; throws TypeError on a non-string. */
-const decisionsChannel = (raw: unknown): string | undefined => {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "string") throw new TypeError("decisionsChannel must be a Discord channel id string");
+  if (typeof raw !== "string") throw new TypeError(`${name} must be a Discord channel id string`);
   return raw.trim() || undefined;
 };
 
 /**
  * Where the supervisor's system notices go (lead stuck or restart-capped, SUPERVISOR_STUCK, TASK_STALLED, a failed
  * unit, and what the lead posts with `dori send --to alerts`): `alertsChannel` when set, else `discordChannels[0]`.
- * Lane reports, owner replies, close buttons and closed-thread redirects keep using `discordChannels[0]`.
+ * Lane reports, owner replies and closed-thread redirects keep using `discordChannels[0]`.
  */
 export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "discordChannels">): string | undefined =>
   config.alertsChannel?.trim() || config.discordChannels[0];
+
+/** Where the autopilot executor opens lane threads: `autopilot.threadChannel` when set, else `discordChannels[0]`. */
+export const autopilotThreadChannelOf = (config: Pick<DoriConfig, "autopilot" | "discordChannels">): string | undefined =>
+  config.autopilot.threadChannel || config.discordChannels[0];
 
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
 export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
@@ -502,11 +521,12 @@ export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
 /** `leadCwd`'s former name: still read while a file has no `leadCwd`, until `dori setup` renames it. */
 export const LEGACY_LEAD_CWD_KEY = "defaultCwd";
 
-let warnedIgnoredKeys = false;
-let warnedLegacyLeadCwd = false;
-let warnedLeadArray = false;
-let warnedPaneKeys = false;
-let warnedAutopilot = false;
+const warned = new Set<string>();
+const warnOnce = (id: string, line: string): void => {
+  if (warned.has(id)) return;
+  warned.add(id);
+  console.error(line);
+};
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -520,62 +540,51 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const raw = Object.fromEntries(Object.entries(loaded).filter(([key]) => kept.includes(key))) as Record<string, unknown>;
   if (LEGACY_LEAD_CWD_KEY in loaded) {
     if (!("leadCwd" in loaded)) raw.leadCwd = loaded[LEGACY_LEAD_CWD_KEY];
-    if (!warnedLegacyLeadCwd) {
-      warnedLegacyLeadCwd = true;
-      console.error(`CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
-    }
+    warnOnce("legacyLeadCwd", `CONFIG_KEY_RENAMED ${LEGACY_LEAD_CWD_KEY} -> leadCwd in ${path}: ${"leadCwd" in loaded ? "leadCwd is set, so defaultCwd is ignored" : "still read as leadCwd for now"}; run dori setup to rename it`);
   }
   const rawHooks = isRecord(raw.hooks) ? raw.hooks : {};
   ignored.push(...Object.keys(rawHooks).filter((key) => !(HOOK_KEYS as readonly string[]).includes(key)).map((key) => `hooks.${key}`));
   if (isRecord(raw.laneSandbox) && "default" in raw.laneSandbox) ignored.push("laneSandbox.default");
   if (isRecord(raw.placement) && "workspaces" in raw.placement) ignored.push("placement.workspaces");
   ignored.push(...ignoredRunnerKeys(raw.runners));
-  if (ignored.length && !warnedIgnoredKeys) {
-    warnedIgnoredKeys = true;
-    console.error(`CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
-  }
+  if (ignored.length) warnOnce("ignoredKeys", `CONFIG_KEYS_IGNORED ${ignored.join(", ")} in ${path}: these keys are no longer read from config.json; they can be deleted`);
   if (Array.isArray(raw.leadModel)) {
-    if (!warnedLeadArray) {
-      warnedLeadArray = true;
-      console.error(`CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
-    }
+    warnOnce("leadArray", `CONFIG_LEAD_CHAIN_REMOVED leadModel in ${path}: only the first valid entry is used; replace the array with that entry`);
     raw.leadModel = modelEntries(raw.leadModel, undefined)[0];
   }
   const hooks = Object.fromEntries(Object.entries(rawHooks).filter(([key]) => (HOOK_KEYS as readonly string[]).includes(key))) as Hooks;
   const fromFile = raw as Partial<DoriConfig>;
   const stateDir = expandHome(process.env.DORI_STATE_DIR ?? fromFile.stateDir ?? base.stateDir, home);
   const panes = resolveManagedPanes(stateDir, loaded);
-  if (paneKeys.length && !warnedPaneKeys) {
-    warnedPaneKeys = true;
-    console.error(panes.migrated?.saved
+  if (paneKeys.length) {
+    warnOnce("paneKeys", panes.migrated?.saved
       ? `CONFIG_PANE_KEYS_MIGRATED ${paneKeys.join(", ")} in ${path}: copied into ${managedPanesPath(stateDir)}; the supervisor manages the lead pane and lanes workspace from now on, and the keys are ignored and can be deleted`
       : `CONFIG_PANE_KEYS_IGNORED ${paneKeys.join(", ")} in ${path}: the supervisor manages the lead pane and lanes workspace in ${managedPanesPath(stateDir)}; the keys can be deleted`);
   }
   const { runners: rawRunners, ...rest } = fromFile;
   const machineRunners = runners(rawRunners);
   const { alertsChannel: rawAlerts, decisionsChannel: rawDecisions, ...fileValues } = rest;
-  const alerts = alertsChannel(rawAlerts);
-  const decisions = decisionsChannel(rawDecisions);
+  const alerts = optionalChannel("alertsChannel", rawAlerts);
+  const decisions = optionalChannel("decisionsChannel", rawDecisions);
   const merged: DoriConfig = { ...base, ...fileValues, ...(machineRunners ? { runners: machineRunners } : {}), hooks: { ...base.hooks, ...hooks } };
   return {
     ...merged,
     ...(alerts ? { alertsChannel: alerts } : {}),
     ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
-    secrets: secrets(raw.secrets),
+    review: reviewConfig(raw.review),
+    autoReport: autoReport(raw.autoReport),
+    memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),
     laneSandbox: laneSandbox(raw.laneSandbox),
     guardMachines: stringRecord(raw.guardMachines),
     placement: placement(raw.placement),
     autopilot: parseAutopilotConfig(raw.autopilot, (line) => {
-      if (warnedAutopilot) return;
-      warnedAutopilot = true;
-      console.error(`CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
+      warnOnce("autopilot", `CONFIG_AUTOPILOT_KEYS_IGNORED ${line} in ${path}`);
     }),
     buttonHooks: buttonHooks(raw.buttonHooks, path),
     stateDir,
-    store: storeOnDisk(stateDir),
     leadCwd: expandHome(merged.leadCwd, home),
     leadPane: process.env.DORI_LEAD_PANE ?? panes.leadPane,
     laneWorkspace: panes.laneWorkspace,

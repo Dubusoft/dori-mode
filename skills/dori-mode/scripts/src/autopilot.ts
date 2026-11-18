@@ -11,12 +11,19 @@ import { redactSecrets } from "./redact.ts";
  * Rows:
  * - launch attempt (written by `dori autopilot launch`): lane `toodo:<taskId>`, action `autopilot-launch`, target
  *   `<attempt number>`, data `{ laneKey }`; planned while reserved, then verified, failed or ambiguous. When its lane
- *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed).
+ *   closes, settleLaneOutcome adds `outcome` to the data: `done` (state verified) or `failed` (state failed). After the
+ *   close the supervisor's Toodo follow-up adds `toodo` (markLaneToodo): what it recorded on the task, written once.
+ * - re-arm (written by `dori autopilot rearm` on the owner's word): lane `toodo:<taskId>`, action `autopilot-rearm`,
+ *   target `<the highest attempt number it covers>`, state verified, data `{ note? }`. Attempts it covers no longer refuse
+ *   the task, so its next launch is attempt n+1.
+ * The owner's word also reaches the predicate through the Toodo task itself (ownerSignal): a task paused after its latest
+ * attempt holds, and once a wait set after that pause ends, the attempt counts as covered without a re-arm row.
  */
 
 export const LAUNCH_ACTION = "autopilot-launch";
+export const REARM_ACTION = "autopilot-rearm";
 /** A task ref naming the owner's word that marked it, e.g. `owner:discord:<channel>/<message>`. */
-const OWNER_REF = /^owner:\S+$/;
+export const OWNER_REF = /^owner:\S+$/;
 
 /** The toodo-server task fields the predicate reads (camelCase, as `list_tasks` / `get_task` return them). */
 export type ToodoTask = {
@@ -35,19 +42,25 @@ export type ToodoTask = {
   readonly autopilot: boolean;
   /** `YYYY-MM-DD`, or null when the task has no due date. */
   readonly dueDate: string | null;
+  /** Seconds: the latest move back to `planned` after work started (a pause, a wait's pause or a reopen); null when none since the latest start. */
+  readonly pausedAt: number | null;
+  /** Seconds: when a wait was last set on the task (the progress note toodo records with `wait_task`); null when never. */
+  readonly waitSetAt: number | null;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Config
 
 export type AutopilotConfig = {
-  readonly quotaUnreadable: "hold";
+  /** Supervisor execution is opt-in; false keeps the lead's manual launch flow. */
+  readonly executor: boolean;
   readonly mergeBase: string;
-  readonly crossWorkspacePrereqs: "block";
   /** Seconds between the supervisor's autopilot ticks. */
   readonly tickSec: number;
   /** Seconds a quota read is reused by every caller (judge, `dori quota`, `/quota`) before the endpoints are read again. */
   readonly quotaCacheSec: number;
+  /** Discord channel the executor opens lane threads under (autopilotThreadChannelOf); empty: `discordChannels[0]`. */
+  readonly threadChannel: string;
 };
 
 export const TICK_SEC_MIN = 30;
@@ -56,16 +69,18 @@ export const QUOTA_CACHE_SEC_MIN = 30;
 export const QUOTA_CACHE_SEC_MAX = 900;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
-  quotaUnreadable: "hold", mergeBase: "dev", crossWorkspacePrereqs: "block", tickSec: 300, quotaCacheSec: 90,
+  executor: false,
+  mergeBase: "dev", tickSec: 300, quotaCacheSec: 90, threadChannel: "",
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Keys read as nothing so an older config still loads: the bundle design's, `mode` (autopilot is always on; `dori
- * setup` removes it, see config-schema.ts) and `quotaMaxUsedPct` (an account counts as spent only at 100%).
+ * setup` removes it, see config-schema.ts), `quotaMaxUsedPct` (an account counts as spent only at 100%), and
+ * `quotaUnreadable` / `crossWorkspacePrereqs` (each had one value: unreadable quota holds, a cross-workspace prerequisite refuses).
  */
-const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode", "quotaMaxUsedPct"]);
+const REMOVED_KEYS: ReadonlySet<string> = new Set(["workspaces", "bundleExpiryDays", "wip", "wipCap", "attemptCap", "onRevoke", "mode", "quotaMaxUsedPct", "quotaUnreadable", "crossWorkspacePrereqs"]);
 
 /**
  * The config's `autopilot` (absent: DEFAULT_AUTOPILOT; each key optional). Throws TypeError naming the key on an
@@ -84,26 +99,51 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
     if (!ok(v)) throw new TypeError(`autopilot.${key} must be ${what}, not ${JSON.stringify(v)}`);
     return v as T;
   };
-  const only = (value: string) => (v: unknown) => v === value;
   return {
-    quotaUnreadable: pick<"hold">("quotaUnreadable", only("hold"), "\"hold\""),
+    executor: pick<boolean>("executor", (v) => typeof v === "boolean", "a boolean"),
     mergeBase: pick<string>("mergeBase", (v) => typeof v === "string" && v.trim() !== "" && v === v.trim(), "a branch name"),
-    crossWorkspacePrereqs: pick<"block">("crossWorkspacePrereqs", only("block"), "\"block\""),
     tickSec: pick<number>("tickSec", (v) => Number.isInteger(v) && (v as number) >= TICK_SEC_MIN && (v as number) <= TICK_SEC_MAX,
       `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
     quotaCacheSec: pick<number>("quotaCacheSec", (v) => Number.isInteger(v) && (v as number) >= QUOTA_CACHE_SEC_MIN && (v as number) <= QUOTA_CACHE_SEC_MAX,
       `an integer from ${QUOTA_CACHE_SEC_MIN} to ${QUOTA_CACHE_SEC_MAX}`),
+    threadChannel: pick<string>("threadChannel", (v) => typeof v === "string", "a Discord channel id string").trim(),
   };
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Ledger
 
-export type LedgerState = { readonly attempts: number; readonly ambiguous: boolean; readonly live: boolean };
+/**
+ * What the owner did to a task after its latest attempt (`attemptAt`, ms), as Toodo shows it: `paused` when the task was
+ * paused (or reopened) back to planned since then and no wait was set after that pause, `waiting` while a wait set after
+ * the pause runs, `released` once that wait has ended (its next launch runs again); undefined when it was not paused since.
+ */
+export type OwnerSignal = "paused" | "waiting" | "released";
 
-/** Every launch-attempt row in the store. */
+export const ownerSignal = (task: ToodoTask, attemptAt: number): OwnerSignal | undefined => {
+  if (task.pausedAt === null || task.pausedAt * 1000 < attemptAt) return undefined;
+  if (task.waitSetAt === null || task.waitSetAt < task.pausedAt) return "paused";
+  return task.wait !== null ? "waiting" : "released";
+};
+
+/**
+ * `through` is the highest attempt number the owner covered: by a re-arm, or the latest attempt once ownerSignal
+ * released it. `attempts` and `ambiguous` count only the attempts above it; `live` counts every attempt; `last` is the
+ * highest attempt number taken or covered (0: none), so the next attempt is `last + 1`. `signal` is ownerSignal against
+ * the latest attempt above the re-arm, present only when the task was given and it has one.
+ */
+export type LedgerState = {
+  readonly attempts: number; readonly last: number; readonly through: number; readonly ambiguous: boolean; readonly live: boolean;
+  readonly signal?: OwnerSignal;
+};
+
+/** Every ledger row in the store: launch attempts and re-arms. */
 export const ledgerRows = (store: OperationStore): Operation[] =>
-  store.list().filter((op) => op.action === LAUNCH_ACTION && op.lane.startsWith("toodo:"));
+  store.list().filter((op) => (op.action === LAUNCH_ACTION || op.action === REARM_ACTION) && op.lane.startsWith("toodo:"));
+
+/** The highest attempt number a re-arm of `taskId` covers, 0 when it was never re-armed. */
+export const rearmedThrough = (rows: readonly Operation[], taskId: number): number =>
+  Math.max(0, ...rows.filter((op) => op.action === REARM_ACTION && op.lane === `toodo:${taskId}`).map((op) => Number(op.target)));
 
 const rowsOf = (rows: readonly Operation[], taskId: number): Operation[] =>
   rows.filter((op) => op.action === LAUNCH_ACTION && op.lane === `toodo:${taskId}`);
@@ -118,6 +158,13 @@ export const laneKeyOf = (op: Operation): string | undefined => {
   } catch { return undefined; }
 };
 
+/** The task id of the launch attempt reserved for `laneKey` (its ledger row names the lane), else undefined. */
+export const reservedTaskOf = (rows: readonly Operation[], laneKey: string): number | undefined => {
+  const op = rows.find((row) => row.action === LAUNCH_ACTION && row.lane.startsWith("toodo:") && laneKeyOf(row) === laneKey);
+  const id = op ? Number(op.lane.slice("toodo:".length)) : NaN;
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+};
+
 /** A row still running: open (planned/attempted), or verified with its laneKey an open registry lane. */
 const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
   if (OPEN_STATES.includes(op.state)) return true;
@@ -126,13 +173,30 @@ const rowLive = (op: Operation, openLanes: ReadonlySet<string>): boolean => {
   return key !== undefined && openLanes.has(key);
 };
 
+/** The machine a launch attempt was reserved on (`data.machine`), else undefined (a row written before it was recorded). */
+export const reservedMachineOf = (op: Operation): string | undefined => {
+  try {
+    const data = JSON.parse(op.data ?? "") as unknown;
+    return isRecord(data) && typeof data.machine === "string" ? data.machine : undefined;
+  } catch { return undefined; }
+};
+
 /**
- * Reservations of other tasks not running as a lane yet (open rows whose laneKey is no open lane): each takes one host
- * slot that the pane count does not show.
+ * Reservations of other tasks not running as a lane yet (open rows whose laneKey is no open lane), by the machine each
+ * was reserved on (`defaultMachine` for a row that names none): each takes one slot of that machine that its pane count
+ * does not show.
  */
-export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, exceptTaskId?: number): number =>
-  rows.filter((op) => op.action === LAUNCH_ACTION && (exceptTaskId === undefined || op.lane !== `toodo:${exceptTaskId}`) && OPEN_STATES.includes(op.state))
-    .filter((op) => { const key = laneKeyOf(op); return key === undefined || !openLanes.has(key); }).length;
+export const pendingReservations = (rows: readonly Operation[], openLanes: ReadonlySet<string>, defaultMachine: string, exceptTaskId?: number): Map<string, number> => {
+  const pending = new Map<string, number>();
+  for (const op of rows) {
+    if (op.action !== LAUNCH_ACTION || (exceptTaskId !== undefined && op.lane === `toodo:${exceptTaskId}`) || !OPEN_STATES.includes(op.state)) continue;
+    const key = laneKeyOf(op);
+    if (key !== undefined && openLanes.has(key)) continue;
+    const machine = reservedMachineOf(op) ?? defaultMachine;
+    pending.set(machine, (pending.get(machine) ?? 0) + 1);
+  }
+  return pending;
+};
 
 /** A stable key for local autopilot state that can change without a toodo event. */
 export const autopilotLocalStateKey = (store: OperationStore, openLanes: ReadonlySet<string>): string =>
@@ -141,9 +205,13 @@ export const autopilotLocalStateKey = (store: OperationStore, openLanes: Readonl
     store.list({ states: OPEN_STATES })
       .filter((op) => op.action === LAUNCH_ACTION && op.lane.startsWith("toodo:"))
       .map((op) => `${op.id}:${op.state}`).sort(),
+    ledgerRows(store).filter((op) => op.action === REARM_ACTION).map((op) => op.id).sort(),
   ]);
 
-/** The lines settleLaneOutcome returns; the lead reports a failure to the owner and completes the toodo task of a done one. */
+/**
+ * The lines settleLaneOutcome returns. A done one asks the lead to complete the task unless the supervisor did
+ * (task-finish.ts rewrites it `toodo=done`); a failed one goes to the owner with the task's blocker recorded.
+ */
 export const LANE_DONE_EVENT = "AUTOPILOT_LANE_DONE";
 export const LANE_FAILED_EVENT = "AUTOPILOT_LANE_FAILED";
 export const isLaneOutcomeLine = (line: string): boolean => line.startsWith(`${LANE_DONE_EVENT} `) || line.startsWith(`${LANE_FAILED_EVENT} `);
@@ -159,7 +227,8 @@ const outcomeOf = (op: Operation): unknown => {
  * not start, was given up, or its Done can never hold) settles the row `failed`; any other close (every Done signal held,
  * its PR merged) marks it done. Returns the line for the lead, or undefined when no launch attempt names the lane (not an
  * autopilot lane), the row already has an outcome, or the launch itself was settled failed or ambiguous. Nothing is
- * relaunched: the predicate refuses the task `already-attempted` from now on.
+ * relaunched: the predicate refuses the task `already-attempted` from now on, until the owner covers the attempt (a re-arm,
+ * or a pause and then a wait that ends).
  */
 export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: string, failed?: string): string | undefined => {
   const op = ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
@@ -176,9 +245,45 @@ export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: s
   return `${LANE_FAILED_EVENT} ${head}${why ? ` ${why}` : ""}: tell the owner; autopilot does not launch it again`;
 };
 
-export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
+/** The launch attempt whose lane is `laneKey`, else undefined (not an autopilot lane). */
+export const laneAttempt = (store: OperationStore, laneKey: string): Operation | undefined =>
+  ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
+
+/** What the supervisor recorded on the Toodo task of an attempt's closed lane (`data.toodo`), else undefined. */
+export const toodoMarkOf = (op: Operation): string | undefined => {
+  try {
+    const data = JSON.parse(op.data ?? "") as unknown;
+    return isRecord(data) && typeof data.toodo === "string" ? data.toodo : undefined;
+  } catch { return undefined; }
+};
+
+/**
+ * Records on the launch attempt of `laneKey` what the supervisor wrote to its Toodo task when the lane closed (e.g.
+ * `done`, `blocked`): the terminal mark that keeps a resumed or repeated close from writing to the task or telling the
+ * lead again. Returns false when the lane has no attempt or the mark is already there.
+ */
+export const markLaneToodo = (store: OperationStore, now: number, laneKey: string, mark: string): boolean => {
+  const op = laneAttempt(store, laneKey);
+  if (!op || toodoMarkOf(op) !== undefined) return false;
+  // Found by the laneKey in its data, so the data is a JSON object.
+  const data = JSON.parse(op.data ?? "{}") as Record<string, unknown>;
+  store.put({ ...op, data: JSON.stringify({ ...data, toodo: mark }), updatedAt: now });
+  return true;
+};
+
+/** The ledger of `taskId`; with its Toodo `task`, a pause and an ended wait since the latest attempt cover it (ownerSignal). */
+export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>, task?: ToodoTask): LedgerState => {
   const mine = rowsOf(rows, taskId);
-  return { attempts: mine.length, ambiguous: mine.some((op) => op.state === "ambiguous"), live: mine.some((op) => rowLive(op, openLanes)) };
+  const rearmed = rearmedThrough(rows, taskId);
+  const latest = mine.filter((op) => Number(op.target) > rearmed).sort((a, b) => Number(b.target) - Number(a.target))[0];
+  const signal = task && latest ? ownerSignal(task, latest.at) : undefined;
+  const through = signal === "released" ? Number(latest!.target) : rearmed;
+  const counted = mine.filter((op) => Number(op.target) > through);
+  return {
+    attempts: counted.length, last: Math.max(through, ...mine.map((op) => Number(op.target))), through,
+    ambiguous: counted.some((op) => op.state === "ambiguous"), live: mine.some((op) => rowLive(op, openLanes)),
+    ...(signal ? { signal } : {}),
+  };
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -190,13 +295,15 @@ export const REFUSE_REASONS = [
   "not-flagged", "owner-ref-missing", "criteria-missing", "task-missing", "not-planned", "prerequisite-missing",
   "prerequisite-open", "prerequisite-not-adopted", "cross-workspace-prerequisite", "already-attempted", "ledger-ambiguous",
 ] as const;
-export const HOLD_REASONS = ["waiting", "lane-live", "quota-unreadable", "quota-over-threshold", "host-hold", "no-slot"] as const;
+export const HOLD_REASONS = ["waiting", "paused", "lane-live", "quota-unreadable", "quota-over-threshold", "host-hold", "no-slot"] as const;
 export type Reason = (typeof REFUSE_REASONS)[number] | (typeof HOLD_REASONS)[number];
 
 export type Verdict = {
   readonly taskId: number;
   readonly verdict: VerdictKind;
   readonly reasons: readonly Reason[];
+  /** LAUNCH from judgeAll: the machine whose slot the task took. */
+  readonly machine?: string;
 };
 
 /** One readable Claude account and the highest used percentage over its 5h and 7d windows. */
@@ -226,10 +333,27 @@ export const quotaSplit = (quota: QuotaSummary): { over: QuotaAccount[]; room: Q
 /** "default (100%)". */
 export const quotaAccountText = (a: QuotaAccount): string => `${a.name} (${a.maxUsedPct}%)`;
 /**
- * The `dori can-launch` verdict for the default machine; `slots` is how many more lanes its pane limit allows
- * (absent when the pane limit is off, so nothing caps the count).
+ * One machine's `dori can-launch` verdict; `slots` is how many more lanes its pane limit allows (absent when the pane
+ * limit is off, so nothing caps the count).
  */
-export type HostSummary = { readonly ok: boolean; readonly reason?: string; readonly slots?: number };
+export type HostSummary = {
+  readonly ok: boolean; readonly reason?: string; readonly slots?: number;
+  /** Keys already charged to slots by shared admission, so autopilot does not charge them again. */
+  readonly reservedKeys?: readonly string[];
+};
+
+/**
+ * The machines the judged tasks would launch on: each one's summary (its slots already less the reservations waiting
+ * for it), and each task's target machines, most preferred first (where its launch is placed, then the fallbacks a
+ * movable placement may take).
+ */
+export type Hosts = {
+  readonly machines: ReadonlyMap<string, HostSummary>;
+  readonly targets: (taskId: number) => readonly string[];
+};
+
+/** Hosts of one machine every task targets. */
+export const singleHost = (host: HostSummary, machine = "local"): Hosts => ({ machines: new Map([[machine, host]]), targets: () => [machine] });
 
 export type JudgeContext = {
   /** Tasks returned by toodo, keyed by id, including every dependency. */
@@ -240,7 +364,7 @@ export type JudgeContext = {
   readonly openLanes: ReadonlySet<string>;
   /** Each readable Claude account's highest 5h/7d use. */
   readonly quota: QuotaSummary;
-  readonly host: HostSummary;
+  readonly hosts: Hosts;
   readonly config: AutopilotConfig;
 };
 
@@ -250,7 +374,7 @@ const REFUSE_SET: ReadonlySet<string> = new Set(REFUSE_REASONS);
 const ORDER: readonly Reason[] = [...REFUSE_REASONS, ...HOLD_REASONS];
 
 /** A dependency counts as satisfied only when done with resolution merged or completed. */
-const depSatisfied = (dep: ToodoTask): boolean => dep.status === "done" && (dep.resolution === "merged" || dep.resolution === "completed");
+export const depSatisfied = (dep: ToodoTask): boolean => dep.status === "done" && (dep.resolution === "merged" || dep.resolution === "completed");
 
 const verdictOf = (taskId: number, found: ReadonlySet<Reason>): Verdict => {
   const reasons = ORDER.filter((r) => found.has(r));
@@ -261,7 +385,9 @@ const verdictOf = (taskId: number, found: ReadonlySet<Reason>): Verdict => {
 /**
  * Judges one task on its own (no slot assignment; judgeAll adds that). Every failing reason is collected; the verdict
  * is REFUSE if any reason is a refusal, else HOLD if any reason holds, else LAUNCH. Reasons come in REFUSE_REASONS then
- * HOLD_REASONS order. Any earlier launch attempt refuses: autopilot never retries by itself.
+ * HOLD_REASONS order. Any earlier launch attempt the owner did not cover refuses: autopilot never retries by itself. The
+ * owner covers it with a re-arm, or by pausing the task and then setting a wait: paused without a wait it holds `paused`,
+ * while that wait runs it holds `waiting`, and once the wait ends it judges afresh as attempt n+1.
  */
 export const judge = (input: JudgeInput): Verdict => {
   const { taskId, tasks, config } = input;
@@ -285,14 +411,16 @@ export const judge = (input: JudgeInput): Verdict => {
     }
   }
 
-  const ledger = ledgerState(input.ledger, taskId, input.openLanes);
+  const ledger = ledgerState(input.ledger, taskId, input.openLanes, task);
   if (ledger.live) found.add("lane-live");
-  else if (ledger.attempts > 0) found.add("already-attempted");
+  else if (ledger.signal === "paused") found.add("paused");
+  // `waiting` (the task's wait, above) holds it until the wait ends and releases the attempt.
+  else if (ledger.attempts > 0 && ledger.signal !== "waiting") found.add("already-attempted");
   if (ledger.ambiguous) found.add("ledger-ambiguous");
 
   if (!input.quota.readable) found.add("quota-unreadable");
   else if (quotaSplit(input.quota).room.length === 0) found.add("quota-over-threshold");
-  if (!input.host.ok) found.add("host-hold");
+  if (!input.hosts.targets(taskId).some((machine) => input.hosts.machines.get(machine)?.ok)) found.add("host-hold");
 
   return verdictOf(taskId, found);
 };
@@ -310,15 +438,25 @@ const launchOrder = (tasks: ReadonlyMap<number, ToodoTask>) => (a: number, b: nu
 };
 
 /**
- * Judges `taskIds` (ascending by id), then assigns the host's free slots: only the first `host.slots` LAUNCH tasks in
- * launch order stay LAUNCH, the rest HOLD `no-slot`. Without `host.slots` every LAUNCH task keeps its verdict.
+ * Judges `taskIds` (ascending by id), then assigns free slots machine by machine: in launch order each LAUNCH task takes
+ * a slot of its first target machine that is not held and has one left, and keeps LAUNCH naming that `machine`; a task
+ * none of whose targets has a slot left HOLDs `no-slot`. A machine without `slots` never runs out.
  */
 export const judgeAll = (ctx: JudgeContext, taskIds: readonly number[]): Verdict[] => {
   const verdicts = [...new Set(taskIds)].sort((a, b) => a - b).map((taskId) => judge({ ...ctx, taskId }));
-  const slots = ctx.host.slots ?? Number.POSITIVE_INFINITY;
-  const launching = verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort(launchOrder(ctx.tasks));
-  const noSlot = new Set(launching.slice(Math.max(0, slots)));
-  return verdicts.map((v) => noSlot.has(v.taskId) ? verdictOf(v.taskId, new Set<Reason>(["no-slot"])) : v);
+  const free = new Map([...ctx.hosts.machines].map(([machine, h]) => [machine, h.slots ?? Number.POSITIVE_INFINITY]));
+  const placed = new Map<number, string>();
+  for (const taskId of verdicts.filter((v) => v.verdict === "LAUNCH").map((v) => v.taskId).sort(launchOrder(ctx.tasks))) {
+    const machine = ctx.hosts.targets(taskId).find((m) => ctx.hosts.machines.get(m)?.ok && (free.get(m) ?? 0) > 0);
+    if (machine === undefined) continue;
+    free.set(machine, free.get(machine)! - 1);
+    placed.set(taskId, machine);
+  }
+  return verdicts.map((v) => {
+    if (v.verdict !== "LAUNCH") return v;
+    const machine = placed.get(v.taskId);
+    return machine === undefined ? verdictOf(v.taskId, new Set<Reason>(["no-slot"])) : { ...v, machine };
+  });
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -327,8 +465,10 @@ export const judgeAll = (ctx: JudgeContext, taskIds: readonly number[]): Verdict
 export type CandidatesReport = {
   /** `dori autopilot pause` is in force: nothing launches. */
   readonly paused: boolean;
-  /** Free host slots; null when the pane limit is off. */
+  /** Free slots of every machine not held, summed; null when one of them has the pane limit off. */
   readonly slots: number | null;
+  /** Each target machine's free slots (null: no pane limit) or `hold`; present only when the tasks target two or more. */
+  readonly machines?: readonly { readonly machine: string; readonly slots: number | null | "hold" }[];
   readonly verdicts: readonly Verdict[];
   /** Claude accounts the quota read left out, as "name (reason)"; absent when none was. */
   readonly quotaSkipped?: readonly string[];
@@ -339,12 +479,17 @@ export type CandidatesReport = {
   readonly quotaRoom?: readonly string[];
 };
 
+/** The quota notes a report may carry, in output order: header label and CandidatesReport key (quotaOver is followed by quotaRoom). */
+const QUOTA_NOTES = [["quota-skipped", "quotaSkipped"], ["quota-stale", "quotaStale"], ["quota-over", "quotaOver"]] as const;
+
 /** Text output of `dori autopilot candidates`: a header line and one line per verdict, or AUTOPILOT_NO_CANDIDATES. */
 export const formatCandidates = (report: CandidatesReport): string[] => {
   if (report.verdicts.length === 0) return ["AUTOPILOT_NO_CANDIDATES"];
+  const quota = QUOTA_NOTES.filter(([, key]) => report[key]?.length)
+    .map(([label, key]) => ` ${label}: ${report[key]!.join(", ")}${key === "quotaOver" ? ` quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`).join("");
   return [
-    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"} candidates=${report.verdicts.length}${report.quotaSkipped?.length ? ` quota-skipped: ${report.quotaSkipped.join(", ")}` : ""}${report.quotaStale?.length ? ` quota-stale: ${report.quotaStale.join(", ")}` : ""}${report.quotaOver?.length ? ` quota-over: ${report.quotaOver.join(", ")} quota-room: ${report.quotaRoom?.length ? report.quotaRoom.join(", ") : "none"}` : ""}`,
-    ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? "would-launch" : v.reasons.join(", ")}`),
+    `AUTOPILOT${report.paused ? " paused: nothing launches" : ""} slots=${report.slots ?? "unlimited"}${report.machines ? ` machines=${report.machines.map((m) => `${m.machine}:${m.slots ?? "unlimited"}`).join(",")}` : ""} candidates=${report.verdicts.length}${quota}`,
+    ...report.verdicts.map((v) => `AUTOPILOT_CANDIDATE #${v.taskId} ${v.verdict} ${v.verdict === "LAUNCH" ? `would-launch${report.machines && v.machine ? ` machine=${v.machine}` : ""}` : v.reasons.join(", ")}`),
   ];
 };
 
@@ -352,8 +497,8 @@ export const formatCandidates = (report: CandidatesReport): string[] => {
 export const candidatesJson = (report: CandidatesReport) => ({
   paused: report.paused,
   slots: report.slots,
-  candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons })),
-  ...(report.quotaSkipped?.length ? { quotaSkipped: report.quotaSkipped } : {}),
-  ...(report.quotaStale?.length ? { quotaStale: report.quotaStale } : {}),
-  ...(report.quotaOver?.length ? { quotaOver: report.quotaOver, quotaRoom: report.quotaRoom ?? [] } : {}),
+  ...(report.machines ? { machines: report.machines } : {}),
+  candidates: report.verdicts.map((v) => ({ taskId: v.taskId, verdict: v.verdict, reasons: v.reasons, ...(report.machines && v.machine ? { machine: v.machine } : {}) })),
+  ...Object.fromEntries(QUOTA_NOTES.filter(([, key]) => report[key]?.length)
+    .flatMap(([, key]): [string, unknown][] => key === "quotaOver" ? [[key, report[key]], ["quotaRoom", report.quotaRoom ?? []]] : [[key, report[key]]])),
 });

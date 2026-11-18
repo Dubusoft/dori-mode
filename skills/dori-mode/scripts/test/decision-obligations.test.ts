@@ -54,7 +54,7 @@ test("the default kinds table matches decision events like eventPolicy does, and
     "LANE_REPORT_LATE alpha done x", "LANE_NOT_DONE alpha dirty tree", "WAIT_DONE ci green", "WAIT_TIMEOUT ci", "WAIT_FAILED ci", "DEAD_PANE w:p3",
     "OWNER_DECISION_ANSWERED ap-1-1 d3 blocking discord:1/2: q",
   ]) expect(isDecision(line, kinds)).toBe(true);
-  for (const line of ["LANE_REPORT alpha progress x", "LANE_REPORT alpha done x", "LANE_REPORT_LATE alpha milestone x", "LANE_CLOSED alpha", "WAIT_DONEX x", "INBOUND 1 1 hi"]) {
+  for (const line of ["LANE_REPORT alpha progress x", "LANE_REPORT alpha done x", "LANE_REPORT_LATE alpha milestone x", "LANE_CLOSED alpha", "WAIT_DONEX x", "WAIT_DONE_DIGEST ci green", "WAIT_DONE_SILENT ci green", "INBOUND 1 1 hi"]) {
     expect(isDecision(line, kinds)).toBe(false);
   }
 });
@@ -102,6 +102,12 @@ test("a receipt that arrives before its event closes it; an id no event ever had
   recordResolved(f.state.dir, "dead:p3", f.clock.now());
   const lines = await logged(() => supervisor.resolveTick());
   expect(lines).toContain("DECISION_RESOLVED_UNMATCHED dead:p3");
+  // A journaled event that opens no obligation needs no receipt: logged as not needed, nothing kept.
+  supervisor.enqueue("report:p", "LANE_REPORT alpha progress halfway");
+  recordResolved(f.state.dir, "report:p", f.clock.now());
+  expect(await logged(() => supervisor.resolveTick())).toContain("DECISION_RESOLVED_NOT_NEEDED report:p");
+  expect(readdirSync(join(f.state.dir, RESOLVED_DIR))).toEqual([]);
+  expect(readJournal(f.state.dir).pending.some((item: { id: string }) => item.id === "report:p")).toBe(false);
   supervisor.enqueue("dead:p3", "DEAD_PANE w:p3");
   supervisor.enqueue("dead:p4", "DEAD_PANE w:p4");
   f.clock.at += 15 * MIN;
@@ -136,7 +142,7 @@ test("open decisions are listed for inbox take until resolved", () => {
 });
 
 test("retention keeps the body of an open decision event and prunes it once resolved", async () => {
-  const f = fixture({ store: "sqlite" });
+  const f = fixture();
   f.world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const supervisor = new Supervisor({
     ...f.deps,
@@ -203,10 +209,13 @@ const cli = async (dir: string, args: string[], env: Record<string, string> = {}
   return { out, err, code };
 };
 
-test("dori resolved is lead-only, takes several ids, names unmatched ones, and writes one receipt each", async () => {
+test("dori resolved is lead-only, takes several ids, names unmatched and not-needed ones, and writes one receipt each it records", async () => {
   const f = fixture();
   const supervisor = f.open();
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");
+  supervisor.enqueue("report:p", "LANE_REPORT alpha progress halfway");
+  f.world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  await logged(() => supervisor.flush());
   supervisor.resolveTick();
   const denied = await cli(f.state.dir, ["resolved", "wait:1"], { DORI_LANE_KEY: "alpha" });
   expect(denied.code).toBe(2);
@@ -214,13 +223,18 @@ test("dori resolved is lead-only, takes several ids, names unmatched ones, and w
   const usage = await cli(f.state.dir, ["resolved"]);
   expect(usage.code).toBe(1);
   expect(existsSync(join(f.state.dir, RESOLVED_DIR))).toBe(false);
-  const ok = await cli(f.state.dir, ["resolved", "wait:1", "typo:9", "--note", "merged"]);
+  const ok = await cli(f.state.dir, ["resolved", "wait:1", "report:p", "typo:9", "--note", "merged"]);
   expect(ok.code).toBe(0);
-  expect(ok.out.trim().split("\n")).toEqual(["RESOLVED_RECORDED wait:1", "RESOLVED_UNMATCHED typo:9: no open decision has this id; recorded anyway"]);
+  expect(ok.out.trim().split("\n")).toEqual([
+    "RESOLVED_RECORDED wait:1", "RESOLVED_NOT_NEEDED report:p: this event opens no decision; nothing recorded",
+    "RESOLVED_UNMATCHED typo:9: no open decision has this id; recorded anyway",
+  ]);
   expect(pendingResolved(f.state.dir).map(({ id, note }) => ({ id, note })).sort((a, b) => a.id.localeCompare(b.id)))
     .toEqual([{ id: "typo:9", note: "merged" }, { id: "wait:1", note: "merged" }]);
   const taken = await cli(f.state.dir, ["inbox", "take"]);
   expect(taken.out).toContain("unresolved:wait:1\tUNRESOLVED wait:1 since ");
+  expect(taken.out).toContain("wait:1\t[resolve] WAIT_DONE ci green\n");
+  expect(taken.out).toContain("report:p\tLANE_REPORT alpha progress halfway\n");
 });
 
 /** A lead pane that is idle, with a fresh omo session, as push-delivery.test.ts sets it up. */

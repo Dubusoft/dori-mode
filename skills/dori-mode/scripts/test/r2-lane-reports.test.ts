@@ -5,11 +5,12 @@ import { Database } from "bun:sqlite";
 
 import { deadPaneTick, newDeadPaneState } from "../src/dead-panes.ts";
 import { eventClass } from "../src/event-policy.ts";
-import { INLINE_REPORT_MAX, JsonLaneReports, type LaneReportStore, openLaneReports, POISON_ALERT_AFTER, routeReports, SqliteLaneReports } from "../src/lane-reports.ts";
+import { INLINE_REPORT_MAX, POISON_ALERT_AFTER, routeReports } from "../src/lane-reports.ts";
+import { type LaneReportStore, openLaneReports, SqliteLaneReports } from "../src/lane-report-store.ts";
 import { launchLane } from "../src/launch.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
-import { depsFor, fakeClock, newWorld, withSqliteStore, withState } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, withSqliteStore, withState, storePath } from "./fakes.ts";
 
 setDefaultTimeout(30_000);
 
@@ -25,7 +26,6 @@ const stateDir = (): string => {
 };
 
 const STORES: readonly (readonly [string, (dir: string) => LaneReportStore])[] = [
-  ["json", (dir) => new JsonLaneReports(dir)],
   ["sqlite", (dir) => {
     new SqliteStore(join(dir, SQLITE_FILE), { create: true }).close();
     return new SqliteLaneReports(join(dir, SQLITE_FILE));
@@ -77,7 +77,7 @@ test("a long or many-line report is saved to a file and its event carries a cut 
   const dir = stateDir();
   const deps = depsFor(newWorld(), fakeClock(T0), dir);
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   const long = `${"x".repeat(INLINE_REPORT_MAX + 50)} tail`;
   store.append({ lane: "local-lane", generation: 0, kind: "question", text: long, at: T0 });
   store.append({ lane: "local-lane", generation: 0, kind: "blocked", text: "line 1\nline 2\nline 3\nline 4", at: T0 + 1 });
@@ -101,7 +101,7 @@ test("generation fence: a row stamped before the lane's last relaunch is late, n
   const deps = depsFor(newWorld(), fakeClock(T0 + 10 * MIN), dir);
   const relaunchedAt = T0 + 5 * MIN;
   await deps.registry.write(lane(dir, { lastRecoveryAt: relaunchedAt }));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: T0, kind: "done", text: "old session done", evidence: "abc", at: T0 + 6 * MIN });
   store.append({ lane: "local-lane", generation: 0, kind: "question", text: "unfenced", at: T0 + 7 * MIN });
   store.append({ lane: "local-lane", generation: relaunchedAt, kind: "question", text: "current", at: T0 + 8 * MIN });
@@ -125,7 +125,7 @@ test("a poison row raises one urgent REPORT_STUCK event after POISON_ALERT_AFTER
     return realRead(key);
   };
   await deps.registry.write(lane(dir));
-  const store = new JsonLaneReports(dir);
+  const store = new SqliteLaneReports(storePath(dir));
   store.append({ lane: "local-lane", generation: 0, kind: "question", text: "q", at: T0 });
   const journal: [string, string][] = [];
   const realError = console.error;
@@ -180,6 +180,7 @@ test("a lane registered on the old [REPORT] footer moves onto dori report when i
   const text = await Bun.file(brief).text();
   expect(text).toContain("dori report old-lane <milestone|progress|question|request|blocked>");
   expect(text).not.toContain("sent to pane w:lead");
+  expect(text).toContain("Every stored secret arrives in the lane environment at launch");
   expect(text).toStartWith("do the thing\n");
   expect(text.split("## Lane footer (written by dori launch)")).toHaveLength(2);
 });

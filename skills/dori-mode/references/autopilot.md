@@ -1,6 +1,6 @@
 # Autopilot
 
-Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). Autopilot is always on: the supervisor judges the marked tasks, wakes the lead with `AUTOPILOT_READY`, and the lead launches; the task's mark alone decides whether it may run, and `dori autopilot pause` is the emergency stop. dori code itself never calls `dori launch`, never changes toodo and never merges. `dori autopilot launch` is the lead's reservation step for a launch it runs itself: it records the attempt in the ledger and launches nothing, and it refuses while autopilot is paused (`dori autopilot pause`).
+Autopilot decides which ready toodo tasks may run as lanes without a fresh word from the owner. It acts only on tasks marked for autopilot in toodo (the task's `autopilot` field, set in the web app or through MCP `create_task` / `update_task`). Autopilot is always on: the supervisor judges the marked tasks, wakes the lead with `AUTOPILOT_READY`, and the lead launches; the task's mark alone decides whether it may run, and `dori autopilot pause` is the emergency stop. dori code itself never calls `dori launch`, never changes toodo and never merges. `dori autopilot launch` is the lead's reservation step for a launch it runs itself: it records the attempt in the ledger and launches nothing, and it refuses while autopilot is paused (`dori autopilot pause`). With `autopilot.executor` on, the supervisor runs that launch instead and `dori autopilot launch` refuses to reserve (see Switch-over).
 
 ## Flag contract
 
@@ -12,18 +12,57 @@ Autopilot decides which ready toodo tasks may run as lanes without a fresh word 
 
 Toodo's web RPC `list_tasks` filter has no `autopilot` key, so dori reads every planned task (`{ statuses: ["planned"] }`, all workspaces) and keeps the marked ones.
 
+## Execution contract
+
+A marked task states how it runs through task refs, which toodo stores without interpreting them. `planTask` (`scripts/src/autopilot-plan.ts`) reads them, with the task, its dependencies, the workspace guidelines (`ToodoClient.guidelines`, toodo's `list_guidelines`) and the workspace's `repository` (`ToodoClient.workspaceRepository`, toodo's `get_workspace`), and returns either a ready contract with its template brief or the reasons the task needs the lead's review. It is pure: nothing in it reads toodo, writes a file or launches.
+
+| Ref | Default | Meaning |
+| --- | --- | --- |
+| `repo:<owner>/<name>` | the workspace's repository, else none | The one repository the lane works in (case-insensitive). |
+| `base:<branch>` | `autopilot.mergeBase` | The branch the lane starts from and opens its PR into. It must be `autopilot.mergeBase`. |
+| `branch:<name>` | `autopilot/<taskId>` | The lane's branch, a valid git branch name other than the base. The lane's Done is `pr <repo> <branch>`. |
+| `mode:<ulw\|mass-ulw>` | `ulw` | The lane's mode. Nothing guesses it from the text. |
+| `model:<id>` | `defaultModel` | The lane's model. |
+| `approved:<version>` | none | The lead reviewed the task at that contract version. |
+
+Without a `repo:` ref the task takes its workspace's `repository` when that free text names a GitHub repository (`owner/name`, or a github.com URL or remote); anything else there (empty, `discord:<channel>`, a path) means no repo. A task with no repo at all runs repo-less:
+
+- It makes no branch, commit or PR (`repo` and `branch` are null). Its brief says so, declares `deliverable: report` (the runner refuses a done claim without report files) and asks for the result, criterion by criterion, in `DORI_LANE_OUT/report.md`.
+- Its Done is `file "<research>/<laneKey>/report.md"`: the lead-host path where the claim installs that file (`lane-files.ts` `laneReportFile`, next to the state dir). Done checks of local and remote lanes both run on the lead host, so the signal is live once the claim is collected.
+- It is placed like any launch with no repo: `placement.defaultMachine`, then the fallbacks. A local lane works in `<worktree root>/<laneKey>`.
+- When it closes, the supervisor completes its task with the report as evidence (see Ledger).
+
+The contract also carries:
+
+- `version`: a 12-digit sha256 over the title, description, criteria, dependencies and contract refs; for a task without a `repo:` ref, also the repo its workspace gives it (or none), so changing the workspace's repository moves the version of those tasks only. Status, notes and other refs (`owner:`, `lane:`, `approved:`) are left out, so starting or approving the task keeps it, while a scope change moves it.
+- `guidelines`: a snapshot of the workspace's guidelines (rules and memories, by id) with its own hash, so a later run can tell whether they changed since the brief was built.
+- `approvedVersion`: the version an `approved:` ref names when it matches.
+
+The task goes to review instead (`kind: "review"`, reasons in this order) on `repo-missing` (no repo and no report path to run repo-less with; the executor always passes one), `repo-ambiguous` (two repos), `ref-invalid` (a malformed repo, base, branch, mode or model, or a branch equal to the base), `ref-conflict` (two different values for one key), `base-not-allowed` (a base other than `autopilot.mergeBase`) and `approval-stale` (an `approved:` ref none of which names the current version). Whether a criterion can be judged by a script is not guessed: a lead who reviews such a task records `approved:<version>`, and any later scope change sends it back to review.
+
+The template brief is the task's title (`# <title> (Toodo #<id>)`), its description as written, its criteria with kind and target, its dependencies with status, its other refs, the workspace guidelines (rules, then memories) and the contract (repo, base, branch, Done, mode, version, snapshot hash). `dori launch` appends the common lane footer, so the brief does not repeat it. Storing the snapshot outside the repo and launching from the contract belong to the executor.
+
 ## Ledger
 
 Launch attempts are operation rows: lane `toodo:<taskId>`, action `autopilot-launch`, target `<attempt number>` (1, 2, ...), data `{ "laneKey" }` with the lane key `ap-<taskId>-<attempt>`. Only `dori autopilot launch` writes them (see Commands): `planned` when reserved, then `verified` (launched), `failed` or `ambiguous` when settled. The predicate reads them:
 
-- Autopilot never retries by itself: any earlier attempt that is not running refuses `already-attempted`, for the owner to decide.
-- A row in `ambiguous` sends the task to the owner (REFUSE `ledger-ambiguous`); it is never retried.
+- Autopilot never retries by itself: any earlier attempt that is not running refuses `already-attempted`, for the owner to decide, until the owner covers it: by pausing the task and then setting a wait, or by a re-arm (both below).
+- The owner's word on the task itself: when the task's latest pause (Toodo `milestones.pausedAt`: a pause, a wait that paused it, or a reopen back to `planned`) is later than the latest attempt no re-arm covers, the predicate reads it instead of refusing. With no wait set since that pause (the `Waiting until ...` / `Wait changed: ...` progress note `wait_task` records) the task holds `paused` and never launches. While a wait set after the pause runs it holds `waiting`; once that wait ends, the attempt counts as covered and the task launches as attempt `n+1`, with no re-arm. An attempt with no pause after it keeps refusing `already-attempted`.
+- A row in `ambiguous` sends the task to the owner (REFUSE `ledger-ambiguous`); it is never retried by itself.
+- A re-arm row (lane `toodo:<taskId>`, action `autopilot-rearm`, target `<n>`, state `verified`, data `{ "note"? }`) is the owner's word to run the task again: attempts numbered up to `n` no longer count toward `already-attempted` or `ledger-ambiguous`, and the next launch is attempt `n+1` (lane `ap-<taskId>-<n+1>`). Only `dori autopilot rearm` writes it (see Commands). The rest of the predicate still applies, so a re-armed task that waits holds `waiting` and launches when its wait ends. A failed attempt nobody re-armed keeps refusing.
 - A row that is open (`planned`, `attempted`), or `verified` with its `laneKey` an open registry lane, means the task is running (HOLD `lane-live`).
 
 When the lane a row names closes, the close settles the row once and adds `outcome` to its data (every close path: `dori close`, a settled done claim, a merge, a recovery close, a close the supervisor resumes after a crash):
 
 - A close with `--cancelled` (the lane never started, e.g. after `RUNNER_LAUNCH_FAILED`, was given up, or its Done can never hold) settles the row `failed` with `outcome: "failed"` and gives the lead `AUTOPILOT_LANE_FAILED #<id> lane=<key> attempt=<n> cancelled: <reason>: tell the owner; autopilot does not launch it again`.
 - Any other close (every Done signal held, or its PR merged) keeps the row `verified` with `outcome: "done"` and gives `AUTOPILOT_LANE_DONE #<id> lane=<key> attempt=<n>: complete toodo task #<id>`.
+
+After the close the supervisor writes the outcome to the task (task-finish.ts, every write read back with `get_task`) and marks the row's data `toodo` once (`done`, `blocked` or `failed`), so a resumed or repeated close never writes to the task or tells the lead again; nothing is relaunched:
+
+- Repo-less (its Done names no repo), `report.md` installed: each pending manual criterion is checked with the report path as evidence and the task is completed with a note naming the report; its report gets `Toodo #<id> done` (in the owner's language) appended, and the line is `TOODO_TASK_COMPLETED <key> #<id> report=<path>; ...`. With no report there, the task is left open with a blocker as below.
+- Done, PR read back merged: each pending manual criterion is checked with the merge as evidence and the task is completed with the PR as a ref and a note naming its merge SHA. The line becomes `AUTOPILOT_LANE_DONE ... attempt=<n> toodo=done: toodo task #<id> completed and read back by the supervisor`, which is digest.
+- Done, but the task could not be completed (no merge read back, toodo refused or did not confirm): the task gets a blocker note and the one failure line, `TOODO_TASK_NOT_COMPLETED`, ends with `blocker recorded on toodo task #<id>` (or why it was not).
+- Cancelled: `dori close` (or the supervisor resuming it) records the blocker note and the failure line reads `AUTOPILOT_LANE_FAILED ... cancelled: <reason> toodo=blocked: blocker recorded on toodo task #<id>; tell the owner; ...`.
 
 `dori close` prints the line; a close the supervisor runs journals it as an urgent event under the id `autopilot-outcome:<key>`, so it is told once. A row the launch itself settled `failed` or `ambiguous` is left as it is.
 
@@ -35,13 +74,13 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `quotaUnreadable` | `"hold"` | Only value in v1: unreadable quota holds (`quota-unreadable`). |
 | `mergeBase` | `"dev"` | Autopilot lanes merge into this branch only. |
-| `crossWorkspacePrereqs` | `"block"` | Only value in v1: a prerequisite in another workspace refuses (`cross-workspace-prerequisite`). |
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
 | `quotaCacheSec` | `90` | Seconds a quota read is reused before the usage endpoints are read again, an integer from 30 to 900. It applies to every quota caller (the judge, `dori quota`, Discord `/quota`); see Quota reads. |
+| `executor` | `false` | A boolean (anything else is rejected). `true` lets the supervisor launch LAUNCH tasks itself; see Supervisor executor. |
+| `threadChannel` | `""` | The Discord channel id the executor opens lane threads under (trimmed; anything but a string is rejected). Empty: the first `discordChannels` entry. Set it when `discordChannels[0]` is not where lane threads belong (e.g. a reports channel); closed-thread redirects and owner lines keep using `discordChannels[0]`. `dori doctor` shows the channel in use as `config.autopilot.threadChannel`. |
 
-Both apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
+All apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
 
 ## Selection predicate
 
@@ -60,19 +99,20 @@ REFUSE means the task needs the owner or the lead, or is not eligible yet:
 | `prerequisite-open` | A dependency is not done yet. The next tick after it is done judges again. |
 | `prerequisite-not-adopted` | A dependency is done with resolution `not_adopted`. |
 | `cross-workspace-prerequisite` | A dependency lives in another workspace. |
-| `already-attempted` | A launch attempt exists for the task and none is running. |
-| `ledger-ambiguous` | A ledger row for the task is `ambiguous`. |
+| `already-attempted` | A launch attempt the owner did not cover (a re-arm, or a pause and then a wait that ended) exists for the task, none is running, and the task was not paused since. |
+| `ledger-ambiguous` | A launch attempt the owner did not cover is `ambiguous`. |
 
 HOLD is temporary; the next tick judges again:
 
 | Reason | When |
 | --- | --- |
-| `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. |
+| `waiting` | The task has a wait. A waiting in-progress task reads `planned` plus a wait, so it lands here too. A task paused after its latest attempt and then put on a wait holds here, and launches as attempt `n+1` when the wait ends. |
+| `paused` | The task was paused (or reopened) after its latest attempt and no wait was set since: the owner holds it. A wait set later and ended releases it. |
 | `lane-live` | An open ledger row, a verified row whose lane is open, or a task ref `lane:<key>` naming an open lane. |
 | `quota-unreadable` | No account of the provider serving `defaultModel` (for `anthropic-subscription/...`, every Claude subscription account) has a usable read. An unreadable account (expired token, failed request, a last good read older than 30 minutes: `stale-read`) is skipped while another is readable, and named in the candidates header (`quota-skipped: ...`) and JSON (`quotaSkipped`). An account judged on a cached read older than `quotaCacheSec` (rate-limited, or no lookup during a backoff) still counts, and is named with its age (`quota-stale: default (12m)`, JSON `quotaStale`). |
 | `quota-over-threshold` | Every readable account of that provider is spent: its 5h or 7d window is at 100%. One account with room is enough, since omo moves a lane off an account that hits its limit. When an account is spent, the candidates header names it and the ones with room (`quota-over: default (100%) quota-room: account-2 (40%)`, JSON `quotaOver` / `quotaRoom`). |
-| `host-hold` | `dori can-launch` holds the default machine. |
-| `no-slot` | The task would launch, but the host's free slots went to tasks ahead of it. |
+| `host-hold` | `dori can-launch` holds every machine the task may launch on. |
+| `no-slot` | The task would launch, but the free slots of the machines it may launch on went to tasks ahead of it. |
 
 ## Quota reads
 
@@ -85,7 +125,7 @@ Every quota caller (the judge, `dori quota`, Discord `/quota`) reads through one
 
 ## Slots
 
-The default machine's free slots are `guard.panesMax` minus its panes (the runner's thresholds for a remote machine). After every task is judged, only that many LAUNCH tasks keep LAUNCH: those with a due date first (earliest first), then by ascending id. The rest HOLD `no-slot`. The tick and launch count slots the same way: other tasks' reservations that aren't running yet are subtracted first, so `slots=` already counts them. With the pane limit off (`panesMax` 0) nothing caps the count. A held host gives every task `host-hold` and reports `slots=0`.
+Slots are counted per machine. A task is placed the way `dori launch` places a launch with no repo or checkout: `placement.defaultMachine` first, then the `placement.fallback` machines (the shared launch service in `scripts/src/launch-service.ts`, which `dori launch` uses too). Each of those machines' free slots are `guard.panesMax` (the runner's thresholds for a remote machine) minus its panes, minus launches admitted there whose pane hasn't appeared yet (`scripts.md`, launch); review lanes use the same slots. After every task is judged, the LAUNCH tasks take slots in launch order (a due date first, earliest first, then ascending id): each takes one on its first machine that is not held and has a slot left, and keeps LAUNCH naming that machine. The rest HOLD `no-slot`. So a full local machine does not stop a task whose fallback has room. The tick and launch count slots the same way: other tasks' reservations that aren't running yet are subtracted first from the machine each was reserved on (the default machine for a reservation that names none), so `slots=` already counts them. With the pane limit off (`panesMax` 0) nothing caps authors on that machine. `slots=` is the free slots of every machine not held, summed; when the tasks may go to two or more machines the header adds `machines=<label>:<n|unlimited|hold>,...` and each LAUNCH line `machine=<label>`. A task all of whose machines are held gets `host-hold`, and with every machine held `slots=0`.
 
 ## Commands
 
@@ -94,6 +134,7 @@ Lead-only; inside a lane each one exits with `LANE_PERMISSION_DENIED`.
 ```
 dori autopilot candidates [--tasks 12,13] [--json]
 dori autopilot launch <taskId> [--launched <laneKey> | --failed | --ambiguous] [--note TEXT]
+dori autopilot rearm <taskId> [--note TEXT]
 dori autopilot pause [--reason TEXT]
 dori autopilot resume
 ```
@@ -107,9 +148,11 @@ dori autopilot resume
   AUTOPILOT_CANDIDATE #14 REFUSE owner-ref-missing, criteria-missing
   ```
 
-  While a pause is in force the header reads `AUTOPILOT paused: nothing launches slots=<n> candidates=<n>`. With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ paused, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit). Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
-- `launch <taskId>` reserves the task's next launch attempt. While paused it prints `AUTOPILOT_LAUNCH_REFUSED #<id> paused since <ISO>[: <reason>] (dori autopilot resume lifts it)` and exits 1 before reading anything. Otherwise it holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the host's free slots, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0). Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
-- `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`. Settling works while paused too, so a launch already under way can still be recorded.
+  While a pause is in force the header reads `AUTOPILOT paused: nothing launches slots=<n> candidates=<n>`. With no candidate it prints `AUTOPILOT_NO_CANDIDATES`. `--json` prints `{ paused, slots, candidates: [{taskId, verdict, reasons}] }` (`slots` is null without a pane limit), plus `machines: [{machine, slots}]` and each LAUNCH candidate's `machine` when the tasks may go to two or more machines. Exit 0 whenever it judged (all HOLD included), 1 with `AUTOPILOT_TOODO_UNREADABLE <why>` when toodo-server cannot be read (token file missing or empty, network error, non-200), 2 on usage errors.
+- `launch <taskId>` reserves the task's next launch attempt. While paused it prints `AUTOPILOT_LAUNCH_REFUSED #<id> paused since <ISO>[: <reason>] (dori autopilot resume lifts it)` and exits 1 before reading anything. Otherwise it holds a state lock (`<stateDir>/autopilot-launch.lock.sqlite`) while it reads toodo, the ledger, open lanes, quota and the host again, and judges the task among every marked task as `candidates` does. Another task's reservation that is not running as a lane yet takes one of the free slots of the machine it was reserved on, since its pane does not exist yet. Only on LAUNCH it writes the `planned` row and prints `AUTOPILOT_RESERVED #<id> lane=ap-<id>-<n> attempt=<n>` (exit 0); a slot taken on a machine other than the default one is recorded in the row's data (`machine`) and printed as ` machine=<label>`. Otherwise it prints `AUTOPILOT_LAUNCH_REFUSED #<id> <HOLD|REFUSE> <reasons>` and writes nothing (exit 1). A second reserve of the same task holds `lane-live`, so handling one event twice launches once.
+- With `autopilot.executor` on, `launch <taskId>` prints `AUTOPILOT_LAUNCH_REFUSED #<id> executor-on: ...` and exits 1 before reading anything or writing a row, and a settle flag on a reservation an executor sequence owns (`toodo:<id>/autopilot-execute/<n>` exists) prints `AUTOPILOT_LAUNCH_REFUSED #<id> executor-owned: ...` and exits 1 without touching the row. A reservation the lead opened before the switch has no sequence row and still settles.
+- `launch <taskId> --launched <laneKey>` settles the open reservation as `verified` (the key must be the reserved one, else `AUTOPILOT_LANE_MISMATCH`, exit 1). `--failed` settles it `failed` when the launch surely did not happen, and `--ambiguous` settles it `ambiguous` when that cannot be told; `--note` adds why to the row. Each prints `AUTOPILOT_SETTLED #<id> attempt=<n> <state> lane=<key>`; with no open reservation, `AUTOPILOT_NO_RESERVATION #<id>` (exit 1). A settled attempt is never retried by itself: `failed` and a closed lane refuse `already-attempted`, `ambiguous` also refuses `ledger-ambiguous`, until `rearm`. Settling works while paused too, so a launch already under way can still be recorded.
+- `rearm <taskId> [--note TEXT]` is for the owner's word to run a task again when Toodo does not carry it, e.g. "run it again now" with no pause and wait (a pause and then a wait that ends release the attempt by themselves, see Ledger). Under the launch lock it writes one re-arm row covering the task's highest attempt number (launch attempts and executor sequences alike) and prints `AUTOPILOT_REARMED #<id> through=<n> next=ap-<id>-<n+1>` (exit 0); the task then judges like a fresh one, so it launches as attempt `n+1` once the rest of the predicate passes (a wait still holds `waiting`). Re-arming again with no attempt since changes nothing and adds ` (already)`. While an attempt still runs (an open reservation or executor sequence, or a verified attempt whose lane is open) it prints `AUTOPILOT_REARM_REFUSED #<id> lane-live: ...`, and with no attempt at all `AUTOPILOT_REARM_NOTHING #<id>: ...` (exit 1 for both). It launches nothing, works while paused and with the executor on, and is run only on the owner's word: re-arming an `ambiguous` attempt states that the owner checked no lane of it still runs.
 - `pause [--reason TEXT]` writes `<stateDir>/autopilot-pause.json` and prints `AUTOPILOT_PAUSED since <ISO>[: <reason>]` (` (already paused)` when one was in force; the first is kept). While it is in force, `launch` refuses new reservations and the tick wakes no one; lanes already running go on to their claim. A pause file that cannot be read still counts as paused. `resume` removes it (`AUTOPILOT_RESUMED`, or `AUTOPILOT_NOT_PAUSED`). Both exit 0. Use pause to stop autopilot at once without editing the config.
 
 ## Supervisor tick
@@ -122,8 +165,51 @@ The supervisor judges the same candidates itself every `autopilot.tickSec` (5 mi
 - `AUTOPILOT_READY` never comes while paused. Take the named tasks through the order below: `dori autopilot launch <id>` judges each again under its lock, so a task that changed since the tick is refused there. The supervisor's tick replaces any periodic reconcile of your own; there is no `autopilot-reconcile` schedule job any more.
 - Autopilot has no mode to set. When the owner says to stop autopilot, run `dori autopilot pause --reason TEXT` (and `resume` when they say to go on).
 - Autopilot lanes merge into `dev` only (`autopilot.mergeBase`). Merging to main or releasing always needs the owner's explicit word for that merge or release.
-- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched.
-- A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them (`report_blocker` on it). On `AUTOPILOT_LANE_DONE` complete the task (`complete_task` with the PR as a ref), which lets its dependents become ready.
+- Order: `dori autopilot launch <id>` (reserve; use the lane key it prints), `start_task` with a `lane:<key>` ref, `dori launch <key>`, then settle with `dori autopilot launch <id> --launched <key>`, or `--failed` / `--ambiguous` when the launch did not happen or its outcome is unclear (either goes to the owner). After a restart, an in-progress task with no live lane is reported, never relaunched. With `autopilot.executor` on, the supervisor runs this order itself and the lead does none of it (see Switch-over).
+- A started autopilot lane that fails (`RUNNER_LAUNCH_FAILED`, the work is given up, its Done can never hold) is closed with `dori close <key> --cancelled --reason TEXT`, never launched again by itself.
+- When the owner sends an attempted task back to run at a later time, pause it (or reopen it) and put it on a Toodo wait until then: it holds `waiting` and launches as attempt `n+1` when the wait ends. When the owner only says to hold it, pause it with no wait: it holds `paused`. Only for "run it again" with no wait, run `dori autopilot rearm <id> --note TEXT` on that word. Never re-arm, or pause and wait to relaunch, on your own judgment. On `AUTOPILOT_LANE_FAILED` tell the owner what failed and leave the task for them; the close already recorded its blocker (`toodo=blocked`), so add one only when the line says it was not recorded. `AUTOPILOT_LANE_DONE ... toodo=done` needs nothing: the supervisor completed the task with its PR, which lets its dependents become ready. On a plain `AUTOPILOT_LANE_DONE` (its `TOODO_TASK_NOT_COMPLETED` says why) complete the task yourself (`complete_task` with the PR as a ref).
 - While any task is marked for autopilot, never archive a task that has dependents, and never run `delete_done_tasks` or any bulk delete in a workspace that holds marked tasks.
 - Clearing the mark (`update_task` with `autopilot: false`) stops new launches. Running lanes go on to claim, and their merges wait until the owner speaks.
 
+## Supervisor executor
+
+`src/autopilot-executor.ts` can take the lead's launch order over. It's off by default (`autopilot.executor: false`), and while it's off `runExecutor` and `reconcileExecutions` return `disabled` and touch nothing, so the lead keeps launching by hand as above. It stays off until the owner approves turning it on; see Switch-over.
+
+When on, each supervisor tick first runs `reconcileExecutions`, then `runExecutor` on the tick's LAUNCH ids, one task at a time under the same `autopilot-launch.lock.sqlite` lock as `dori autopilot launch`. A task goes through these steps:
+
+1. prepare: read the task and its contract again; a reason to stop goes to review before anything is reserved or started.
+2. reserve: open the task's `autopilot-launch` ledger attempt, exactly as the CLI does. A reservation the CLI opened is never adopted.
+3. start-task: `start_task` with the `lane:<key>` ref.
+4. thread: create the lane's Discord thread under `autopilot.threadChannel` (else the first `discordChannels` entry) and add `discord.ownerId`.
+5. launch: write the brief, then place, validate and admit through the real launch service (never `launchLane` directly). A HOLD from admission queues the lane.
+6. settle: settle the ledger attempt `verified`, `failed` or `ambiguous`, and notify with `AUTOPILOT_EXECUTOR_LAUNCHED`, `_REVIEW`, `_FAILED` or `_AMBIGUOUS`.
+
+Every step is journaled in the operation store: one sequence row `toodo:<taskId>/autopilot-execute/<n>` (attempt `n`: 1, or one past the attempts a re-arm covers) and step rows with actions `autopilot-prepare`, `autopilot-reserve`, `autopilot-start-task`, `autopilot-thread`, `autopilot-brief`, `autopilot-hold`, `autopilot-admit`, `autopilot-settle`, `autopilot-drop-held`, `autopilot-blocker` and `autopilot-notice`. The thread id and its member result are kept, so a member-add error doesn't create a second thread. The `autopilot-launch` ledger row stays authoritative.
+
+- Crash reconcile: at startup and on every tick, `reconcileExecutions` resumes open sequences from their last journaled step. It never relaunches. An admission whose start can't be proved (a startup receipt or the runner's journaled startup result; a registered pane alone isn't proof) settles `ambiguous` and goes to the lead, as does a lost thread-create reply. Positive proof that a launch never started settles `failed` with one blocker, without retry.
+- HOLD resume: a held lane drains under its original key. A pause or a changed contract keeps it queued, and a scope change sends it to review. If the key left the queue outside the executor, a registry lane for it is `ambiguous` (a manual `dori launch` is never repeated) and no lane is review `hold-dropped` (`dori hold drop` was the lead's call). Neither path admits again.
+- Base enforcement: `autopilot.mergeBase` must equal the CI merge base, and the contract's base and version are recorded before launch.
+- Worktree isolation: a local launch runs in `<worktree root>/<repo name>-<laneKey>` (a repo-less one in `<worktree root>/<laneKey>`), created empty right before validation. The root is the local runner's reported worktree root, else `config.worktreeRoot`; with neither the task goes to review `worktree-root-missing`, and a directory that can't be made is review `local-cwd-unusable`. It's never under the state dir and never left out. Remote placement drops the cwd so the runner makes its own lane directory.
+
+## Switch-over
+
+The switch is `autopilot.executor` in `config.json` (it applies live). The lead sets it to `true` only after the owner approves the switch-over, and sets it back to `false` when the owner says so; nothing else turns it on.
+
+One task has exactly one launcher. Both launchers take the same `autopilot-launch.lock.sqlite` lock and write the same `autopilot-launch` ledger, and each refuses the other's work:
+
+- With the switch on, `dori autopilot launch <id>` refuses to reserve (`executor-on`) and refuses to settle a reservation an executor sequence owns (`executor-owned`).
+- The executor never adopts a ledger row it did not open: a task with any earlier `autopilot-launch` row the owner did not cover comes back `refused`, and the tick wakes the lead for it as before.
+
+With the switch on, the lead does not:
+
+- reserve, `start_task`, `dori launch` or settle a marked task, nor run `dori launch` / `dori hold drop` on an `ap-<id>-<n>` key the executor holds;
+- settle a launch the executor settled, or complete a task the supervisor completed (`AUTOPILOT_LANE_DONE ... toodo=done`).
+
+The lead still:
+
+- reviews a task the executor sent to review (`AUTOPILOT_EXECUTOR_REVIEW`, or an `AUTOPILOT_READY` naming it): fill in the missing or conflicting contract refs, or judge criteria a script cannot and record `approved:<version>`; the next tick runs it again. A task that should not run loses its mark.
+- decides on `AUTOPILOT_EXECUTOR_FAILED` and `AUTOPILOT_EXECUTOR_AMBIGUOUS`: read the task, its thread and the registry, tell the owner, and leave a new attempt to the owner; a failed or ambiguous attempt is never retried by itself. When the owner wants it run again, a pause and a wait that ends (or `dori autopilot rearm <id>`) let the executor run attempt `n+1`.
+- finishes a reservation it opened before the switch (the executor refuses that task): `dori launch` and settle it as before, or settle it `--failed` / `--ambiguous`.
+- handles lane outcomes as before: `AUTOPILOT_LANE_FAILED`, and a plain `AUTOPILOT_LANE_DONE` whose task the supervisor could not complete.
+
+Turning the switch off stops new and resumed executions; an open executor sequence stays where it stopped. Its reservation then has no owner, so the lead settles it (`--launched <key>` when its lane runs, else `--failed` or `--ambiguous`) and handles the task by hand.

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,44 @@ import { type Ran, run as realRun, type Runner } from "../src/run.ts";
 import {
   branchPresence, capOutput, discoverWorktrees, GIT_OUTPUT_CAP, gitFacts, gitOpArgv, LaneGitError, laneGit, laneGitEffect, listWorktrees, worktreeState,
 } from "../src/runner/lane-git.ts";
+
+test("leftover-remove deletes a directory holding only omo's files (or nothing) and refuses, deleting nothing, one holding anything else", async () => {
+  const base = mkdtempSync(join(tmpdir(), "leftover-"));
+  const unused = recording(() => undefined).run;
+  const dir = (name: string, files: Record<string, string> = {}): string => {
+    const path = join(base, name);
+    mkdirSync(path);
+    for (const [file, text] of Object.entries(files)) {
+      mkdirSync(join(path, file, ".."), { recursive: true });
+      writeFileSync(join(path, file), text);
+    }
+    return path;
+  };
+  try {
+    const omoOnly = dir("omo-only", { ".omo/omo.jsonc": "{}", ".omo/omo.jsonc.bak.1": "{}" });
+    const empty = dir("empty");
+    for (const path of [omoOnly, empty]) {
+      expect(await laneGit(unused, { key: "k", op: "leftover-remove", root: path, path })).toEqual({ code: 0, out: "", err: "" });
+      expect(existsSync(path)).toBe(false);
+    }
+    const report = dir("report", { ".omo/omo.jsonc": "{}", "report.md": "work" });
+    const checkout = dir("checkout", { ".git": "gitdir: /elsewhere" });
+    const omoExtra = dir("omo-extra", { ".omo/notes.md": "x" });
+    const linked = dir("linked");
+    symlinkSync(omoExtra, join(linked, ".omo"));
+    for (const [path, holds] of [[report, "report.md"], [checkout, ".git"], [omoExtra, ".omo/notes.md"], [linked, ".omo"]] as const) {
+      const r = await laneGit(unused, { key: "k", op: "leftover-remove", root: path, path });
+      expect(r.code).toBe(1);
+      expect(r.err).toBe(`RUNNER_LANE_GIT_REFUSED ${path} is no worktree and holds ${holds}`);
+    }
+    expect(readFileSync(join(report, "report.md"), "utf8")).toBe("work");
+    expect(existsSync(join(report, ".omo/omo.jsonc"))).toBe(true);
+    expect(existsSync(join(omoExtra, ".omo/notes.md"))).toBe(true);
+    expect((await laneGitEffect(unused, { key: "k", op: "leftover-remove", root: report, path: report })).detail).toBe(`git leftover-remove ${report} exit 1`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
 
 type Script = (argv: readonly string[]) => Ran | undefined;
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
@@ -22,6 +60,7 @@ const PORCELAIN = [
   "worktree /repo/.wt/demo-lane-2", "HEAD 3333", "branch refs/heads/feature/demo-lane-2", "",
   "worktree /repo/.wt/other", "HEAD 4444", "branch refs/heads/other", "",
   "worktree /repo/.wt/detached", "HEAD 5555", "detached", "",
+  "worktree /repo/.wt/demo-lane-3", "HEAD 6666", "detached", "",
 ].join("\n");
 
 const repo: Script = (argv) => {
@@ -31,6 +70,8 @@ const repo: Script = (argv) => {
   if (a.startsWith("git -C /repo/.wt/demo-lane rev-list")) return ok("2\n");
   if (a.startsWith("git -C /repo/.wt/demo-lane-2 status")) return ok("");
   if (a.startsWith("git -C /repo/.wt/demo-lane-2 rev-list")) return { code: 128, out: "", err: "fatal: bad HEAD" };
+  if (a.startsWith("git -C /repo/.wt/demo-lane-3 status")) return ok("");
+  if (a.startsWith("git -C /repo/.wt/demo-lane-3 rev-list")) return ok("0\n");
   if (a === "git -C /repo rev-parse --show-toplevel") return ok("/repo\n");
   if (a === "git -C /repo remote get-url origin") return ok("git@github.com:o/r.git\n");
   if (a === "git -C /repo symbolic-ref --quiet --short HEAD") return ok("main\n");
@@ -49,10 +90,10 @@ test("listWorktrees parses path, HEAD and branch", async () => {
   expect(await listWorktrees(recording(() => undefined).run, "/nope")).toBeUndefined();
 });
 
-test("discoverWorktrees finds the key's worktrees by branch or directory, never the root or others", async () => {
+test("discoverWorktrees finds the key's worktrees by branch or directory (a detached one by directory), never the root or others", async () => {
   const { run } = recording(repo);
   const found = await discoverWorktrees(run, "demo-lane", ["/repo", "/repo", "/unreadable"]);
-  expect(found.map((w) => w.path)).toEqual(["/repo/.wt/demo-lane", "/repo/.wt/demo-lane-2"]);
+  expect(found.map((w) => w.path)).toEqual(["/repo/.wt/demo-lane", "/repo/.wt/demo-lane-2", "/repo/.wt/demo-lane-3"]);
 });
 
 test("gitFacts: dirty/ahead per worktree, an unreadable one carries error, a missing one exists:false", async () => {
@@ -63,6 +104,7 @@ test("gitFacts: dirty/ahead per worktree, an unreadable one carries error, a mis
     worktrees: [
       { path: "/repo/.wt/demo-lane", branch: "demo-lane", head: "2222", exists: true, dirty: true, ahead: 2 },
       { path: "/repo/.wt/demo-lane-2", branch: "feature/demo-lane-2", head: "3333", exists: true, error: "fatal: bad HEAD" },
+      { path: "/repo/.wt/demo-lane-3", head: "6666", exists: true, dirty: false, ahead: 0 },
     ],
     branches: { "demo-lane": { local: true, remote: true }, gone: { local: false, remote: false } },
   });

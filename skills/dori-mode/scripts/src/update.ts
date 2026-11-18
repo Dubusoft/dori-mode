@@ -1,3 +1,7 @@
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { replaceFileAtomic } from "./durable-write.ts";
 import type { Runner } from "./run.ts";
 
 export const SUPERVISOR_UNIT = "dori-supervisor.service";
@@ -164,3 +168,4 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
     return 1;
   }
 };
+

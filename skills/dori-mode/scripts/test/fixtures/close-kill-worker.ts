@@ -1,4 +1,5 @@
-// One supervisor pass over a done-claimed lane whose window has passed (the automatic close).
+// Two supervisor passes over a done-claimed lane whose window has passed: the automatic close (it queues the lane's
+// worktrees), then the closed-lane sweep (it removes them).
 // argv: <stateDir> <worldDir> <killAt> <mode: watch|close>. The process SIGKILLs itself right after its killAt-th step;
 // a step is an operation row write, an effect on the world, or a registry write. killAt -1 never kills and prints
 // {"steps": n, "lines": [...]}. The world (panes, worktree directories, effect log) lives in worldDir.
@@ -12,7 +13,7 @@ import { Registry } from "../../src/registry.ts";
 import type { LaneOps } from "../../src/lane-ops.ts";
 import type { Ran, Runner } from "../../src/run.ts";
 import { checkDone } from "../../src/signals.ts";
-import { fakeClock, fakeLaneOps, newWorld, TEST_STORE, testTunables } from "../fakes.ts";
+import { fakeClock, fakeLaneOps, newWorld, testTunables } from "../fakes.ts";
 
 const [stateDir = "", worldDir = "", killArg = "-1", mode = "watch"] = process.argv.slice(2);
 const killAt = Number(killArg);
@@ -70,7 +71,7 @@ class StepRegistry extends Registry {
   }
 }
 
-const config = { ...defaultConfig("/home/test"), stateDir, leadCwd: repo, leadPane: "lead:p1", store: TEST_STORE };
+const config = { ...defaultConfig("/home/test"), stateDir, leadCwd: repo, leadPane: "lead:p1" };
 const inner = openOperations(config);
 const operations: OperationStore = {
   get: (id) => inner.get(id),
@@ -85,6 +86,7 @@ if (mode === "close") {
   const lane = await deps.registry.read("demo-lane");
   if (lane) lines.push(...(await closeLane(deps, lane, "closed by the lead")).lines);
 } else {
+  lines.push(...(await watchTick(deps)));
   lines.push(...(await watchTick(deps)));
 }
 inner.close();

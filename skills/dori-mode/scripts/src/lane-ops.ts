@@ -8,8 +8,9 @@ import type {
   SupervisorCommandBodies, TurnEvidence,
 } from "./runner/protocol.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
-import { checkLaneFilesBody, isLaneOutputFiles } from "./lane-files.ts";
-import type { LaneBriefFiles, LaneOutputFiles } from "./runner/protocol.ts";
+import { isLaneOutputFiles } from "./lane-files.ts";
+import { checkLaneFilesBody } from "./lane-file-contract.ts";
+import type { LaneBriefFiles, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
 
 /**
  * The lane facade (design 3.3): every lane and host-pane operation the supervisor and the CLI need, each one a single
@@ -31,12 +32,16 @@ export type InspectWant = {
   readonly process?: boolean; readonly session?: boolean; readonly sessionsDir?: string; readonly cwd?: string;
 };
 export type StartInput = {
+  /** Uses the runner's restricted review profile. */
+  readonly review?: true;
   readonly files?: LaneBriefFiles;
   readonly key: string; readonly machine?: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
   readonly sandbox: boolean; readonly mode: string; readonly model: string; readonly keywords: string; readonly session?: string;
   readonly target?: { pane?: string; workspace?: string }; readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
   /** The herdr workspace a new tab opens in (the supervisor-managed lanes workspace of a local lane). */
   readonly tabWorkspace?: string;
+  /** Names in the runner's runner-config `grants` (`dori launch --grant`); sent only when non-empty. */
+  readonly grants?: readonly string[];
 };
 export type AdoptInput = { readonly key: string; readonly machine?: string; readonly pane: string; readonly cwd?: string; readonly mode: string; readonly model: string };
 export type GitOp =
@@ -46,7 +51,9 @@ export type GitOp =
   | { readonly op: "remote-branch-delete"; readonly root: string; readonly branch: string; readonly remote: string; readonly sha?: string }
   // fetch-branch: `git fetch <remote> +refs/heads/<branch>:refs/remotes/<remote>/<branch>`; worktree-add: a detached worktree of `ref` at `path`.
   | { readonly op: "fetch-branch"; readonly root: string; readonly remote: string; readonly branch: string }
-  | { readonly op: "worktree-add"; readonly root: string; readonly path: string; readonly ref: string };
+  | { readonly op: "worktree-add"; readonly root: string; readonly path: string; readonly ref: string }
+  // leftover-remove: the directory at `path` git lists no worktree at, removed only while omo's own files are all it holds.
+  | { readonly op: "leftover-remove"; readonly root: string; readonly path: string };
 export type LaneNotice = { readonly status: string; readonly objection?: Objection; readonly claim?: { readonly at: string; readonly evidence: string } };
 
 export type LaneOpsErrorCode = "RUNNER_UNAVAILABLE" | "RUNNER_OUTDATED" | "LANE_OP_FAILED" | "LANE_OP_AMBIGUOUS";
@@ -93,6 +100,8 @@ export type LaneOps = {
   readonly git: (lane: LaneRef, op: GitOp, opts?: { readonly cmdId?: string }) => Promise<Ran>;
   /** Never throws (logged). */
   readonly notify: (lane: LaneRef, notice: LaneNotice) => Promise<void>;
+  /** Adds `tree` to the running lane's briefs/<key>.files (proto 7); throws like `start`. */
+  readonly attach: (lane: LaneRef, tree: LaneFileTree) => Promise<CommandResults["lane.attach"]>;
   readonly kill: (machine: string | undefined, keys: readonly string[]) => Promise<KilledProc[]>;
   readonly observe: (lane: LaneRef) => Promise<LaneStatus>;
   /** An idle lane's last stopped turn as its runner recorded it (`lane.observe`); undefined when it has none to give. */
@@ -103,6 +112,7 @@ export type LaneOps = {
 /** The runner profiles `lane.start` names (the runner holds the argv): `sandboxed` wraps `default` in the lane sandbox. */
 const AGENT_PROFILE = "default";
 const SANDBOXED_PROFILE = "sandboxed";
+const REVIEW_PROFILE = "review";
 /** A failed send is logged at most this often per lane. */
 const SEND_LOG_EVERY_MS = 60_000;
 
@@ -144,19 +154,21 @@ const QUERY_GUARDS: { readonly [T in QueryType]: (v: unknown) => boolean } = {
     && (v.done === undefined || (isObj(v.done) && isStr(v.done.cwd) && isBool(v.done.fallback) && listOf(v.done.checks, isCheck)))
     && (v.session === undefined || (isObj(v.session) && isStr(v.session.id) && isStr(v.session.via))),
   "q.machine.observe": (v) => isObj(v) && isStr(v.os) && isNum(v.sampledAt) && isObj(v.sample) && listOf(v.panes, isPane)
-    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum))),
+    && (v.guard === undefined || (isObj(v.guard) && Object.values(v.guard).every(isNum)))
+    && (v.profiles === undefined || listOf(v.profiles, isStr)),
 };
 
 export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) => boolean } = {
-  "lane.start": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStartup(v.startup),
+  "lane.start": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStartup(v.startup) && optStr(v.model),
   "lane.adopt": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isStr(v.tokenFile),
   "lane.stop": (v) => isObj(v) && CLOSED(v.closed) && isBool(v.gone),
   "lane.close": (v) => isObj(v) && CLOSED(v.closed) && isBool(v.gone),
   "lane.pause": (v) => isObj(v) && (v.goal === undefined || GOALS(v.goal)) && optBool(v.working) && optBool(v.stopped),
   "lane.resume": (v) => isObj(v) && GOALS(v.goal),
-  "lane.recover": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isBool(v.relaunched) && isBool(v.resumed) && (v.startup === undefined || isStartup(v.startup)),
+  "lane.recover": (v) => isObj(v) && isStr(v.pane) && isStr(v.tab) && isBool(v.relaunched) && isBool(v.resumed) && (v.startup === undefined || isStartup(v.startup)) && optStr(v.model),
   "lane.send": (v) => isObj(v) && DELIVERIES(v.delivery) && optStr(v.refusal),
   "lane.notify": (v) => v === undefined || isObj(v),
+  "lane.attach": (v) => isObj(v) && isStr(v.dir),
   "lane.git": (v) => isObj(v) && isNum(v.code) && isStr(v.out) && isStr(v.err),
   "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status) && (v.turn === undefined || isTurn(v.turn)),
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
@@ -206,6 +218,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
   ): Promise<CommandResults[T]> => {
     let r;
     try {
+      if (type === "lane.attach") checkLaneFilesBody((body as { key?: string }).key!, body);
       if (type === "lane.start" || type === "lane.recover") {
         cmdId ??= `${type === "lane.start" ? "lane-start" : "recover"}:${(body as { key?: string }).key}:${deps.now()}`;
         checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
@@ -307,7 +320,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
     resume: (lane) => effect(runnerOf(lane), "lane.resume", { key: lane.key }),
     start: (input) => effect(machineRunner(input.machine), "lane.start", {
       key: input.key, briefText: input.briefText, done: input.done, thread: input.thread, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
-      agentProfile: input.sandbox ? SANDBOXED_PROFILE : AGENT_PROFILE, mode: input.mode, model: input.model, sandbox: input.sandbox,
+      agentProfile: input.review ? REVIEW_PROFILE : input.sandbox ? SANDBOXED_PROFILE : AGENT_PROFILE, mode: input.mode, model: input.model, sandbox: input.sandbox,
       expectedLaneGen: 0, keywords: input.keywords,
       ...(input.files !== undefined ? { files: input.files } : {}),
       ...(input.session !== undefined ? { session: input.session } : {}),
@@ -315,6 +328,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
       ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}),
       ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
       ...(input.tabWorkspace !== undefined ? { tabWorkspace: input.tabWorkspace } : {}),
+      ...(input.grants?.length ? { grants: input.grants } : {}),
     }, input.cmdId),
     adopt: (input) => effect(machineRunner(input.machine), "lane.adopt", {
       key: input.key, pane: input.pane, mode: input.mode, model: input.model, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
@@ -352,6 +366,7 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
         log(`LANE_NOTIFY_FAILED ${lane.key} runner=${label} ${toOpsError(e, label).message}`);
       }
     },
+    attach: (lane, tree) => effect(runnerOf(lane), "lane.attach", { key: lane.key, tree }),
     kill: async (machine, keys) => [...(await effect(machineRunner(machine), "guard.kill", { keys: [...keys] })).killed],
     observe: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).status,
     turn: async (lane) => (await effect(runnerOf(lane), "lane.observe", { key: lane.key })).turn,

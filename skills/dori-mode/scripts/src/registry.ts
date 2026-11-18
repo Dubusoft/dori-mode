@@ -1,8 +1,9 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { normalizeThreadRef } from "./messenger/target.ts";
 import { acquireStateLock } from "./state-lock.ts";
+import { replaceFileDurable } from "./durable-write.ts";
 import type { LaneFileRun } from "./runner/protocol.ts";
 export { LOCK_WAIT_MS, StateLockError as RegistryLockError } from "./state-lock.ts";
 
@@ -26,12 +27,18 @@ export type Claim = {
    * a PR only at exactly this head; a claim without it (an older dori, GitHub unreadable) never auto-merges.
    */
   readonly pulls?: readonly ClaimedPull[];
+  /** The lane's own done text (`dori report <key> done --text`): the body of the supervisor's auto report (done-flow.ts). */
+  readonly text?: string;
+  /** The message id of the supervisor's auto report of this claim: the claim was reported to the owner without the lead. */
+  readonly autoReported?: string;
 };
 export type ClaimedPull = { readonly repo: string; readonly number: number; readonly sha: string };
 export type Objection = { readonly at: string; readonly reasons: readonly string[] };
 export type HistoryEntry = { readonly at: string; readonly status: LaneStatus; readonly note: string };
 
 export type Lane = {
+  /** A review lane (review-lane.ts): it takes a free lane slot like any lane and runs under the review sandbox profile. */
+  readonly review?: true;
   readonly fileRun?: LaneFileRun;
   readonly pendingFileRun?: LaneFileRun;
   readonly key: string;
@@ -55,8 +62,18 @@ export type Lane = {
   readonly mode?: LaneMode;
   /** The GitHub issue the lane works on (`owner/repo#N`, the brief's `issue:` line); closed once its PR merges into ciMergeBase. */
   readonly ghIssue?: string;
+  /**
+   * The Toodo task the lane works on (`dori launch --task <id>`, a positive integer; Toodo is not asked). An autopilot lane
+   * gets its reservation's task id here. Absent: no task was named (or the lane predates the field).
+   */
+  readonly task?: number;
   readonly recoveryPending?: boolean;
   readonly recoveryPreviousPane?: string;
+  /**
+   * The pane the lane's last RUNNER_LANE_DEAD named. Another dead about the same pane raises nothing (nor a dead-panes
+   * alert) until the runner sees the lane alive there again or the lane starts afresh.
+   */
+  readonly deadAlertPane?: string;
   /** A runner lane's recovery: the runner journal head at the hello that asked for it; a lane.started at or before it is stale. */
   readonly recoveryAfter?: number;
   /** An admission reservation is paused until its agent is registered, so recovery never launches it too. */
@@ -98,6 +115,8 @@ export type Lane = {
   readonly reportVia?: "cli";
   /** Launched behind `laneSandbox.command` (every local `dori launch` that the sandbox fits, or `--sandbox`); recovery relaunches it the same way. */
   readonly sandbox?: true;
+  /** The runner-config `grants` names the lane was launched with (`--grant`); recovery relaunches it with the same ones. */
+  readonly grants?: readonly string[];
   /** @deprecated No longer written; kept so old registries load. */
   readonly leadPaneSeen?: readonly { readonly hash: string; readonly at: string }[];
   /** @deprecated No longer written; kept so old registries load. */
@@ -150,11 +169,6 @@ const readLaneFile = (path: string): Lane | null => {
     return typeof lane.thread === "string" ? { ...lane, thread: normalizeThreadRef(lane.thread) } : lane;
   }
   catch (e) { if (missing(e)) return null; throw e; }
-};
-
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
 };
 
 /**
@@ -213,16 +227,13 @@ export class Registry {
     // An archived lane that stays closed is rewritten in place; anything else is written to lanes/ first.
     const dir = closed && archived ? this.archiveDir : this.dir;
     const target = join(dir, `${lane.key}.json`);
-    const tmp = `${target}.${process.pid}.tmp`;
-    const fd = openSync(tmp, "w", 0o600);
-    try { writeFileSync(fd, JSON.stringify(next, null, 1)); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, target);
-    fsyncDir(dir);
+    replaceFileDurable(target, JSON.stringify(next, null, 1), 0o600);
     if (closed && !archived) this.moveToArchive(lane.key);
     else if (!closed && archived) {
       // Reopened: the archived copy goes, so the key lives in exactly one place.
       unlinkSync(this.archivePath(lane.key));
-      fsyncDir(this.archiveDir);
+      const archive = openSync(this.archiveDir, "r");
+      try { fsyncSync(archive); } finally { closeSync(archive); }
     }
     return next;
   }
@@ -231,8 +242,10 @@ export class Registry {
   private moveToArchive(key: string): void {
     mkdirSync(this.archiveDir, { recursive: true });
     renameSync(this.path(key), this.archivePath(key));
-    fsyncDir(this.archiveDir);
-    fsyncDir(this.dir);
+    const archive = openSync(this.archiveDir, "r");
+    try { fsyncSync(archive); } finally { closeSync(archive); }
+    const lanes = openSync(this.dir, "r");
+    try { fsyncSync(lanes); } finally { closeSync(lanes); }
   }
 
   /** Archives a closed lane left in lanes/ (written by older code, or a crash between save and rename). */
@@ -258,7 +271,8 @@ export class Registry {
       const to = join(this.legacyDir, f);
       if (!existsSync(to)) renameSync(join(this.oldClosedDir, f), to);
     }
-    fsyncDir(this.legacyDir);
+    const legacy = openSync(this.legacyDir, "r");
+    try { fsyncSync(legacy); } finally { closeSync(legacy); }
     if (readdirSync(this.oldClosedDir).length === 0) rmdirSync(this.oldClosedDir);
   }
 
@@ -305,7 +319,8 @@ export class Registry {
     try {
       if ((await this.read(key))?.launchReservation !== token) return;
       unlinkSync(this.path(key));
-      fsyncDir(this.dir);
+      const lanes = openSync(this.dir, "r");
+      try { fsyncSync(lanes); } finally { closeSync(lanes); }
     } finally { release(); }
   }
 

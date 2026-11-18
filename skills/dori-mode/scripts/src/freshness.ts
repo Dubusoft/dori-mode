@@ -1,7 +1,8 @@
 import { languageInstruction } from "./config.ts";
 import { redactSecrets } from "./redact.ts";
+import { laneOwnerWait, type LaneOwnerWait, readDecisions } from "./decision-store.ts";
 import type { FlowDeps, LaneReads } from "./done-flow.ts";
-import type { LaneReportStore } from "./lane-reports.ts";
+import type { LaneReportStore } from "./lane-report-store.ts";
 import { checkPausedLane } from "./pause.ts";
 import { type Lane, statusOf } from "./registry.ts";
 import type { SweepView } from "./sweep-view.ts";
@@ -49,14 +50,18 @@ const lastRowAt = (reports: LaneReportStore): Map<string, number> => {
  * lane with a row newer than nudgeAfterMin costs no pane read at all. Its pane status is read (for the nudge) only once
  * no row arrived within nudgeAfterMin, counted from its newest row or reply. A pane's text is never read for a report.
  * Every read and the nudge go through the lane's runner: `view` (the supervisor round's cached reads), else `deps.ops`.
- * A lane whose machine is not `admitted` (its runner has no admitted connection) is skipped.
+ * A lane whose machine is not `admitted` (its runner has no admitted connection) is skipped, and so is a lane waiting on
+ * its own blocking question or request (decision-store.ts laneOwnerWait): it parked its goal and ended its turn, and the
+ * answer wakes it. Once that wait ends its silence counts from the close (or the direct answer), not from the question.
  */
 export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: LaneReportStore, admitted: (machine?: string) => boolean = () => true): Promise<SweepAct[]> => {
   const acts: SweepAct[] = [];
   const now = deps.clock.now();
   const reads: LaneReads = view ?? deps.ops;
   let rows: Map<string, number> | undefined;
-  for (const lane of await deps.registry.open()) {
+  let owner: LaneOwnerWait | undefined;
+  const open = await deps.registry.open();
+  for (const lane of open) {
     if (!admitted(lane.machine)) continue;
     if (statusOf(lane) === "paused") {
       const checked = view ? await checkPausedLane(deps, lane, view) : await checkPausedLane(deps, lane);
@@ -69,10 +74,12 @@ export const freshnessTick = async (deps: FlowDeps, view?: SweepView, reports?: 
       continue;
     }
     if (statusOf(lane) !== "working" || !lane.pane || lane.recoveryPending) continue;
+    owner ??= laneOwnerWait(readDecisions(deps.config.stateDir).decisions, open);
+    if (owner.waiting.has(lane.key)) continue;
     if (reports) rows ??= lastRowAt(reports);
     const rowAt = rows?.get(lane.key);
     if (rowAt !== undefined && now - rowAt < deps.tunables.nudgeAfterMin * 60_000) continue;
-    const heard = Math.max(lastHeard(lane), rowAt ?? -Infinity);
+    const heard = Math.max(lastHeard(lane), rowAt ?? -Infinity, owner.resolvedAt.get(lane.key) ?? -Infinity);
     const silentMin = Math.round((now - heard) / 60_000);
     let current = lane;
     // Only this sweep's own fields are written, onto the fresh lane: a pause, objection or claim made meanwhile stands.

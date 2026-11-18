@@ -1,8 +1,9 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
 
 import { eventClass, type EventPolicy, forLead } from "./event-policy.ts";
+import { dropFile, publishReceipt, receiptPaths } from "./receipts.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 import type { Event, Journal, JournalCore, Obligation } from "./supervise-journal.ts";
 
 /**
@@ -35,7 +36,6 @@ export const DEFAULT_RESOLVE_KINDS: readonly string[] = [
 
 /** One word without control characters: an event id as a receipt and the UNRESOLVED line can carry it. */
 const EVENT_ID = /^[^\s\p{Cc}]{1,300}$/u;
-const RECEIPT_FILE = /^\d+-[\w-]+\.json$/;
 export const validEventId = (id: string): boolean => EVENT_ID.test(id);
 
 export class ResolvedError extends Error {}
@@ -51,40 +51,24 @@ const table = (kinds: readonly string[]): EventPolicy => {
 /** `line` is a decision event under `kinds`. */
 export const isDecision = (line: string, kinds: readonly string[]): boolean => eventClass(line, table(kinds)) === "lead-urgent";
 
+/**
+ * A live event with `line` opens an obligation: a decision kind that reaches the lead. `dori inbox take` marks such lines
+ * `[resolve]`, and `dori resolved` on a known event that does not is RESOLVED_NOT_NEEDED.
+ */
+export const opensObligation = (line: string, tunables: { readonly resolveKinds: readonly string[]; readonly eventPolicy: EventPolicy }): boolean =>
+  isDecision(line, tunables.resolveKinds) && forLead(eventClass(line, tunables.eventPolicy));
+
 /** `dori resolved <eventId>`'s receipt: written like `dori reported`'s (tmp, fsync, rename, both directories fsynced). */
 export const recordResolved = (stateDir: string, id: string, at: number, note?: string): string => {
   if (!EVENT_ID.test(id)) throw new ResolvedError("usage: dori resolved <eventId> [<eventId> ...] [--note TEXT] (an event id)");
-  const dir = join(stateDir, RESOLVED_DIR);
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, `${at}-${randomUUID()}.json`);
-  const tmp = `${path}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ id, at, ...(note ? { note } : {}) }), { mode: 0o600, flush: true });
-  renameSync(tmp, path);
-  fsyncDir(dir);
-  fsyncDir(stateDir);
-  return path;
-};
-
-const fsyncDir = (dir: string): void => {
-  const fd = openSync(dir, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
-};
-
-const dropReceipt = (path: string): void => {
-  try { unlinkSync(path); } catch (e) {
-    if (!(e instanceof Error && "code" in e && e.code === "ENOENT")) throw e;
-  }
+  return publishReceipt(stateDir, RESOLVED_DIR, at, { id, at, ...(note ? { note } : {}) });
 };
 
 export type ResolvedReceipt = { readonly path: string; readonly id: string; readonly at: number; readonly note?: string };
 
 /** Receipts waiting for the supervisor; unreadable or malformed files are skipped (and never dropped). */
 export const pendingResolved = (stateDir: string): ResolvedReceipt[] => {
-  const dir = join(stateDir, RESOLVED_DIR);
-  let names: string[];
-  try { names = readdirSync(dir); } catch { return []; }
-  return names.filter((name) => RECEIPT_FILE.test(name)).flatMap((name) => {
-    const path = join(dir, name);
+  return receiptPaths(join(stateDir, RESOLVED_DIR)).flatMap((path) => {
     try {
       const { id, at, note } = JSON.parse(readFileSync(path, "utf8")) as { id?: unknown; at?: unknown; note?: unknown };
       if (typeof id !== "string" || !EVENT_ID.test(id)) return [];
@@ -141,7 +125,7 @@ export class DecisionTracking {
    */
   track(event: Event): void {
     const { tunables } = this.core.deps;
-    if (!EVENT_ID.test(event.id) || !isDecision(event.line, tunables.resolveKinds) || !forLead(eventClass(event.line, tunables.eventPolicy))) return;
+    if (!EVENT_ID.test(event.id) || !opensObligation(event.line, tunables)) return;
     const pending = this.journal.pending ?? [];
     const line = event.line.slice(0, OBLIGATION_LINE_MAX);
     const at = pending.findIndex((item) => item.id === event.id);
@@ -155,16 +139,26 @@ export class DecisionTracking {
 
   /**
    * `dori resolved` receipts close their obligation; one naming no obligation yet is kept (resolved before its event
-   * arrived, or a mistyped id: logged as unmatched), so that event opens nothing. Persisted before the receipts are
-   * dropped: a replay only takes the earliest resolve time again.
+   * arrived, or a mistyped id: logged as unmatched), so that event opens nothing. One naming a journaled event that
+   * opens no obligation (a decision close's or `--from-event`'s source, say) is only logged as not needed. Persisted
+   * before the receipts are dropped: a replay only takes the earliest resolve time again.
    */
   consumeReceipts(): void {
     const receipts = pendingResolved(this.core.deps.config.stateDir);
     if (!receipts.length) return;
     const pending = [...(this.journal.pending ?? [])];
+    let lines: Map<string, string> | undefined;
     for (const receipt of receipts) {
       const at = pending.findIndex((item) => item.id === receipt.id);
       const found = at < 0 ? undefined : pending[at];
+      if (!found) {
+        lines ??= new Map(this.journal.events.map((event) => [event.id, event.line]));
+        const line = lines.get(receipt.id);
+        if (line !== undefined && !opensObligation(line, this.core.deps.tunables)) {
+          console.log(`DECISION_RESOLVED_NOT_NEEDED ${receipt.id}`);
+          continue;
+        }
+      }
       const note = found?.note ?? receipt.note;
       const next: Obligation = {
         ...(found ?? { id: receipt.id, since: receipt.at }),
@@ -177,7 +171,7 @@ export class DecisionTracking {
     }
     this.journal = { ...this.journal, pending };
     this.core.persist();
-    for (const receipt of receipts) dropReceipt(receipt.path);
+    for (const receipt of receipts) dropFile(receipt.path);
     this.publish();
   }
 
@@ -220,9 +214,7 @@ export class DecisionTracking {
     const text = JSON.stringify(list);
     if (text === this.published) return;
     const path = join(this.core.deps.config.stateDir, UNRESOLVED_FILE);
-    const tmp = `${path}.${process.pid}.tmp`;
-    writeFileSync(tmp, text, { mode: 0o600 });
-    renameSync(tmp, path);
+    replaceFileAtomic(path, text, 0o600);
     this.published = text;
   }
 }

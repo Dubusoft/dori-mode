@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { type DeliveryConfig, omoSessionsDir } from "./config.ts";
 import { DEFAULT_RESOLVE_KINDS } from "./decision-obligations.ts";
 import { DEFAULT_EVENT_POLICY, type EventPolicy } from "./event-policy.ts";
+import type { ToodoClientConfig } from "./toodo-client.ts";
 import type { ToodoEventsConfig } from "./toodo-events.ts";
 
 /**
@@ -23,6 +24,8 @@ export type Tunables = {
   readonly githubTimeoutMs: number;
   /** The toodo-server event stream the supervisor follows for task status changes and readiness (toodo-events.ts). */
   readonly toodoEvents: ToodoEventsConfig;
+  /** toodo-server's MCP endpoint and its `mcp-token`, which the supervisor writes a closed lane's task with (task-finish.ts). */
+  readonly toodoWriter: ToodoClientConfig;
   /** Opening keywords of a `--mode ulw` lane (the default): clear, contained work. */
   readonly launchKeywords: string;
   /** Opening keywords of a `--mode mass-ulw` lane: wide changes or vague instructions that need investigation first. */
@@ -47,6 +50,12 @@ export type Tunables = {
    * draft; green and clean but its lane never claimed at that head) before the lead hears urgent MERGE_STALLED once.
    */
   readonly mergeStallMin: number;
+  /**
+   * Minutes an open lane may hold the automatic `dori update --dev` back (auto-update.ts) before the supervisor checks
+   * whether it can close it safely (update-blocker.ts) and, when it cannot, tells the lead once. An initial value, not a
+   * measured one.
+   */
+  readonly updateBlockerStaleMin: number;
   /** Digest events wait for an urgent one, but never longer than this. */
   readonly digestMaxDelayMin: number;
   /** Posted once in the owner's channel or thread when the lead has not received their message within a minute. */
@@ -86,6 +95,7 @@ export const builtInTunables = (home = homedir()): Tunables => ({
   githubPollSeconds: 90,
   githubTimeoutMs: 30_000,
   toodoEvents: { enabled: true, url: "http://127.0.0.1:47616", tokenFile: join(home, ".local", "share", "toodo-server", "web-token") },
+  toodoWriter: { url: "http://127.0.0.1:47616", tokenFile: join(home, ".local", "share", "toodo-server", "mcp-token") },
   launchKeywords: "ulw set goal and work",
   massLaunchKeywords: "/mass-ulw set goal and work",
   laneThinking: "medium",
@@ -95,6 +105,7 @@ export const builtInTunables = (home = homedir()): Tunables => ({
   closeAfterMin: 5,
   mergeWaitMaxMin: 60,
   mergeStallMin: 15,
+  updateBlockerStaleMin: 360,
   digestMaxDelayMin: 60,
   ownerDelayNotice: "메시지를 받았습니다. 리드 세션이 아직 메시지를 받지 못하고 있어 대기열에 보관해 두었고, 리드가 돌아오는 대로 답변드립니다.",
   ackTimeoutSec: 60,

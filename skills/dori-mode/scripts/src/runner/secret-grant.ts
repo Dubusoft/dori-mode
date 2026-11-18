@@ -1,44 +1,8 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import type { SecretRule } from "../config.ts";
-import { GithubMintError, mintInstallationToken } from "../github-app-token.ts";
 import type { Runner } from "../run.ts";
 import { type SecretStore, SecretStoreError } from "../secret-store.ts";
 import type { SecretGrant } from "./lane-socket.ts";
-import type { SecretRunAuditEntry } from "./secret-run.ts";
 
-/**
- * The runner side of the lane socket's `secret` verb: checks the requested names against the config `secrets`
- * allowlist (default deny), reads the values from the secret store and records one audit line per request. Audit
- * lines carry names, lane, runner and time only, never a value or anything derived from one.
- */
-
-/** One audit line: who asked for which names and whether the runner handed them out. */
-export type SecretAuditEntry = {
-  readonly at: string; readonly runner: string; readonly lane: string; readonly names: readonly string[];
-  readonly allowed: boolean; readonly reason?: string;
-  /** Names whose value was minted (a GitHub App token) rather than read from the store. */
-  readonly minted?: readonly string[];
-};
-
-export type SecretGranterDeps = {
-  readonly store: Pick<SecretStore, "read">;
-  readonly rules: () => Promise<Readonly<Record<string, SecretRule>>>;
-  /** The lane's repo as "owner/repo", if it has one. */
-  readonly laneRepo: (key: string) => Promise<string | undefined>;
-  readonly audit: (entry: SecretAuditEntry) => void;
-  readonly runner: string;
-  readonly now: () => number;
-  /** Called with the granted values, e.g. to register them for log masking. */
-  readonly onGranted?: (values: readonly string[]) => void;
-  /** Mints a GitHub App installation token; defaults to `mintInstallationToken`. Injected by tests to stay offline. */
-  readonly mint?: typeof mintInstallationToken;
-};
-
-/** Where the runner appends its secret audit lines. */
-export const secretAuditPath = (stateDir: string): string => join(stateDir, "secret-audit.jsonl");
-
-/** Whether lane `key` matches one of `patterns`: an exact key or a `prefix-*`. */
+/** Match the lanes or repositories allowed to run a host operation. */
 export const laneMatches = (patterns: readonly string[], key: string): boolean =>
   patterns.some((p) => (p.endsWith("*") ? key.startsWith(p.slice(0, -1)) : p === key));
 
@@ -49,99 +13,36 @@ export const ruleMatches = async (rule: { readonly lanes: readonly string[]; rea
   return r !== undefined && rule.repos.some((p) => p.toLowerCase() === r);
 };
 
-/** Where a granted value comes from: the store, or a GitHub App mint for a rule with `mint`. */
-export type SecretSource = { readonly store: Pick<SecretStore, "read">; readonly mint?: typeof mintInstallationToken };
+export type SecretSource = { readonly store: Pick<SecretStore, "read"> };
 
-/** One value read through `readSecretValue`, or the refusal with its audit reason. */
-export type SecretRead =
-  | { readonly ok: true; readonly value: string; readonly minted: boolean }
-  | { readonly ok: false; readonly code: string; readonly detail: string; readonly reason: string };
-
-/**
- * Reads `name` for lane `key` (no allowlist check: the caller decided): a rule with `mint` mints a token for the lane
- * repo with the App key `keySecret` from the store (never handed out itself), any other name is read from the store.
- * Refusals name names and lanes only.
- */
-export const readSecretValue = async (src: SecretSource, name: string, rule: SecretRule | undefined, key: string, laneRepo: () => Promise<string | undefined>): Promise<SecretRead> => {
-  const spec = rule?.mint;
-  let reading = name;
-  try {
-    if (!spec) return { ok: true, value: await src.store.read(name), minted: false };
-    const lane = await laneRepo();
-    if (lane === undefined) return { ok: false, code: "RUNNER_SECRET_DENIED", detail: `${name} is minted per repo and lane ${key} has no repo`, reason: `no repo: ${name}` };
-    reading = spec.keySecret;
-    const privateKeyPem = await src.store.read(spec.keySecret);
-    reading = name;
-    const minted = await (src.mint ?? mintInstallationToken)({ appId: spec.appId, installationId: spec.installationId, privateKeyPem, repo: lane, permissions: spec.permissions });
-    return { ok: true, value: minted.token, minted: true };
-  } catch (e) {
-    if (e instanceof GithubMintError) return { ok: false, code: "RUNNER_SECRET_FAILED", detail: e.message, reason: `mint failed: ${name}` };
-    if (e instanceof SecretStoreError && e.code === "SECRET_MISSING" && reading !== name) {
-      return { ok: false, code: "RUNNER_SECRET_MISSING", detail: `${reading} (App key for ${name}) is not in the secret store`, reason: `missing: ${reading}` };
-    }
-    if (e instanceof SecretStoreError && e.code === "SECRET_MISSING") {
-      return { ok: false, code: "RUNNER_SECRET_MISSING", detail: `${name} is not in the secret store`, reason: `missing: ${name}` };
-    }
-    const message = e instanceof Error ? e.message : String(e);
-    return { ok: false, code: "RUNNER_SECRET_FAILED", detail: message, reason: `read failed: ${reading}` };
+/** Read one store value for a host operation. */
+export const readSecretValue = async (src: SecretSource, name: string): Promise<{ readonly ok: true; readonly value: string } | { readonly ok: false; readonly code: string; readonly detail: string }> => {
+  try { return { ok: true, value: await src.store.read(name) }; }
+  catch (e) {
+    if (e instanceof SecretStoreError && e.code === "SECRET_MISSING") return { ok: false, code: "RUNNER_SECRET_MISSING", detail: `${name} is not in the secret store` };
+    return { ok: false, code: "RUNNER_SECRET_FAILED", detail: e instanceof Error ? e.message : String(e) };
   }
 };
 
-/** The `secrets` handler for the lane socket: grants all of `names` to lane `key`, or refuses the whole request. */
-export const secretGranter = (deps: SecretGranterDeps) => async (key: string, names: readonly string[]): Promise<SecretGrant> => {
-  const minted: string[] = [];
-  const audit = (allowed: boolean, reason?: string): void => {
-    deps.audit({ at: new Date(deps.now()).toISOString(), runner: deps.runner, lane: key, names: [...names], allowed, ...(reason !== undefined ? { reason } : {}), ...(minted.length ? { minted: [...minted] } : {}) });
-  };
-  const refuse = (code: string, detail: string, reason: string): SecretGrant => {
-    audit(false, reason);
-    return { ok: false, code, detail };
-  };
-  let rules: Readonly<Record<string, SecretRule>>;
-  try { rules = await deps.rules(); } catch (e) {
-    const message = e instanceof Error ? e.message : String(e);
-    return refuse("RUNNER_SECRET_FAILED", message, `config: ${message}`);
-  }
-  let repo: Promise<string | undefined> | undefined;
-  const laneRepo = (): Promise<string | undefined> => (repo ??= deps.laneRepo(key).catch(() => undefined));
-  const denied: string[] = [];
-  for (const name of names) {
-    const rule = Object.hasOwn(rules, name) ? rules[name] : undefined;
-    if (!rule || !await ruleMatches(rule, key, laneRepo)) denied.push(name);
-  }
-  if (denied.length) {
-    const list = denied.join(",");
-    return refuse("RUNNER_SECRET_DENIED", `${key} may not receive ${list} (config secrets)`, `not allowed: ${list}`);
-  }
-  const values: Record<string, string> = {};
-  const kinds: Record<string, "env" | "ssh-key"> = {};
-  for (const name of names) {
-    const rule = rules[name] as SecretRule;
-    const read = await readSecretValue(deps, name, rule, key, laneRepo);
-    if (!read.ok) return refuse(read.code, read.detail, read.reason);
-    values[name] = read.value;
-    if (read.minted) minted.push(name);
-    if (rule.as === "ssh-key") kinds[name] = "ssh-key";
-  }
-  audit(true);
-  deps.onGranted?.(Object.values(values));
-  return { ok: true, values, ...(Object.keys(kinds).length ? { kinds } : {}) };
+export type SecretGranterDeps = {
+  readonly store: Pick<SecretStore, "readAll" | "read">;
+  readonly onGranted?: (values: readonly string[]) => void;
 };
 
-/**
- * An audit function that appends one JSON line per entry to `path`; a new file is created with mode 0600 (and its
- * directory 0700 when missing). A write
- * failure goes to `log` and is not thrown.
- */
-export const appendSecretAudit = (path: string, log: (line: string) => void = () => {}) => (entry: SecretAuditEntry | SecretRunAuditEntry): void => {
+/** Every store value; named requests from older remote runners read just those names. */
+export const secretGranter = (deps: SecretGranterDeps) => async (_key: string, names: readonly string[] = []): Promise<SecretGrant> => {
   try {
-    const created = !existsSync(path);
-    if (created) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    appendFileSync(path, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
-    if (created) chmodSync(path, 0o600);
-  } catch (e) {
-    log(`RUNNER_SECRET_AUDIT_FAILED ${path}: ${e instanceof Error ? e.message : String(e)}`);
-  }
+    const values: Record<string, string> = {};
+    if (names.length) {
+      for (const name of names) {
+        const read = await readSecretValue(deps, name);
+        if (!read.ok) return read;
+        values[name] = read.value;
+      }
+    } else Object.assign(values, Object.fromEntries(await deps.store.readAll(true)));
+    deps.onGranted?.(Object.values(values));
+    return { ok: true, values };
+  } catch (e) { return { ok: false, code: "RUNNER_SECRET_FAILED", detail: e instanceof Error ? e.message : String(e) }; }
 };
 
 /** "owner/repo" from a GitHub-style remote URL (https, scp-like ssh or ssh://), else undefined. */

@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmdirSync, rmSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import type { Runner } from "../run.ts";
-import type { CommandResults, LaneInspection, SupervisorCommandBodies } from "./protocol.ts";
+import type { CommandResults, LaneGitOp, LaneInspection, SupervisorCommandBodies } from "./protocol.ts";
 
 /**
  * Runner-side git facts and git cleanup steps of a lane (design C7/C8, rows A17-A19): worktree discovery with each
@@ -44,15 +44,16 @@ export const listWorktrees = async (run: Runner, root: string): Promise<ListedWo
 
 /**
  * The worktrees of lane `key`: in each root (the lane's cwd first, then `roots`), every linked worktree other than the
- * root itself whose branch or directory name is the key or starts with `<key>-`. Unreadable roots are skipped.
+ * root itself whose branch or directory name is the key or starts with `<key>-` (a detached HEAD by its directory name
+ * alone). Unreadable roots are skipped.
  */
 export const discoverWorktrees = async (run: Runner, key: string, roots: readonly string[]): Promise<ListedWorktree[]> => {
   const ours = (name: string): boolean => name === key || name.startsWith(`${key}-`);
   const found = new Map<string, ListedWorktree>();
   for (const root of new Set(roots.filter(Boolean))) {
     for (const wt of (await listWorktrees(run, root)) ?? []) {
-      if (wt.path === root || !wt.branch) continue;
-      if ((ours(wt.branch.split("/").pop() ?? "") || ours(basename(wt.path))) && !found.has(wt.path)) found.set(wt.path, wt);
+      if (wt.path === root) continue;
+      if ((ours(wt.branch?.split("/").pop() ?? "") || ours(basename(wt.path))) && !found.has(wt.path)) found.set(wt.path, wt);
     }
   }
   return [...found.values()];
@@ -190,6 +191,8 @@ export class LaneGitError extends Error {
 }
 
 type GitBody = Omit<SupervisorCommandBodies["lane.git"], "cmdId">;
+/** A `lane.git` body that runs git (every op but `leftover-remove`). */
+type GitArgvBody = GitBody & { readonly op: Exclude<LaneGitOp, "leftover-remove"> };
 
 /** A full commit id (SHA-1 or SHA-256 hex). */
 const fullSha = (sha: string): boolean => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha);
@@ -200,7 +203,7 @@ const fullSha = (sha: string): boolean => /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.tes
  * `push --force-with-lease=refs/heads/<branch>:<sha> <remote> :refs/heads/<branch>` remotely, so a branch that moved
  * off `sha` is kept; without `sha` the delete is unconditional.
  */
-export const gitOpArgv = (body: GitBody): string[] => {
+export const gitOpArgv = (body: GitArgvBody): string[] => {
   const sha = (): string | undefined => {
     if (body.sha === undefined) return undefined;
     if (!fullSha(body.sha)) throw new LaneGitError(`sha ${JSON.stringify(body.sha)} is not a full commit id`);
@@ -260,7 +263,8 @@ const branchHeld = async (run: Runner, root: string, branch: string): Promise<st
  * the worktree (`omoNoise`); git's own refusal of any other change still decides.
  */
 export const laneGit = async (run: Runner, body: GitBody): Promise<CommandResults["lane.git"]> => {
-  const argv = gitOpArgv(body);
+  if (body.op === "leftover-remove") return removeLeftover(body.path ?? "");
+  const argv = gitOpArgv({ ...body, op: body.op });
   if (body.op === "worktree-remove" && body.path) await dropOmoNoise(run, body.path);
   if ((body.op === "branch-delete" || body.op === "remote-branch-delete") && body.branch) {
     const held = await branchHeld(run, body.root, body.branch);
@@ -278,9 +282,42 @@ const dropOmoNoise = async (run: Runner, path: string): Promise<void> => {
   if (noise.config) await run(["git", "-C", path, "checkout", "--", OMO_CONFIG], { timeoutMs: GIT_TIMEOUT_MS });
 };
 
+/** The files omo writes in `.omo`: its config and the config's migration backups. */
+const OMO_FILE = /^omo\.jsonc(?:\.bak\.[^/\s"]+)?$/;
+
+/**
+ * `leftover-remove`: deletes directory `path`, which git lists no worktree at (a worktree git already removed or pruned,
+ * that omo wrote its config back into), only while omo's own files in `.omo` are all it holds. Those go first, then each
+ * directory with a plain rmdir, which refuses anything that appeared in between. A `.git`, any other entry, or a
+ * `.omo` that is not a plain directory refuses as data, and nothing is deleted.
+ */
+export const removeLeftover = (path: string): CommandResults["lane.git"] => {
+  if (!path) throw new LaneGitError("leftover-remove needs path");
+  const failed = (err: string) => ({ code: 1, out: "", err: capOutput(err) });
+  try {
+    const entries = readdirSync(path, { withFileTypes: true });
+    const omo = entries.find((e) => e.name === ".omo" && e.isDirectory());
+    const files = omo ? readdirSync(join(path, ".omo"), { withFileTypes: true }) : [];
+    const foreign = [
+      ...entries.filter((e) => e !== omo).map((e) => e.name),
+      ...files.filter((f) => !f.isFile() || !OMO_FILE.test(f.name)).map((f) => `.omo/${f.name}`),
+    ];
+    if (foreign.length) {
+      const shown = foreign.slice(0, 5).join(", ") + (foreign.length > 5 ? ` (+${foreign.length - 5} more)` : "");
+      return failed(`${LANE_GIT_REFUSED} ${path} is no worktree and holds ${shown}`);
+    }
+    for (const f of files) rmSync(join(path, ".omo", f.name));
+    if (omo) rmdirSync(join(path, ".omo"));
+    rmdirSync(path);
+    return { code: 0, out: "", err: "" };
+  } catch (e) {
+    return failed(e instanceof Error ? e.message : String(e));
+  }
+};
+
 /** The `lane.git` effect output: the detail line for the command record, with the structured result. */
 export const laneGitEffect = async (run: Runner, body: GitBody): Promise<{ readonly detail: string; readonly result: CommandResults["lane.git"] }> => {
   const result = await laneGit(run, body);
-  const target = body.op === "worktree-remove" ? body.path : body.branch;
+  const target = body.op === "worktree-remove" || body.op === "leftover-remove" ? body.path : body.branch;
   return { detail: `git ${body.op} ${target ?? ""} exit ${result.code}`.replace(/\s+/g, " "), result };
 };

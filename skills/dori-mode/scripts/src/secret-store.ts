@@ -1,11 +1,4 @@
-/**
- * Supervisor-side secret store: one file per secret under ~/.dori/secrets.
- *
- * Values never go to argv, stdout, logs or error text: they reach systemd-creds only through stdin and are
- * otherwise held in memory or in a 0600 file. Protection is file mode 0600 (directory 0700) plus optional
- * systemd-creds encryption at rest (`<NAME>.cred`; `<NAME>.plain` when it is unavailable). It does not protect
- * against other processes running as the same UID outside the lane sandbox.
- */
+/** One 0600 plain file per secret under the 0700 supervisor store; legacy credentials remain readable. */
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -15,11 +8,11 @@ import { SECRET_NAME } from "./secret-name.ts";
 /** The store directory under a home directory. */
 export const secretsDir = (home: string = homedir()): string => join(home, ".dori", "secrets");
 
-export type SecretBackend = "systemd-creds" | "plain";
+export type SecretBackend = "cred" | "plain";
 export type SecretEntry = { readonly name: string; readonly backend: SecretBackend };
 export type SecretStoreErrorCode =
   | "SECRET_NAME_INVALID" | "SECRET_EXISTS" | "SECRET_MISSING" | "SECRET_VALUE_EMPTY"
-  | "SECRET_ENCRYPT_FAILED" | "SECRET_DECRYPT_FAILED" | "SECRET_DIR_UNSAFE";
+  | "SECRET_DECRYPT_FAILED" | "SECRET_DIR_UNSAFE";
 
 /** A store failure; the message starts with the code and never contains a secret value. */
 export class SecretStoreError extends Error {
@@ -31,30 +24,18 @@ export class SecretStoreError extends Error {
 
 export type SecretStoreDeps = { readonly dir?: string; readonly run?: Runner };
 
-const PROBE_NAME = "dori-probe";
 const EXTENSIONS: readonly { readonly ext: string; readonly backend: SecretBackend }[] = [
-  { ext: ".cred", backend: "systemd-creds" },
+  { ext: ".cred", backend: "cred" },
   { ext: ".plain", backend: "plain" },
 ];
 
 export class SecretStore {
   readonly dir: string;
   private readonly runner: Runner;
-  private available: Promise<boolean> | undefined;
 
   constructor(deps: SecretStoreDeps = {}) {
     this.dir = deps.dir ?? secretsDir();
     this.runner = deps.run ?? run;
-  }
-
-  /** Whether `systemd-creds --user` can encrypt here; probed once with a fixed non-secret string. */
-  encryptionAvailable(): Promise<boolean> {
-    this.available ??= (async () => {
-      if ((await this.runner(["systemd-creds", "--version"])).code !== 0) return false;
-      const probe = await this.runner(["systemd-creds", "encrypt", "--user", `--name=${PROBE_NAME}`, "-", "-"], { stdin: PROBE_NAME });
-      return probe.code === 0;
-    })();
-    return this.available;
   }
 
   /** Stores a new secret; SECRET_EXISTS when the name is taken. */
@@ -109,17 +90,18 @@ export class SecretStore {
     }
     const plain = join(this.dir, `${name}.plain`);
     if (existsSync(plain)) {
+      // A hand-written file (echo VALUE > NAME.plain) ends in a newline the value never had.
       const text = readFileSync(plain, "utf8");
       return text.endsWith("\n") ? text.slice(0, -1) : text;
     }
     throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING: secret ${name} does not exist`);
   }
 
-  /** Every readable secret by name; entries that fail to read are skipped. */
-  async readAll(): Promise<ReadonlyMap<string, string>> {
+  /** Every readable secret by name; strict pulls reject instead of skipping unreadable entries. */
+  async readAll(strict = false): Promise<ReadonlyMap<string, string>> {
     const values = new Map<string, string>();
     for (const { name } of this.list()) {
-      try { values.set(name, await this.read(name)); } catch { /* skipped: unreadable entry */ }
+      try { values.set(name, await this.read(name)); } catch (error) { if (strict) throw error; }
     }
     return values;
   }
@@ -149,21 +131,14 @@ export class SecretStore {
 
   private async write(name: string, value: string): Promise<SecretEntry> {
     const tmp = join(this.dir, `.${name}.tmp`);
-    const encrypted = await this.encryptionAvailable();
-    const [keep, drop] = encrypted ? [".cred", ".plain"] : [".plain", ".cred"];
     try {
-      if (encrypted) {
-        const res = await this.runner(["systemd-creds", "encrypt", "--user", `--name=${name}`, "-", tmp], { stdin: value });
-        if (res.code !== 0) throw new SecretStoreError("SECRET_ENCRYPT_FAILED", `SECRET_ENCRYPT_FAILED: ${name}: ${res.err}`);
-      } else {
-        writeFileSync(tmp, value, { mode: 0o600 });
-      }
+      writeFileSync(tmp, value, { mode: 0o600 });
       chmodSync(tmp, 0o600);
-      renameSync(tmp, join(this.dir, `${name}${keep}`));
+      renameSync(tmp, join(this.dir, `${name}.plain`));
     } finally {
       rmSync(tmp, { force: true });
     }
-    rmSync(join(this.dir, `${name}${drop}`), { force: true });
-    return { name, backend: encrypted ? "systemd-creds" : "plain" };
+    rmSync(join(this.dir, `${name}.cred`), { force: true });
+    return { name, backend: "plain" };
   }
 }

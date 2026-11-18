@@ -17,6 +17,13 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = 1_800_000_000_000;
 
+/** Moves the clock forward in whole seconds until the retry is due; returns how long that took. */
+const advanceToDue = (clock: { at: number }, delivery: { readonly due: boolean }): number => {
+  const from = clock.at;
+  while (!delivery.due) clock.at += 1000;
+  return clock.at - from;
+};
+
 /** A retrying delivery whose flush is scripted; time only moves when the test moves it. */
 const scripted = (failWith: () => Error | undefined) => {
   const clock = fakeClock(T0);
@@ -40,9 +47,8 @@ test("a transient error retries instead of throwing, and backoff doubles up to t
   const delays: number[] = [];
   for (let i = 0; i < 8; i++) {
     await s.delivery.tick();
-    delays.push(s.delivery.nextAttemptAt - s.clock.at);
     expect(s.delivery.due).toBe(false);
-    s.clock.at = s.delivery.nextAttemptAt;
+    delays.push(advanceToDue(s.clock, s.delivery));
     expect(s.delivery.due).toBe(true);
   }
   expect(delays).toEqual([BACKOFF_MIN_MS, 10_000, 20_000, 40_000, BACKOFF_MAX_MS, BACKOFF_MAX_MS, BACKOFF_MAX_MS, BACKOFF_MAX_MS]);
@@ -61,7 +67,7 @@ test("after ten minutes of the same failure exactly one SUPERVISOR_STUCK is queu
   const s = scripted(() => new TransientSuperviseError("old lead has not exited; events retained"));
   while (s.clock.at - T0 < STUCK_AFTER_MS + 3 * BACKOFF_MAX_MS) {
     await s.delivery.tick();
-    s.clock.at = s.delivery.nextAttemptAt;
+    advanceToDue(s.clock, s.delivery);
   }
   expect(s.enqueued).toEqual(["SUPERVISOR_STUCK old lead has not exited; events retained"]);
   expect(s.notified).toEqual(s.enqueued);
@@ -71,7 +77,7 @@ test("the SUPERVISOR_STUCK channel post is scrubbed of home paths and pane ids; 
   const s = scripted(() => new TransientSuperviseError(`cannot stop owned lead process in wL1:p3 (${homedir()}/.dori/state)`));
   while (s.clock.at - T0 < STUCK_AFTER_MS + BACKOFF_MAX_MS) {
     await s.delivery.tick();
-    s.clock.at = s.delivery.nextAttemptAt;
+    advanceToDue(s.clock, s.delivery);
   }
   expect(s.enqueued).toEqual([`SUPERVISOR_STUCK cannot stop owned lead process in wL1:p3 (${homedir()}/.dori/state)`]);
   expect(s.notified).toEqual(["SUPERVISOR_STUCK cannot stop owned lead process in (pane) (~/.dori/state)"]);
@@ -111,7 +117,7 @@ test("a failing sweep never ends the supervisor or loses a done claim: the claim
   const w = sweepWorld(true);
   await w.deps.registry.write({ key: "demo-lane", title: "d", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), status: "done-claimed", claim: { at: new Date(T0).toISOString(), evidence: "merged acme/app#1 abc", emitted: false } });
   await w.tick();
-  expect(w.queue).toContain("LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc");
+  expect(w.queue).toContain("LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc | verified: pr=none sig=ok");
   expect(w.queue).toContain(`SWEEP_WARN dead-panes ${PANES_DOWN}`);
   expect((await w.deps.registry.read("demo-lane"))?.claim?.emitted).toBe(true);
   expect(w.logs).toContain(`SWEEP_ERROR dead-panes ${PANES_DOWN}`);
@@ -148,6 +154,25 @@ test("a runner without an admitted connection is one RUNNER_UNAVAILABLE per outa
   expect(runnerLines(w.queue.slice(back))).toEqual([down]);
 });
 
+test("a runner that drops during the watch pass is one RUNNER_UNAVAILABLE, never a LANE_WATCH_WARN per lane", async () => {
+  const w = sweepWorld(false);
+  const at = new Date(T0).toISOString();
+  const lane = { title: "l", thread: "none", brief: "/b.md", done: "merged acme/app#1", openedAt: at, closedAt: at };
+  for (const key of ["kept-a", "kept-b"]) {
+    await w.deps.registry.write({ ...lane, key, pane: "w:p3", receipt: { cleanup: [`worktree /data/repos/worktrees/${key} kept: dirty`] } } as Parameters<typeof w.deps.registry.write>[0]);
+  }
+  // The snapshot sees the runner admitted; it drops while the watcher reads the closed lanes' worktrees.
+  const ops = { ...w.deps.ops, exists: async () => { w.world.runnerDown = true; throw new LaneOpsError("RUNNER_UNAVAILABLE", "local", "disconnected: no admitted connection"); } };
+  const sweeps = supervisorSweeps({ ...w.deps, ops }, "/home/test", undefined, undefined, undefined, () => undefined);
+  const tick = () => runSweeps(sweeps, async (line) => { w.queue.push(line); }, w.clock.now, new Map(), () => {});
+  await tick();
+  // Still down on the next round: its snapshot reports the outage once.
+  await tick();
+  await tick();
+  const runnerLines = w.queue.filter((line) => /RUNNER_UNAVAILABLE|LANE_WATCH_WARN/.test(line));
+  expect(runnerLines).toEqual(["RUNNER_UNAVAILABLE runner=local no admitted connection: watch, dead-panes and freshness skip its lanes until it says hello"]);
+});
+
 test("a launch held by dori can-launch wakes the lead with LAUNCH_READY once the host has room, once", async () => {
   const w = sweepWorld(false);
   w.world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "working" }];
@@ -163,7 +188,7 @@ test("success resets the streak so a later failure starts its own ten minutes", 
   const s = scripted(() => (fail ? new TransientSuperviseError("STARTUP_UNCONFIRMED x") : undefined));
   await s.delivery.tick();
   fail = false;
-  s.clock.at = s.delivery.nextAttemptAt;
+  advanceToDue(s.clock, s.delivery);
   await s.delivery.tick();
   expect(s.delivery.due).toBe(true);
   fail = true;
@@ -188,7 +213,7 @@ test("a missing lead pane keeps events and journal untouched, then delivers once
   expect(JSON.stringify(readJournal(state.dir))).toBe(journal);
   expect(readFileSync(supervisor.eventLog, "utf8")).toBe("");
   world.panes.push({ pane_id: "lead:p1", workspace_id: "w", cwd: "/repo", agent: "omo", agent_status: "working" });
-  clock.at = delivery.nextAttemptAt;
+  advanceToDue(clock, delivery);
   await delivery.tick();
   expect(readFileSync(supervisor.eventLog, "utf8")).toContain("INBOUND hello");
 });

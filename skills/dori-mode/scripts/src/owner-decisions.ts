@@ -1,146 +1,24 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-
-import { alertsChannelOf, type DoriConfig } from "./config.ts";
+import { type DoriConfig } from "./config.ts";
+import {
+  DECISION_AUTO_ARCHIVE_MIN, DECISION_KEEP_CLOSED_MS, DECISION_POSTING_STUCK_MS, DECISION_RELAY_ATTEMPTS, type DecisionTarget, type DecisionsFile, decisionTargetOf, type OwnerDecision,
+  OwnerDecisionError, patchOne, readDecisions, removeOne, type TargetLane, updateDecisions,
+} from "./decision-store.ts";
 import { recordResolved } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
+import { decisionButtonRows, decisionButtonsKey, hasDecisionButtons, POSTED_BUTTONS_KEY } from "./messenger/decision-buttons.ts";
 import { MessengerError } from "./messenger/http.ts";
 import { type DecisionChoices, parseDecisionText, parseRequestText } from "./runner/decision-text.ts";
-import { withStateLockSync } from "./state-lock.ts";
-import { saveJsonFile } from "./store.ts";
 import { appendToMessage, closedByOwner } from "./thread-followup.ts";
 
-/**
- * Owner decisions (decision channel): one question that needs the owner's choice opens one thread, in `decisionsChannel`
- * (else the channel it was asked from, else `discordChannels[0]`), with numbered options, a recommendation and its reason.
- * The thread starts without a message, so the channel body keeps nothing: the question is the thread's first message.
- * The lead opens one with `dori decision open`; a lane question carrying choices (runner/decision-text.ts) is opened by
- * the supervisor. The owner's first reply in the thread raises `OWNER_DECISION_ANSWERED`, a decision obligation
- * (decision-obligations.ts) the lead closes with `dori decision close`, which also writes its `dori resolved` receipt.
- * Not to be confused with those obligations: an owner decision is a question to the owner, an obligation is an event the
- * lead must act on.
- * A request (`kind: "request"`) is the same record for input only the owner can give (a one-time code, a file or value):
- * no options, its `question` is what is needed, and it says where to send it (a reply in the thread, or `file`). It opens,
- * is answered and closes exactly like a decision; thread names start `[요청]` instead of `[결정]`. The channel is wired
- * by id only, so the owner may rename it.
- *
- * Every decision lives in `<stateDir>/decisions.json`, rewritten whole under DECISIONS_LOCK by the CLI and the supervisor.
- * Discord calls run outside the lock.
- */
-
-export const DECISIONS_FILE = "decisions.json";
-export const DECISIONS_LOCK = "decisions.lock.sqlite";
-/** Discord keeps a decision thread open this long without activity (the longest it allows). */
-export const DECISION_AUTO_ARCHIVE_MIN = 10080;
-/** A decision still `posting` this long (its writer died mid-post) raises OWNER_DECISION_STUCK once. */
-export const DECISION_POSTING_STUCK_MS = 10 * 60_000;
-/** Closed decisions are dropped this long after they closed; `dori decision list --all` shows the last DECISION_LIST_CLOSED_MS. */
-export const DECISION_KEEP_CLOSED_MS = 30 * 24 * 60 * 60_000;
-export const DECISION_LIST_CLOSED_MS = 7 * 24 * 60 * 60_000;
-/** The daily reminder of decisions still waiting is posted on the first pass at or after this hour in displayTimeZone. */
-export const DECISION_DIGEST_HOUR = 9;
-
-export type OwnerDecisionState = "posting" | "open" | "answered" | "closed";
-
-export type OwnerAnswer = { readonly channel: string; readonly message: string; readonly at: number };
-
-export type OwnerDecision = DecisionChoices & {
-  /** `d<n>`. */
-  readonly id: string;
-  /** Absent: a decision. `request`: owner input; `options` is empty and `question` names what is needed. */
-  readonly kind?: "request";
-  /** A request's file the owner writes the value to (chmod 600) instead of replying in the thread. */
-  readonly file?: string;
-  readonly state: OwnerDecisionState;
-  readonly task?: number;
-  readonly lane?: string;
-  /** The thread ref the question came from (a lane's `thread`, or `--thread`), where the link line goes. */
-  readonly origin?: string;
-  readonly source: "lead" | "lane";
-  /** The lane report row a lane decision came from; one decision per row. */
-  readonly sourceRef?: string;
-  readonly channel: string;
-  readonly thread?: string;
-  /**
-   * Set when a lane decision was posted into the lane's own thread because that thread already sits in decisionsChannel
-   * (laneThreadInDecisions): `thread` is the lane thread, no thread of its own is started, no link line is posted, and
-   * closing it leaves the lane thread open.
-   */
-  readonly inLaneThread?: boolean;
-  /** The question's message, the first one in the thread. */
-  readonly message?: string;
-  /** Why Discord's "started a thread" notice was left in the channel body; unset when it was deleted or never posted. */
-  readonly noticeKept?: string;
-  readonly linkMessage?: string;
-  /** Why no link line was posted in the origin thread; set once, never retried. */
-  readonly linkSkipped?: string;
-  readonly openedAt: number;
-  readonly answers?: readonly OwnerAnswer[];
-  readonly answeredAt?: number;
-  /** The OWNER_DECISION_ANSWERED event id; closing the decision resolves it. */
-  readonly answerEvent?: string;
-  readonly closedAt?: number;
-  readonly choice?: number;
-  readonly closeText?: string;
-  readonly cancelled?: boolean;
-  readonly archivePending?: boolean;
-  readonly stuckAt?: number;
-  readonly goneAt?: number;
-};
-
-export type DecisionsFile = {
-  readonly nextSeq: number;
-  /** The displayTimeZone date (YYYY-MM-DD) the daily reminder last ran on. */
-  readonly digestDay?: string;
-  readonly decisions: readonly OwnerDecision[];
-};
-
-export class OwnerDecisionError extends Error {
-  constructor(readonly code: string, message: string) { super(message); }
-}
-
-const EMPTY: DecisionsFile = { nextSeq: 1, decisions: [] };
-
-const parseFile = (text: string): DecisionsFile => {
-  const value = JSON.parse(text) as Partial<DecisionsFile>;
-  if (typeof value !== "object" || value === null || !Array.isArray(value.decisions) || typeof value.nextSeq !== "number") throw new Error("decisions.json is malformed");
-  return value as DecisionsFile;
-};
-
-/** decisions.json as it is now; no file or an unreadable one reads as no decisions (for readers: status, inbox, list). */
-export const readDecisions = (stateDir: string): DecisionsFile => {
-  try { return parseFile(readFileSync(join(stateDir, DECISIONS_FILE), "utf8")); } catch { return EMPTY; }
-};
-
-/**
- * Reads decisions.json under DECISIONS_LOCK, lets `act` change it, and writes it back when it changed. A malformed file
- * throws instead of being overwritten.
- */
-export const updateDecisions = <T>(stateDir: string, act: (file: DecisionsFile) => { readonly file?: DecisionsFile; readonly result: T }): T =>
-  withStateLockSync(join(stateDir, DECISIONS_LOCK), () => {
-    const path = join(stateDir, DECISIONS_FILE);
-    const file = existsSync(path) ? parseFile(readFileSync(path, "utf8")) : EMPTY;
-    const { file: next, result } = act(file);
-    if (next && next !== file) saveJsonFile(path, next);
-    return result;
-  });
-
-const patchOne = (stateDir: string, id: string, patch: (d: OwnerDecision) => OwnerDecision | undefined): OwnerDecision | undefined =>
-  updateDecisions(stateDir, (file) => {
-    const found = file.decisions.find((d) => d.id === id);
-    const next = found ? patch(found) : undefined;
-    if (!found || !next) return { result: found };
-    return { file: { ...file, decisions: file.decisions.map((d) => (d.id === id ? next : d)) }, result: next };
-  });
-
-const removeOne = (stateDir: string, id: string): void => {
-  updateDecisions(stateDir, (file) => ({ file: { ...file, decisions: file.decisions.filter((d) => d.id !== id) }, result: undefined }));
-};
-
+import { recordReviewDecision, REVIEW_DECISION_OUTCOMES, type ReviewDecisionOutcome, ReviewJobs } from "./review-jobs.ts";
+import type { ReviewCapDecision } from "./decision-store.ts";
 /** What opening, closing and the tick need from Discord; the Discord client fits it. */
 export type DecisionTransport = {
-  send(channel: string, content: string, stableId?: string): Promise<string>;
+  /** `components` (action rows) ride under the message, as Discord.send puts them. */
+  send(channel: string, content: string, stableId?: string, components?: readonly unknown[]): Promise<string>;
   edit(channel: string, messageId: string, content: string): Promise<void>;
+  /** Replaces a message's action rows, leaving its text as it is. */
+  editComponents(channel: string, messageId: string, components: readonly unknown[]): Promise<void>;
   content(channel: string, messageId: string): Promise<string>;
   deleteMessage(channel: string, messageId: string): Promise<void>;
   messagesAfter(channel: string, afterId: string): Promise<readonly { readonly id: string; readonly type: number; readonly reference?: string }[]>;
@@ -154,12 +32,27 @@ export type DecisionConfig = Pick<DoriConfig, "stateDir" | "discordChannels" | "
   readonly discord?: { readonly ownerId?: string } | undefined;
 };
 
+/**
+ * What closing needs to settle the owner's answer messages: the lead's stale guard and read/handled receipts (ack.ts and
+ * inbox.ts, injected by the CLI). Without it a close touches no answer message.
+ */
+export type DecisionReceipts = {
+  /** Owner events in `channel` the lead has not seen, as `UNREAD ...` lines; the printed ones are recorded as seen. */
+  readonly unseen: (channel: string) => { readonly count: number; readonly lines: readonly string[] };
+  readonly acked: (channel: string, message: string) => boolean;
+  /** `dori ack` on one message (hourglass off, eyes on, read receipt). */
+  readonly ack: (channel: string, message: string) => Promise<void>;
+  /** `dori handled <channel> <message> --reply --tasks <tasks>`. */
+  readonly handled: (channel: string, message: string, tasks: number) => Promise<void>;
+};
+
 export type DecisionContext = {
   readonly config: DecisionConfig;
   readonly transport: DecisionTransport;
   readonly now: () => number;
   /** The home directory scrubbed out of posted text. */
   readonly home: string;
+  readonly receipts?: DecisionReceipts;
 };
 
 /** The Toodo task number in an autopilot lane key `ap-<task>-<attempt>`. */
@@ -213,9 +106,12 @@ export const decisionThreadName = (d: Pick<OwnerDecision, "id" | "task" | "quest
   return chars.length <= DECISION_THREAD_NAME_MAX ? chars.join("") : `${chars.slice(0, DECISION_THREAD_NAME_MAX - 1).join("").trimEnd()}…`;
 };
 
-/** The thread's starter message: question, numbered options with the recommendation marked, reason, what waits, origin. */
+/**
+ * The thread's starter message: question, numbered options with the recommendation marked, reason, what waits, origin.
+ * A question with answer buttons (decisionButtonRows) says the owner can press one.
+ */
 export const decisionStartText = (d: OwnerDecision, home: string): string => {
-  const head = [`**[${label(d)} ${d.id}]**`, d.task !== undefined ? `Toodo #${d.task}` : undefined, d.lane ? `레인 ${d.lane}` : undefined].filter(Boolean).join(" · ");
+  const head = [`**[${label(d)} ${d.id}]**`, d.task !== undefined ? `Toodo #${d.task}` : undefined, d.lane ? `레인 ${d.lane}` : undefined, d.attachedTo ? `${d.attachedTo}에 이어서` : undefined].filter(Boolean).join(" · ");
   const origin = refIds(d.origin)?.thread;
   if (d.kind === "request") return scrubForThread([
     head,
@@ -234,7 +130,7 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
     `추천 이유: ${d.reason}`,
     d.blocking ? `기다리는 동안 멈춘 것: ${d.waiting}` : `먼저 진행 중: 추천안(${d.recommend}번)으로 진행하고 있습니다(${d.waiting}). 다르게 정하시면 되돌립니다.`,
     ...(origin && !d.inLaneThread ? [`원래 스레드: <#${origin}>`] : []),
-    "이 스레드에 번호나 문장으로 답해 주세요.",
+    hasDecisionButtons(d) ? "버튼을 누르거나, 이 스레드에 번호나 문장으로 답해 주세요." : "이 스레드에 번호나 문장으로 답해 주세요.",
   ].join("\n"), home);
 };
 
@@ -242,21 +138,35 @@ export const decisionStartText = (d: OwnerDecision, home: string): string => {
 export const decisionLinkText = (d: OwnerDecision): string => `[System] 오너 ${label(d)} ${d.id}: <#${d.thread ?? ""}>`;
 
 export type CloseOptions = {
+  /** The close text: the reply to the owner, except for a decision that relays to its lane, where it goes to the lane (relaysToLane). */
   readonly text: string;
+  /** The owner's line in the thread confirmation, in place of `text` (or of the automatic line when `text` goes to the lane). */
+  readonly ownerText?: string;
   readonly choice?: number;
   /** `<channel>/<message>` of an answer the owner gave outside the decision thread. */
   readonly from?: string;
   readonly cancel?: boolean;
+  /** The tasks each covered answer message holds; the close covers one of them (the rest go to `dori handled --lane`). */
+  readonly tasks?: number;
+  /** Close even when the lead has not seen every owner message in the decision's thread and answer channels. */
+  readonly force?: boolean;
 };
 
-export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string): string => {
+/**
+ * A lane's own question or request (asked with `dori report`), or a lead decision opened with `--relay-to`: its close
+ * text is relayed to that lane (decision-relay.ts), not shown to the owner.
+ */
+export const relaysToLane = (d: Pick<OwnerDecision, "source" | "lane" | "relayTo">): boolean =>
+  !!d.lane && (d.source === "lane" || d.relayTo === d.lane);
+
+export const decisionCloseText = (d: OwnerDecision, options: CloseOptions, home: string, keepsThread = d.inLaneThread === true): string => {
   const from = options.from ? /^(\d+)\/(\d+)$/.exec(options.from) : null;
   const picked = options.choice !== undefined ? ` ${options.choice}번(${cut(d.options[options.choice - 1] ?? "", 60)})` : "";
-  const by = d.answeredAt === undefined && !from && !options.cancel ? " (리드가 정함)" : "";
+  const by = d.answeredAt === undefined && !d.revisions?.length && !from && !options.cancel ? " (리드가 정함)" : "";
   const where = from ? ` (<#${from[1]}>에서 받은 답: https://discord.com/channels/@me/${from[1]}/${from[2]})` : "";
-  const note = options.text.replace(/\s+/g, " ").trim();
+  const note = (options.ownerText ?? (relaysToLane(d) ? `레인 ${d.lane}에 전달합니다` : options.text)).replace(/\s+/g, " ").trim();
   const outcome = options.cancel ? "취소" : d.kind === "request" ? "요청 처리" : `결정 반영:${picked}`;
-  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${d.inLaneThread ? "" : " 스레드를 닫습니다."}`, home);
+  return scrubForThread(`[System] ${d.id} ${outcome}${d.kind === "request" ? "" : by}${where}. ${note}${/[.!?。]$/.test(note) ? "" : "."}${keepsThread ? "" : " 스레드를 닫습니다."}`, home);
 };
 
 /** The line appended to the origin thread's link message when the decision closes. */
@@ -287,9 +197,13 @@ export type DecisionSpec = DecisionChoices & {
   readonly origin?: string;
   readonly source: "lead" | "lane";
   readonly sourceRef?: string;
+  readonly target?: DecisionTarget;
+  /** A lead decision's `--relay-to`: the same key as `lane`. */
+  readonly relayTo?: string;
+  readonly reviewCap?: ReviewCapDecision;
 };
 
-const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+export const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
 const isGone = (e: unknown): boolean => e instanceof MessengerError && e.status === 404;
 
 /**
@@ -297,7 +211,7 @@ const isGone = (e: unknown): boolean => e instanceof MessengerError && e.status 
  * no origin thread or the owner closed it, failed (retried by the tick) when the post throws.
  */
 export const postDecisionLink = async (ctx: DecisionContext, d: OwnerDecision): Promise<LinkResult> => {
-  if (d.inLaneThread) return { kind: "none" };
+  if (d.inLaneThread || d.attachedTo) return { kind: "none" };
   const origin = refIds(d.origin)?.thread;
   if (!origin || !d.thread) {
     if (!d.linkSkipped) patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, linkSkipped: "no origin thread" }));
@@ -379,14 +293,20 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       const same = file.decisions.find((d) => d.state !== "closed" && d.lane === spec.lane && d.question === spec.question);
       if (same) return { result: { decision: same, duplicateOf: same.id } };
     }
-    if (!channel) return { result: undefined };
+    // One open blocking question per lane or task gets a thread; a later one joins it instead of opening another.
+    const attach = laneThread ? undefined : file.decisions.filter((x) => (x.state === "open" || x.state === "answered") && x.blocking && x.thread
+      && ((spec.lane !== undefined && x.lane === spec.lane) || (spec.task !== undefined && x.task === spec.task))).at(-1);
+    if (!channel && !attach) return { result: undefined };
     const decision: OwnerDecision = {
       id: `d${file.nextSeq}`, state: "posting", question: spec.question, options: spec.options, recommend: spec.recommend, reason: spec.reason,
-      waiting: spec.waiting, blocking: spec.blocking, source: spec.source, channel: channel.channel, openedAt: now,
+      waiting: spec.waiting, blocking: spec.blocking, source: spec.source, channel: attach?.channel ?? channel?.channel ?? "", openedAt: now,
       ...(spec.kind ? { kind: spec.kind } : {}), ...(spec.file ? { file: spec.file } : {}),
       ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.lane ? { lane: spec.lane } : {}),
       ...(spec.origin ? { origin: spec.origin } : {}), ...(spec.sourceRef ? { sourceRef: spec.sourceRef } : {}),
+      ...(spec.target ? { target: spec.target } : {}), ...(spec.relayTo ? { relayTo: spec.relayTo } : {}),
+      ...(spec.reviewCap ? { reviewCap: spec.reviewCap } : {}),
       ...(laneThread ? { thread: laneThread, inLaneThread: true, linkSkipped: "posted in the lane's own thread" } : {}),
+      ...(attach ? { thread: attach.thread, attachedTo: attach.id, linkSkipped: `posted in ${attach.id}'s thread`, ...(attach.inLaneThread ? { inLaneThread: true } : {}) } : {}),
     };
     return { file: { ...file, nextSeq: file.nextSeq + 1, decisions: [...file.decisions, decision] }, result: { decision, duplicateOf: undefined } };
   });
@@ -407,12 +327,14 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
       d = patchOne(stateDir, d.id, (x) => ({ ...x, thread: started })) ?? { ...d, thread: started };
       noticeKept = await removeThreadNotice(ctx.transport, d.channel, started);
     }
-    const message = d.message ?? await ctx.transport.send(thread, decisionStartText(d, ctx.home), `decision:${d.id}`);
+    const message = d.message ?? await ctx.transport.send(thread, decisionStartText(d, ctx.home), `decision:${d.id}`, decisionButtonRows(d));
     const kept = noticeKept;
     d = patchOne(stateDir, d.id, (x) => ({ ...x, state: "open", message, ...(kept ? { noticeKept: kept } : {}) })) ?? { ...d, state: "open", message };
   } catch (e) {
-    if (thread && !d.inLaneThread) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     removeOne(stateDir, d.id);
+    // An attached decision archives the shared thread only when the decisions it joined all closed meanwhile.
+    const orphaned = thread !== undefined && !d.inLaneThread && (!d.attachedTo || !readDecisions(stateDir).decisions.some((x) => x.thread === thread && x.state !== "closed"));
+    if (thread && orphaned) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
     throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errorText(e)}`);
   }
   const link = await postDecisionLink(ctx, d);
@@ -430,46 +352,189 @@ const archiveThread = async (transport: Pick<DecisionTransport, "setThread" | "t
   if (!await transport.threadArchived(thread)) throw new Error(`thread ${thread} is still open after archiving it`);
 };
 
+/**
+ * Brings `d`'s answer buttons in line with its state (decision-buttons.ts decisionButtonState) when its starter message
+ * shows something else: one edit of the message's action rows, then `buttons` recorded. A failed edit throws and leaves
+ * `buttons` as it was, so the next call tries again.
+ */
+export const syncDecisionButtons = async (ctx: Pick<DecisionContext, "config" | "transport">, d: OwnerDecision): Promise<OwnerDecision> => {
+  const rows = decisionButtonRows(d);
+  const key = decisionButtonsKey(d);
+  if (!rows || !d.thread || !d.message || key === (d.buttons ?? POSTED_BUTTONS_KEY)) return d;
+  await ctx.transport.editComponents(d.thread, d.message, rows);
+  return patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, buttons: key })) ?? d;
+};
+
 export type CloseResult = {
   readonly decision: OwnerDecision;
+  /** Why the answer buttons could not be disabled (the decision is closed; they stay as they were). */
+  readonly buttonsNote?: string;
   /** Why archiving failed (the decision is closed; the tick retries the archive). */
   readonly archivePending?: string;
   /** The OWNER_DECISION_ANSWERED event resolved by this close. */
   readonly resolved?: string;
   readonly linkNote?: string;
+  /** What the close did with the owner's answer messages (set when the context carries receipts). */
+  readonly answers?: AnswerOutcome;
+  /** The outcome a review limit decision's choice recorded on its capped job. */
+  readonly review?: { readonly jobId: string; readonly outcome: ReviewDecisionOutcome };
+};
+
+export type AnswerRef = { readonly channel: string; readonly message: string };
+
+export type AnswerOutcome = {
+  /** The task count each covered message was recorded with (coverage 1/tasks). */
+  readonly tasks: number;
+  readonly acked: readonly AnswerRef[];
+  readonly ackFailed: readonly (AnswerRef & { readonly error: string })[];
+  readonly handled: readonly AnswerRef[];
+  readonly handledFailed: readonly (AnswerRef & { readonly error: string })[];
+  /** Answer messages acked but not covered (a decision in a lane's own thread covers only its first answer). */
+  readonly left: readonly AnswerRef[];
+};
+
+const refKey = (a: AnswerRef): string => `${a.channel}/${a.message}`;
+const refOf = (key: string): AnswerRef => {
+  const [channel = "", message = ""] = key.split("/");
+  return { channel, message };
 };
 
 /**
- * Closes a decision: posts the `[System]` confirmation into its thread (stable nonce `decision-close:<id>`, so two closes
- * post it once), archives the thread and reads it back (archiveThread), records it closed, appends the outcome to the origin link
- * line, and resolves its OWNER_DECISION_ANSWERED obligation. Throws OwnerDecisionError DECISION_UNKNOWN,
- * DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, or DECISION_NOT_CLOSED (the confirmation could not be posted; nothing changed).
+ * The answer messages a close covers, and the ones it only acks: every recorded answer plus `--from`; in a lane's own
+ * thread (where every owner message counts as an answer while the decision is open) only the first answer and `--from`.
+ */
+const answerTargets = (d: OwnerDecision, from: string | undefined): { readonly covered: string[]; readonly left: string[] } => {
+  // A button press handed to the lead is no Discord message: nothing to ack or record handled.
+  const recorded = (d.answers ?? []).filter((a) => a.choice === undefined).map(refKey);
+  const fromKey = from && /^\d+\/\d+$/.test(from) ? [from] : [];
+  const covered = [...new Set([...(d.inLaneThread ? recorded.slice(0, 1) : recorded), ...fromKey])];
+  return { covered, left: [...new Set(recorded)].filter((key) => !covered.includes(key)) };
+};
+
+/** The close's lines about the answer messages, in the order they happened. */
+export const answerOutcomeLines = (o: AnswerOutcome): string[] => {
+  const tasks = o.tasks > 1 ? ` --tasks ${o.tasks}` : "";
+  return [
+    ...o.acked.map((a) => `DECISION_ACKED ${a.channel} ${a.message}`),
+    ...o.ackFailed.map((a) => `DECISION_ACK_FAILED ${a.channel} ${a.message}: ${a.error}; the close went on`),
+    ...o.handled.map((a) => `DECISION_HANDLED ${a.channel} ${a.message} coverage=1/${o.tasks}`),
+    ...o.handledFailed.map((a) => `DECISION_HANDLED_FAILED ${a.channel} ${a.message}: ${a.error}; run the close again, or dori handled ${a.channel} ${a.message} --reply${tasks}`),
+    ...o.left.map((a) => `DECISION_ANSWER_LEFT ${a.channel} ${a.message}: acked, not covered by the close; cover it with dori handled ${a.channel} ${a.message} --reply|--lane KEY`),
+  ];
+};
+
+/** Records handled --reply for each covered answer not recorded yet, each success noted on the decision at once. */
+const recordAnswersHandled = async (
+  stateDir: string, receipts: DecisionReceipts, d: OwnerDecision,
+): Promise<{ readonly handled: AnswerRef[]; readonly handledFailed: (AnswerRef & { readonly error: string })[] }> => {
+  const handled: AnswerRef[] = [];
+  const handledFailed: (AnswerRef & { readonly error: string })[] = [];
+  const done = new Set(d.handledAnswers ?? []);
+  for (const key of d.coveredAnswers ?? []) {
+    if (done.has(key)) continue;
+    const ref = refOf(key);
+    try {
+      await receipts.handled(ref.channel, ref.message, d.closeTasks ?? 1);
+      patchOne(stateDir, d.id, (x) => ({ ...x, handledAnswers: [...new Set([...(x.handledAnswers ?? []), key])] }));
+      handled.push(ref);
+    } catch (e) {
+      handledFailed.push({ ...ref, error: errorText(e) });
+    }
+  }
+  return { handled, handledFailed };
+};
+
+/**
+ * Closes a decision, the lead's one call on the owner's answer. In order: validates; with receipts, refuses
+ * (DECISION_STALE, unless `force`) when the lead has not seen every owner message in the decision's thread and answer
+ * channels, then acks the answer messages before the thread is archived (a failed ack only warns); posts the `[System]`
+ * confirmation into its thread (stable nonce `decision-close:<id>`, so two closes post it once), archives the thread and
+ * reads it back (archiveThread), records it closed, appends the outcome to the origin link line, and resolves its
+ * OWNER_DECISION_ANSWERED obligation; its answer buttons are disabled once it is recorded closed, before the archive; last, records handled --reply (coverage 1/`tasks`) for each covered answer. A
+ * close of a closed decision records the handled receipts still missing, then throws DECISION_ALREADY_CLOSED with their
+ * lines. Throws OwnerDecisionError DECISION_UNKNOWN, DECISION_ALREADY_CLOSED, DECISION_BAD_CHOICE, DECISION_STALE, or
+ * DECISION_NOT_CLOSED (the confirmation could not be posted; nothing closed).
  */
 export const closeOwnerDecision = async (ctx: DecisionContext, id: string, options: CloseOptions): Promise<CloseResult> => {
   const { stateDir } = ctx.config;
+  const { receipts } = ctx;
   const d = readDecisions(stateDir).decisions.find((x) => x.id === id);
   if (!d) throw new OwnerDecisionError("DECISION_UNKNOWN", `DECISION_UNKNOWN ${id}`);
-  if (d.state === "closed") throw new OwnerDecisionError("DECISION_ALREADY_CLOSED", `DECISION_ALREADY_CLOSED ${id}`);
+  if (d.state === "closed") {
+    const again = receipts ? await recordAnswersHandled(stateDir, receipts, d) : { handled: [], handledFailed: [] };
+    const lines = answerOutcomeLines({ tasks: d.closeTasks ?? 1, acked: [], ackFailed: [], left: [], ...again });
+    throw new OwnerDecisionError("DECISION_ALREADY_CLOSED", `DECISION_ALREADY_CLOSED ${id}`, lines);
+  }
   if (options.choice !== undefined && d.kind === "request") throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: a request takes no --choice`);
   if (options.choice !== undefined && (!Number.isInteger(options.choice) || options.choice < 1 || options.choice > d.options.length)) {
     throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: --choice must be 1-${d.options.length}`);
   }
-  let archivePending: string | undefined;
-  if (d.thread) {
-    try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home), `decision-close:${d.id}`); }
-    catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
-    // A decision posted in a lane's own thread leaves that thread open: the lane keeps working there.
-    if (!d.inLaneThread) {
-      try { await archiveThread(ctx.transport, d.thread); }
-      catch (e) { archivePending = errorText(e); }
+  if (d.reviewCap && options.choice === undefined && !options.cancel) {
+    throw new OwnerDecisionError("DECISION_BAD_CHOICE", `DECISION_BAD_CHOICE ${id}: a review limit decision closes with --choice 1-${d.options.length} (or --cancel)`);
+  }
+  const tasks = options.tasks ?? 1;
+  const targets = answerTargets(d, options.from);
+  const acked: AnswerRef[] = [];
+  const ackFailed: (AnswerRef & { readonly error: string })[] = [];
+  if (receipts) {
+    if (!options.force) {
+      const channels = [...new Set([d.thread, ...[...targets.covered, ...targets.left].map((key) => refOf(key).channel)].filter((c): c is string => !!c))];
+      const stale = channels.map((channel) => receipts.unseen(channel));
+      const count = stale.reduce((sum, s) => sum + s.count, 0);
+      if (count) throw new OwnerDecisionError("DECISION_STALE", `DECISION_STALE ${count}`, stale.flatMap((s) => s.lines));
+    }
+    // Before the archive: a reaction on a message in an archived thread may be refused.
+    for (const key of [...targets.covered, ...targets.left]) {
+      const ref = refOf(key);
+      if (receipts.acked(ref.channel, ref.message)) continue;
+      try { await receipts.ack(ref.channel, ref.message); acked.push(ref); }
+      catch (e) { ackFailed.push({ ...ref, error: errorText(e) }); }
     }
   }
+  // A review limit decision's outcome is recorded on its job first too: the review gate reads it from there.
+  let review: CloseResult["review"];
+  const outcome = d.reviewCap && options.choice !== undefined ? REVIEW_DECISION_OUTCOMES[options.choice - 1] : undefined;
+  if (d.reviewCap && outcome) {
+    try {
+      recordReviewDecision(new ReviewJobs(stateDir), ctx.now(), d.reviewCap.jobId, d.id, outcome);
+      review = { jobId: d.reviewCap.jobId, outcome };
+    } catch (e) { throw new OwnerDecisionError("DECISION_REVIEW_FAILED", `DECISION_REVIEW_FAILED ${id}: ${errorText(e)}; nothing closed`); }
+  }
+  let archivePending: string | undefined;
+  if (d.thread) {
+    // The confirmation's wording only: whether this close archives is settled below, with the close itself.
+    const shared = readDecisions(stateDir).decisions.some((x) => x.id !== d.id && x.thread === d.thread && x.state !== "closed");
+    const keepsThread = d.inLaneThread === true || shared;
+    try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home, keepsThread), `decision-close:${d.id}`); }
+    catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
+  }
   const at = ctx.now();
-  const closed = patchOne(stateDir, id, (x) => (x.state === "closed" ? undefined : {
-    ...x, state: "closed", closedAt: at, closeText: options.text,
-    ...(options.choice !== undefined ? { choice: options.choice } : {}), ...(options.cancel ? { cancelled: true } : {}),
-    ...(archivePending ? { archivePending: true } : {}),
-  })) ?? d;
+  // Under DECISIONS_LOCK with the close: the close that leaves no other decision waiting in its thread (attachedTo, either
+  // way; a lane's own thread never) owns the archive, recorded as archivePending until it is done. Overlapping closes and
+  // a decision attaching during the confirmation post therefore archive the thread exactly once, after its last decision.
+  const recorded = updateDecisions(stateDir, (file): { file?: DecisionsFile; result: { decision: OwnerDecision; owns: boolean } | undefined } => {
+    const x = file.decisions.find((y) => y.id === id);
+    if (!x || x.state === "closed") return { result: undefined };
+    const owns = x.thread !== undefined && !x.inLaneThread && !file.decisions.some((y) => y.id !== id && y.thread === x.thread && y.state !== "closed");
+    const next: OwnerDecision = {
+      ...x, state: "closed", closedAt: at, closeText: options.text,
+      ...(options.choice !== undefined ? { choice: options.choice } : {}), ...(options.cancel ? { cancelled: true } : {}),
+      ...(owns ? { archivePending: true } : {}),
+      ...(receipts && targets.covered.length ? { coveredAnswers: targets.covered, closeTasks: tasks } : {}),
+    };
+    return { file: { ...file, decisions: file.decisions.map((y) => (y.id === id ? next : y)) }, result: { decision: next, owns } };
+  });
+  let closed = recorded?.decision ?? d;
+  // Before the archive: a message in an archived thread cannot be edited.
+  let buttonsNote: string | undefined;
+  try { closed = await syncDecisionButtons(ctx, closed); }
+  catch (e) { buttonsNote = `answer buttons not disabled: ${errorText(e)}`; }
+  if (recorded?.owns && closed.thread) {
+    try {
+      await archiveThread(ctx.transport, closed.thread);
+      closed = patchOne(stateDir, id, (x) => { const { archivePending: _, ...rest } = x; return rest; }) ?? closed;
+    } catch (e) { archivePending = errorText(e); }
+  }
   let resolved: string | undefined;
   if (closed.answerEvent) {
     recordResolved(stateDir, closed.answerEvent, at, `decision ${id}`);
@@ -483,7 +548,13 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
       else if (!await appendToMessage(ctx.transport, origin, closed.linkMessage, decisionLinkClosedText(closed), await ctx.transport.threadArchived(origin))) linkNote = "link line too long to append";
     } catch (e) { linkNote = `link line not updated: ${errorText(e)}`; }
   }
-  return { decision: closed, ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}) };
+  let answers: AnswerOutcome | undefined;
+  if (receipts) {
+    const recorded = await recordAnswersHandled(stateDir, receipts, closed);
+    answers = { tasks: closed.closeTasks ?? tasks, acked, ackFailed, left: targets.left.map(refOf), ...recorded };
+  }
+  const decision = readDecisions(stateDir).decisions.find((x) => x.id === id) ?? closed;
+  return { decision, ...(buttonsNote ? { buttonsNote } : {}), ...(archivePending ? { archivePending } : {}), ...(resolved ? { resolved } : {}), ...(linkNote ? { linkNote } : {}), ...(answers ? { answers } : {}), ...(review ? { review } : {}) };
 };
 
 /**
@@ -524,22 +595,35 @@ export const recordChannelAnswer = (stateDir: string, channel: string, message: 
   return recordAnswer(stateDir, (file) => { const waiting = waitingIn(file.decisions, channel); return waiting.length === 1 ? waiting[0] : undefined; }, channel, message, at);
 };
 
+/**
+ * Records the owner's press of button `choice` on decision `id`, made in `channel` as interaction message `message`
+ * (decision-inbound.ts routeDecisionClick, a click the lane cannot take directly), as an answer the lead holds, like
+ * recordOwnerAnswer: each click once; the first answer moves the decision to `answered` and returns `first: true`.
+ * `added` is false for a click already recorded or a closed decision. Undefined for an unknown decision.
+ */
+export const recordButtonAnswer = (
+  stateDir: string, id: string, channel: string, message: string, choice: number, at: number,
+): { readonly decision: OwnerDecision; readonly first: boolean; readonly added: boolean } | undefined =>
+  recordAnswer(stateDir, (file) => file.decisions.find((d) => d.id === id), channel, message, at, choice);
+
 const recordAnswer = (
-  stateDir: string, pick: (file: DecisionsFile) => OwnerDecision | undefined, channel: string, message: string, at: number,
-): { readonly decision: OwnerDecision; readonly first: boolean } | undefined =>
-  updateDecisions(stateDir, (file) => {
+  stateDir: string, pick: (file: DecisionsFile) => OwnerDecision | undefined, channel: string, message: string, at: number, choice?: number,
+): { readonly decision: OwnerDecision; readonly first: boolean; readonly added: boolean } | undefined =>
+  updateDecisions(stateDir, (file): { file?: DecisionsFile; result: { decision: OwnerDecision; first: boolean; added: boolean } | undefined } => {
     const d = pick(file);
     if (!d) return { result: undefined };
-    if (d.state === "closed" || d.answers?.some((a) => a.message === message)) return { result: { decision: d, first: false } };
+    if (d.state === "closed" || d.answers?.some((a) => a.message === message)) return { result: { decision: d, first: false, added: false } };
     const first = d.answeredAt === undefined;
     const next: OwnerDecision = {
-      ...d, answers: [...(d.answers ?? []), { channel, message, at }],
+      ...d, answers: [...(d.answers ?? []), { channel, message, at, ...(choice !== undefined ? { choice } : {}) }],
       ...(first ? { state: "answered" as const, answeredAt: at, answerEvent: answeredEventId(d.id) } : {}),
     };
-    return { file: { ...file, decisions: file.decisions.map((x) => (x.id === d.id ? next : x)) }, result: { decision: next, first } };
+    return { file: { ...file, decisions: file.decisions.map((x) => (x.id === d.id ? next : x)) }, result: { decision: next, first, added: true } };
   });
 
-const short = (text: string, max = 80): string => cut(text.replace(/\s+/g, " ").trim(), max);
+export const short = (text: string, max = 80): string => cut(text.replace(/\s+/g, " ").trim(), max);
+/** How the lead's lines name a choice: its number and option text, `choice=2 "Replace"`. */
+export const choiceLabel = (d: Pick<OwnerDecision, "options">, choice: number): string => `choice=${choice} "${short(d.options[choice - 1] ?? "", 80)}"`;
 /** The question as the lead's lines show it: a request marked `[request]`. */
 const subject = (d: OwnerDecision, max = 80): string => (d.kind === "request" ? `[request] ${short(d.question, max - 10)}` : short(d.question, max));
 const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel}/${d.thread}` : `discord:${d.channel}`);
@@ -547,16 +631,30 @@ const threadRef = (d: OwnerDecision): string => (d.thread ? `discord:${d.channel
 /** The event raised by the owner's first answer; its second word is the lane (`-` for none), as decision obligations read it. */
 export const answeredLine = (d: OwnerDecision): string => {
   const answer = d.answers?.[0];
-  const from = answer && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
-  const act = d.kind === "request"
-    ? `${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`}: hand it to ${d.lane ? `lane ${d.lane}` : "the work that waits"} (never into a report, the repo or another thread)`
-    : "act on the owner's answer";
-  return `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}; ${act}, then run dori decision close ${d.id}${from} --text "..."`;
+  // A button press the lane could not take directly: its choice is the answer, and no message to point --from at.
+  const button = answer?.choice;
+  const from = answer && button === undefined && answer.channel !== d.thread ? ` --from ${answer.channel}/${answer.message}` : "";
+  const value = d.kind === "request"
+    ? `; ${d.file ? `the owner says the value is in ${d.file}` : `the owner's reply is message ${answer?.channel ?? "?"}/${answer?.message ?? "?"}`} (never into a report, the repo or another thread)`
+    : "";
+  const close = `dori decision close ${d.id}${from}${button !== undefined ? ` --choice ${button}` : ""} --text "..."`;
+  const head = `OWNER_DECISION_ANSWERED ${d.lane ?? "-"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)}: ${subject(d)}${from ? " (answered in the channel body)" : ""}`
+    + (button !== undefined ? ` ${choiceLabel(d, button)} via button` : "");
+  // One wording for decisions and requests: the close is the first call, and for a decision that relays to its lane it
+  // also types --text into that lane (decision-relay.ts), so --text is what the lane needs to go on.
+  const relay = relaysToLane(d)
+    ? ` and types --text into lane ${d.lane}, so write it for the lane; hand it over yourself only on DECISION_RELAY_FAILED`
+    : d.lane ? `; it does not reach lane ${d.lane}, relay it yourself` : "";
+  return `${head}${value}; run ${close} first (it acks the answer, posts the reply, records it handled${relay}; --tasks N when the answer asks for more work), then act on it`;
 };
+
+/** The lead's urgent line for a close whose text could not be typed into its lane after every attempt (decision-relay.ts). */
+export const relayFailedLine = (d: Pick<OwnerDecision, "id" | "relay">): string =>
+  `DECISION_RELAY_FAILED ${d.relay?.lane ?? "-"} ${d.id}: ${d.relay?.reason ?? "not delivered"}; the close text did not reach the lane after ${d.relay?.attempts ?? 1} attempts and is not retried again, hand it to the lane yourself with dori lane send naming ${d.id} (its parked goal resumes once the lane acks it)`;
 
 /** The digest event of a decision the supervisor opened from a lane question. */
 export const openedLine = (d: OwnerDecision, duplicateOf?: string): string =>
-  `OWNER_DECISION_OPENED ${d.id} lane ${d.lane ?? "-"} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)} ${subject(d)}${duplicateOf ? ` (duplicate of ${duplicateOf})` : ""}`;
+  `OWNER_DECISION_OPENED ${d.id} lane ${d.lane ?? "-"} ${d.blocking ? "blocking" : "nonblocking"} ${threadRef(d)} ${subject(d)}${duplicateOf ? ` (duplicate of ${duplicateOf})` : ""}${d.attachedTo && !duplicateOf ? ` (posted in ${d.attachedTo}'s thread)` : ""}`;
 
 const age = (ms: number): string => {
   const min = Math.max(0, Math.floor(ms / 60_000));
@@ -564,8 +662,11 @@ const age = (ms: number): string => {
 };
 
 /** `dori decision list`'s line for one decision. */
-export const decisionListLine = (d: OwnerDecision, now: number): string =>
-  `${d.id} ${d.state} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""} age=${age(now - d.openedAt)} thread=${threadRef(d)} ${subject(d)}`;
+export const decisionListLine = (d: OwnerDecision, now: number): string => {
+  const last = d.revisions?.at(-1);
+  const answer = last ? ` answer=r${last.rev}:${last.choice ?? "withdrawn"} delivery=${last.delivery.state}` : "";
+  return `${d.id} ${d.state} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""}${answer} age=${age(now - d.openedAt)} thread=${threadRef(d)} ${subject(d)}`;
+};
 
 /** Decisions not closed, oldest first. */
 export const openOwnerDecisions = (stateDir: string): OwnerDecision[] =>
@@ -579,26 +680,9 @@ export const takeOwnerDecisionLines = (stateDir: string, now: number): string[] 
   openOwnerDecisions(stateDir).map((d) =>
     `decision:${d.id}\tDECISION_${d.state === "answered" ? "ANSWERED" : "WAITING"} ${d.id} ${d.blocking ? "blocking" : "nonblocking"}${d.task !== undefined ? ` task=#${d.task}` : ""}${d.lane ? ` lane=${d.lane}` : ""} open ${age(now - d.openedAt)}: ${subject(d)}`);
 
-/** Open decisions bound to a lane, as close-button blockers (thread-finality.ts): `{ id, lane }`. */
+/** Open decisions bound to a lane, as blockers of a thread's automatic close (thread-finality.ts): `{ id, lane }`. */
 export const ownerDecisionBlockers = (stateDir: string): { readonly id: string; readonly lane: string }[] =>
   openOwnerDecisions(stateDir).flatMap((d) => (d.lane ? [{ id: d.id, lane: d.lane }] : []));
-
-/** The local date (YYYY-MM-DD) and hour of `ms` in `timeZone`. */
-export const localDayHour = (ms: number, timeZone: string): { readonly day: string; readonly hour: number } => {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hourCycle: "h23" })
-    .formatToParts(new Date(ms)).map((p) => [p.type, p.value]));
-  return { day: `${parts.year}-${parts.month}-${parts.day}`, hour: Number(parts.hour) };
-};
-
-/** The daily reminder: one line per decision still waiting on the owner or on the lead. */
-export const digestText = (decisions: readonly OwnerDecision[], now: number): string => [
-  `[System] 답을 기다리는 결정·요청 ${decisions.length}건`,
-  ...decisions.map((d) => {
-    const days = Math.floor(Math.max(0, now - d.openedAt) / 86_400_000) + 1;
-    const state = d.state === "answered" ? "답 받음, 리드 반영 대기" : `${days}일째, ${d.blocking ? "막는 중" : "선진행"}`;
-    return `- [${label(d)}] ${d.id} <#${d.thread ?? d.channel}> ${state} · ${d.task !== undefined ? `#${d.task} ` : ""}${short(d.question, 60)}`;
-  }),
-].join("\n");
 
 export type TickDeps = DecisionContext & {
   /** Journals one event under a stable id (the supervisor dedupes ids). */
@@ -609,9 +693,10 @@ export type TickDeps = DecisionContext & {
 /**
  * The supervisor's pass over decisions.json: a decision stuck `posting` raises OWNER_DECISION_STUCK once; a missing link
  * line is posted again; a pending archive is retried (a thread Discord no longer has raises OWNER_DECISION_THREAD_GONE
- * once); the daily reminder goes to decisionsChannel (else alertsChannelOf) on the first pass at or after
- * DECISION_DIGEST_HOUR in displayTimeZone when anything still waits; closed decisions past DECISION_KEEP_CLOSED_MS are
- * dropped. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
+ * once); a close whose text could not be relayed to its lane in DECISION_RELAY_ATTEMPTS tries (decision-relay.ts
+ * retryDecisionRelays) raises DECISION_RELAY_FAILED once; closed decisions past
+ * DECISION_KEEP_CLOSED_MS are dropped. Nothing is posted
+ * to the decisions channel on a schedule: the lead sees open decisions in `dori inbox take`. The owner's answers themselves arrive through inbound (recordOwnerAnswer), and an answered decision left
  * unclosed is reminded as an UNRESOLVED obligation.
  */
 export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
@@ -628,6 +713,10 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
       const link = await postDecisionLink(deps, d);
       if (link.kind === "failed") log(`OWNER_DECISION_LINK_FAILED ${d.id} ${link.reason}`);
     }
+    if (d.state === "closed" && d.relay?.state === "failed" && d.relay.reportedAt === undefined && (d.relay.attempts ?? 1) >= DECISION_RELAY_ATTEMPTS) {
+      await deps.enqueue(`decision-relay-failed:${d.id}`, relayFailedLine(d));
+      patchOne(stateDir, d.id, (x) => (x.relay ? { ...x, relay: { ...x.relay, reportedAt: now } } : x));
+    }
     if (d.state === "closed" && d.archivePending && d.thread && d.goneAt === undefined) {
       try {
         await archiveThread(deps.transport, d.thread);
@@ -639,17 +728,6 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
         } else log(`OWNER_DECISION_ARCHIVE_FAILED ${d.id} ${errorText(e)}`);
       }
     }
-  }
-  const { day, hour } = localDayHour(now, deps.config.displayTimeZone);
-  if (hour >= DECISION_DIGEST_HOUR && readDecisions(stateDir).digestDay !== day) {
-    const waiting = openOwnerDecisions(stateDir).filter((d) => d.state === "open" || d.state === "answered");
-    const target = deps.config.decisionsChannel?.trim() || alertsChannelOf(deps.config);
-    if (waiting.length && target) {
-      try {
-        await deps.transport.send(target, digestText(waiting, now), `decision-digest:${day}`);
-        updateDecisions(stateDir, (f) => ({ file: { ...f, digestDay: day }, result: undefined }));
-      } catch (e) { log(`OWNER_DECISION_DIGEST_FAILED ${errorText(e)}`); }
-    } else updateDecisions(stateDir, (f) => ({ file: { ...f, digestDay: day }, result: undefined }));
   }
   if (readDecisions(stateDir).decisions.some((d) => d.state === "closed" && now - (d.closedAt ?? now) >= DECISION_KEEP_CLOSED_MS)) {
     updateDecisions(stateDir, (f) => ({ file: { ...f, decisions: f.decisions.filter((d) => !(d.state === "closed" && now - (d.closedAt ?? now) >= DECISION_KEEP_CLOSED_MS)) }, result: undefined }));
@@ -668,14 +746,14 @@ export const requestSpec = (request: { readonly need: string; readonly reason: s
  * openOwnerDecision.
  */
 export const openLaneDecision = async (
-  ctx: DecisionContext, lane: { readonly key: string; readonly thread: string }, report: { readonly id: string; readonly text: string },
+  ctx: DecisionContext, lane: TargetLane & { readonly thread: string }, report: { readonly id: string; readonly text: string },
 ): Promise<OpenResult | undefined> => {
   const request = parseRequestText(report.text);
   const choices = request ? requestSpec(request) : parseDecisionText(report.text);
   if (!choices) return undefined;
-  const task = taskOfLane(lane.key);
+  const task = lane.task ?? taskOfLane(lane.key);
   return openOwnerDecision(ctx, {
-    ...choices, source: "lane", sourceRef: report.id, lane: lane.key,
+    ...choices, source: "lane", sourceRef: report.id, lane: lane.key, ...(request ? {} : { target: decisionTargetOf(lane) }),
     ...(task !== undefined ? { task } : {}), ...(lane.thread !== "none" && refIds(lane.thread) ? { origin: lane.thread } : {}),
   });
 };

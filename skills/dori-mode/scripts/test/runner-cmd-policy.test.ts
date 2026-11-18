@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkCommand, checkCwd, checkQuery, loadPolicy, parsePolicy, rejection, type RunnerPolicy } from "../src/runner/policy.ts";
+import { checkCommand, checkCwd, checkQuery, loadPolicy, parsePolicy, rejection, resolveGrants, type RunnerPolicy } from "../src/runner/policy.ts";
 
 const policy: RunnerPolicy = { agents: { omo: ["omo", "run"] }, allowedRoots: ["/data/repos"], sandbox: "required", jobs: "allow" };
 
@@ -304,5 +304,56 @@ describe("runner command policy", () => {
   test("absent config file yields defaults", () => {
     const p = loadPolicy("/nonexistent-runner-dir-for-test");
     expect(p).toEqual({ agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow" });
+  });
+});
+
+describe("runner-config grants", () => {
+  const home = "/home/u";
+  const parse = (grants: unknown, runtimeDir?: string) => parsePolicy({ grants }, home, "/tmp", { runnerDir: "/home/u/.dori/runner", platform: "linux", ...(runtimeDir ? { runtimeDir } : {}) });
+  const refusal = (grants: unknown, runtimeDir?: string): string => {
+    try { parse(grants, runtimeDir); return "parsed"; } catch (e) { return (e as Error).message; }
+  };
+
+  test("a named table of write and read paths parses, ~ expanded; either list may be absent", () => {
+    expect(parse({ "blog-topic": { write: ["/data/dori/blog-writer/runs"] }, notes: { read: ["~/notes"] } }).grants).toEqual({
+      "blog-topic": { write: ["/data/dori/blog-writer/runs"], read: [] }, notes: { write: [], read: ["/home/u/notes"] },
+    });
+  });
+
+  test("the table may not name ~/.dori, ~/.config, the user runtime dir (bus), home or anything above it", () => {
+    for (const path of ["~/.dori", "~/.dori/state", "~/.config/gh", "~/", "/home", "/", "/run/user/1000/bus", "/xdg/bus", "/home/u/.config/../.dori/env"]) {
+      expect(refusal({ g: { write: [path] } }, "/xdg")).toMatch(/^runner-config: grants\.g\.write /);
+      expect(refusal({ g: { read: [path] } }, "/xdg")).toMatch(/^runner-config: grants\.g\.read /);
+    }
+  });
+
+  test("a relative or colon path, an empty entry, an unknown key or a bad name is refused", () => {
+    expect(refusal({ g: { write: ["data/x"] } })).toContain("is not absolute");
+    expect(refusal({ g: { write: ["/data/a:/data/b"] } })).toContain("holds ':'");
+    expect(refusal({ g: {} })).toContain("names no path");
+    expect(refusal({ g: { write: ["/data/x"], exec: ["/data/y"] } })).toContain("unknown key grants.g.exec");
+    expect(refusal({ "Bad Name": { write: ["/data/x"] } })).toContain("grants key Bad Name");
+    expect(refusal(["/data/x"])).toContain("grants must be an object");
+  });
+
+  const granted: RunnerPolicy = { ...policy, grants: { "blog-topic": { write: ["/data/dori/blog-writer/runs"], read: [] } } };
+
+  test("lane.start grants: a name in the table passes, any other is RUNNER_CMD_REJECTED grant-unknown, and an unsandboxed start may not carry one", () => {
+    expect(checkCommand(granted, start({ grants: ["blog-topic"] }), realpath).ok).toBe(true);
+    expect(rejection(checkCommand(granted, start({ grants: ["blog-topic", "nope"] }), realpath))).toBe("RUNNER_CMD_REJECTED grant-unknown");
+    expect(rejection(checkCommand(policy, start({ grants: ["blog-topic"] }), realpath))).toBe("RUNNER_CMD_REJECTED grant-unknown");
+    expect(rejection(checkCommand({ ...granted, sandbox: "optional" }, start({ sandbox: false, grants: ["blog-topic"] }), realpath))).toBe("RUNNER_CMD_REJECTED grant-unsandboxed");
+    expect(rule(start({ grants: "blog-topic" }), granted)).toBe("field-type");
+  });
+
+  test("resolveGrants follows symlinks into refused places, refuses a checkout as a write grant, and drops repeats", () => {
+    const real: Record<string, string> = { "/data/runs": "/data/runs", "/data/sneaky": "/home/u/.dori/state", "/data/repo": "/data/repo" };
+    const o = { home, realpath: (p: string) => { const r = real[p]; if (!r) throw new Error("ENOENT"); return r; }, isCheckout: (p: string) => p === "/data/repo" };
+    const table = (write: string[], read: string[] = []) => ({ grants: { g: { write, read }, h: { write: ["/data/runs"], read: [] } } });
+    expect(resolveGrants(table(["/data/runs", "/data/missing"]), ["g", "h"], o)).toEqual({ write: ["/data/runs", "/data/missing"], read: [] });
+    expect(() => resolveGrants(table(["/data/sneaky"]), ["g"], o)).toThrow("RUNNER_CMD_REJECTED grant-path g.write /data/sneaky overlaps /home/u/.dori");
+    expect(() => resolveGrants(table(["/data/repo"]), ["g"], o)).toThrow("RUNNER_CMD_REJECTED grant-path g.write /data/repo is a git checkout");
+    expect(resolveGrants(table([], ["/data/repo"]), ["g"], o).read).toEqual(["/data/repo"]);
+    expect(() => resolveGrants(table([]), ["gone"], o)).toThrow("RUNNER_CMD_REJECTED grant-unknown gone");
   });
 });
