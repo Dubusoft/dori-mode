@@ -47,6 +47,20 @@ test("laneRules defaults to none, collapses whitespace, drops blanks, and refuse
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
 });
 
+test("autoReport defaults to autopilot, takes off|autopilot|all trimmed, and refuses anything else", async () => {
+  const path = join(state.dir, "auto-report.json");
+  await Bun.write(path, JSON.stringify({}));
+  expect((await loadConfig(path, "/home/ana")).autoReport).toBe("autopilot");
+  for (const scope of ["off", " all "]) {
+    await Bun.write(path, JSON.stringify({ autoReport: scope }));
+    expect((await loadConfig(path, "/home/ana")).autoReport).toBe(scope.trim() as "off" | "all");
+  }
+  for (const bad of ["none", true, ["all"]]) {
+    await Bun.write(path, JSON.stringify({ autoReport: bad }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("autoReport must be one of off|autopilot|all");
+  }
+});
+
 test("review.repos turns the review gate on per repo, case-insensitively; absent or empty is off; a bad shape is refused", async () => {
   const path = join(state.dir, "review.json");
   await Bun.write(path, JSON.stringify({ closeAfterMin: 7 }));

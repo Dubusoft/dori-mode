@@ -57,7 +57,8 @@ const FACT_WORDS = {
   en: { merged: "Merged", done: (task: number) => `Toodo #${task} done` },
 } as const;
 
-const factLanguage = (language: string | undefined): keyof typeof FACT_WORDS => {
+/** The owner's language (config ownerLanguage) as one of the languages dori writes fixed text in; anything else is English. */
+export const factLanguage = (language: string | undefined): keyof typeof FACT_WORDS => {
   const l = (language ?? "").trim().toLowerCase();
   if (/^ko\b|korean|한국/.test(l)) return "ko";
   if (/^ja\b|japanese|日本/.test(l)) return "ja";

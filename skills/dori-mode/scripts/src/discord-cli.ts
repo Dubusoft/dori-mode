@@ -11,7 +11,8 @@ import { buttonRow } from "./messenger/discord-buttons.ts";
 import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
 import { Discord } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
-import { discordThreadOf, resolveTarget } from "./messenger/target.ts";
+import { resolveTarget } from "./messenger/target.ts";
+import type { ReportPosted } from "./report-post.ts";
 import { realClock } from "./run.ts";
 
 const redirectClosedThread = async (
@@ -79,19 +80,18 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
       }
       const found = (await deps.registry.read(key ?? "")) ?? die(`no registered lane "${key}"`);
       const followUps = await import("./thread-followup.ts");
+      const { postLaneReport, redirectReport, ReportPostError } = await import("./report-post.ts");
       const discord = new Discord(fetchHttp, realClock, messengerToken("DORI_DISCORD_TOKEN"));
-      const owner = config.discordChannels[0];
+      const post = { config, discord, now: realClock.now };
       const note = opt("note");
-      const receipt = (posted: { message: string; target: string; thread?: string; button?: boolean; followUp?: boolean }, kept = note): void => {
+      const receipt = (posted: { message: string; target: string; followUp?: boolean }, kept = note): void => {
         recordReported(config.stateDir, found.key, realClock.now(), kept ? oneLine(kept) : undefined, posted);
       };
-      const redirect = async (thread: string, text: string, parent: string | undefined): Promise<void> => {
-        const { message, target } = await redirectClosedThread(
-          discord, thread, text, parent, owner, followUps.closedThreadLine,
-          () => die(`REPORT_NOT_POSTED ${found.key}: thread ${thread} was closed by the owner, its parent channel is unknown and no discordChannels entry names the owner channel; nothing recorded`),
-        );
-        receipt({ message, target: `discord:${target}`, followUp: true });
-        console.log(`REPORT_REDIRECTED ${found.key} ${message}: thread ${thread} was closed by the owner, so one line linking it went to ${parent ? "its parent channel" : "the owner channel"} ${target}`);
+      const told = async (posting: Promise<ReportPosted>): Promise<void> => {
+        let posted: ReportPosted;
+        try { posted = await posting; } catch (e) { if (e instanceof ReportPostError) die(e.message); throw e; }
+        if (posted.kind === "posted") console.log(`REPORTED_RECORDED ${found.key} ${posted.message}`);
+        else console.log(`REPORT_REDIRECTED ${found.key} ${posted.message}: thread ${posted.thread} was closed by the owner, so one line linking it went to ${posted.parent ? "its parent channel" : "the owner channel"} ${posted.target}`);
       };
       if (append !== undefined) {
         // The follow-up edits the lane's last report (else its [System] status message): nothing new lands in the thread.
@@ -106,7 +106,7 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
           console.log(`REPORT_NOT_REDIRECTED ${found.key} ${last.message}: thread ${last.channel} was closed by the owner and --no-redirect is set, so nothing was posted; the text is kept in the receipt`);
           break;
         }
-        if (closed) { await redirect(last.channel, append, closed.parent); break; }
+        if (closed) { await told(redirectReport(post, found.key, last.channel, append, closed.parent, note)); break; }
         const archived = await discord.threadArchived(last.channel).catch(() => false);
         if (!(await followUps.appendToMessage(discord, last.channel, last.message, append, archived))) {
           die(`REPORT_APPEND_TOO_LONG ${found.key}: the report with this text would pass Discord's message limit; shorten it, or post a new report with --text`);
@@ -115,27 +115,9 @@ export const discordMain = async (args: string[], { flow: deps, die, messengerTo
         console.log(`REPORT_APPENDED ${found.key} ${last.message}`);
         break;
       }
-      const bound = found.thread && found.thread !== "none" ? found.thread : undefined;
-      const ref = opt("to") ?? bound ?? die(`lane ${key} has no bound thread; name where to post with --to TARGET (a thread ref such as discord:<channel>/<thread>)`);
-      // A Discord ref posts there; a bare --to id posts on Discord only when the lane's bound thread is a Discord one.
-      const isDiscord = (r: string | undefined): boolean => r?.startsWith("discord:") === true;
-      if (!isDiscord(ref) && (ref.includes(":") || !isDiscord(bound))) die(`cannot tell the platform of "${ref}"; use a thread ref such as discord:<channel>/<thread>`);
-      const platform = "discord";
-      const { to, thread } = resolveTarget(platform, ref, opt("thread"));
       // No report carries a close button: `dori supervise` closes the thread itself once its work is finished and
       // reported. `--final` (from older leads) is accepted and changes nothing.
-      // `discord:<thread>` and a bare thread id count as a thread too, unless the id is a configured channel.
-      const threadId = opt("thread") ?? discordThreadOf(ref, config.discordChannels);
-      const closed = threadId === to ? await followUps.closedByOwner(config.stateDir, discord, to) : undefined;
-      if (closed) { await redirect(to, opt("text") ?? "", closed.parent); break; }
-      const message = await postMessage(to, opt("text") ?? "");
-      if (!message) die(`REPORT_NOT_POSTED ${key}: ${platform} returned no message id; nothing recorded`);
-      // The message a later --append edits.
-      if (threadId === to) followUps.recordLastReport(config.stateDir, found.key, { channel: to, message, at: realClock.now() });
-      // The lane's thread for the supervisor's automatic close: its bound thread, else the thread this report went into.
-      const laneThread = (bound && isDiscord(bound) ? discordThreadOf(bound, config.discordChannels) : undefined) ?? (threadId === to ? to : undefined);
-      receipt({ message, target: `${platform}:${to}${thread ? `/${thread}` : ""}`, ...(laneThread ? { thread: laneThread } : {}) });
-      console.log(`REPORTED_RECORDED ${found.key} ${message}`);
+      await told(postLaneReport(post, found, opt("text") ?? "", { to: opt("to"), thread: opt("thread"), note }));
       break;
     }
     case "handled": {

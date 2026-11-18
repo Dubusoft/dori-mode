@@ -129,7 +129,7 @@ export const routeReports = async (
         route = "decision";
       } else if (report.kind === "done") {
         if (lane.fileRun && !report.fileReceipt) throw new LaneFileError("LANE_REPORT_FILES_MISSING", lane.key, "this managed lane's done report has no file snapshot; claim done again through its runner");
-        await claimDone(deps, lane, oneLine(report.evidence ?? report.text), report.fileReceipt);
+        await claimDone(deps, lane, oneLine(report.evidence ?? report.text), report.fileReceipt, report.text);
         const claim = (await deps.registry.read(report.lane))?.claim;
         // done-flow.ts claimEventId's format, spelled here: test/cli-sync-watch.test.ts mocks done-flow with a fixed export list.
         if (claim) eventId = `done-claim:${report.lane}:${claim.at}`;

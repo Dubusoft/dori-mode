@@ -67,7 +67,9 @@ const URGENT_KINDS = [
   // A merged lane PR whose merge the supervisor could not read back, and an open one it has been unable to merge.
   "MERGE_UNVERIFIED", "MERGE_STALLED",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
-  "LANE_DONE_CLAIMED",
+  // A clean claim the supervisor reports to the owner itself is digest LANE_DONE_AUTO_REPORTED (below); a failed auto
+  // report wakes the lead, with the claim, so it reports the lane itself.
+  "LANE_DONE_CLAIMED", "LANE_AUTO_REPORT_FAILED",
   // A lane that ended is news the lead acts on: report to the owner, free the slot, finish its Toodo task. That holds for
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
   // waits on the close itself, so it must not sit in the digest. Only a seen-claim close with no task left to finish
@@ -137,6 +139,9 @@ const DIGEST_KINDS = [
   // the merge to (task-finish.ts), or whose lane has no Toodo task: nothing is left for the lead. The report the claim
   // opened is still owed and comes back as urgent UNREPORTED (lane-outcomes.ts).
   "LANE_CLOSED * closed seen-claim toodo=done", "LANE_CLOSED * closed seen-claim toodo=no-task", "TOODO_TASK_COMPLETED",
+  // A clean done claim the supervisor posted to the owner as the lane's report (config autoReport, auto-report.ts): the
+  // lead checks it at its next wake and corrects it with dori reported --append or dori object-done if it must.
+  "LANE_DONE_AUTO_REPORTED",
   // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
   "AUTOPILOT_LANE_DONE * * * toodo=done:",
   // Review gate progress the supervisor settles itself (review-gate.ts): a review started, held, passed or went stale,

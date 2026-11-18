@@ -208,6 +208,23 @@ test("a lane with autoClose: machine owes no report", async () => {
 });
 
 const CLAIM = "LANE_DONE_CLAIMED alpha w:p1 merged acme/app#1";
+const AUTO = "LANE_DONE_AUTO_REPORTED alpha w:p1 merged acme/app#1 | verified: pr=#1 head=abc1234 checks=green conflict=no sig=ok report=m-1";
+
+test("an auto-reported claim is owed nothing: its receipt closes the row whichever comes first, and the merge of its head is quiet", async () => {
+  for (const receiptFirst of [true, false]) {
+    const f = fixture();
+    const supervisor = new Supervisor(f.deps);
+    if (receiptFirst) recordReported(f.state.dir, "alpha", f.clock.now(), "auto-reported by the supervisor");
+    supervisor.enqueue("done-claim:alpha:1", AUTO);
+    if (!receiptFirst) recordReported(f.state.dir, "alpha", f.clock.now(), "auto-reported by the supervisor");
+    f.clock.at += 10 * MIN;
+    await supervisor.reportTick();
+    expect(f.unreported()).toEqual([]);
+    expect(readJournal(f.state.dir).outcomes).toMatchObject([{ lane: "alpha", reportedAt: T0, line: AUTO, claim: true, claimed: true }]);
+    supervisor.enqueue("ci-merged:acme/app#1", "CI_MERGED acme/app#1 into dev lane=alpha head=abc1234 merge=def https://x");
+    expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ reportedAt: T0, quiet: ["ci-merged:acme/app#1"] });
+  }
+});
 
 test("a done claim opens the lane's obligation: listed for inbox take, UNREPORTED after reportTimeoutMin", async () => {
   const f = fixture();

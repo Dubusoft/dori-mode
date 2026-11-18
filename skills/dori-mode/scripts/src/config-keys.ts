@@ -3,7 +3,7 @@
 
 import { readFileSync } from "node:fs";
 
-import { CONFIG_FILE_KEYS, DEFAULT_LANE_SANDBOX, defaultConfig, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
+import { AUTO_REPORT_SCOPES, CONFIG_FILE_KEYS, DEFAULT_LANE_SANDBOX, defaultConfig, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
 import { DEFAULT_POLICY, effectiveWorktreeRoot, GUARD_KEYS, RUNNER_POLICY_KEYS } from "./runner/policy.ts";
 import { writeFileAtomic } from "./setup.ts";
 
@@ -44,6 +44,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("autopilot", "json", "Autopilot (always on; dori autopilot pause stops it): tickSec, quota threshold, merge base, executor (default false)"),
   spec("review", "json", "PR review gate: { repos: [\"owner/repo\", ...] } (case-insensitive); unlisted or empty: lane PRs merge without review"),
   spec("memoryLimits", "json", "Lead memory limits: humanMaxKb (15), systemMaxTokens (omo's advisory, 30000), triggerPct (80: past it the lead is woken at once)"),
+  spec("autoReport", "enum", "Whose clean done claims the supervisor reports to the owner itself instead of waking the lead (off restores the lead's report)", { values: [...AUTO_REPORT_SCOPES] }),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
