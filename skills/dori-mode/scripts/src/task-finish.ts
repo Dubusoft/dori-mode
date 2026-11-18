@@ -13,7 +13,8 @@ import type { ToodoWriter } from "./toodo-client.ts";
  * read back nothing is appended and the task is left to the lead.
  *
  * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
- * supervisor completed the task (finishedOutcome). An autopilot task the supervisor did not finish, or whose lane closed
+ * supervisor completed the task (finishedOutcome). A repo-less autopilot lane has no PR: the report its claim installed
+ * stands in for the merge (reportFinish). An autopilot task the supervisor did not finish, or whose lane closed
  * cancelled, gets a blocker note (taskBlocker, read back) and its one failure line says so; done-flow.ts marks the
  * launch attempt (autopilot.ts markLaneToodo) so the task is written to and told about once, and never relaunched.
  */
@@ -41,8 +42,11 @@ export type TaskFinisherDeps = {
   readonly language?: () => string | undefined;
 };
 
-/** The merges of a closed lane (done-flow.ts laneMerges), or why none was read back. */
-export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly why: string };
+/**
+ * The merges of a closed lane (done-flow.ts laneMerges), or why none was read back; for a repo-less autopilot lane, the
+ * lead-host path of the report its claim installed (done-flow.ts laneReport), which stands in for the merge.
+ */
+export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly report: string } | { readonly why: string };
 
 /** `task` is undefined for a lane with no Toodo task: only the merge fact line is appended. */
 export type TaskFinisher = (lane: Lane, task: number | undefined, read: LaneMergeRead) => Promise<TaskFinish>;
@@ -146,8 +150,32 @@ const unmergedFinish = async (writer: Pick<ToodoWriter, "read">, lane: Lane, tas
   return { tag: "unmerged", lines: [notCompletedLine(lane, task, `no merge read back: ${why}${unread}`)] };
 };
 
+/**
+ * A repo-less autopilot lane closed with its report installed: each pending manual criterion is checked with the report
+ * as evidence and the task is completed, then its report gets the task-done fact line (no merge part).
+ */
+const reportFinish = async (deps: TaskFinisherDeps, lane: Lane, task: number, report: string): Promise<TaskFinish> => {
+  try {
+    const record = await deps.writer.read(task);
+    const evidence = `report ${report} (lane ${lane.key} closed after its Done signals read back live)`;
+    for (const criterion of record.criteria) {
+      if (criterion.kind === "manual" && criterion.state !== "met") await deps.writer.checkCriterion(task, criterion.id, evidence);
+    }
+    await deps.writer.completeTask(task, { note: `Report: ${report}. Completed by the dori supervisor when lane ${lane.key} closed.` });
+  } catch (e) {
+    return { tag: "failed", lines: [`TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} toodo: ${errorText(e)}; finish it yourself (complete_task with the report ${report})`] };
+  }
+  const head = `TOODO_TASK_COMPLETED ${lane.key} #${task} report=${report}`;
+  try {
+    return { tag: "done", lines: [`${head}; report ${appendedText(await deps.append(lane, FACT_WORDS[factLanguage(deps.language?.())].done(task)))}`] };
+  } catch (e) {
+    return { tag: "append-failed", lines: [`${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`] };
+  }
+};
+
 export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, read) => {
-  if (task === undefined) return "why" in read ? { tag: "no-task", lines: [] } : { tag: "no-task", lines: [await appendMergeFact(deps, lane, read.merges)] };
+  if (task === undefined) return "merges" in read ? { tag: "no-task", lines: [await appendMergeFact(deps, lane, read.merges)] } : { tag: "no-task", lines: [] };
+  if ("report" in read) return reportFinish(deps, lane, task, read.report);
   if ("why" in read) return unmergedFinish(deps.writer, lane, task, read.why);
   const { merges } = read;
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");

@@ -8,6 +8,7 @@ import { autopilotThreadChannelOf } from "./config.ts";
 import { resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { type LaunchInput, SandboxRefusal, validateLaunch } from "./launch.ts";
+import { laneReportFile } from "./lane-files.ts";
 import { admitLaunch, type LaunchOutcome, placeLaunch, type PlacedLaunch } from "./launch-service.ts";
 import { Discord, type ThreadMember } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
@@ -34,7 +35,8 @@ import { ToodoClient, ToodoWriter } from "./toodo-client.ts";
  * its own lanes/<key> directory, and the standard footer creates the worktree under that runner's reported root.
  * Local lanes cannot omit cwd (launchLane falls back to leadCwd) and cannot start under stateDir (the lane sandbox
  * hides it), so they start in an empty <local worktree root>/<repo name>-<key>, the exact path the footer tells the lane
- * to create its worktree at (git accepts an existing empty directory). The runner refuses a missing explicit cwd, so
+ * to create its worktree at (git accepts an existing empty directory); a repo-less lane's work folder is
+ * <local worktree root>/<key>. The runner refuses a missing explicit cwd, so
  * the directory is created first (parents recursively, then the leaf by ensureRunnerSubdir: idempotent, refuses a
  * symlink). No known root is review, never a launch.
  * The brief stays under stateDir: only the lead reads it; the runner writes the lane's own copy from briefText.
@@ -57,7 +59,7 @@ export type ExecutorThread = { readonly parent: string; readonly title: string; 
 export type ExecutorDeps = Omit<AutopilotDeps, "toodo"> & {
   readonly stateDir: string;
   readonly ciMergeBase: string;
-  readonly toodo: () => Pick<ToodoClient, "task" | "tasksByIds" | "flaggedTasks" | "guidelines">;
+  readonly toodo: () => Pick<ToodoClient, "task" | "tasksByIds" | "flaggedTasks" | "guidelines" | "workspaceRepository">;
   readonly writer: Pick<ToodoWriter, "startTask" | "read" | "reportBlocker">;
   readonly parentChannel: string;
   readonly createThread: (thread: ExecutorThread) => Promise<{ readonly id: string; readonly member: ThreadMember }>;
@@ -111,12 +113,20 @@ const save = (deps: ExecutorDeps, row: Operation, patch: Partial<Execution>): Ex
   return data;
 };
 
+/** The executor runs one attempt per task. */
+const ATTEMPT = 1;
+
 const prepare = async (deps: ExecutorDeps, taskId: number) => {
   const reader = deps.toodo();
   const task = await reader.task(taskId);
   if (!task) return { kind: "review" as const, reasons: ["task-missing"] };
-  const [tasks, guidelines] = await Promise.all([reader.tasksByIds(task.dependsOn), reader.guidelines(task.workspaceId)]);
-  const planned = planTask({ task, tasks: new Map(tasks.map((t) => [t.id, t])), guidelines, config: deps.config });
+  const [tasks, guidelines, workspaceRepository] = await Promise.all([
+    reader.tasksByIds(task.dependsOn), reader.guidelines(task.workspaceId), reader.workspaceRepository(task.workspaceId),
+  ]);
+  const planned = planTask({
+    task, tasks: new Map(tasks.map((t) => [t.id, t])), guidelines, config: deps.config, workspaceRepository,
+    reportFile: laneReportFile(deps.stateDir, autopilotLaneKey(taskId, ATTEMPT)),
+  });
   if (planned.kind === "review") return planned;
   const reasons: string[] = [];
   if (!deps.parentChannel) reasons.push("thread-channel-missing");
@@ -287,7 +297,7 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
   if (!placement.machine) {
     const root = deps.worktreeRoot(machineRunner(undefined))?.replace(/\/+$/, "");
     if (!root) return stop(deps, row, "review", ["worktree-root-missing"]);
-    localCwd = join(root, `${data.contract.repo.split("/").pop()}-${data.laneKey}`);
+    localCwd = join(root, data.contract.repo === null ? data.laneKey : `${data.contract.repo.split("/").pop()}-${data.laneKey}`);
   }
   const placed = { ...placement, cwd: localCwd };
   const launch = { ...input, machine: placed.machine, cwd: placed.cwd };
@@ -343,7 +353,7 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
         results.push({ taskId, kind: "review", reasons: ready.reasons });
         continue;
       }
-      const attempt = 1;
+      const attempt = ATTEMPT;
       const laneKey = autopilotLaneKey(taskId, attempt);
       const data: Execution = {
         taskId, laneKey, title: ready.task.title, contract: ready.contract, brief: ready.brief,

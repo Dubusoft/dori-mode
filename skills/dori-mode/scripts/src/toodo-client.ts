@@ -107,7 +107,7 @@ export class ToodoClient {
   }
 
   /** One read command; `allow404` returns undefined on 404 instead of throwing. */
-  private async call(command: "list_tasks" | "get_task" | "list_guidelines", args: unknown, allow404 = false): Promise<unknown> {
+  private async call(command: "list_tasks" | "get_task" | "list_guidelines" | "get_workspace", args: unknown, allow404 = false): Promise<unknown> {
     const url = `${this.config.url.replace(/\/+$/, "")}/api/rpc/${command}`;
     const token = this.token();
     let response: Response;
@@ -161,6 +161,17 @@ export class ToodoClient {
     const reply = await this.call("list_guidelines", { workspaceId });
     if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_guidelines did not answer a guideline list");
     return reply.map(toGuideline);
+  }
+
+  /**
+   * A workspace's optional `repository` (free text toodo does not interpret), the default repo of its autopilot tasks;
+   * null when it has none or toodo-server has no such workspace.
+   */
+  async workspaceRepository(workspaceId: number): Promise<string | null> {
+    const reply = await this.call("get_workspace", { id: workspaceId }, true);
+    if (reply === undefined) return null;
+    if (!isRecord(reply) || (reply.repository != null && typeof reply.repository !== "string")) throw new ToodoUnreadable(`toodo-server get_workspace returned workspace ${workspaceId} with an unreadable repository`);
+    return reply.repository ?? null;
   }
 }
 

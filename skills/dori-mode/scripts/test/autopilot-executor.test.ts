@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { DEFAULT_AUTOPILOT, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
 import { type ExecutorDeps, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
@@ -53,6 +53,7 @@ const harness = (initial = task()) => {
   const placements: PlacedLaunch[] = [];
   let guidelines: ToodoGuideline[] = [];
   let dependencies: ToodoTask[] = [];
+  let workspaceRepository: string | null = null;
   const checkpoint = () => {
     if (!crashed && crashAfter && store.list().some((op) => op.action === `autopilot-${crashAfter}` && op.state === "verified")) {
       crashed = true;
@@ -68,6 +69,7 @@ const harness = (initial = task()) => {
       tasksByIds: async (ids) => { checkpoint(); return [current, ...dependencies].filter((t) => ids.includes(t.id)); },
       flaggedTasks: async () => { checkpoint(); calls.reserve++; return current.status === "planned" ? [current] : []; },
       guidelines: async () => { checkpoint(); return guidelines; },
+      workspaceRepository: async () => { checkpoint(); return workspaceRepository; },
     }),
     openLanes: async () => new Set(lanes.keys()),
     quota: async () => ({ readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] }),
@@ -139,6 +141,7 @@ const harness = (initial = task()) => {
     crashAfter: (step: string) => { crashAfter = step; }, crashed: () => crashed,
     changeOnStart: () => { mutateOnStart = true; }, guidelines: (value: ToodoGuideline[]) => { guidelines = value; },
     dependencies: (value: ToodoTask[]) => { dependencies = value; },
+    workspaceRepository: (value: string | null) => { workspaceRepository = value; },
   };
 };
 
@@ -165,11 +168,29 @@ test("ready contract reserves, starts, threads, writes, launches and settles exa
 });
 
 test("review contract has no reservations, writes, threads, or admission", async () => {
-  const h = harness(task({ refs: ["owner:discord:c/m"] }));
-  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, kind: "review", reasons: ["repo-missing"] }]);
+  const h = harness(task({ refs: ["owner:discord:c/m", "repo:a/b", "repo:a/c"] }));
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, kind: "review", reasons: ["repo-ambiguous"] }]);
   expect(store.list()).toEqual([]);
   expect(Object.values(h.calls).every((n) => n === 0)).toBe(true);
-  expect(h.logs[0]).toContain("repo-missing");
+  expect(h.logs[0]).toContain("repo-ambiguous");
+});
+
+test("a task with no repo ref takes its workspace's GitHub repository", async () => {
+  const h = harness(task({ refs: ["owner:discord:c/m"] }));
+  h.workspaceRepository("https://github.com/Owner/Tool.git");
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(h.inputs[0]).toMatchObject({ done: "pr owner/tool autopilot/12", cwd: `/wt/tool-${KEY}` });
+});
+
+test("a task with no repo anywhere launches repo-less in <root>/<key> with its report file as Done", async () => {
+  const h = harness(task({ refs: ["owner:discord:c/m"] }));
+  h.workspaceRepository("discord:tasks");
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  const report = join(dirname(dir), "research", KEY, "report.md");
+  expect(h.inputs[0]).toMatchObject({ done: `file ${JSON.stringify(report)}`, cwd: `/wt/${KEY}` });
+  expect(h.dirs).toEqual([`/wt/${KEY}`]);
+  expect([...h.files.values()][0]).toContain("- deliverable: report");
+  expect(ledgerRows(store)[0]?.state).toBe("verified");
 });
 
 test("base mismatch refuses before reserving or starting", async () => {

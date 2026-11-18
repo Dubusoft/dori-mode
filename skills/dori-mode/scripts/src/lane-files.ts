@@ -306,6 +306,10 @@ type Intent = {
 const sameReceipt = (a: Receipt | undefined | null, b: Receipt | undefined | null): boolean =>
   Boolean(a && b && a.key === b.key && a.run.id === b.run.id && a.run.requiredReport === b.run.requiredReport && a.revision === b.revision && a.sha256 === b.sha256);
 const destination = (stateDir: string, key: string): string => join(dirname(resolve(stateDir)), "research", key);
+/** The report file a repo-less autopilot lane writes in DORI_LANE_OUT (autopilot-plan.ts). */
+export const LANE_REPORT_NAME = "report.md";
+/** Where a lane's `report.md` lands on the lead host once its claim's files are installed: the Done of a repo-less lane. */
+export const laneReportFile = (stateDir: string, key: string): string => join(destination(stateDir, key), LANE_REPORT_NAME);
 const unsafeDestination = (key: string, path: string): LaneFileError => new LaneFileError("LANE_REPORT_DESTINATION_UNSAFE", key,
   `collection destination ${JSON.stringify(path)} is not a safe dori-managed directory; move the conflicting path aside and retry the claim`);
 const ownerSafe = (path: string, st: Stats): boolean => {

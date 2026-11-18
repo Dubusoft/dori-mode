@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 import { LAUNCH_ACTION, ledgerRows } from "../src/autopilot.ts";
 import { claimDone, closeLane, finishClosedTask, type FlowDeps, watchTick } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
+import { laneReportFile } from "../src/lane-files.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { mergeFactLine, taskBlocker, taskFinisher } from "../src/task-finish.ts";
 import { appendFollowUp, type FollowUpDiscord, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
@@ -289,6 +290,42 @@ test("an autopilot task toodo refuses to complete gets a blocker note, one failu
   const again = await finishClosedTask({ ...at(T0 + 6 * MIN), finishTask: async () => { throw new Error("finished again"); } }, apLane);
   expect(again).toEqual({ tag: "failed", lines: [] });
   expect(calls.length).toBe(before);
+});
+
+/** A repo-less autopilot lane `ap-951-1` (Done = its report file) closed and finished by the supervisor. */
+const finishRepoless = async (task: Task, discord: FollowUpDiscord) => {
+  reserveAutopilot();
+  const report = laneReportFile(at(T0).config.stateDir, "ap-951-1");
+  const toodo = fakeToodo(task);
+  stops.push(toodo.stop);
+  const writer = new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") });
+  const finishTask = taskFinisher({ writer, append: (l, text) => appendFollowUp(state.dir, discord, l, text), language: () => "Korean" });
+  return { report, finish: await finishClosedTask({ ...at(T0), finishTask, blockTask: taskBlocker(writer) }, { ...apLane, done: `file ${JSON.stringify(report)}` }) };
+};
+
+test("a repo-less autopilot lane without its report leaves the task open with a blocker", async () => {
+  const task = inProgress([manual(1)]);
+  const { report, finish } = await finishRepoless(task, fakeDiscord().discord);
+  expect(finish?.tag).toBe("unmerged");
+  expect(finish?.lines[0]).toContain(`no report of the repo-less lane at ${report}`);
+  expect(task.status).toBe("in_progress");
+  expect(task.notes.map((n) => n.kind)).toEqual(["blocker"]);
+});
+
+test("a repo-less autopilot lane is completed with its installed report as evidence and its report gets the done line", async () => {
+  const report = laneReportFile(at(T0).config.stateDir, "ap-951-1");
+  mkdirSync(dirname(report), { recursive: true });
+  writeFileSync(report, "# result\n");
+  recordLastReport(state.dir, "ap-951-1", { channel: "900", message: "m1", at: T0 });
+  const task = inProgress([manual(1), manual(2, true)]);
+  const fake = fakeDiscord();
+  const { finish } = await finishRepoless(task, fake.discord);
+  expect(finish).toEqual({ tag: "done", lines: [`TOODO_TASK_COMPLETED ap-951-1 #951 report=${report}; report appended (m1)`] });
+  expect(task.status).toBe("done");
+  expect(task.criteria.map((c) => [c.state, c.evidence?.startsWith(`report ${report} `) ?? false])).toEqual([["met", true], ["met", false]]);
+  expect(task.refs).toEqual([]);
+  expect(fake.edits).toEqual([["900", "m1", "report\nToodo #951 완료"]]);
+  expect(attemptData()).toMatchObject({ toodo: "done" });
 });
 
 test("a cancelled autopilot lane gets its blocker recorded once and its failure line says so", async () => {

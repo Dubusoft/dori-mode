@@ -14,24 +14,31 @@ Toodo's web RPC `list_tasks` filter has no `autopilot` key, so dori reads every 
 
 ## Execution contract
 
-A marked task states how it runs through task refs, which toodo stores without interpreting them. `planTask` (`scripts/src/autopilot-plan.ts`) reads them, with the task, its dependencies and the workspace guidelines (`ToodoClient.guidelines`, toodo's `list_guidelines`), and returns either a ready contract with its template brief or the reasons the task needs the lead's review. It is pure: nothing in it reads toodo, writes a file or launches.
+A marked task states how it runs through task refs, which toodo stores without interpreting them. `planTask` (`scripts/src/autopilot-plan.ts`) reads them, with the task, its dependencies, the workspace guidelines (`ToodoClient.guidelines`, toodo's `list_guidelines`) and the workspace's `repository` (`ToodoClient.workspaceRepository`, toodo's `get_workspace`), and returns either a ready contract with its template brief or the reasons the task needs the lead's review. It is pure: nothing in it reads toodo, writes a file or launches.
 
 | Ref | Default | Meaning |
 | --- | --- | --- |
-| `repo:<owner>/<name>` | required | The one repository the lane works in (case-insensitive). |
+| `repo:<owner>/<name>` | the workspace's repository, else none | The one repository the lane works in (case-insensitive). |
 | `base:<branch>` | `autopilot.mergeBase` | The branch the lane starts from and opens its PR into. It must be `autopilot.mergeBase`. |
 | `branch:<name>` | `autopilot/<taskId>` | The lane's branch, a valid git branch name other than the base. The lane's Done is `pr <repo> <branch>`. |
 | `mode:<ulw\|mass-ulw>` | `ulw` | The lane's mode. Nothing guesses it from the text. |
 | `model:<id>` | `defaultModel` | The lane's model. |
 | `approved:<version>` | none | The lead reviewed the task at that contract version. |
 
+Without a `repo:` ref the task takes its workspace's `repository` when that free text names a GitHub repository (`owner/name`, or a github.com URL or remote); anything else there (empty, `discord:<channel>`, a path) means no repo. A task with no repo at all runs repo-less:
+
+- It makes no branch, commit or PR (`repo` and `branch` are null). Its brief says so, declares `deliverable: report` (the runner refuses a done claim without report files) and asks for the result, criterion by criterion, in `DORI_LANE_OUT/report.md`.
+- Its Done is `file "<research>/<laneKey>/report.md"`: the lead-host path where the claim installs that file (`lane-files.ts` `laneReportFile`, next to the state dir). Done checks of local and remote lanes both run on the lead host, so the signal is live once the claim is collected.
+- It is placed like any launch with no repo: `placement.defaultMachine`, then the fallbacks. A local lane works in `<worktree root>/<laneKey>`.
+- When it closes, the supervisor completes its task with the report as evidence (see Ledger).
+
 The contract also carries:
 
-- `version`: a 12-digit sha256 over the title, description, criteria, dependencies and contract refs. Status, notes and other refs (`owner:`, `lane:`, `approved:`) are left out, so starting or approving the task keeps it, while a scope change moves it.
+- `version`: a 12-digit sha256 over the title, description, criteria, dependencies and contract refs; for a task without a `repo:` ref, also the repo its workspace gives it (or none), so changing the workspace's repository moves the version of those tasks only. Status, notes and other refs (`owner:`, `lane:`, `approved:`) are left out, so starting or approving the task keeps it, while a scope change moves it.
 - `guidelines`: a snapshot of the workspace's guidelines (rules and memories, by id) with its own hash, so a later run can tell whether they changed since the brief was built.
 - `approvedVersion`: the version an `approved:` ref names when it matches.
 
-The task goes to review instead (`kind: "review"`, reasons in this order) on `repo-missing`, `repo-ambiguous` (two repos), `ref-invalid` (a malformed repo, base, branch, mode or model, or a branch equal to the base), `ref-conflict` (two different values for one key), `base-not-allowed` (a base other than `autopilot.mergeBase`) and `approval-stale` (an `approved:` ref none of which names the current version). Whether a criterion can be judged by a script is not guessed: a lead who reviews such a task records `approved:<version>`, and any later scope change sends it back to review.
+The task goes to review instead (`kind: "review"`, reasons in this order) on `repo-missing` (no repo and no report path to run repo-less with; the executor always passes one), `repo-ambiguous` (two repos), `ref-invalid` (a malformed repo, base, branch, mode or model, or a branch equal to the base), `ref-conflict` (two different values for one key), `base-not-allowed` (a base other than `autopilot.mergeBase`) and `approval-stale` (an `approved:` ref none of which names the current version). Whether a criterion can be judged by a script is not guessed: a lead who reviews such a task records `approved:<version>`, and any later scope change sends it back to review.
 
 The template brief is the task's title (`# <title> (Toodo #<id>)`), its description as written, its criteria with kind and target, its dependencies with status, its other refs, the workspace guidelines (rules, then memories) and the contract (repo, base, branch, Done, mode, version, snapshot hash). `dori launch` appends the common lane footer, so the brief does not repeat it. Storing the snapshot outside the repo and launching from the contract belong to the executor.
 
@@ -50,6 +57,7 @@ When the lane a row names closes, the close settles the row once and adds `outco
 
 After the close the supervisor writes the outcome to the task (task-finish.ts, every write read back with `get_task`) and marks the row's data `toodo` once (`done`, `blocked` or `failed`), so a resumed or repeated close never writes to the task or tells the lead again; nothing is relaunched:
 
+- Repo-less (its Done names no repo), `report.md` installed: each pending manual criterion is checked with the report path as evidence and the task is completed with a note naming the report; its report gets `Toodo #<id> done` (in the owner's language) appended, and the line is `TOODO_TASK_COMPLETED <key> #<id> report=<path>; ...`. With no report there, the task is left open with a blocker as below.
 - Done, PR read back merged: each pending manual criterion is checked with the merge as evidence and the task is completed with the PR as a ref and a note naming its merge SHA. The line becomes `AUTOPILOT_LANE_DONE ... attempt=<n> toodo=done: toodo task #<id> completed and read back by the supervisor`, which is digest.
 - Done, but the task could not be completed (no merge read back, toodo refused or did not confirm): the task gets a blocker note and the one failure line, `TOODO_TASK_NOT_COMPLETED`, ends with `blocker recorded on toodo task #<id>` (or why it was not).
 - Cancelled: `dori close` (or the supervisor resuming it) records the blocker note and the failure line reads `AUTOPILOT_LANE_FAILED ... cancelled: <reason> toodo=blocked: blocker recorded on toodo task #<id>; tell the owner; ...`.
@@ -175,7 +183,7 @@ Every step is journaled in the operation store: one sequence row `toodo:<taskId>
 - Crash reconcile: at startup and on every tick, `reconcileExecutions` resumes open sequences from their last journaled step. It never relaunches. An admission whose start can't be proved (a startup receipt or the runner's journaled startup result; a registered pane alone isn't proof) settles `ambiguous` and goes to the lead, as does a lost thread-create reply. Positive proof that a launch never started settles `failed` with one blocker, without retry.
 - HOLD resume: a held lane drains under its original key. A pause or a changed contract keeps it queued, and a scope change sends it to review. If the key left the queue outside the executor, a registry lane for it is `ambiguous` (a manual `dori launch` is never repeated) and no lane is review `hold-dropped` (`dori hold drop` was the lead's call). Neither path admits again.
 - Base enforcement: `autopilot.mergeBase` must equal the CI merge base, and the contract's base and version are recorded before launch.
-- Worktree isolation: a local launch runs in `<worktree root>/<repo name>-<laneKey>`, created empty right before validation. The root is the local runner's reported worktree root, else `config.worktreeRoot`; with neither the task goes to review `worktree-root-missing`, and a directory that can't be made is review `local-cwd-unusable`. It's never under the state dir and never left out. Remote placement drops the cwd so the runner makes its own lane directory.
+- Worktree isolation: a local launch runs in `<worktree root>/<repo name>-<laneKey>` (a repo-less one in `<worktree root>/<laneKey>`), created empty right before validation. The root is the local runner's reported worktree root, else `config.worktreeRoot`; with neither the task goes to review `worktree-root-missing`, and a directory that can't be made is review `local-cwd-unusable`. It's never under the state dir and never left out. Remote placement drops the cwd so the runner makes its own lane directory.
 
 ## Switch-over
 

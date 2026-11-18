@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 
 import type { AutopilotConfig, ToodoTask } from "./autopilot.ts";
+import { githubRepoFromRemote } from "./git-remote.ts";
+import { LANE_REPORT_NAME } from "./lane-files.ts";
 import { LANE_MODES, type LaneMode } from "./registry.ts";
 import { parseSignal } from "./signals.ts";
 import type { ToodoGuideline } from "./toodo-client.ts";
@@ -11,7 +13,10 @@ import type { ToodoGuideline } from "./toodo-client.ts";
  * guidelines (ToodoClient) and pass them in; nothing here reads toodo, writes a file or launches.
  *
  * The contract is read from task refs, which toodo stores without interpreting them:
- * - `repo:<owner>/<name>` (required, exactly one repo): the repository the lane works in.
+ * - `repo:<owner>/<name>` (optional, at most one repo): the repository the lane works in. Without it the workspace's
+ *   `repository` is used when it names a GitHub repository (`owner/name` or a github.com URL); with neither the task
+ *   runs repo-less: in a plain work folder, no branch or PR, and its Done is the report file its claim installs on the
+ *   lead host (`reportFile`).
  * - `base:<branch>` (optional, default `autopilot.mergeBase`): the branch the lane starts from and opens its PR into;
  *   it must be `autopilot.mergeBase`, since autopilot lanes merge there only.
  * - `branch:<name>` (optional, default `autopilot/<taskId>`): the lane's branch; Done is `pr <repo> <branch>`.
@@ -45,11 +50,12 @@ export type AutopilotContract = {
   readonly taskId: number;
   /** sha256 (first 12 hex digits) over the task content the lane works from; see contractVersion. */
   readonly version: string;
-  /** `owner/name`, lowercase. */
-  readonly repo: string;
+  /** `owner/name`, lowercase; null for a repo-less task. */
+  readonly repo: string | null;
   readonly base: string;
-  readonly branch: string;
-  /** The lane's Done expression: `pr <repo> <branch>`. */
+  /** null for a repo-less task: it makes no branch. */
+  readonly branch: string | null;
+  /** The lane's Done expression: `pr <repo> <branch>`, or `file "<reportFile>"` for a repo-less task. */
   readonly done: string;
   readonly mode: LaneMode;
   /** Absent: the config's defaultModel. */
@@ -66,6 +72,13 @@ export type PlanInput = {
   /** The guidelines of the task's workspace (ToodoClient.guidelines). */
   readonly guidelines: readonly ToodoGuideline[];
   readonly config: Pick<AutopilotConfig, "mergeBase">;
+  /** The task workspace's `repository` (ToodoClient.workspaceRepository): free text, used only when it names a GitHub repo. */
+  readonly workspaceRepository?: string | null;
+  /**
+   * The lead-host path the lane's `report.md` lands at once its claim is collected (lane-files.ts laneReportFile). A
+   * task with no repo runs repo-less with this file as its Done; without it such a task goes to review `repo-missing`.
+   */
+  readonly reportFile?: string;
 };
 
 export type Plan =
@@ -85,6 +98,13 @@ export const validBranch = (name: string): boolean =>
 
 const isContractKey = (key: string): key is ContractKey => (CONTRACT_REF_KEYS as readonly string[]).includes(key);
 
+/** The GitHub repository a workspace's free-text `repository` names (`owner/name` or a github.com URL), lowercase. */
+export const workspaceRepo = (repository: string | null | undefined): string | undefined => {
+  const value = (repository ?? "").trim().toLowerCase();
+  const repo = REPO.test(value) ? value : githubRepoFromRemote(value);
+  return repo && REPO.test(repo) ? repo : undefined;
+};
+
 /** The task's contract refs by key (trimmed values, in ref order); other refs are left out. */
 const contractRefs = (task: ToodoTask): Map<ContractKey, string[]> => {
   const out = new Map<ContractKey, string[]>();
@@ -100,14 +120,18 @@ const contractRefs = (task: ToodoTask): Map<ContractKey, string[]> => {
 /**
  * The task's contract version: a hash of everything the lane works from (title, description, criteria, dependencies
  * and the contract refs). Notes, status, `lane:`/`owner:`/`approved:` and other refs are left out, so starting the task
- * or approving it does not change the version, while a scope change does.
+ * or approving it does not change the version, while a scope change does. A task without a `repo:` ref also hashes the
+ * repo its workspace gives it (or none), so changing the workspace's repository moves it; a task with one hashes as
+ * before.
  */
-export const contractVersion = (task: ToodoTask): string => {
-  const refs = [...contractRefs(task)].map(([key, values]) => [key, [...new Set(values.map((v) => (key === "repo" ? v.toLowerCase() : v)))].sort()]).sort();
+export const contractVersion = (task: ToodoTask, workspaceRepository?: string | null): string => {
+  const contract = contractRefs(task);
+  const refs = [...contract].map(([key, values]) => [key, [...new Set(values.map((v) => (key === "repo" ? v.toLowerCase() : v)))].sort()]).sort();
   return sha({
     title: task.title, description: task.description,
     criteria: task.criteria.map((c) => [c.text, c.kind, c.target ?? null]),
     dependsOn: [...new Set(task.dependsOn)].sort((a, b) => a - b), refs,
+    ...(contract.has("repo") ? {} : { workspaceRepo: workspaceRepo(workspaceRepository) ?? null }),
   });
 };
 
@@ -125,12 +149,14 @@ const single = (refs: Map<ContractKey, string[]>, key: ContractKey): string | un
 /** Reads the task's contract, or the reasons it needs the lead's review. */
 export const planTask = (input: PlanInput): Plan => {
   const { task, config } = input;
-  const version = contractVersion(task);
+  const version = contractVersion(task, input.workspaceRepository);
   const refs = contractRefs(task);
   const reasons = new Set<ReviewReason>();
 
-  const repos = [...new Set((refs.get("repo") ?? []).map((r) => r.toLowerCase()))];
-  if (repos.length === 0) reasons.add("repo-missing");
+  const named = [...new Set((refs.get("repo") ?? []).map((r) => r.toLowerCase()))];
+  const fallback = named.length ? undefined : workspaceRepo(input.workspaceRepository);
+  const repos = fallback ? [fallback] : named;
+  if (repos.length === 0) { if (input.reportFile === undefined) reasons.add("repo-missing"); }
   else if (repos.length > 1) reasons.add("repo-ambiguous");
   else if (!REPO.test(repos[0]!)) reasons.add("ref-invalid");
 
@@ -151,11 +177,11 @@ export const planTask = (input: PlanInput): Plan => {
   if (approvals.length > 0 && approvedVersion === null) reasons.add("approval-stale");
 
   if (reasons.size > 0) return { kind: "review", taskId: task.id, version, reasons: REVIEW_REASONS.filter((r) => reasons.has(r)) };
-  const repo = repos[0]!;
-  const done = `pr ${repo} ${branch}`;
-  parseSignal(done); // a valid repo and branch always parse; a throw here is a bug, not a review case
+  const repo = repos[0] ?? null;
+  const done = repo === null ? `file ${JSON.stringify(input.reportFile)}` : `pr ${repo} ${branch}`;
+  parseSignal(done); // a valid repo and branch (or a quoted path) always parse; a throw here is a bug, not a review case
   const contract: AutopilotContract = {
-    taskId: task.id, version, repo, base, branch, done, mode, ...(model === undefined ? {} : { model }),
+    taskId: task.id, version, repo, base, branch: repo === null ? null : branch, done, mode, ...(model === undefined ? {} : { model }),
     guidelines: snapshotGuidelines(task.workspaceId, input.guidelines), approvedVersion,
   };
   return { kind: "ready", contract, brief: renderBrief(task, contract, input.tasks) };
@@ -192,9 +218,17 @@ export const renderBrief = (task: ToodoTask, contract: AutopilotContract, tasks:
     if (rules.length > 0) out.push("", "### 규칙", ...rules.map((g) => bullet(g.body)));
     if (memories.length > 0) out.push("", "### 메모", ...memories.map((g) => bullet(g.body)));
   }
+  out.push("", "## 실행 계약");
+  if (contract.repo === null) {
+    out.push(
+      bullet("저장소 없음: 레인 작업 폴더에서 작업하고 브랜치·커밋·PR을 만들지 않는다. 푸터의 PR·머지 규칙은 이 레인에 해당하지 않는다."),
+      bullet("deliverable: report"),
+      bullet(`결과를 DORI_LANE_OUT/${LANE_REPORT_NAME}에 쓴다: 완료 기준마다 결과와 근거(링크, 파일, 확인한 내용). 다른 산출물도 DORI_LANE_OUT에 둔다. 다 쓴 뒤 done을 보고하면 그 파일이 리드에 설치되어 Done이 된다.`),
+    );
+  } else {
+    out.push(bullet(`저장소 ${contract.repo}. origin/${contract.base}에서 브랜치 ${contract.branch}를 만들어 ${contract.base}로 PR을 연다. PR 전에 origin/${contract.base}로 리베이스한다.`));
+  }
   out.push(
-    "", "## 실행 계약",
-    bullet(`저장소 ${contract.repo}. origin/${contract.base}에서 브랜치 ${contract.branch}를 만들어 ${contract.base}로 PR을 연다. PR 전에 origin/${contract.base}로 리베이스한다.`),
     bullet(`Done = ${contract.done}`),
     bullet(`모드 ${contract.mode}${contract.model ? `, 모델 ${contract.model}` : ""}`),
     bullet(`계약 버전 ${contract.version}, 가이드라인 스냅샷 ${contract.guidelines.hash}`),
