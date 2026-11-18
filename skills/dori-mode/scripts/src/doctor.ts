@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
-import { alertsChannelOf, CONFIG_FILE_KEYS, configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
+import { alertsChannelOf, autopilotThreadChannelOf, CONFIG_FILE_KEYS, configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
@@ -383,6 +383,7 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
     else checks.push(line(key, inFile ? "file" : values[key] === undefined ? "unset" : "default", values[key]));
   }
   checks.push(
+    line("autopilot.threadChannel", c.autopilot.threadChannel ? "file" : "derived from discordChannels[0]", autopilotThreadChannelOf(c)),
     line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
     line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
   );

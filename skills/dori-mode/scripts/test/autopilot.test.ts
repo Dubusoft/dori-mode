@@ -241,6 +241,8 @@ test("parseAutopilotConfig defaults every key", () => {
   expect(DEFAULT_AUTOPILOT.tickSec).toBe(300);
   expect(parseAutopilotConfig({ tickSec: 30 }).tickSec).toBe(30);
   expect(parseAutopilotConfig({ tickSec: 3600 }).tickSec).toBe(3600);
+  expect(parseAutopilotConfig({ threadChannel: " 900 " }).threadChannel).toBe("900");
+  expect(() => parseAutopilotConfig({ threadChannel: 900 })).toThrow("autopilot.threadChannel must be a Discord channel id string");
 });
 
 test("parseAutopilotConfig ignores the removed bundle keys, quotaMaxUsedPct and mode (any value) with one warning", () => {

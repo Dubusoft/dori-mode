@@ -68,8 +68,9 @@ Key `autopilot` in `config.json`; every field is optional. An invalid value or a
 | `tickSec` | `300` | Seconds between the supervisor's ticks, an integer from 30 to 3600. |
 | `quotaCacheSec` | `90` | Seconds a quota read is reused before the usage endpoints are read again, an integer from 30 to 900. It applies to every quota caller (the judge, `dori quota`, Discord `/quota`); see Quota reads. |
 | `executor` | `false` | A boolean (anything else is rejected). `true` lets the supervisor launch LAUNCH tasks itself; see Supervisor executor. |
+| `threadChannel` | `""` | The Discord channel id the executor opens lane threads under (trimmed; anything but a string is rejected). Empty: the first `discordChannels` entry. Set it when `discordChannels[0]` is not where lane threads belong (e.g. a reports channel); closed-thread redirects and owner lines keep using `discordChannels[0]`. `dori doctor` shows the channel in use as `config.autopilot.threadChannel`. |
 
-Both apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
+All apply live when `config.json` is edited (no supervisor restart). There is no workspace allow list (every workspace's marked tasks are candidates), no autopilot WIP cap and no daily cap: the host guard alone limits how many lanes run (see Slots).
 
 ## Selection predicate
 
@@ -165,7 +166,7 @@ When on, each supervisor tick first runs `reconcileExecutions`, then `runExecuto
 1. prepare: read the task and its contract again; a reason to stop goes to review before anything is reserved or started.
 2. reserve: open the task's `autopilot-launch` ledger attempt, exactly as the CLI does. A reservation the CLI opened is never adopted.
 3. start-task: `start_task` with the `lane:<key>` ref.
-4. thread: create the lane's Discord thread under the first `discordChannels` entry and add `discord.ownerId`.
+4. thread: create the lane's Discord thread under `autopilot.threadChannel` (else the first `discordChannels` entry) and add `discord.ownerId`.
 5. launch: write the brief, then place, validate and admit through the real launch service (never `launchLane` directly). A HOLD from admission queues the lane.
 6. settle: settle the ledger attempt `verified`, `failed` or `ambiguous`, and notify with `AUTOPILOT_EXECUTOR_LAUNCHED`, `_REVIEW`, `_FAILED` or `_AMBIGUOUS`.
 
