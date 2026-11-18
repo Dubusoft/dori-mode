@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
@@ -6,7 +7,7 @@ import { type Claim, type ClaimedPull, type Lane, type Registry, statusOf, withS
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { OPEN_STATES, openOperations, type Operation, operationId, type OperationStore, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
-import { type Check, parseSignal, type SignalIo } from "./signals.ts";
+import { type Check, doneRepos, parseSignal, type SignalIo } from "./signals.ts";
 import { BRANCH_DELETE, type BranchPlan, planBranchCleanup, readBindings, readBranchBindings, type WorktreeFact } from "./branch-cleanup.ts";
 import { eventClass } from "./event-policy.ts";
 import type { EventMeta } from "./supervise-journal.ts";
@@ -14,7 +15,7 @@ import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
 import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
 import { blockedOutcome, finishedOutcome, type LaneMerge, type LaneMergeRead, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
-import { checkLaneReportText, installLaneReports, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
+import { checkLaneReportText, installLaneReports, laneReportFile, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import { LaneFileError } from "./lane-file-contract.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import type { Tunables } from "./tunables.ts";
@@ -850,6 +851,15 @@ export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<LaneMergeR
   return { merges };
 };
 
+/**
+ * The report of a repo-less autopilot lane (its Done names no repo, so it has no PR): the `report.md` its claim installed
+ * on the lead host, which completes its task in place of a merge, or why it is not there.
+ */
+const laneReport = (deps: FlowDeps, lane: Lane): LaneMergeRead => {
+  const report = laneReportFile(deps.config.stateDir, lane.key);
+  return existsSync(report) ? { report } : { why: `no report of the repo-less lane at ${report}` };
+};
+
 /** The supervisor's task follow-up of a lane it closed (deps.finishTask), or undefined when it has none to run. */
 export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<TaskFinish | undefined> => {
   if (!deps.finishTask) return undefined;
@@ -877,8 +887,8 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
   let finish: TaskFinish;
   let why: string | undefined;
   try {
-    // With no merge read back the finisher completes nothing; it only reads whether the task is already done.
-    finish = await deps.finishTask(lane, task, await laneMerges(deps, lane));
+    // With no merge (or, repo-less, no report) read back the finisher completes nothing; it only reads whether the task is already done.
+    finish = await deps.finishTask(lane, task, attempt && !doneRepos(lane.done).length ? laneReport(deps, lane) : await laneMerges(deps, lane));
   } catch (e) {
     why = e instanceof Error ? e.message : String(e);
     finish = { tag: "failed", lines: [notCompletedLine(lane, task, why)] };

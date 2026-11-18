@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { DEFAULT_AUTOPILOT, type ToodoTask } from "../src/autopilot.ts";
 import { contractVersion, type Plan, planTask, snapshotGuidelines, validBranch } from "../src/autopilot-plan.ts";
+import { briefDeliverable } from "../src/launch.ts";
 import { parseSignal } from "../src/signals.ts";
 import { ToodoClient, type ToodoFetch, type ToodoGuideline, ToodoUnreadable } from "../src/toodo-client.ts";
 
@@ -19,10 +20,14 @@ const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
 const rule: ToodoGuideline = { id: 2, workspaceId: WS, kind: "rule", body: "Write reports in Korean.", updatedAt: 100 };
 const memory: ToodoGuideline = { id: 1, workspaceId: WS, kind: "memory", body: "CI runs the typecheck only.", updatedAt: 90 };
 
-const plan = (t: ToodoTask, over: { tasks?: ToodoTask[]; guidelines?: ToodoGuideline[]; mergeBase?: string } = {}): Plan => planTask({
+type Over = { tasks?: ToodoTask[]; guidelines?: ToodoGuideline[]; mergeBase?: string; workspaceRepository?: string | null; reportFile?: string };
+const plan = (t: ToodoTask, over: Over = {}): Plan => planTask({
   task: t, tasks: new Map((over.tasks ?? [t]).map((x) => [x.id, x])), guidelines: over.guidelines ?? [rule, memory],
   config: { mergeBase: over.mergeBase ?? DEFAULT_AUTOPILOT.mergeBase },
+  ...(over.workspaceRepository === undefined ? {} : { workspaceRepository: over.workspaceRepository }),
+  ...(over.reportFile === undefined ? {} : { reportFile: over.reportFile }),
 });
+const REPORT = "/home/u/.dori/research/ap-1-1/report.md";
 
 const ready = (p: Plan) => {
   if (p.kind !== "ready") throw new Error(`expected ready, got review ${p.reasons.join(", ")}`);
@@ -53,6 +58,36 @@ test("the guideline snapshot keeps the task workspace's guidelines by id and its
   expect(contract.guidelines.guidelines.map((g) => g.id)).toEqual([1, 2]);
   expect(contract.guidelines.hash).toBe(snapshotGuidelines(WS, [memory, rule]).hash);
   expect(snapshotGuidelines(WS, [memory, { ...rule, body: "changed", updatedAt: 101 }]).hash).not.toBe(contract.guidelines.hash);
+});
+
+// Repo from the workspace, or none
+
+test("a task without a repo ref takes the workspace's GitHub repository, as owner/name or a github.com URL", () => {
+  for (const ws of ["Dubusoft/Toodo", "https://github.com/dubusoft/toodo.git", "git@github.com:Dubusoft/toodo"]) {
+    expect(ready(plan(task(1, { refs: ["owner:discord:c/m"] }), { workspaceRepository: ws, reportFile: REPORT })).contract)
+      .toMatchObject({ repo: "dubusoft/toodo", branch: "autopilot/1", done: "pr dubusoft/toodo autopilot/1" });
+  }
+  expect(ready(plan(task(1), { workspaceRepository: "dubusoft/toodo" })).contract.repo).toBe("dubusoft/dori-mode");
+});
+
+test("a task with no repo anywhere runs repo-less: no branch, its report file as Done, the report deliverable in its brief", () => {
+  for (const ws of [null, "", "discord:tasks", "/data/repos/x"]) {
+    const { contract, brief } = ready(plan(task(1, { refs: ["owner:discord:c/m"] }), { workspaceRepository: ws, reportFile: REPORT }));
+    expect(contract).toMatchObject({ repo: null, branch: null, base: "dev", done: `file "${REPORT}"` });
+    expect(parseSignal(contract.done)).toEqual({ kind: "file", path: REPORT });
+    expect(briefDeliverable(brief)).toBe(true);
+    expect(brief).toContain("DORI_LANE_OUT/report.md");
+    expect(brief).not.toContain("PR을 연다");
+  }
+  expect(reasons(plan(task(1, { refs: ["owner:discord:c/m"] }), { workspaceRepository: "discord:tasks" }))).toEqual(["repo-missing"]);
+});
+
+test("the workspace repository moves the version of a task without a repo ref only", () => {
+  const withRef = task(1);
+  expect(contractVersion(withRef, "a/b")).toBe(contractVersion(withRef));
+  const without = task(1, { refs: ["owner:discord:c/m"] });
+  expect(contractVersion(without, "a/b")).not.toBe(contractVersion(without));
+  expect(contractVersion(without, "discord:x")).toBe(contractVersion(without, null));
 });
 
 // Review
@@ -160,6 +195,17 @@ test("guidelines posts list_guidelines with the workspace id and returns the gui
   };
   expect(await new ToodoClient({ url: "http://toodo.test/", tokenFile }, { fetch }).guidelines(WS)).toEqual([rule]);
   expect(calls).toEqual([{ url: "http://toodo.test/api/rpc/list_guidelines", body: { workspaceId: WS } }]);
+});
+
+test("workspaceRepository posts get_workspace with the id and returns its repository, null when absent or unknown", async () => {
+  const calls: { url: string; body: unknown }[] = [];
+  const replies = [json(200, { id: WS, name: "w", repository: "Dubusoft/toodo" }), json(200, { id: WS, name: "w", repository: null }), json(404, { error: "x" })];
+  const fetch: ToodoFetch = async (url, init) => { calls.push({ url, body: JSON.parse(init.body as string) }); return replies.shift()!; };
+  const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch });
+  expect([await client.workspaceRepository(WS), await client.workspaceRepository(WS), await client.workspaceRepository(WS)]).toEqual(["Dubusoft/toodo", null, null]);
+  expect(calls[0]).toEqual({ url: "http://toodo.test/api/rpc/get_workspace", body: { id: WS } });
+  const bad = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, { repository: 5 }) });
+  expect(await bad.workspaceRepository(WS).catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
 });
 
 test("a guideline of an unknown kind or a reply that is not a list is ToodoUnreadable", async () => {

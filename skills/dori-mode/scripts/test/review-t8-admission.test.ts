@@ -100,6 +100,7 @@ const autopilot = (h: World, count: number) => {
       tasksByIds: async (ids) => ids.map((id) => tasks.get(id)).filter((t): t is ToodoTask => t !== undefined),
       flaggedTasks: async () => [...tasks.values()],
       guidelines: async () => [],
+      workspaceRepository: async () => null,
     }),
     writer: {
       startTask: async (id, opts) => {
