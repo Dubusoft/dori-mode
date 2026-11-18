@@ -47,13 +47,13 @@ test("laneRules defaults to none, collapses whitespace, drops blanks, and refuse
   await expect(loadConfig(path, "/home/ana")).rejects.toThrow("laneRules must be an array of strings");
 });
 
-test("autoReport defaults to autopilot, takes off|autopilot|all trimmed, and refuses anything else", async () => {
+test("autoReport defaults to all, takes off|autopilot|all trimmed, and refuses anything else", async () => {
   const path = join(state.dir, "auto-report.json");
   await Bun.write(path, JSON.stringify({}));
-  expect((await loadConfig(path, "/home/ana")).autoReport).toBe("autopilot");
-  for (const scope of ["off", " all "]) {
+  expect((await loadConfig(path, "/home/ana")).autoReport).toBe("all");
+  for (const scope of ["off", " autopilot "]) {
     await Bun.write(path, JSON.stringify({ autoReport: scope }));
-    expect((await loadConfig(path, "/home/ana")).autoReport).toBe(scope.trim() as "off" | "all");
+    expect((await loadConfig(path, "/home/ana")).autoReport).toBe(scope.trim() as "off" | "autopilot");
   }
   for (const bad of ["none", true, ["all"]]) {
     await Bun.write(path, JSON.stringify({ autoReport: bad }));
