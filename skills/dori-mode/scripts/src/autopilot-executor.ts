@@ -4,6 +4,7 @@ import { basename, dirname, join } from "node:path";
 import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, OWNER_REF } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
+import { autopilotThreadChannelOf } from "./config.ts";
 import { resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { type LaunchInput, SandboxRefusal, validateLaunch } from "./launch.ts";
@@ -375,7 +376,7 @@ export const liveExecutorDeps = (
   return {
     ...liveJudgeDeps(flow, store), stateDir: flow.config.stateDir, ciMergeBase: flow.config.ciMergeBase,
     toodo: () => new ToodoClient(flow.tunables.toodoEvents), writer: new ToodoWriter(flow.tunables.toodoWriter),
-    parentChannel: flow.config.discordChannels[0] ?? "", now: flow.clock.now, out: log, err: log, notify,
+    parentChannel: autopilotThreadChannelOf(flow.config) ?? "", now: flow.clock.now, out: log, err: log, notify,
     lock: () => acquireStateLock(join(flow.config.stateDir, "autopilot-launch.lock.sqlite")),
     createThread: (thread) => transport().startThread(thread.parent, undefined, thread.title, flow.config.discord?.ownerId),
     // A lost Discord create reply has no durable remote id. Stop ambiguous rather than creating a duplicate.

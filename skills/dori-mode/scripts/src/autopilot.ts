@@ -49,6 +49,8 @@ export type AutopilotConfig = {
   readonly tickSec: number;
   /** Seconds a quota read is reused by every caller (judge, `dori quota`, `/quota`) before the endpoints are read again. */
   readonly quotaCacheSec: number;
+  /** Discord channel the executor opens lane threads under (autopilotThreadChannelOf); empty: `discordChannels[0]`. */
+  readonly threadChannel: string;
 };
 
 export const TICK_SEC_MIN = 30;
@@ -58,7 +60,7 @@ export const QUOTA_CACHE_SEC_MAX = 900;
 
 export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   executor: false,
-  mergeBase: "dev", tickSec: 300, quotaCacheSec: 90,
+  mergeBase: "dev", tickSec: 300, quotaCacheSec: 90, threadChannel: "",
 };
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -94,6 +96,7 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
       `an integer from ${TICK_SEC_MIN} to ${TICK_SEC_MAX}`),
     quotaCacheSec: pick<number>("quotaCacheSec", (v) => Number.isInteger(v) && (v as number) >= QUOTA_CACHE_SEC_MIN && (v as number) <= QUOTA_CACHE_SEC_MAX,
       `an integer from ${QUOTA_CACHE_SEC_MIN} to ${QUOTA_CACHE_SEC_MAX}`),
+    threadChannel: pick<string>("threadChannel", (v) => typeof v === "string", "a Discord channel id string").trim(),
   };
 };
 

@@ -493,6 +493,10 @@ const optionalChannel = (name: string, raw: unknown): string | undefined => {
 export const alertsChannelOf = (config: Pick<DoriConfig, "alertsChannel" | "discordChannels">): string | undefined =>
   config.alertsChannel?.trim() || config.discordChannels[0];
 
+/** Where the autopilot executor opens lane threads: `autopilot.threadChannel` when set, else `discordChannels[0]`. */
+export const autopilotThreadChannelOf = (config: Pick<DoriConfig, "autopilot" | "discordChannels">): string | undefined =>
+  config.autopilot.threadChannel || config.discordChannels[0];
+
 /** `hooks` entries that are read; any other (e.g. the removed threadDone) is ignored. */
 export const HOOK_KEYS = ["threadReply", "transcribe"] as const;
 
