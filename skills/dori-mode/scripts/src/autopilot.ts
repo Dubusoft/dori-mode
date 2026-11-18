@@ -16,6 +16,8 @@ import { redactSecrets } from "./redact.ts";
  * - re-arm (written by `dori autopilot rearm` on the owner's word): lane `toodo:<taskId>`, action `autopilot-rearm`,
  *   target `<the highest attempt number it covers>`, state verified, data `{ note? }`. Attempts it covers no longer refuse
  *   the task, so its next launch is attempt n+1.
+ * The owner's word also reaches the predicate through the Toodo task itself (ownerSignal): a task paused after its latest
+ * attempt holds, and once a wait set after that pause ends, the attempt counts as covered without a re-arm row.
  */
 
 export const LAUNCH_ACTION = "autopilot-launch";
@@ -40,6 +42,10 @@ export type ToodoTask = {
   readonly autopilot: boolean;
   /** `YYYY-MM-DD`, or null when the task has no due date. */
   readonly dueDate: string | null;
+  /** Seconds: the latest move back to `planned` after work started (a pause, a wait's pause or a reopen); null when none since the latest start. */
+  readonly pausedAt: number | null;
+  /** Seconds: when a wait was last set on the task (the progress note toodo records with `wait_task`); null when never. */
+  readonly waitSetAt: number | null;
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -108,10 +114,28 @@ export const parseAutopilotConfig = (raw: unknown, warn: (line: string) => void 
 // Ledger
 
 /**
- * `attempts` and `ambiguous` count only the attempts no re-arm covers; `live` counts every attempt; `last` is the highest
- * attempt number taken or covered by a re-arm (0: none), so the next attempt is `last + 1`.
+ * What the owner did to a task after its latest attempt (`attemptAt`, ms), as Toodo shows it: `paused` when the task was
+ * paused (or reopened) back to planned since then and no wait was set after that pause, `waiting` while a wait set after
+ * the pause runs, `released` once that wait has ended (its next launch runs again); undefined when it was not paused since.
  */
-export type LedgerState = { readonly attempts: number; readonly last: number; readonly ambiguous: boolean; readonly live: boolean };
+export type OwnerSignal = "paused" | "waiting" | "released";
+
+export const ownerSignal = (task: ToodoTask, attemptAt: number): OwnerSignal | undefined => {
+  if (task.pausedAt === null || task.pausedAt * 1000 < attemptAt) return undefined;
+  if (task.waitSetAt === null || task.waitSetAt < task.pausedAt) return "paused";
+  return task.wait !== null ? "waiting" : "released";
+};
+
+/**
+ * `through` is the highest attempt number the owner covered: by a re-arm, or the latest attempt once ownerSignal
+ * released it. `attempts` and `ambiguous` count only the attempts above it; `live` counts every attempt; `last` is the
+ * highest attempt number taken or covered (0: none), so the next attempt is `last + 1`. `signal` is ownerSignal against
+ * the latest attempt above the re-arm, present only when the task was given and it has one.
+ */
+export type LedgerState = {
+  readonly attempts: number; readonly last: number; readonly through: number; readonly ambiguous: boolean; readonly live: boolean;
+  readonly signal?: OwnerSignal;
+};
 
 /** Every ledger row in the store: launch attempts and re-arms. */
 export const ledgerRows = (store: OperationStore): Operation[] =>
@@ -203,7 +227,8 @@ const outcomeOf = (op: Operation): unknown => {
  * not start, was given up, or its Done can never hold) settles the row `failed`; any other close (every Done signal held,
  * its PR merged) marks it done. Returns the line for the lead, or undefined when no launch attempt names the lane (not an
  * autopilot lane), the row already has an outcome, or the launch itself was settled failed or ambiguous. Nothing is
- * relaunched: the predicate refuses the task `already-attempted` from now on, until the owner re-arms it.
+ * relaunched: the predicate refuses the task `already-attempted` from now on, until the owner covers the attempt (a re-arm,
+ * or a pause and then a wait that ends).
  */
 export const settleLaneOutcome = (store: OperationStore, now: number, laneKey: string, failed?: string): string | undefined => {
   const op = ledgerRows(store).find((row) => laneKeyOf(row) === laneKey);
@@ -246,13 +271,18 @@ export const markLaneToodo = (store: OperationStore, now: number, laneKey: strin
   return true;
 };
 
-export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>): LedgerState => {
+/** The ledger of `taskId`; with its Toodo `task`, a pause and an ended wait since the latest attempt cover it (ownerSignal). */
+export const ledgerState = (rows: readonly Operation[], taskId: number, openLanes: ReadonlySet<string>, task?: ToodoTask): LedgerState => {
   const mine = rowsOf(rows, taskId);
-  const through = rearmedThrough(rows, taskId);
+  const rearmed = rearmedThrough(rows, taskId);
+  const latest = mine.filter((op) => Number(op.target) > rearmed).sort((a, b) => Number(b.target) - Number(a.target))[0];
+  const signal = task && latest ? ownerSignal(task, latest.at) : undefined;
+  const through = signal === "released" ? Number(latest!.target) : rearmed;
   const counted = mine.filter((op) => Number(op.target) > through);
   return {
-    attempts: counted.length, last: Math.max(through, ...mine.map((op) => Number(op.target))),
+    attempts: counted.length, last: Math.max(through, ...mine.map((op) => Number(op.target))), through,
     ambiguous: counted.some((op) => op.state === "ambiguous"), live: mine.some((op) => rowLive(op, openLanes)),
+    ...(signal ? { signal } : {}),
   };
 };
 
@@ -265,7 +295,7 @@ export const REFUSE_REASONS = [
   "not-flagged", "owner-ref-missing", "criteria-missing", "task-missing", "not-planned", "prerequisite-missing",
   "prerequisite-open", "prerequisite-not-adopted", "cross-workspace-prerequisite", "already-attempted", "ledger-ambiguous",
 ] as const;
-export const HOLD_REASONS = ["waiting", "lane-live", "quota-unreadable", "quota-over-threshold", "host-hold", "no-slot"] as const;
+export const HOLD_REASONS = ["waiting", "paused", "lane-live", "quota-unreadable", "quota-over-threshold", "host-hold", "no-slot"] as const;
 export type Reason = (typeof REFUSE_REASONS)[number] | (typeof HOLD_REASONS)[number];
 
 export type Verdict = {
@@ -355,7 +385,9 @@ const verdictOf = (taskId: number, found: ReadonlySet<Reason>): Verdict => {
 /**
  * Judges one task on its own (no slot assignment; judgeAll adds that). Every failing reason is collected; the verdict
  * is REFUSE if any reason is a refusal, else HOLD if any reason holds, else LAUNCH. Reasons come in REFUSE_REASONS then
- * HOLD_REASONS order. Any earlier launch attempt no re-arm covers refuses: autopilot never retries by itself.
+ * HOLD_REASONS order. Any earlier launch attempt the owner did not cover refuses: autopilot never retries by itself. The
+ * owner covers it with a re-arm, or by pausing the task and then setting a wait: paused without a wait it holds `paused`,
+ * while that wait runs it holds `waiting`, and once the wait ends it judges afresh as attempt n+1.
  */
 export const judge = (input: JudgeInput): Verdict => {
   const { taskId, tasks, config } = input;
@@ -379,9 +411,11 @@ export const judge = (input: JudgeInput): Verdict => {
     }
   }
 
-  const ledger = ledgerState(input.ledger, taskId, input.openLanes);
+  const ledger = ledgerState(input.ledger, taskId, input.openLanes, task);
   if (ledger.live) found.add("lane-live");
-  else if (ledger.attempts > 0) found.add("already-attempted");
+  else if (ledger.signal === "paused") found.add("paused");
+  // `waiting` (the task's wait, above) holds it until the wait ends and releases the attempt.
+  else if (ledger.attempts > 0 && ledger.signal !== "waiting") found.add("already-attempted");
   if (ledger.ambiguous) found.add("ledger-ambiguous");
 
   if (!input.quota.readable) found.add("quota-unreadable");

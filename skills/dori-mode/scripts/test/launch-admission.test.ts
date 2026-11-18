@@ -212,7 +212,7 @@ test("autopilot plans 19 lanes and de-duplicates shared ledger claims against pe
   cleanups.push(() => store.close());
   const tasks: ToodoTask[] = Array.from({ length: 20 }, (_, i) => ({
     id: i + 1, workspaceId: 1, title: `task ${i + 1}`, description: "Do it", status: "planned", resolution: null, dependsOn: [],
-    refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null,
+    refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
   }));
   const live = liveJudgeDeps(h.deps, store);
   const deps = {

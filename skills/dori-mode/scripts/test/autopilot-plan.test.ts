@@ -14,7 +14,7 @@ const WS = 7;
 const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
   id, workspaceId: WS, title: `task ${id}`, description: `## Purpose\ndo ${id}\n\n## Background\nwhy ${id}`, status: "planned", resolution: null,
   dependsOn: [], refs: ["owner:discord:c/m", "repo:Dubusoft/dori-mode"], criteria: [{ text: "tests pass", kind: "manual" }],
-  wait: null, autopilot: true, dueDate: null, ...over,
+  wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null, ...over,
 });
 
 const rule: ToodoGuideline = { id: 2, workspaceId: WS, kind: "rule", body: "Write reports in Korean.", updatedAt: 100 };

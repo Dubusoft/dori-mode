@@ -113,7 +113,7 @@ const save = (deps: ExecutorDeps, row: Operation, patch: Partial<Execution>): Ex
   return data;
 };
 
-/** `attempt`: the executor runs one attempt per task, attempt 1 unless the owner re-armed the task (rearmedThrough + 1). */
+/** `attempt`: the executor runs one attempt per task, attempt 1 unless the owner covered earlier ones (ledgerState through + 1). */
 const prepare = async (deps: ExecutorDeps, taskId: number, attempt: number) => {
   const reader = deps.toodo();
   const task = await reader.task(taskId);
@@ -338,17 +338,20 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
     if (!deps.config.executor) { results.push({ taskId, kind: "disabled" }); continue; }
     const release = await deps.lock();
     try {
-      // Sequences and attempts a re-arm covers are the owner's to forget; the next one is attempt through + 1.
+      // Sequences and attempts the owner covered (a re-arm, or a pause and a wait that ended since) are the owner's to
+      // forget; the next one is attempt through + 1. The task is read only when an attempt is left to cover.
       const ledger = ledgerRows(deps.store);
-      const through = rearmedThrough(ledger, taskId);
-      const existing = deps.store.list({ lane: `toodo:${taskId}` }).find((op) => op.action === EXECUTE && Number(op.target) > through);
-      if (existing) {
-        results.push(["planned", "attempted"].includes(existing.state) ? await resume(deps, existing) : resultOf(dataOf(existing), dataOf(existing).outcome!));
-        continue;
-      }
+      const executions = deps.store.list({ lane: `toodo:${taskId}` }).filter((op) => op.action === EXECUTE);
+      const running = executions.find((op) => ["planned", "attempted"].includes(op.state) && Number(op.target) > rearmedThrough(ledger, taskId));
+      if (running) { results.push(await resume(deps, running)); continue; }
+      const rearmed = ledgerState(ledger, taskId, new Set());
+      const task = rearmed.attempts > 0 ? await deps.toodo().task(taskId) : undefined;
+      const state = task ? ledgerState(ledger, taskId, new Set(), task) : rearmed;
+      const existing = executions.find((op) => Number(op.target) > state.through);
+      if (existing) { results.push(resultOf(dataOf(existing), dataOf(existing).outcome!)); continue; }
       if (readPause(deps.pauseFile)) { results.push({ taskId, kind: "paused" }); continue; }
-      if (ledgerState(ledger, taskId, new Set()).attempts > 0) { results.push({ taskId, kind: "refused" }); continue; }
-      const attempt = through + 1;
+      if (state.attempts > 0) { results.push({ taskId, kind: "refused" }); continue; }
+      const attempt = state.through + 1;
       const ready = await prepare(deps, taskId, attempt);
       if (ready.kind === "review") {
         deps.out(`AUTOPILOT_EXECUTOR_REVIEW #${taskId} ${ready.reasons.join(", ")}`);

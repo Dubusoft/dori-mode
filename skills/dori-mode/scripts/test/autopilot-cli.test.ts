@@ -31,7 +31,7 @@ afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); 
 
 const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
   id, workspaceId: WS, title: `task ${id}`, description: `do ${id}`, status: "planned", resolution: null, dependsOn: [],
-  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, ...over,
+  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null, ...over,
 });
 
 /** toodo-server's JSON for a task: extra fields, criteria with a null target. */
@@ -52,6 +52,22 @@ test("list_tasks posts the ids with the bearer token and returns the predicate's
   expect(calls.map((c) => [c.url, c.init.method, (c.init.headers as Record<string, string>).authorization, c.init.body])).toEqual([
     ["http://toodo.test/api/rpc/list_tasks", "POST", "Bearer tok-1", JSON.stringify({ filter: { ids: [12, 3] } })],
   ]);
+});
+
+test("a task's latest pause comes from its milestones and its latest wait from the wait notes toodo records", async () => {
+  const body = {
+    ...wire(task(12)), milestones: { startedAt: 100, pausedAt: 300, pauseCount: 1 },
+    notes: [
+      { kind: "progress", body: "Waiting until 2026-11-26T00:00:00Z: stage 1 first", at: 50 },
+      { kind: "progress", body: "Wait changed: waiting until 2026-11-27T00:00:00Z", at: 400 },
+      { kind: "decision", body: "Waiting until the owner answers", at: 500 },
+      { kind: "progress", body: "Wait ended early: owner said go", at: 600 },
+    ],
+  };
+  const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [body]) });
+  expect(await client.tasksByIds([12])).toEqual([task(12, { pausedAt: 300, waitSetAt: 400 })]);
+  const bad = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [{ ...body, milestones: { pausedAt: "soon" } }]) });
+  await expect(bad.tasksByIds([12])).rejects.toThrow("unreadable milestones.pausedAt (#12)");
 });
 
 test("flaggedTasks reads every planned task of every workspace and keeps the marked ones; an old server reads unmarked", async () => {

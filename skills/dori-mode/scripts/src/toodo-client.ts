@@ -38,6 +38,8 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 const isId = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
 const STATUSES = new Set(["planned", "in_progress", "in_review", "done"]);
 const RESOLUTIONS = new Set(["merged", "completed", "not_adopted"]);
+/** The progress note toodo-server records with `wait_task` (`Waiting until <time>`, or `Wait changed: waiting until <time>`). */
+const WAIT_SET_NOTE = /^(Waiting until |Wait changed: waiting until )/;
 
 /** The predicate's fields of one task as toodo-server returns it; ToodoUnreadable on a shape the predicate cannot read. */
 const toTask = (raw: unknown): ToodoTask => {
@@ -61,6 +63,13 @@ const toTask = (raw: unknown): ToodoTask => {
   if (typeof autopilot !== "boolean") return bad(`unreadable autopilot (#${id})`);
   const dueDate = raw.dueDate ?? null;
   if (dueDate !== null && typeof dueDate !== "string") return bad(`unreadable dueDate (#${id})`);
+  const milestones = raw.milestones ?? null;
+  if (milestones !== null && !isRecord(milestones)) return bad(`unreadable milestones (#${id})`);
+  const pausedAt = milestones?.pausedAt ?? null;
+  if (pausedAt !== null && typeof pausedAt !== "number") return bad(`unreadable milestones.pausedAt (#${id})`);
+  const notes = raw.notes ?? [];
+  if (!Array.isArray(notes) || !notes.every((n) => isRecord(n) && typeof n.kind === "string" && typeof n.body === "string" && typeof n.at === "number")) return bad(`unreadable notes (#${id})`);
+  const waitSet = (notes as { kind: string; body: string; at: number }[]).filter((n) => n.kind === "progress" && WAIT_SET_NOTE.test(n.body)).map((n) => n.at);
   return {
     id, workspaceId: raw.workspaceId, title: raw.title, description: raw.description, status: raw.status as ToodoTask["status"],
     resolution: resolution as ToodoTask["resolution"], dependsOn: dependsOn as number[], refs: refs as string[],
@@ -68,7 +77,7 @@ const toTask = (raw: unknown): ToodoTask => {
       text: c.text as string, kind: c.kind as string, ...(typeof c.target === "string" ? { target: c.target } : {}),
     })),
     wait: wait === null ? null : { until: (wait as { until: number }).until, status: (wait as { status: string }).status },
-    autopilot, dueDate,
+    autopilot, dueDate, pausedAt, waitSetAt: waitSet.length ? Math.max(...waitSet) : null,
   };
 };
 

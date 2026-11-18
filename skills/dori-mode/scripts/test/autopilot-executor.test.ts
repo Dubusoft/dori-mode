@@ -19,7 +19,7 @@ const KEY = "ap-12-1";
 const task = (over: Partial<ToodoTask> = {}): ToodoTask => ({
   id: 12, workspaceId: 7, title: "Build the feature", description: "Ship the complete feature.", status: "planned", resolution: null,
   dependsOn: [], refs: ["owner:discord:c/m", "repo:owner/repo"], criteria: [{ text: "tests pass", kind: "manual" }],
-  wait: null, autopilot: true, dueDate: null, ...over,
+  wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null, ...over,
 });
 
 let dir: string;
@@ -425,5 +425,16 @@ test("a failed execution never runs again by itself; once the owner re-arms it, 
   const again = harness(task(), 2);
   expect(await runExecutor(again.fresh(), [12])).toEqual([{ taskId: 12, laneKey: "ap-12-2", kind: "launched" }]);
   expect(again.inputs[0]?.key).toBe("ap-12-2");
+  expect(ledgerRows(store).filter((op) => op.action === "autopilot-launch").map((op) => [op.target, op.state])).toEqual([["1", "failed"], ["2", "verified"]]);
+});
+
+test("a failed execution the owner paused stays done; once a wait set after the pause ends, the next tick runs attempt 2 without a re-arm", async () => {
+  const first = harness(); first.failValidation();
+  expect((await runExecutor(first.fresh(), [12]))[0]?.kind).toBe("failed");
+  const pausedAt = T0 / 1000 + 60;
+  expect((await runExecutor(harness(task({ pausedAt })).fresh(), [12]))[0]?.kind).toBe("failed");
+  expect((await runExecutor(harness(task({ pausedAt, waitSetAt: pausedAt, wait: { until: pausedAt + 3600, status: "planned" } })).fresh(), [12]))[0]?.kind).toBe("failed");
+  const again = harness(task({ pausedAt, waitSetAt: pausedAt }), 2);
+  expect(await runExecutor(again.fresh(), [12])).toEqual([{ taskId: 12, laneKey: "ap-12-2", kind: "launched" }]);
   expect(ledgerRows(store).filter((op) => op.action === "autopilot-launch").map((op) => [op.target, op.state])).toEqual([["1", "failed"], ["2", "verified"]]);
 });
