@@ -25,7 +25,7 @@ afterEach(() => { store.close(); rmSync(dir, { recursive: true, force: true }); 
 /** A planned task marked for autopilot with an owner ref and one criterion: it launches unless a case changes it. */
 const task = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => ({
   id, workspaceId: WS, title: `task ${id}`, description: `do ${id}`, status: "planned", resolution: null, dependsOn: [],
-  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, ...over,
+  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null, ...over,
 });
 const merged = (id: number, over: Partial<ToodoTask> = {}): ToodoTask => task(id, { status: "done", resolution: "merged", ...over });
 
@@ -112,7 +112,7 @@ test("a live attempt holds lane-live instead; an ambiguous row refuses ledger-am
   const live = [attempt(12, 1, "verified", "lane-12")];
   expect(outcome(ctx([task(12)], { ledger: live, openLanes: new Set(["lane-12"]) }), 12)).toEqual(["HOLD", ["lane-live"]]);
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "attempted")] }), 12)).toEqual(["HOLD", ["lane-live"]]);
-  expect(ledgerState(live, 12, new Set(["lane-12"]))).toEqual({ attempts: 1, last: 1, ambiguous: false, live: true });
+  expect(ledgerState(live, 12, new Set(["lane-12"]))).toEqual({ attempts: 1, last: 1, through: 0, ambiguous: false, live: true });
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "ambiguous")] }), 12)).toEqual(["REFUSE", ["already-attempted", "ledger-ambiguous"]]);
 });
 
@@ -125,7 +125,7 @@ test("a re-arm forgives the attempts it covers: the task judges afresh and its n
   for (const state of ["failed", "verified", "ambiguous"] as const) {
     const ledger = [attempt(12, 1, state), rearmed(12, 1)];
     expect(outcome(ctx([task(12)], { ledger }), 12)).toEqual(["LAUNCH", []]);
-    expect(ledgerState(ledger, 12, new Set())).toEqual({ attempts: 0, last: 1, ambiguous: false, live: false });
+    expect(ledgerState(ledger, 12, new Set())).toEqual({ attempts: 0, last: 1, through: 1, ambiguous: false, live: false });
   }
   const wait = { until: Date.parse("2026-11-26T00:00:00Z") / 1000, status: "planned" };
   expect(outcome(ctx([task(12, { wait })], { ledger: [attempt(12, 1, "failed"), rearmed(12, 1)] }), 12)).toEqual(["HOLD", ["waiting"]]);
@@ -134,6 +134,42 @@ test("a re-arm forgives the attempts it covers: the task judges afresh and its n
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "failed"), rearmed(13, 1)] }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
   // A covered attempt whose lane is still open holds.
   expect(outcome(ctx([task(12)], { ledger: [attempt(12, 1, "verified", "lane-12"), rearmed(12, 1)], openLanes: new Set(["lane-12"]) }), 12)).toEqual(["HOLD", ["lane-live"]]);
+});
+
+// The owner's word through Toodo: the attempt ran at T0; a pause after it holds, and a wait set after the pause releases
+// the attempt once it ends.
+const SEC = T0 / 1000;
+const UNTIL = { until: SEC + 7 * 24 * 3600, status: "planned" };
+
+test("a task paused after its attempt with no wait holds paused, not already-attempted, and never launches", () => {
+  const ledger = [attempt(12, 1, "failed")];
+  expect(outcome(ctx([task(12, { pausedAt: SEC + 3600 })], { ledger }), 12)).toEqual(["HOLD", ["paused"]]);
+  // A wait set before the pause (e.g. before the attempt) is not the owner's word on this attempt.
+  expect(outcome(ctx([task(12, { pausedAt: SEC + 3600, waitSetAt: SEC - 3600 })], { ledger }), 12)).toEqual(["HOLD", ["paused"]]);
+  expect(ledgerState(ledger, 12, new Set(), task(12, { pausedAt: SEC + 3600 }))).toEqual({ attempts: 1, last: 1, through: 0, ambiguous: false, live: false, signal: "paused" });
+});
+
+test("a pause and then a wait hold waiting while it runs; once it ends the task launches as attempt n+1 without a re-arm", () => {
+  const ledger = [attempt(12, 1, "verified")];
+  const paused = { pausedAt: SEC + 3600, waitSetAt: SEC + 3600 };
+  expect(outcome(ctx([task(12, { ...paused, wait: UNTIL })], { ledger }), 12)).toEqual(["HOLD", ["waiting"]]);
+  expect(outcome(ctx([task(12, paused)], { ledger }), 12)).toEqual(["LAUNCH", []]);
+  expect(ledgerState(ledger, 12, new Set(), task(12, paused))).toEqual({ attempts: 0, last: 1, through: 1, ambiguous: false, live: false, signal: "released" });
+  // The wait may also come later than the pause.
+  expect(outcome(ctx([task(12, { pausedAt: SEC + 3600, waitSetAt: SEC + 7200 })], { ledger }), 12)).toEqual(["LAUNCH", []]);
+  // Attempt n+1 counts again: once it ran (after the pause), it refuses as any other attempt.
+  const second = { ...attempt(12, 2, "failed"), at: T0 + 2 * HOUR };
+  expect(outcome(ctx([task(12, paused)], { ledger: [...ledger, second] }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
+});
+
+test("without a pause after the attempt, a failed attempt still refuses already-attempted", () => {
+  const ledger = [attempt(12, 1, "failed")];
+  // Paused and waited before the attempt ran: the owner said nothing about it since.
+  expect(outcome(ctx([task(12, { pausedAt: SEC - 7200, waitSetAt: SEC - 7200 })], { ledger }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
+  // A wait with no pause (a planned task) is not the owner sending the attempt back.
+  expect(outcome(ctx([task(12, { waitSetAt: SEC + 3600 })], { ledger }), 12)).toEqual(["REFUSE", ["already-attempted"]]);
+  // A live attempt holds lane-live whatever the task shows.
+  expect(outcome(ctx([task(12, { pausedAt: SEC + 3600 })], { ledger: [attempt(12, 1, "attempted")] }), 12)).toEqual(["HOLD", ["lane-live"]]);
 });
 
 test("another task's live lane never holds this one: no autopilot WIP cap", () => {

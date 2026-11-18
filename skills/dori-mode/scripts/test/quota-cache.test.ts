@@ -109,7 +109,7 @@ test("the judge counts a stale read with its age as readable, and holds quota-un
   expect(unreadable).toEqual({ readable: false, skipped: ["a (stale-read)"] });
   const task: ToodoTask = {
     id: 1, workspaceId: 1, title: "t", description: "d", status: "planned", resolution: null, dependsOn: [], refs: ["owner:x"],
-    criteria: [{ text: "c", kind: "manual" }], wait: null, autopilot: true, dueDate: null,
+    criteria: [{ text: "c", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
   };
   const ctx = { tasks: new Map([[1, task]]), ledger: [], openLanes: new Set<string>(), hosts: singleHost({ ok: true }), config: DEFAULT_AUTOPILOT };
   expect(judge({ ...ctx, taskId: 1, quota: summary }).verdict).toBe("LAUNCH");

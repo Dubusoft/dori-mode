@@ -82,7 +82,7 @@ const autopilot = (h: World, count: number) => {
   cleanups.push(worktrees.done);
   const tasks = new Map<number, ToodoTask>(Array.from({ length: count }, (_, i) => [i + 1, {
     id: i + 1, workspaceId: 1, title: `task ${i + 1}`, description: "Do it", status: "planned", resolution: null, dependsOn: [],
-    refs: ["owner:discord:c/m", "repo:acme/app"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null,
+    refs: ["owner:discord:c/m", "repo:acme/app"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
   } satisfies ToodoTask]));
   const record = (id: number): ToodoTaskRecord => {
     const t = tasks.get(id)!;
