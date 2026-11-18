@@ -880,7 +880,7 @@ test("a failed auto post wakes the lead with LANE_AUTO_REPORT_FAILED and the usu
 
 const URGENT_CLAIM = "LANE_DONE_CLAIMED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok";
 const notReported: [string, (post: AutoReportPost) => Promise<string[]>][] = [
-  ["under autoReport autopilot, a lane no autopilot attempt names", (post) => claimAp(post, KO_TEXT, { autopilot: false, patch: { autoReport: "autopilot" } })],
+  ["a lane no autopilot attempt names", (post) => claimAp(post, KO_TEXT, { autopilot: false })],
   ["autoReport off", (post) => claimAp(post, KO_TEXT, { patch: { autoReport: "off" } })],
   ["a done text not in the owner's language", (post) => claimAp(post, "Fixed the login bug; the PR is green")],
   ["a claim with no done text (dori claim-done)", (post) => claimAp(post, undefined)],
