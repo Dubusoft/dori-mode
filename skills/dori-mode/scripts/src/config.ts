@@ -247,9 +247,18 @@ export type DoriConfig = {
    * mergeable lane PR is merged directly.
    */
   readonly review?: ReviewConfig;
+  /**
+   * Whose clean done claims the supervisor reports to the owner itself (done-flow.ts, auto-report.ts): `autopilot` (the
+   * default) the lanes an autopilot launch attempt names, `all` every lane but review lanes, `off` none, so every claim
+   * wakes the lead as LANE_DONE_CLAIMED and the lead reports it.
+   */
+  readonly autoReport: AutoReportScope;
 };
 
 export type ReviewConfig = { readonly repos?: readonly string[] };
+
+export const AUTO_REPORT_SCOPES = ["off", "autopilot", "all"] as const;
+export type AutoReportScope = (typeof AUTO_REPORT_SCOPES)[number];
 
 /** Tools the lead never uses; with `leadDiet` they are excluded from its omo session (`--exclude-tools`). */
 export const LEAD_DIET_EXCLUDED_TOOLS: readonly string[] = [
@@ -301,6 +310,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
   autopilot: DEFAULT_AUTOPILOT,
+  autoReport: "autopilot",
 });
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
@@ -317,6 +327,14 @@ const reviewConfig = (raw: unknown): ReviewConfig => {
   if (raw.repos == null) return {};
   if (!Array.isArray(raw.repos) || raw.repos.some((repo) => typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo.trim()))) throw bad;
   return { repos: (raw.repos as string[]).map((repo) => repo.trim()) };
+};
+
+/** The config's `autoReport`, trimmed; absent is `autopilot`. Throws TypeError unless it is one of AUTO_REPORT_SCOPES. */
+const autoReport = (raw: unknown): AutoReportScope => {
+  if (raw == null) return "autopilot";
+  const value = typeof raw === "string" ? raw.trim() : raw;
+  if (!AUTO_REPORT_SCOPES.some((scope) => scope === value)) throw new TypeError(`autoReport must be one of ${AUTO_REPORT_SCOPES.join("|")}, not ${JSON.stringify(raw)}`);
+  return value as AutoReportScope;
 };
 
 /** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
@@ -468,7 +486,7 @@ export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
-  "memoryLimits",
+  "memoryLimits", "autoReport",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -555,6 +573,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     ...(decisions ? { decisionsChannel: decisions } : {}),
     laneRules: laneRules(raw.laneRules),
     review: reviewConfig(raw.review),
+    autoReport: autoReport(raw.autoReport),
     memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),

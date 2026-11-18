@@ -27,6 +27,10 @@ export type Claim = {
    * a PR only at exactly this head; a claim without it (an older dori, GitHub unreadable) never auto-merges.
    */
   readonly pulls?: readonly ClaimedPull[];
+  /** The lane's own done text (`dori report <key> done --text`): the body of the supervisor's auto report (done-flow.ts). */
+  readonly text?: string;
+  /** The message id of the supervisor's auto report of this claim: the claim was reported to the owner without the lead. */
+  readonly autoReported?: string;
 };
 export type ClaimedPull = { readonly repo: string; readonly number: number; readonly sha: string };
 export type Objection = { readonly at: string; readonly reasons: readonly string[] };

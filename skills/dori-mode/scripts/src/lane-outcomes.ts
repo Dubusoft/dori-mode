@@ -21,7 +21,8 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
  * obligation it opened while no real outcome has joined it. The lead tells the owner itself and then records
  * `dori reported <key>`, an immutable receipt the supervisor consumes.
  * An obligation still open after reportTimeoutMin comes back as urgent `UNREPORTED <key> ...`, re-sent with backoff; in
- * push mode it also keeps the lead pushed and counts toward the push escalation. The supervisor never posts the report.
+ * push mode it also keeps the lead pushed and counts toward the push escalation. The supervisor posts the report itself
+ * only for a clean claim config autoReport covers (below).
  *
  * The obligation is also the lane's one finish record: a finish event that joins it with nothing new for the lead is
  * quiet and wakes no one (supervise-delivery.ts); it rides along with the next delivery. That is a claimed lane's first
@@ -30,6 +31,11 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
  * supervisor finished (`toodo=done`, task-finish.ts) or that has none (`toodo=no-task`) and the lane's
  * AUTOPILOT_LANE_DONE are quiet too: one lane result wakes the lead once. A claim, a close the lead still has work on, and a merge at another PR head always wake; so do the
  * failure lines (LANE_NOT_DONE, TOODO_TASK_NOT_COMPLETED, AUTOPILOT_LANE_FAILED), which never join a row.
+ *
+ * A clean claim the supervisor reported to the owner itself (config autoReport, done-flow.ts) arrives as digest
+ * `LANE_DONE_AUTO_REPORTED <key> ...`. Its post wrote the `dori reported` receipt first, so the row it opens or joins is
+ * already reported and no UNREPORTED follows; it counts as the lane's claim, so a later merge of the claimed head is quiet
+ * and LANE_NOT_DONE drops the row as for any claim.
  */
 
 export const REPORTED_DIR = "reported";
@@ -46,6 +52,9 @@ const LANE_KEY = /^[\w.-]+$/;
 export class ReportedError extends Error {}
 
 const CLAIM = "LANE_DONE_CLAIMED ";
+const AUTO_REPORTED = "LANE_DONE_AUTO_REPORTED ";
+/** A done claim, whether the lead reports it or the supervisor already did. */
+const isClaim = (line: string): boolean => line.startsWith(CLAIM) || line.startsWith(AUTO_REPORTED);
 const REJECTED = "LANE_NOT_DONE ";
 const MERGED = "CI_MERGED ";
 const AUTOPILOT_DONE = "AUTOPILOT_LANE_DONE ";
@@ -58,11 +67,12 @@ const mergedHead = (line: string): string | undefined => (line.startsWith(MERGED
 const keyOf = (lane: string | undefined): string | undefined => (lane && LANE_KEY.test(lane) ? lane : undefined);
 
 /**
- * The lane an obligation-opening event names: a done claim `LANE_DONE_CLAIMED <key> ...`, or a finished lane
- * `LANE_CLOSED <key> ...` / `CI_MERGED ... lane=<key> ...`. A machine lane's LANE_AUTO_CLAIMED names none.
+ * The lane an obligation-opening event names: a done claim `LANE_DONE_CLAIMED <key> ...` (or `LANE_DONE_AUTO_REPORTED
+ * <key> ...`), or a finished lane `LANE_CLOSED <key> ...` / `CI_MERGED ... lane=<key> ...`. A machine lane's
+ * LANE_AUTO_CLAIMED names none.
  */
 export const outcomeLane = (line: string): string | undefined =>
-  keyOf(line.startsWith("LANE_CLOSED ") || line.startsWith(CLAIM) ? line.split(" ")[1] : line.startsWith("CI_MERGED ") ? / lane=(\S+)/.exec(line)?.[1] : undefined);
+  keyOf(line.startsWith("LANE_CLOSED ") || isClaim(line) ? line.split(" ")[1] : line.startsWith("CI_MERGED ") ? / lane=(\S+)/.exec(line)?.[1] : undefined);
 
 /** The lane an autopilot lane's done outcome names (`AUTOPILOT_LANE_DONE #<task> lane=<key> ...`): it joins a row, never opens one. */
 const riderLane = (line: string): string | undefined => keyOf(line.startsWith(AUTOPILOT_DONE) ? / lane=(\S+)/.exec(line)?.[1] : undefined);
@@ -161,7 +171,7 @@ export class OutcomeTracking {
     const found = at < 0 ? undefined : outcomes[at];
     if (found?.events?.includes(event.id) || (rider && !found)) return;
     // Claim-only while every event in the row is a claim (a receipt-only row has none yet).
-    const claim = event.line.startsWith(CLAIM) && (!found || found.claim === true || !found.events?.length);
+    const claim = isClaim(event.line) && (!found || found.claim === true || !found.events?.length);
     const head = mergedHead(event.line);
     const heads = found?.heads ?? [];
     // A merge after the claim (of the claimed head, or one already merged) adds nothing the lead must do now.
@@ -173,7 +183,7 @@ export class OutcomeTracking {
     const { claim: _was, ...kept } = found ?? { lane, since: event.at ?? this.core.deps.clock.now() };
     const next: LaneOutcome = {
       ...kept, line: kept.line ?? line, events: [...(kept.events ?? []), event.id], ...(claim ? { claim } : {}),
-      ...(event.line.startsWith(CLAIM) ? { claimed: true as const } : {}),
+      ...(isClaim(event.line) ? { claimed: true as const } : {}),
       ...(head && !heads.includes(head) ? { heads: [...heads, head] } : {}),
       ...(quiet ? { quiet: [...(kept.quiet ?? []), event.id] } : {}),
       ...(woke || (cls === "lead-urgent" && !quiet) ? { woke: true as const } : {}),

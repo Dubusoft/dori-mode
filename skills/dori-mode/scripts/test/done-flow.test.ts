@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, symlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { treeDigest } from "../src/lane-file-contract.ts";
 import type { LaneOutputFiles } from "../src/runner/protocol.ts";
 
 import { claimDone, claimEventId, closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import type { AutoReportPost } from "../src/auto-report.ts";
+import type { DoriConfig } from "../src/config.ts";
+import { UNRESOLVED_FILE } from "../src/decision-obligations.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { OUTCOME_LINE_MAX } from "../src/lane-outcomes.ts";
@@ -810,4 +813,101 @@ test("events about a lane carry its meta: the claim announcement gets lane, thre
   const got: [string, unknown][] = [];
   await watchTick(at(T0 + MIN), async (line, _id, meta) => { got.push([line, meta]); });
   expect(got).toEqual([["LANE_DONE_CLAIMED demo-lane w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok", { lane: "demo-lane", thread: "chat:team/123", cwd: "/repo" }]]);
+});
+
+/** The supervisor's auto report (config autoReport): autopilot lane ap-12-1, whose claim carries a Korean done text. */
+const reportedAp: Lane = { ...lane, key: "ap-12-1", task: 12 };
+const KO_TEXT = "로그인 버그를 고친 PR을 열었고 CI가 통과했습니다";
+/** A post that records what it was asked to post and answers message m-1, or throws `fails`. */
+const recordingPost = (fails?: string) => {
+  const posts: { key: string; text?: string }[] = [];
+  const post: AutoReportPost = async (l, c) => {
+    if (fails) throw new Error(fails);
+    posts.push({ key: l.key, ...(c.text ? { text: c.text } : {}) });
+    return "m-1";
+  };
+  return { posts, post };
+};
+const reporting = (base: FlowDeps, post: AutoReportPost, patch: Partial<DoriConfig> = {}, delivered?: (id: string) => boolean): FlowDeps =>
+  ({ ...base, config: { ...base.config, ownerLanguage: "Korean", ...patch }, autoReport: post, ...(delivered ? { leadDelivered: delivered } : {}) });
+/** Registers `ap` (an autopilot lane unless `autopilot` is false), records its claim with `text` and runs one watch pass. */
+const claimAp = async (post: AutoReportPost, text: string | undefined, opts: { patch?: Partial<DoriConfig>; ap?: Lane; autopilot?: boolean } = {}): Promise<string[]> => {
+  if (opts.autopilot !== false) reserveAutopilot(true);
+  const ap = opts.ap ?? reportedAp;
+  await at(T0).registry.write(ap);
+  await claimDone(reporting(at(T0), post, opts.patch), ap, "merged acme/app#1 abc123", undefined, text);
+  return watchTick(reporting(at(T0), post, opts.patch));
+};
+
+test("a clean claim of an autopilot lane is posted by the supervisor, reaches the lead as digest, and closes as seen without waiting for the lead", async () => {
+  livePane();
+  const { posts, post } = recordingPost();
+  const never = () => false;
+  reserveAutopilot(true);
+  await at(T0).registry.write(reportedAp);
+  await claimDone(reporting(at(T0), post), reportedAp, "merged acme/app#1 abc123", undefined, KO_TEXT);
+  const lines = await watchTick(reporting(at(T0), post, {}, never));
+  expect(lines).toEqual(["LANE_DONE_AUTO_REPORTED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok report=m-1"]);
+  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
+  expect(posts).toEqual([{ key: "ap-12-1", text: KO_TEXT }]);
+  expect((await at(T0).registry.read("ap-12-1"))?.claim).toMatchObject({ text: KO_TEXT, autoReported: "m-1", emitted: true, event: claimEventId("ap-12-1", new Date(T0).toISOString()) });
+  // The window runs from the hand-over though the lead never took the line; the close is seen, and nothing is posted again.
+  expect(await watchTick(reporting(at(T0 + 4 * MIN), post, {}, never))).toEqual([]);
+  expect((await watchTick(reporting(at(T0 + 5 * MIN + 1), post, {}, never)))[0]).toBe("LANE_CLOSED ap-12-1 closed seen-claim");
+  expect(posts).toHaveLength(1);
+});
+
+test("a claim whose auto report was posted before a crash is announced with that message and never posted twice", async () => {
+  const { posts, post } = recordingPost();
+  reserveAutopilot(true);
+  await at(T0).registry.write(reportedAp);
+  await claimDone(reporting(at(T0), post), reportedAp, "merged acme/app#1 abc123", undefined, KO_TEXT);
+  await at(T0).registry.patch("ap-12-1", (current) => ({ claim: { ...current.claim!, autoReported: "m-0" } }));
+  expect(await watchTick(reporting(at(T0), post))).toEqual(["LANE_DONE_AUTO_REPORTED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok report=m-0"]);
+  expect(posts).toEqual([]);
+});
+
+test("a failed auto post wakes the lead with LANE_AUTO_REPORT_FAILED and the usual LANE_DONE_CLAIMED", async () => {
+  const { post } = recordingPost("discord 503");
+  const lines = await claimAp(post, KO_TEXT);
+  expect(lines).toEqual([
+    "LANE_AUTO_REPORT_FAILED ap-12-1 discord 503: the claim was not reported to the owner; report it yourself (dori reported ap-12-1 --text TEXT)",
+    "LANE_DONE_CLAIMED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok",
+  ]);
+  expect(lines.map((l) => eventClass(l))).toEqual(["lead-urgent", "lead-urgent"]);
+  expect((await at(T0).registry.read("ap-12-1"))?.claim?.autoReported).toBeUndefined();
+});
+
+const URGENT_CLAIM = "LANE_DONE_CLAIMED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok";
+const notReported: [string, (post: AutoReportPost) => Promise<string[]>][] = [
+  ["a lane no autopilot attempt names", (post) => claimAp(post, KO_TEXT, { autopilot: false })],
+  ["autoReport off", (post) => claimAp(post, KO_TEXT, { patch: { autoReport: "off" } })],
+  ["a done text not in the owner's language", (post) => claimAp(post, "Fixed the login bug; the PR is green")],
+  ["a claim with no done text (dori claim-done)", (post) => claimAp(post, undefined)],
+  ["a lane with an objection on record", (post) => claimAp(post, KO_TEXT, { ap: { ...reportedAp, objection: { at: new Date(T0 - MIN).toISOString(), reasons: ["tests red"] } } })],
+  ["a lane with an unresolved question", (post) => {
+    writeFileSync(join(state.dir, UNRESOLVED_FILE), JSON.stringify([{ id: "lane-report:q1", since: T0, line: "LANE_REPORT ap-12-1 question 어느 쪽으로 할까요?" }]));
+    return claimAp(post, KO_TEXT);
+  }],
+];
+for (const [name, claim] of notReported) {
+  test(`${name} is not auto-reported: its claim wakes the lead as LANE_DONE_CLAIMED`, async () => {
+    const { posts, post } = recordingPost();
+    expect(await claim(post)).toEqual([URGENT_CLAIM]);
+    expect(posts).toEqual([]);
+  });
+}
+
+test("autoReport all covers any lane: a clean PR snapshot is auto-reported, pending checks wake the lead", async () => {
+  const { posts, post } = recordingPost();
+  const green = greenPrLane({ state: "OPEN", base: "dev" });
+  await green.deps(T0).registry.write(green.bound);
+  await claimDone(reporting(green.deps(T0), post, { autoReport: "all" }), green.bound, "https://github.com/acme/app/pull/7 green", undefined, KO_TEXT);
+  expect(await watchTick(reporting(green.deps(T0), post, { autoReport: "all" }))).toEqual(["LANE_DONE_AUTO_REPORTED demo-lane w:p1 https://github.com/acme/app/pull/7 green | verified: pr=#7 head=ccccccc checks=green conflict=no sig=ok report=m-1"]);
+  const pending = mergeOnly({ state: "OPEN", checks: [{ status: "IN_PROGRESS" }] });
+  world.prState = "OPEN";
+  await pending.deps(T0 + MIN).registry.write(pending.bound);
+  await claimDone(reporting(pending.deps(T0 + MIN), post, { autoReport: "all" }), pending.bound, "PR acme/app#1 pushed", undefined, KO_TEXT);
+  expect(await watchTick(reporting(pending.deps(T0 + MIN), post, { autoReport: "all" }))).toEqual(["LANE_DONE_CLAIMED demo-lane w:p1 PR acme/app#1 pushed | verified: pr=#1 head=aaaaaaa checks=pending conflict=no sig=0/1"]);
+  expect(posts).toHaveLength(1);
 });

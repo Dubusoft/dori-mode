@@ -51,6 +51,7 @@
     "mergeBase": "dev",
     "tickSec": 300
   },
+  "autoReport": "autopilot",
   "guardMachines": {},
   "hooks": {
     "threadReply": [

@@ -50,6 +50,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
+import { autoReportPoster } from "./auto-report.ts";
 import { taskBlocker, taskFinisher } from "./task-finish.ts";
 import { ToodoWriter } from "./toodo-client.ts";
 import { writeGatewayStatus } from "./gateway-status.ts";
@@ -708,8 +709,10 @@ export const supervise = async (
     // An autopilot task it cannot finish, or whose lane closed cancelled, gets a blocker note instead.
     const toodoWriter = new ToodoWriter(deps.tunables.toodoWriter);
     const finishTask = taskFinisher({ writer: toodoWriter, append: (lane, text) => appendFollowUp(stateDir, discord, lane, text), language: () => deps.config.ownerLanguage });
+    // A clean done claim of a lane config autoReport covers is posted as its report by the supervisor (auto-report.ts).
+    const autoReport = autoReportPoster({ config: deps.config, discord, now: deps.clock.now, home: home || homedir(), language: () => deps.config.ownerLanguage });
     // The watch sweep holds a lane whose review is pending through the same gate CI follow-up merges with (D11).
-    const sweepDeps: FlowDeps = withReviewHold({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter) }, review);
+    const sweepDeps: FlowDeps = withReviewHold({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter), autoReport }, review);
     const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
       watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
     const recentWarnings = new Map<string, number>();

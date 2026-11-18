@@ -2,7 +2,7 @@ import { join } from "node:path";
 
 import type { DoriConfig } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
-import { type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
+import { type Claim, type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { OPEN_STATES, openOperations, type Operation, operationId, type OperationStore, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
@@ -22,6 +22,7 @@ import { type Act, actRecorded, type LaneRead, probeWorktree, readLane, type Ste
 import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCleanup, QUEUED_WORKTREE, remoteWorktrees } from "./closed-cleanup.ts";
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
 import { OUTCOME_LINE_MAX } from "./lane-outcomes.ts";
+import { type AutoReportPost, openAsks, writtenIn } from "./auto-report.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -66,6 +67,12 @@ export type FlowDeps = {
    * mergeWaitMaxMin too, until every bound PR reads merged. Absent (`dori watch`), nothing is held.
    */
   readonly reviewHold?: (lane: Lane) => Promise<boolean>;
+  /**
+   * The supervisor's auto report of a clean done claim of a lane config `autoReport` covers (auto-report.ts): the claim is
+   * posted to the owner and handed to the lead as digest LANE_DONE_AUTO_REPORTED instead of urgent LANE_DONE_CLAIMED.
+   * Absent (`dori watch`), every claim goes to the lead.
+   */
+  readonly autoReport?: AutoReportPost;
 };
 
 /**
@@ -119,10 +126,11 @@ const machineClose = (lane: Lane): boolean => lane.autoClose === "machine";
 /**
  * Whether the claim's window waits for the lead to receive it: when the policy makes LANE_DONE_CLAIMED wake the lead
  * (the default), so the later close finds the claim delivered and is marked seen-claim. A policy that makes the claim
- * digest leaves it to the supervisor (live re-check, then close or LANE_NOT_DONE), so the window runs from the hand-over.
+ * digest leaves it to the supervisor (live re-check, then close or LANE_NOT_DONE), so the window runs from the hand-over;
+ * so does a claim the supervisor auto-reported (`claim.autoReported`), whose close counts as seen.
  */
-const claimWaitsForLead = (deps: FlowDeps, lane: Lane): boolean =>
-  !machineClose(lane) && eventClass(`LANE_DONE_CLAIMED ${lane.key}`, deps.tunables.eventPolicy) === "lead-urgent";
+const claimWaitsForLead = (deps: FlowDeps, lane: Lane, claim?: Claim): boolean =>
+  !machineClose(lane) && !claim?.autoReported && eventClass(`LANE_DONE_CLAIMED ${lane.key}`, deps.tunables.eventPolicy) === "lead-urgent";
 
 /** The journal id of a claim's announcement: stable, so a repeated announcement after a crash is the same event. */
 export const claimEventId = (key: string, claimAt: string): string => `done-claim:${key}:${claimAt}`;
@@ -159,7 +167,8 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
   return [...found.values()];
 };
 
-export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fileReceipt?: LaneFileReceipt): Promise<string> => {
+/** `text` is the lane's own done text (`dori report <key> done --text`), kept on the claim for an auto report. */
+export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fileReceipt?: LaneFileReceipt, text?: string): Promise<string> => {
   const stale = (): LaneFileError => new LaneFileError("LANE_REPORT_STALE", lane.key, "the report belongs to an older lane run; claim done again from the current lane");
   const options = { now: deps.clock.now, checkCurrent: () => deps.registry.read(lane.key),
     emit: deps.fileNote ?? ((_id: string, line: string) => console.error(line)) };
@@ -192,7 +201,7 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
       throw stale();
-    return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls } });
+    return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls, ...(text ? { text } : {}) } });
   });
   // `dori lane status` inside the lane answers from what its runner was told (D16).
   await deps.ops.notify(lane, { status: "done-claimed", claim: { at, evidence } });
@@ -556,21 +565,25 @@ const SNAPSHOT_PRS = 2;
  * the PR; `reasons` are the mechanical failures the supervisor objects to at once instead (work not pushed, a bound PR
  * that conflicts, has a failed check or moved past the bound head). Running checks are not a failure, and anything that
  * cannot be read is UNREAD, never green and never an objection: the settle at the window's end stays the judge.
+ * `clean` is a snapshot with nothing left to look at: every bound PR read open with `checks=green conflict=no` (or none
+ * bound, `pr=none`), every Done signal live (`sig=ok`) and nothing UNREAD.
  */
-const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly snapshot: string; readonly reasons: string[] }> => {
+const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly snapshot: string; readonly reasons: string[]; readonly clean: boolean }> => {
   const reasons: string[] = [];
   const parts: string[] = [];
   const pulls = lane.claim?.pulls ?? [];
+  let clean = pulls.length <= SNAPSHOT_PRS;
   for (const bound of pulls.slice(0, SNAPSHOT_PRS)) {
     const ref = `${bound.repo}#${bound.number}`;
     const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
     let view: WaitView | undefined;
     try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
-    if (!view) { parts.push(`pr=#${bound.number} head=${bound.sha.slice(0, 7)} checks=UNREAD conflict=UNREAD`); continue; }
+    if (!view) { parts.push(`pr=#${bound.number} head=${bound.sha.slice(0, 7)} checks=UNREAD conflict=UNREAD`); clean = false; continue; }
     const head = view.headRefOid ?? bound.sha;
-    if (view.state !== "OPEN") { parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} state=${view.state ?? "UNREAD"}`); continue; }
+    if (view.state !== "OPEN") { parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} state=${view.state ?? "UNREAD"}`); clean = false; continue; }
     const checks = checksWord(view);
     const conflict = conflicting(view) ? "yes" : view.mergeable === "MERGEABLE" ? "no" : "unknown";
+    if (checks !== "green" || conflict !== "no") clean = false;
     parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} checks=${checks} conflict=${conflict}`);
     if (head !== bound.sha) reasons.push(`${ref} head moved to ${head.slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
     if (conflict === "yes") reasons.push(`${ref} conflicts with its base`);
@@ -590,7 +603,40 @@ const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly sn
   } catch (e) {
     console.error(`CLAIM_PREVERIFY_UNREAD ${lane.key}: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return { snapshot: `verified: ${parts.join(" ")} sig=${sig}`, reasons };
+  return { snapshot: `verified: ${parts.join(" ")} sig=${sig}`, reasons, clean: clean && sig === "ok" && !parts.includes("git=UNREAD") && !reasons.length };
+};
+
+/**
+ * Whether the supervisor reports a claim to the owner itself (auto-report.ts) instead of waking the lead: config
+ * `autoReport` covers the lane (`all`, or `autopilot` and an autopilot launch attempt names it; never a review lane),
+ * the preverify snapshot is clean, the lane has no objection on record and nothing open for the lead (openAsks), and its
+ * done text is written in the owner's language. Anything else stays an urgent LANE_DONE_CLAIMED.
+ */
+const autoReportable = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: boolean): Promise<boolean> => {
+  const scope = deps.config.autoReport;
+  if (scope === "off" || lane.review || !clean || lane.objection || !claim.text) return false;
+  if (scope === "autopilot" && !(await withOperations(deps, async (store) => laneAttempt(store, lane.key) !== undefined))) return false;
+  return writtenIn(claim.text, deps.config.ownerLanguage) && !openAsks(deps.config.stateDir, lane.key).length;
+};
+
+/**
+ * The auto report of a fresh claim: its message id once posted (kept on the claim right away, so a pass repeated after a
+ * crash never posts it twice), the urgent LANE_AUTO_REPORT_FAILED line when the post failed (the claim then wakes the
+ * lead as before), or undefined when the claim is not one the supervisor reports.
+ */
+const autoReportClaim = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: boolean): Promise<{ readonly message: string } | { readonly failed: string } | undefined> => {
+  if (claim.autoReported) return { message: claim.autoReported };
+  if (!deps.autoReport || !(await autoReportable(deps, lane, claim, clean))) return undefined;
+  const post = deps.autoReport;
+  let message: string;
+  try {
+    message = await post(lane, claim);
+  } catch (e) {
+    return { failed: `LANE_AUTO_REPORT_FAILED ${lane.key} ${eventText((e instanceof Error ? e.message : String(e)).replace(/\s+/g, " "), 200)}: the claim was not reported to the owner; report it yourself (dori reported ${lane.key} --text TEXT)` };
+  }
+  const at = claim.at;
+  await deps.registry.patch(lane.key, (current) => (current.claim?.at === at ? { claim: { ...current.claim, autoReported: message } } : undefined));
+  return { message };
 };
 
 /** A claim's announcement: its evidence shortened so the snapshot after it stays inside one outcome line. */
@@ -735,8 +781,14 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
       await push(await objectDone(deps, lane, pre.reasons), undefined, laneMeta(lane));
       return;
     }
-    await push(claimLine(machine ? "LANE_AUTO_CLAIMED" : "LANE_DONE_CLAIMED", lane, claim.evidence, pre?.snapshot), event, laneMeta(lane));
-    const announced = { emitted: true, ...(event ? { event } : {}) };
+    // A clean claim the supervisor reported to the owner itself reaches the lead as digest; a failed post is said first,
+    // and the claim then wakes the lead as before.
+    const auto = pre ? await autoReportClaim(deps, lane, claim, pre.clean) : undefined;
+    if (auto && "failed" in auto) await push(auto.failed, `auto-report-failed:${lane.key}:${claim.at}`, laneMeta(lane));
+    const reported = auto && "message" in auto ? auto.message : undefined;
+    const kind = machine ? "LANE_AUTO_CLAIMED" : reported ? "LANE_DONE_AUTO_REPORTED" : "LANE_DONE_CLAIMED";
+    await push(claimLine(kind, lane, claim.evidence, pre && (reported ? `${pre.snapshot} report=${reported}` : pre.snapshot)), event, laneMeta(lane));
+    const announced = { emitted: true, ...(event ? { event } : {}), ...(reported ? { autoReported: reported } : {}) };
     claim = { ...claim, ...announced };
     lane = { ...lane, claim };
     const at = claim.at;
@@ -755,10 +807,11 @@ const watchLane = async (deps: FlowDeps, listed: Lane, push: Emit): Promise<void
   const settled = await settle(deps, lane, evidence, start ?? deps.clock.now());
   if (settled === undefined) return;
   const line = settled.line;
-  // A close whose claim announcement already reached the lead is marked seen-claim. It wakes the lead unless the
-  // supervisor finished the lane's task itself or it has none (`seen-claim toodo=done` / `toodo=no-task`, digest).
+  // A close whose claim announcement already reached the lead, or whose claim the supervisor reported to the owner, is
+  // marked seen-claim. It wakes the lead unless the supervisor finished the lane's task itself or it has none
+  // (`seen-claim toodo=done` / `toodo=no-task`, digest).
   const event = claim.event;
-  const seen = event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event));
+  const seen = claim.autoReported !== undefined || (event !== undefined && (!deps.leadDelivered || deps.leadDelivered(event)));
   const marked = seen ? line.replace(/^(LANE_CLOSED \S+ closed)(?= |$)/, "$1 seen-claim") : line;
   // The task follow-up runs before the close is handed over: its tag decides whether the close wakes the lead.
   const finish = marked.startsWith("LANE_CLOSED ") ? await finishClosedTask(deps, lane) : undefined;
@@ -881,7 +934,7 @@ const windowStart = async (deps: FlowDeps, lane: Lane, claim: NonNullable<Lane["
   if (claim.deliveredAt) return Date.parse(claim.deliveredAt);
   // Only a claim that wakes the lead (the default) waits for its delivery; a digest one or one the policy keeps from
   // the lead is settled by the supervisor, so handing it over counts.
-  if (claimWaitsForLead(deps, lane) && deps.leadDelivered && !deps.leadDelivered(claim.event)) return undefined;
+  if (claimWaitsForLead(deps, lane, claim) && deps.leadDelivered && !deps.leadDelivered(claim.event)) return undefined;
   const at = iso(deps.clock);
   await deps.registry.patch(lane.key, (current) => (current.claim?.at === claim.at ? { claim: { ...current.claim, deliveredAt: at } } : undefined));
   return Date.parse(at);
