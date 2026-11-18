@@ -49,26 +49,28 @@ export const writtenIn = (text: string, language: string | undefined): boolean =
   }
 };
 
+/** Per owner language: the space before the key's parenthesis, the `[System]` header naming the finished lane, and the evidence label. */
 const WORDS = {
-  ko: { done: "완료", evidence: "근거" },
-  ja: { done: "完了", evidence: "根拠" },
-  zh: { done: "完成", evidence: "依据" },
-  en: { done: "Done", evidence: "Evidence" },
+  ko: { keySpace: "", header: (name: string) => `${name} 완료했습니다.`, evidence: "근거" },
+  ja: { keySpace: "", header: (name: string) => `${name}が完了しました。`, evidence: "根拠" },
+  zh: { keySpace: "", header: (name: string) => `${name}已完成。`, evidence: "依据" },
+  en: { keySpace: " ", header: (name: string) => `${name} is done.`, evidence: "Evidence" },
 } as const;
 
 /** Longest auto report: room is left in Discord's 2000-character message for the merge fact appended at the close. */
 export const AUTO_REPORT_MAX = 1500;
 
 /**
- * The auto report of `claim`: `[<done word>] <title> (<key>)`, the lane's done text as written, then its evidence when it
- * says more than the text, in the owner's language; secrets, local paths and pane ids are scrubbed as for any thread post.
+ * The auto report of `claim`: a `[System]` header like the supervisor's other posts (`[System] <title>(<key>) 완료했습니다.`,
+ * the key alone when the lane has no title of its own), the lane's done text as written, then its evidence when it says
+ * more than the text, in the owner's language; secrets, local paths and pane ids are scrubbed as for any thread post.
  */
 export const autoReportText = (lane: Pick<Lane, "key" | "title">, claim: Pick<Claim, "text" | "evidence">, language: string | undefined, home: string): string => {
   const words = WORDS[factLanguage(language)];
-  const name = lane.title && lane.title !== lane.key ? `${lane.title} (${lane.key})` : lane.key;
+  const name = lane.title && lane.title !== lane.key ? `${lane.title}${words.keySpace}(${lane.key})` : lane.key;
   const body = scrubForThread(claim.text ?? "", home);
   const evidence = scrubForThread(claim.evidence, home);
-  const text = [`[${words.done}] ${name}`, body, ...(evidence && evidence !== oneLine(body) ? [`${words.evidence}: ${evidence}`] : [])].join("\n");
+  const text = [`[System] ${words.header(name)}`, body, ...(evidence && evidence !== oneLine(body) ? [`${words.evidence}: ${evidence}`] : [])].join("\n");
   return text.length <= AUTO_REPORT_MAX ? text : `${text.slice(0, AUTO_REPORT_MAX - 3)}...`;
 };
 
