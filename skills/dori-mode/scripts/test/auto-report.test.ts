@@ -46,7 +46,7 @@ test("the auto report goes into the lane's thread as its last report with a repo
   cleanups.push(state.done);
   const { discord, sends, contents } = fakeDiscord();
   expect(await poster(state.dir, discord)(lane, claim)).toBe("m-1");
-  expect(sends).toEqual([["901", "[완료] 로그인 버그 (ap-12-1)\n로그인 버그를 고쳤습니다\n근거: https://github.com/acme/app/pull/1 abc1234"]]);
+  expect(sends).toEqual([["901", "[System] 로그인 버그(ap-12-1) 완료했습니다.\n로그인 버그를 고쳤습니다\n근거: https://github.com/acme/app/pull/1 abc1234"]]);
   expect(readLastReports(state.dir)["ap-12-1"]).toEqual({ channel: "901", message: "m-1", at: T0 });
   expect(pendingReported(state.dir)).toMatchObject([{ lane: "ap-12-1", message: "m-1", thread: "901", note: "auto-reported by the supervisor" }]);
   expect(await appendFollowUp(state.dir, discord, lane, "머지 acme/app#1 (abc1234)")).toEqual({ appended: true, message: "m-1" });
@@ -60,7 +60,7 @@ test("an auto report for a thread the owner closed is one line in its parent cha
   const { discord, sends } = fakeDiscord(["901"]);
   expect(await poster(state.dir, discord)(lane, claim)).toBe("m-1");
   expect(sends[0]?.[0]).toBe("900");
-  expect(sends[0]?.[1]).toStartWith("<#901> [완료] 로그인 버그 (ap-12-1)");
+  expect(sends[0]?.[1]).toStartWith("<#901> [System] 로그인 버그(ap-12-1) 완료했습니다.");
   expect(pendingReported(state.dir)).toMatchObject([{ lane: "ap-12-1", message: "m-1", target: "discord:900", followUp: true }]);
   expect(readLastReports(state.dir)["ap-12-1"]).toBeUndefined();
 });
