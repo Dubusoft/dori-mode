@@ -47,6 +47,7 @@ import { machineVerdict, summaryOf } from "./placement.ts";
 import { Discord } from "./messenger/discord.ts";
 import { acquireDiscordGateway } from "./messenger/discord-lock.ts";
 import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/discord-supervisor.ts";
+import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
 import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
@@ -563,7 +564,7 @@ export const supervise = async (
     [deps.tunables, "handledTimeoutMin", "positive"], [deps.tunables, "reportTimeoutMin", "positive"],
     [deps.tunables, "resolveTimeoutMin", "positive"], [deps.config, "leadStuckRestartMin", "positive"],
     [deps.config, "leadChildWaitMaxMin", "positive"], [deps.tunables, "idleEscalateMin", "positive"],
-    [deps.tunables, "waitMaxFailures", "a positive integer"],
+    [deps.tunables, "waitMaxFailures", "a positive integer"], [deps.config, "threadCloseAfterHours", "positive"],
   ];
   for (const [source, key, rule] of bounds) {
     const value = source[key] as number;
@@ -843,8 +844,12 @@ export const supervise = async (
       });
       // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
       await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
-      // A thread whose work is all finished and reported is closed (archived) once; the owner gets no button to press.
-      await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick(async (thread) => { await discord.setThread(thread, { archived: true }); }));
+      // A thread whose work is all finished and reported gets the owner's close button on its last report, and is closed
+      // (archived) once threadCloseAfterHours pass with no click.
+      await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick({
+        button: (thread, message, state) => discord.editComponents(thread, message, state === "none" ? [] : closeThreadButton(thread, state === "closed")),
+        archive: (thread) => discord.setThread(thread, { archived: true }),
+      }));
     };
     let lastGitHub = -Infinity;
     let lastLaneMessages = -Infinity;

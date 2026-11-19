@@ -20,7 +20,7 @@ Each piece of work gets its own thread (or topic) with:
 - one status message you edit in place: `working: <work> · <time elapsed>` while working, `done: <work>` when done;
 - a status word at the start of the thread name: `[working]`, `[waiting]` (on the owner or someone else), `[done]`.
 
-When the work is done, remove your "eyes" reaction and leave the thread open: the supervisor closes (archives) it itself once nothing is left on it (every lane closed and reported, no follow-up wait or open question). No close button is posted; the owner decides in the inbox. If the owner writes in a closed thread, reopen it, set it back to `[working]`, and carry on there. Threads the owner started get the same treatment. New work in that thread runs under a new lane key: a repeat report of the same lane into its thread does not close it again.
+When the work is done, remove your "eyes" reaction and leave the thread open: once nothing is left on it (every lane closed and reported, no follow-up wait or open question), the supervisor puts the owner's **스레드 닫기** button on its last report, and archives it when the owner clicks it or after `threadCloseAfterHours` (default 24) with no click; a newer report or the owner writing there restarts that wait. If the owner writes in a closed thread, reopen it, set it back to `[working]`, and carry on there. Threads the owner started get the same treatment. New work in that thread runs under a new lane key: a repeat report of the same lane into its thread moves the button while the thread waits, but does not arm it again once the thread is closed.
 
 ## Files
 

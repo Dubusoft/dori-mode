@@ -5,6 +5,7 @@ import type { FlowDeps } from "../done-flow.ts";
 import type { LaneMessageStore } from "../lane-messages.ts";
 import { statusOf } from "../registry.ts";
 import { answeredEventId, answeredLine, recordChannelAnswer, recordOwnerAnswer } from "../owner-decisions.ts";
+import { dropCloseTimer, touchCloseTimer } from "../thread-finality.ts";
 import { recordOwnerClosed } from "../thread-followup.ts";
 import { DiscordCommands, type QuotaLookup, type StatusLookup } from "./discord-commands.ts";
 import {
@@ -73,6 +74,8 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
   // The owner's close-thread button reaches the lead as a digest line, with the lane bound to that thread when one is.
   const threadClosed = async (threadId: string, interactionId: string): Promise<void> => {
     recordOwnerClosed(deps.config.stateDir, threadId, deps.clock.now());
+    // The click closed it: the automatic close has nothing left to wait for.
+    dropCloseTimer(deps.config.stateDir, threadId);
     const lane = (await deps.registry.open()).find((l) => l.thread.endsWith(`/${threadId}`))?.key;
     await options.emit(`discord:${threadId}:close:${interactionId}`, `THREAD_CLOSED_BY_OWNER ${threadId}${lane ? ` lane ${lane}` : ""}${await channelName(threadId)}`);
   };
@@ -128,6 +131,9 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       ownerMessages.delete(id);
       ownerMessages.set(id, channel);
       if (ownerMessages.size > 1_000) ownerMessages.delete(ownerMessages.keys().next().value ?? "");
+      // The owner wrote in a finished thread waiting for its automatic close: the wait starts again.
+      try { touchCloseTimer(deps.config.stateDir, channel, deps.clock.now()); }
+      catch { log(`THREAD_CLOSE_TIMER_ERROR cannot restart the close wait of ${channel}`); }
       try {
         // An answer in the decisions channel body (not in a thread) counts when exactly one decision there is waiting.
         const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now())

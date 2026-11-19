@@ -13,6 +13,7 @@
   "leadArgs": [],
   "leadStuckRestartMin": 30,
   "leadChildWaitMaxMin": 60,
+  "threadCloseAfterHours": 24,
   "discordChannels": [
     "123456789012345678"
   ],
