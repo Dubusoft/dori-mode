@@ -979,9 +979,10 @@ runner's memory: a pane leaves it on a successful `pane.close`, and the whole se
 - `pane.rename`, `pane.close`, `pane.resize` and `pane.zoom` for a lane pane only, never the own pane.
 - `pane.send_input` (herdr's `pane run`) to a lane pane, once per pane, with `keys` absent or `["Enter"]`. A split pane
   starts herdr's shell outside the sandbox, so the runner rewrites the text to
-  `exec <prefix> /bin/sh -c '<original text>'`. The prefix is the one the lane's own agent was started behind (the
-  lane env and the sandbox wrapper), kept as `sandboxPrefix` in the lane record, so the command gets the lane's
-  sandbox and the pane ends with it. A lane started unsandboxed gets its text through unchanged. A sandboxed lane
+  `exec <prefix> /bin/sh -c '<original text>'`. The prefix is the lane env plus the sandbox wrapper `sandboxCheck`
+  names (its argv without the final `--check`), kept as `sandboxPrefix` in the lane record, so the command gets the
+  lane's sandbox and the pane ends with it. Every sandboxed lane gets it, whatever form its profile's argv gives
+  the wrapper; an unsandboxed lane only when its argv starts with that wrapper. A lane started unsandboxed gets its text through unchanged. A sandboxed lane
   whose record predates `sandboxPrefix` is refused until it's relaunched. After that first command,
   `pane.send_text` and `pane.send_keys` may reach the pane.
 

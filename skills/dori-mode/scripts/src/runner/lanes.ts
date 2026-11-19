@@ -522,9 +522,13 @@ export class RunnerLanes {
         ...(granted?.read.length ? [`LANE_SANDBOX_RO=${quote(granted.read.join(":"))}`] : []),
       ];
       const wrapper = this.deps.policy.sandboxCheck?.slice(0, -1) ?? [];
-      // What the lane runs behind, for a command a lane runs in a pane it split off (herdr-report.ts): `env` makes it
-      // usable after `exec`.
-      if (wrapper.length > 0 && wrapper.every((part, at) => argv[at] === part)) sandboxPrefix = ["env", ...env, ...wrapper.map(quote)].join(" ");
+      // What a command a lane runs in a pane it split off (herdr-report.ts) runs behind: `env` makes it usable after
+      // `exec`. A sandboxed lane gets the wrapper its start was checked with even when its profile names the wrapper
+      // another way (a bare `lane-sandbox`, a `~` path) or puts something before it, so its split panes stay sandboxed
+      // instead of being refused; an unsandboxed lane gets it only when its argv runs behind that wrapper.
+      if (wrapper.length > 0 && (sandboxedLane(input.profile, input.sandbox) || wrapper.every((part, at) => argv[at] === part))) {
+        sandboxPrefix = ["env", ...env, ...wrapper.map(quote)].join(" ");
+      }
       // Only the value of each assignment is quoted, so /bin/sh still reads KEY=value as an assignment.
       command = `export ${env.join(" ")}; eval "$(${quote(this.deps.remote ? join(this.deps.runnerDir, "bin", "dori") : "dori")} secret env)"; ${argv.map(quote).join(" ")}`;
     }

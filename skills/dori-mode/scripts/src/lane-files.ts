@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { bytes, checkLaneFilesBody, compare, FILE_LIMITS, hash, invalidFiles, LaneFileError, limit, MARKER, portableComponent, portablePath, treeDigest, validateFileKey, validateLaneTree } from "./lane-file-contract.ts";
 import type { Lane } from "./registry.ts";
@@ -75,12 +76,19 @@ export const checkLaneReportText = (key: string, text: string, evidence?: string
   limit(key, "evidenceBytes", bytes(evidence ?? ""), true);
 };
 
-export type BriefPath = { readonly start: number; readonly end: number; readonly path: string };
+/** `home`: the reference was written `~/...`; `path` is its expansion against the lead's home, the range covers the `~/` text. */
+export type BriefPath = { readonly start: number; readonly end: number; readonly path: string; readonly home?: true };
 export const briefBody = (text: string): string => text.split(FILE_FOOTER_HEADING, 1)[0]!;
-/** Ranges are UTF-16 indices, deliberately independent of Markdown rendering. */
-export const scanBriefPaths = (text: string, platform: NodeJS.Platform = process.platform): BriefPath[] => {
+/**
+ * Ranges are UTF-16 indices, deliberately independent of Markdown rendering. A `~/` path is the lead's home as a lead
+ * writes it (`~/.dori/research/<key>/report.md`), so it is expanded here; on a remote lane it would name another machine.
+ */
+export const scanBriefPaths = (text: string, platform: NodeJS.Platform = process.platform, home: string = homedir()): BriefPath[] => {
   const body = briefBody(text);
   const native = (s: string): boolean => platform === "win32" ? /^[A-Za-z]:[\\/]/.test(s) : s.startsWith("/") && !s.startsWith("//");
+  const found = (start: number, source: string): BriefPath => source.startsWith("~/")
+    ? { start, end: start + source.length, path: join(home, source.slice(2)), home: true }
+    : { start, end: start + source.length, path: source };
   const out: BriefPath[] = [];
   const suffix = /(?::\d+(?::\d+)?|#L\d+(?:-L\d+)?)$/;
   for (let i = 0; i < body.length;) {
@@ -94,8 +102,8 @@ export const scanBriefPaths = (text: string, platform: NodeJS.Platform = process
         const path = s.replace(suffix, "");
         const prefix = /\S*$/.exec(body.slice(0, i))?.[0] ?? "";
         const inUrl = /(?:^|[([{])[A-Za-z][A-Za-z0-9+.-]*:/.test(prefix);
-        if (!inUrl && native(path) && !/[\r\n]/.test(path)) {
-          out.push({ start: i + 1, end: i + 1 + path.length, path });
+        if (!inUrl && (native(path) || path.startsWith("~/")) && !/[\r\n]/.test(path)) {
+          out.push(found(i + 1, path));
           i = end + 1;
           continue;
         }
@@ -107,15 +115,22 @@ export const scanBriefPaths = (text: string, platform: NodeJS.Platform = process
     }
     const prev = body[i - 1];
     const boundary = i === 0 || /[\s([{=]/.test(prev!) || (prev === ":" && !/[A-Za-z][A-Za-z0-9+.-]*:$/.test(body.slice(0, i)));
-    if (boundary && native(body.slice(i))) {
+    if (boundary && (native(body.slice(i)) || body.startsWith("~/", i))) {
       let end = i;
       while (end < body.length && !/[\s'"`<>()\[\]{};]/.test(body[end]!)) end++;
       const path = body.slice(i, end).replace(/[.,!?]+$/, "").replace(suffix, "");
-      if (path) out.push({ start: i, end: i + path.length, path });
+      if (path) out.push(found(i, path));
       i = end;
     } else i++;
   }
   return out;
+};
+
+/** Brief references under an attachment root that do not exist: a launch would leave them literal, so the lane starts without them. */
+export const missingLaneFiles = (stateDir: string, briefText: string): string[] => {
+  const roots = LEAD_ATTACHMENT_ROOTS(stateDir).map((root) => resolve(root));
+  return [...new Set(scanBriefPaths(briefText).map((o) => resolve(o.path)))]
+    .filter((path) => roots.some((root) => inside(root, path)) && !existsSync(path));
 };
 
 export type FileReaders = {
@@ -142,6 +157,8 @@ export const prepareLaneBrief = (input: {
   readonly key: string; readonly stateDir: string; readonly briefText: string; readonly requiredReport: boolean;
   readonly rawBriefText?: string;
   readonly runId?: string; readonly readers?: FileReaders;
+  /** The home a `~/` reference expands against; the lead's own by default. */
+  readonly home?: string;
   /** Real source paths a recovery may ship (the launch pin); unset on a fresh launch, which may ship any in-root path. */
   readonly allowed?: readonly string[];
 }): { readonly files: LaneBriefFiles; readonly notes: readonly string[]; readonly sources: readonly string[] } => {
@@ -163,11 +180,13 @@ export const prepareLaneBrief = (input: {
   });
   const source = new Map<string, string>();
   const notes: string[] = [], noted = new Set<string>();
-  const occurrences = scanBriefPaths(briefText);
+  const occurrences = scanBriefPaths(briefText, process.platform, input.home);
   for (const occurrence of occurrences) {
     const path = resolve(occurrence.path);
     const root = roots.find((r) => inside(r.path, path) || (r.real !== undefined && inside(r.real, path)));
     if (!root) {
+      // A `~/` path outside the roots may mean the lane machine's own home (`~/.zshrc`): ordinary text, never a note.
+      if (occurrence.home) continue;
       // Metadata only: do not resolve, open, enumerate, or charge outside-root paths.
       try { stat(path); if (!noted.has(occurrence.path)) { noted.add(occurrence.path); notes.push(`LANE_FILE_NOT_SHIPPED ${key}: ${JSON.stringify(occurrence.path)} is outside the attachment roots and stays literal`); } } catch {}
       continue;

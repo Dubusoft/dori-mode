@@ -285,3 +285,25 @@ printf "export SHARED='%s'\\n" "$PULL_VALUE"
     expect(err).toBe(fail ? "RUNNER_SECRET_DENIED refused\n" : "");
   }
 });
+
+test("a sandboxed lane records the checked wrapper as its split-pane prefix even when its profile names the wrapper differently", async () => {
+  const t = await setup();
+  const runnerDir = join(t.s.dir, "runner");
+  mkdirSync(runnerDir, { mode: 0o700 });
+  const wrapper = "/h/.dori/runner/bin/lane-sandbox";
+  const lanes = new RunnerLanes({
+    instance: async () => "server-1", runnerDir, clock: fakeClock(T0), token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }),
+    policy: { agents: { sandboxed: ["lane-sandbox", "omo", "{prompt}"], default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: [wrapper, "--check"] },
+    publish: () => {},
+    run: async (argv) => {
+      if (argv[0] === wrapper) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
+      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
+      return { code: 0, out: "", err: "" } as Ran;
+    },
+  });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0, files: FILES });
+  await lanes.start({ cmdId: "c2", key: "lane-b", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES });
+  expect(lanes.records()["lane-a"]?.sandboxPrefix).toStartWith("env DORI_LANE_KEY=lane-a ");
+  expect(lanes.records()["lane-a"]?.sandboxPrefix).toEndWith(` ${wrapper}`);
+  expect(lanes.records()["lane-b"]?.sandboxPrefix).toBeUndefined();
+});

@@ -177,7 +177,7 @@ The supervisor judges the same candidates itself every `autopilot.tickSec` (5 mi
 
 When on, each supervisor tick first runs `reconcileExecutions`, then `runExecutor` on the tick's LAUNCH ids, one task at a time under the same `autopilot-launch.lock.sqlite` lock as `dori autopilot launch`. A task goes through these steps:
 
-1. prepare: read the task and its contract again; a reason to stop goes to review before anything is reserved or started.
+1. prepare: read the task and its contract again; a reason to stop goes to review before anything is reserved or started. Nobody reads an executor brief before its launch, so a path it names under an attachment root (`~/.dori/research/...` included) that does not exist on the lead is review `lane-file-missing:<path>` rather than a lane that starts without it; the lane's own `research/<key>` collection directory is exempt.
 2. reserve: open the task's `autopilot-launch` ledger attempt, exactly as the CLI does. A reservation the CLI opened is never adopted.
 3. start-task: `start_task` with the `lane:<key>` ref.
 4. thread: create the lane's Discord thread under `autopilot.threadChannel` (else the first `discordChannels` entry) and add `discord.ownerId`.

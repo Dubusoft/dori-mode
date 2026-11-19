@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { briefDeliverable, prepareLeadLaneBrief } from "../src/launch.ts";
-import { checkLaneReportText, installLaneReports, LEAD_ATTACHMENT_ROOTS, prepareLaneAttachment, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, validateLaneOutput, verifyLaneFileReceipt, writeLaneAttachmentPin } from "../src/lane-files.ts";
+import { checkLaneReportText, installLaneReports, LEAD_ATTACHMENT_ROOTS, missingLaneFiles, prepareLaneAttachment, prepareLaneBrief, protectLaneCollectionDirectory, scanBriefPaths, validateLaneOutput, verifyLaneFileReceipt, writeLaneAttachmentPin } from "../src/lane-files.ts";
 import { checkLaneFilesBody, FILE_LIMITS, LaneFileError, treeDigest, validateLaneTree } from "../src/lane-file-contract.ts";
 import { StateLockError, tryStateLock } from "../src/state-lock.ts";
 import type { Lane } from "../src/registry.ts";
@@ -34,9 +34,11 @@ const fixture = () => {
 
 test("scanner pins delimiters, spaces, citations, UTF-16 and foreign/URI exclusions", () => {
   const text = '😀 /a:12 /ab#L2-L4, "/space path:4" `/back tick#L3` </angle space> (/p) [/b] {/c}; x=/d x: /e https://host/no file:/url C:\\foreign \\\\server\\share ~/no $HOME/no relative/no';
-  const found = scanBriefPaths(text, "linux");
-  expect(found.map((x) => x.path)).toEqual(["/a", "/ab", "/space path", "/back tick", "/angle space", "/p", "/b", "/c", "/d", "/e"]);
-  for (const x of found) expect(text.slice(x.start, x.end)).toBe(x.path);
+  const found = scanBriefPaths(text, "linux", "/home/lead");
+  expect(found.map((x) => x.path)).toEqual(["/a", "/ab", "/space path", "/back tick", "/angle space", "/p", "/b", "/c", "/d", "/e", "/home/lead/no"]);
+  for (const x of found) expect(text.slice(x.start, x.end)).toBe(x.home ? "~/no" : x.path);
+  expect(scanBriefPaths("`~/.dori/research/k/report.md` (~/x:3)", "linux", "/h")).toEqual([
+    { start: 1, end: 29, path: "/h/.dori/research/k/report.md", home: true }, { start: 32, end: 35, path: "/h/x", home: true }]);
   expect(found[0]!.start).toBe(3);
   expect(scanBriefPaths("C:\\a:12 C:/b#L3 /foreign //server/share", "win32").map((x) => x.path)).toEqual(["C:\\a", "C:/b"]);
   expect(scanBriefPaths('/yes\n## Lane footer (written by dori launch)\n/no')).toEqual([{ path: "/yes", start: 0, end: 4 }]);
@@ -61,6 +63,18 @@ test("only a deliverable: report line declares a report; any other deliverable l
   expect(briefDeliverable("none")).toBe(false);
   expect(briefDeliverable("- `deliverable: RePoRt`\ndeliverable: other")).toBe(true);
   for (const line of ["deliverable:", "- Deliverable:", "Deliverable: PR", "deliverable: reports"]) expect(briefDeliverable(line)).toBe(false);
+});
+
+test("a ~/ reference under an attachment root ships like an absolute one; any other ~/ path stays ordinary text", () => {
+  const f = fixture(), home = dirname(f.stateDir);
+  mkdirSync(join(f.research, "prior"));
+  writeFileSync(join(f.research, "prior", "report.md"), "evidence");
+  const briefText = "Basis: `~/research/prior/report.md`; also ~/research/gone.md and ~/.zshrc on the lane machine.";
+  const prepared = prepareLaneBrief({ key: "lane-a", stateDir: f.stateDir, briefText, requiredReport: false, runId: run.id, home });
+  expect(prepared.files.tree.files).toEqual([file("r0000/report.md", "evidence")]);
+  expect(prepared.files.references.map((r) => [briefText.slice(r.start, r.end), r.target])).toEqual([["~/research/prior/report.md", "r0000/report.md"]]);
+  expect(prepared.notes).toEqual([`LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(join(f.research, "gone.md"))} does not exist (no ${JSON.stringify(join(f.research, "gone.md"))}) and stays literal`]);
+  expect(missingLaneFiles(f.stateDir, briefText.replaceAll("~/", `${home}/`))).toEqual([join(f.research, "gone.md")]);
 });
 
 const notAttached = (path: string): string => `LANE_FILE_NOT_SHIPPED lane-a: ${JSON.stringify(path)} was not attached at launch and stays literal`;
