@@ -3,9 +3,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync, w
 import { join } from "node:path";
 
 import { eventPriority, Supervisor } from "../src/supervise.ts";
-import { outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders } from "../src/lane-outcomes.ts";
-import { readFinishedThreads } from "../src/thread-finality.ts";
-import { readLastReports, readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
+import { outcomeLane, pendingReported, recordReported, REPORTED_DIR, takeReminders, type ThreadCloseTransport } from "../src/lane-outcomes.ts";
+import { readCloseTimers, readFinishedThreads, touchCloseTimer } from "../src/thread-finality.ts";
+import { readLastReports, readOwnerClosed, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { Waits } from "../src/waits.ts";
 import type { Lane } from "../src/registry.ts";
 import { renderStatus, type Status } from "../src/status.ts";
@@ -465,12 +465,120 @@ const autoClose = () => {
   const supervisor = new Supervisor(f.deps);
   // Each archive the supervisor asked for, in order.
   const posts: string[] = [];
-  const tick = async () => { await supervisor.reportTick(); await supervisor.autoCloseTick(async (thread) => { posts.push(thread); }); };
+  // Each button change (`<state> <thread>/<message>`), and the messages whose button is live now.
+  const buttons: string[] = [];
+  const live = new Set<string>();
+  const transport: ThreadCloseTransport = {
+    archive: async (thread) => { posts.push(thread); },
+    button: async (thread, message, state) => {
+      buttons.push(`${state} ${thread}/${message}`);
+      if (state === "live") live.add(message); else live.delete(message);
+      // The owner never sees two close buttons in a thread.
+      expect(live.size).toBeLessThanOrEqual(1);
+    },
+  };
+  const tick = async () => { await supervisor.reportTick(); await supervisor.autoCloseTick(transport); };
   const close = (key: string) => f.deps.registry.patch(key, { closedAt: new Date(f.clock.now()).toISOString() });
-  // `button` marks a receipt of an older `dori reported --final`, which posted a close button.
-  const report = (key: string, extra: { button?: boolean } = {}) => recordReported(f.state.dir, key, f.clock.now(), undefined, { message: "m", target: "discord:200", thread: "200", ...extra });
-  return { ...f, supervisor, posts, tick, close, report };
+  // `button` marks a receipt of an older `dori reported --final`, which posted a close button. `message` posts the
+  // report into the thread as that message (last-reports.json), so it can carry the close button.
+  const report = (key: string, extra: { button?: boolean; message?: string } = {}) => {
+    const { message, ...rest } = extra;
+    if (message) recordLastReport(f.state.dir, key, { channel: "200", message, at: f.clock.now() });
+    recordReported(f.state.dir, key, f.clock.now(), undefined, { message: message ?? "m", target: "discord:200", thread: "200", ...rest });
+  };
+  return { ...f, supervisor, posts, buttons, live, transport, tick, close, report };
 };
+
+const HOUR = 60 * MIN;
+
+test("a finished thread gets the close button on its last report instead of closing, and closes threadCloseAfterHours later", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { message: "r1" });
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  expect(f.buttons).toEqual(["live 200/r1"]);
+  expect(readCloseTimers(f.state.dir)).toEqual({ "200": { message: "r1", reportAt: T0, since: T0 } });
+  expect(readOwnerClosed(f.state.dir)).toEqual({});
+  f.clock.at += 24 * HOUR - 1;
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  f.clock.at += 1;
+  await f.tick();
+  expect(f.buttons).toEqual(["live 200/r1", "closed 200/r1"]);
+  expect(f.posts).toEqual(["200"]);
+  expect(readCloseTimers(f.state.dir)).toEqual({});
+  expect(readOwnerClosed(f.state.dir)).toEqual({ "200": T0 + 24 * HOUR });
+  await f.tick();
+  expect(f.posts).toHaveLength(1);
+  f.supervisor.close();
+});
+
+test("the close wait survives a restart; the owner writing and a newer report restart it, and the one button moves to the newest report", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { message: "r1" });
+  await f.tick();
+  f.supervisor.close();
+  const restarted = new Supervisor(f.deps);
+  const tick = async () => { await restarted.reportTick(); await restarted.autoCloseTick(f.transport); };
+  f.clock.at += 23 * HOUR;
+  expect(touchCloseTimer(f.state.dir, "200", f.clock.now())).toBe(true);
+  f.clock.at += 23 * HOUR;
+  await tick();
+  expect(f.posts).toEqual([]);
+  // A repeat report of the same lane: the button moves to it, off the old one first.
+  f.report("alpha", { message: "r2" });
+  await tick();
+  expect(f.buttons).toEqual(["live 200/r1", "none 200/r1", "live 200/r2"]);
+  // Another lane reported into the thread: the button moves again.
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200", closedAt: new Date(f.clock.now()).toISOString() }));
+  f.clock.at += HOUR;
+  f.report("beta", { message: "r3" });
+  await tick();
+  expect(f.buttons.slice(3)).toEqual(["none 200/r2", "live 200/r3"]);
+  expect([...f.live]).toEqual(["r3"]);
+  f.clock.at += 24 * HOUR - 1;
+  await tick();
+  expect(f.posts).toEqual([]);
+  f.clock.at += 1;
+  await tick();
+  expect(f.posts).toEqual(["200"]);
+  restarted.close();
+});
+
+test("new work on a waiting thread takes its button off; a failed step is retried and never leaves two buttons", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
+  f.report("alpha", { message: "r1" });
+  await f.tick();
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200" }));
+  await f.tick();
+  expect(f.buttons).toEqual(["live 200/r1", "none 200/r1"]);
+  expect(readCloseTimers(f.state.dir)).toEqual({});
+  f.clock.at += 48 * HOUR;
+  await f.tick();
+  expect(f.posts).toEqual([]);
+  // beta finishes; its report gets the button. The first try to take it off fails, so nothing moves until it works.
+  f.clock.at += 1_000;
+  await f.close("beta");
+  f.report("beta", { message: "r2" });
+  await f.tick();
+  f.clock.at += 1_000;
+  f.report("beta", { message: "r3" });
+  let fail = true;
+  await f.supervisor.reportTick();
+  await f.supervisor.autoCloseTick({ ...f.transport, button: async (thread, message, state) => {
+    if (fail && state === "none") { fail = false; throw new Error("discord PATCH: 500"); }
+    await f.transport.button(thread, message, state);
+  } });
+  expect([...f.live]).toEqual(["r2"]);
+  expect(readCloseTimers(f.state.dir)["200"]?.message).toBe("r2");
+  await f.tick();
+  expect([...f.live]).toEqual(["r3"]);
+  expect(readCloseTimers(f.state.dir)["200"]?.message).toBe("r3");
+  f.supervisor.close();
+});
 
 test("the supervisor closes a thread once its last lane is closed and reported, records it closed, once per report", async () => {
   const f = autoClose();
@@ -509,7 +617,7 @@ test("a failed archive records nothing and is retried on the next pass", async (
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));
   f.report("alpha");
   await f.supervisor.reportTick();
-  await f.supervisor.autoCloseTick(async () => { throw new Error("discord PATCH /channels/200: 500"); });
+  await f.supervisor.autoCloseTick({ ...f.transport, archive: async () => { throw new Error("discord PATCH /channels/200: 500"); } });
   expect(readFinishedThreads(f.state.dir)).toEqual({});
   expect(readOwnerClosed(f.state.dir)).toEqual({});
   await f.tick();
@@ -527,7 +635,7 @@ test("a reported done-claimed lane still open holds the close back across a supe
   f.supervisor.close();
   // A new process on the same state: its first passes see the claim reported and the lane still open.
   const restarted = new Supervisor(f.deps);
-  const tick = async () => { await restarted.reportTick(); await restarted.autoCloseTick(async (thread) => { f.posts.push(thread); }); };
+  const tick = async () => { await restarted.reportTick(); await restarted.autoCloseTick(f.transport); };
   await tick();
   await tick();
   expect(f.posts).toEqual([]);
@@ -715,7 +823,7 @@ test("dori reported --final (older leads) is accepted and posts no close button;
   expect(pendingReported(f.state.dir).map(({ thread, button }) => ({ thread, button }))).toEqual([{ thread: "200", button: undefined }]);
 }, CLI_TIMEOUT);
 
-test("a lane stored with a bare thread id (older launches) has its thread closed by the supervisor", async () => {
+test("a lane stored with a bare thread id (older launches) gets the close button on the report dori reported posted into its thread", async () => {
   const f = autoClose();
   await f.deps.registry.write(lane("beta", { thread: "300", closedAt: new Date(T0).toISOString() }));
   expect((await f.deps.registry.read("beta"))?.thread).toBe("discord:300");
@@ -724,7 +832,8 @@ test("a lane stored with a bare thread id (older launches) has its thread closed
   // The CLI stamps its receipts with the real clock; an old supervisor clock would prune them as long reported.
   f.clock.at = Date.now();
   await f.tick();
-  expect(f.posts).toEqual(["300"]);
+  expect(f.buttons).toEqual(["live 300/m-42"]);
+  expect(f.posts).toEqual([]);
   f.supervisor.close();
 }, CLI_TIMEOUT);
 

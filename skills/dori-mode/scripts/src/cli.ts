@@ -241,7 +241,8 @@ const USAGE = `dori <command> [options]
                                        post a finished lane's outcome (after LANE_CLOSED or CI_MERGED) to the owner in the lane's thread
                                        (--to/--thread override it, as for send) and, once the post returns a message id, record the receipt;
                                        without it the supervisor sends urgent UNREPORTED <key> after reportTimeoutMin;
-                                       supervise closes the thread itself once its work is finished and reported (--final is ignored)
+                                       once its work is finished and reported, supervise puts the owner's close button on the thread's last report
+                                       and closes it after threadCloseAfterHours with no click (--final is ignored)
   reported <key> --append TEXT [--note TEXT] [--no-redirect]
                                        a follow-up after the report (merge result, Toodo done): appended to the lane's last report
                                        by editing it (else its status message), no new post (REPORT_APPENDED)

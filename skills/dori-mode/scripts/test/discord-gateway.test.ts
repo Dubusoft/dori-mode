@@ -8,6 +8,7 @@ import { discordSnowflakeAt } from "../src/messenger/discord-inbound.ts";
 import { discordPresence, type GatewaySocket } from "../src/messenger/discord-gateway.ts";
 import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import { Supervisor } from "../src/supervise.ts";
+import { readCloseTimers, recordCloseTimer } from "../src/thread-finality.ts";
 import { readOwnerClosed } from "../src/thread-followup.ts";
 import type { DoriConfig } from "../src/config.ts";
 import { applyConfigPatch, type ConfigReload, configReloader, watchConfigFiles } from "../src/config-watch.ts";
@@ -286,6 +287,8 @@ test("a restarted supervisor resumes the stopped one's gateway session and carri
   second.s.socket().receive(hello);
   expect(second.s.socket().sent[0]).toEqual({ op: 6, d: { token: "test-token", session_id: "session", seq: 7 } });
   writes.length = 0;
+  // The thread waits for its automatic close with the button on message 555.
+  recordCloseTimer(state.dir, "777", { message: "555", reportAt: 0, since: 0 });
   second.s.socket().receive({ op: 0, t: "INTERACTION_CREATE", s: 8, d: {
     type: 3, id: "900", token: "expired", application_id: "1", guild_id: "2", member: { user: { id: "300" } },
     message: { id: "555" }, data: { component_type: 2, custom_id: "dori:close-thread:777" },
@@ -303,6 +306,8 @@ test("a restarted supervisor resumes the stopped one's gateway session and carri
   expect(emitted.get("discord:777:close:900")).toBe("THREAD_CLOSED_BY_OWNER 777");
   // Recorded, so later posts addressed to the thread go to the owner channel instead of reopening it.
   expect(readOwnerClosed(state.dir)).toEqual({ "777": clock.at });
+  // The click ended the wait: the supervisor does not touch the thread again.
+  expect(readCloseTimers(state.dir)).toEqual({});
 });
 
 test("a stopped supervisor's session older than the resume window, or malformed, is dropped and the next one identifies", async () => {

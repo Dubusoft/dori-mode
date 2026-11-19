@@ -253,6 +253,12 @@ export type DoriConfig = {
    * wakes the lead as LANE_DONE_CLAIMED and the lead reports it.
    */
   readonly autoReport: AutoReportScope;
+  /**
+   * Hours a finished work thread stays open after the owner's close button lands on its last report before the
+   * supervisor archives it (lane-outcomes.ts autoCloseTick); a newer report or the owner writing in the thread restarts
+   * the wait. Positive; absent is 24.
+   */
+  readonly threadCloseAfterHours: number;
 };
 
 export type ReviewConfig = { readonly repos?: readonly string[] };
@@ -311,7 +317,15 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   drift: DEFAULT_DRIFT,
   autopilot: DEFAULT_AUTOPILOT,
   autoReport: "autopilot",
+  threadCloseAfterHours: 24,
 });
+
+/** The config's `threadCloseAfterHours`; absent is 24. Throws TypeError unless it is a positive number. */
+const threadCloseAfterHours = (raw: unknown): number => {
+  if (raw == null) return 24;
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) throw new TypeError(`threadCloseAfterHours must be a positive number of hours, not ${JSON.stringify(raw)}`);
+  return raw;
+};
 
 /** The one-line instruction that lanes write their reports and todo items in the owner's language; "" when none is configured. */
 export const languageInstruction = (ownerLanguage: string | undefined): string => {
@@ -486,7 +500,7 @@ export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
-  "memoryLimits", "autoReport",
+  "memoryLimits", "autoReport", "threadCloseAfterHours",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -574,6 +588,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     laneRules: laneRules(raw.laneRules),
     review: reviewConfig(raw.review),
     autoReport: autoReport(raw.autoReport),
+    threadCloseAfterHours: threadCloseAfterHours(raw.threadCloseAfterHours),
     memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),

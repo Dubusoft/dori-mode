@@ -5,10 +5,9 @@ import { replaceFileAtomic } from "./durable-write.ts";
 import { statusOf, type Lane } from "./registry.ts";
 
 /**
- * Threads whose finished work `dori supervise` closed, thread id -> when (epoch ms): written by `dori supervise` alone,
- * when it archives a finished thread itself, and for a close button posted before threads were closed automatically (an
- * older `--final` report's receipt). A report recorded after that time is new work on the thread. The file keeps its old
- * name so the records of a running install carry over.
+ * Threads whose work `dori supervise` found finished, thread id -> when (epoch ms): written by `dori supervise` alone,
+ * when it puts the owner's close button on a finished thread's last report (or archives a thread with no report in it),
+ * and for an older `--final` report's button (its receipt). A report recorded after that time is new work on the thread.
  */
 export const FINISHED_THREADS_FILE = "close-buttons.json";
 
@@ -25,6 +24,56 @@ export const recordFinishedThread = (stateDir: string, thread: string, at: numbe
   if ((buttons[thread] ?? -Infinity) >= at) return;
   const path = join(stateDir, FINISHED_THREADS_FILE);
   replaceFileAtomic(path, JSON.stringify({ ...buttons, [thread]: at }), 0o600);
+};
+
+/**
+ * Finished threads waiting for their close, thread id -> the report message carrying the owner's close button, when
+ * that report was posted, and when the wait started (epoch ms; the button's post, a newer report or the owner's last
+ * message in the thread, whichever is latest). Written by `dori supervise` alone, so the wait and the one button survive
+ * a restart.
+ */
+export const CLOSE_TIMERS_FILE = "thread-close-timers.json";
+
+export type CloseTimer = { readonly message: string; readonly reportAt: number; readonly since: number };
+
+export const readCloseTimers = (stateDir: string): Record<string, CloseTimer> => {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(join(stateDir, CLOSE_TIMERS_FILE), "utf8")); } catch { return {}; }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, CloseTimer] => {
+    const timer = entry[1] as Partial<CloseTimer> | null;
+    return typeof timer?.message === "string" && Number.isFinite(timer.reportAt) && Number.isFinite(timer.since);
+  }));
+};
+
+const writeCloseTimers = (stateDir: string, timers: Record<string, CloseTimer>): void => {
+  replaceFileAtomic(join(stateDir, CLOSE_TIMERS_FILE), JSON.stringify(timers), 0o600);
+};
+
+/**
+ * Records that `timer.message` carries `thread`'s close button and its wait runs from `timer.since`; a later start
+ * already on record (the owner wrote meanwhile) is kept. Read and written with no await between, so a concurrent touch
+ * is not lost.
+ */
+export const recordCloseTimer = (stateDir: string, thread: string, timer: CloseTimer): void => {
+  const timers = readCloseTimers(stateDir);
+  writeCloseTimers(stateDir, { ...timers, [thread]: { ...timer, since: Math.max(timer.since, timers[thread]?.since ?? -Infinity) } });
+};
+
+/** Restarts `thread`'s wait at `at` when one runs (the owner wrote in the thread); returns whether it did. */
+export const touchCloseTimer = (stateDir: string, thread: string, at: number): boolean => {
+  const timers = readCloseTimers(stateDir);
+  const timer = timers[thread];
+  if (!timer || timer.since >= at) return false;
+  writeCloseTimers(stateDir, { ...timers, [thread]: { ...timer, since: at } });
+  return true;
+};
+
+export const dropCloseTimer = (stateDir: string, thread: string): void => {
+  const timers = readCloseTimers(stateDir);
+  if (!(thread in timers)) return;
+  delete timers[thread];
+  writeCloseTimers(stateDir, timers);
 };
 
 /** The thread id of a ref (`discord:<channel>/<thread>`, `discord:<thread>`) or of a bare id. */
