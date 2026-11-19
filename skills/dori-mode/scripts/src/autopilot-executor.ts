@@ -1,5 +1,5 @@
 import { mkdirSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
@@ -8,7 +8,7 @@ import { autopilotThreadChannelOf } from "./config.ts";
 import { resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { type LaunchInput, SandboxRefusal, validateLaunch } from "./launch.ts";
-import { laneReportFile } from "./lane-files.ts";
+import { laneReportFile, missingLaneFiles } from "./lane-files.ts";
 import { admitLaunch, type LaunchOutcome, placeLaunch, type PlacedLaunch } from "./launch-service.ts";
 import { Discord, type ThreadMember } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
@@ -121,9 +121,9 @@ const prepare = async (deps: ExecutorDeps, taskId: number, attempt: number) => {
   const [tasks, guidelines, workspaceRepository] = await Promise.all([
     reader.tasksByIds(task.dependsOn), reader.guidelines(task.workspaceId), reader.workspaceRepository(task.workspaceId),
   ]);
+  const reportFile = laneReportFile(deps.stateDir, autopilotLaneKey(taskId, attempt));
   const planned = planTask({
-    task, tasks: new Map(tasks.map((t) => [t.id, t])), guidelines, config: deps.config, workspaceRepository,
-    reportFile: laneReportFile(deps.stateDir, autopilotLaneKey(taskId, attempt)),
+    task, tasks: new Map(tasks.map((t) => [t.id, t])), guidelines, config: deps.config, workspaceRepository, reportFile,
   });
   if (planned.kind === "review") return planned;
   const reasons: string[] = [];
@@ -136,6 +136,12 @@ const prepare = async (deps: ExecutorDeps, taskId: number, attempt: number) => {
   for (const id of task.dependsOn) {
     const dep = tasks.find((t) => t.id === id);
     if (!dep || dep.workspaceId !== task.workspaceId || !depSatisfied(dep)) reasons.push(`prerequisite-open:${id}`);
+  }
+  // Nobody reads an autopilot brief before its launch: a lead file it names but cannot ship stops it here instead.
+  // The lane's own collection directory (a repo-less lane's Done report) is written by the lane, never shipped to it.
+  const output = dirname(reportFile);
+  for (const path of missingLaneFiles(deps.stateDir, planned.brief)) {
+    if (path !== output && !path.startsWith(output + sep)) reasons.push(`lane-file-missing:${path}`);
   }
   return reasons.length ? { kind: "review" as const, reasons } : { ...planned, task };
 };

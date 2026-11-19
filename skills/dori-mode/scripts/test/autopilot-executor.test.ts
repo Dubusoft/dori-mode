@@ -319,6 +319,13 @@ test("a dependency re-read refuses an open prerequisite", async () => {
   expect(h.calls.start).toBe(0);
 });
 
+test("a lead file the description names but cannot ship stops the task before it starts", async () => {
+  const file = join(dir, "briefs", "evidence.md");
+  const h = harness(task({ description: `Work from \`${file}\`.` }));
+  expect((await runExecutor(h.fresh(), [12]))[0]).toMatchObject({ kind: "review", reasons: [`lane-file-missing:${file}`] });
+  expect([h.calls.start, h.calls.admit]).toEqual([0, 0]);
+});
+
 test("failed member addition is partial success and never creates another thread", async () => {
   const h = harness(); h.member({ failed: "403" });
   expect((await runExecutor(h.fresh(), [12]))[0]?.kind).toBe("launched");
