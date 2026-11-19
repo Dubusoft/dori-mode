@@ -6,7 +6,7 @@ import { type Event, type EventMeta, JournalCore, type OwnerNoticeKind } from ".
 import { OWNER_INBOUND, OWNER_REVISION, type OwnerMessage, OwnerTracking, quarantineDigest, type SupervisorHooks } from "./supervise-owner-tracking.ts";
 import { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
 import { Delivery } from "./supervise-delivery.ts";
-import { OutcomeTracking } from "./lane-outcomes.ts";
+import { OutcomeTracking, type ThreadCloseTransport } from "./lane-outcomes.ts";
 import { DecisionTracking } from "./decision-obligations.ts";
 
 /*
@@ -143,11 +143,11 @@ export class Supervisor {
   }
 
   /**
-   * Closes (through `archive`) threads whose work is finished and reported, once per report; see
-   * OutcomeTracking.autoCloseTick.
+   * Puts the owner's close button on the last report of threads whose work is finished and reported, and archives them
+   * once their wait passes; see OutcomeTracking.autoCloseTick.
    */
-  autoCloseTick(archive: (thread: string) => Promise<void>): Promise<void> {
-    return this.outcomes.autoCloseTick(this.core.deps.registry, archive);
+  autoCloseTick(transport: ThreadCloseTransport): Promise<void> {
+    return this.outcomes.autoCloseTick(this.core.deps.registry, transport);
   }
 
   /** Consumes `dori resolved` receipts and enqueues UNRESOLVED for decision events the lead left open past resolveTimeoutMin. */
