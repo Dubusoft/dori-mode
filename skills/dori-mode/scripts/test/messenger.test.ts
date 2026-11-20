@@ -48,6 +48,21 @@ test("Discord messages are sent without pinging anyone and edited in place; thre
   expect(seen.map((r) => `${r.method} ${r.url.replace("https://discord.com/api/v10", "")}`)).toEqual(["POST /channels/C1/messages", "PATCH /channels/C1/messages/M1", "POST /channels/C1/messages/M1/threads", "PATCH /channels/T1"]);
 });
 
+test("sendFiles uploads its files with the last chunk as multipart form data, that chunk's message as payload_json", async () => {
+  const { http, seen } = fakeHttp(() => ok({ id: `M${seen.length}` }));
+  const dc = new Discord(http, sleeps().clock, "b");
+  expect(await dc.sendFiles("C1", `${"a".repeat(1500)}\n${"b".repeat(1000)}`, "s", [{ name: "sheet.webp", data: new Uint8Array([1, 2, 3]) }])).toBe("M1");
+  expect(seen).toHaveLength(2);
+  expect(JSON.parse(String(seen[0]?.body))).not.toHaveProperty("attachments");
+  const form = seen[1]?.body as FormData;
+  expect(form).toBeInstanceOf(FormData);
+  expect(seen[1]?.headers).toEqual({ Authorization: "Bot b" });
+  expect(JSON.parse(String(form.get("payload_json")))).toMatchObject({ content: "b".repeat(1000), allowed_mentions: { parse: [] }, enforce_nonce: true, attachments: [{ id: 0, filename: "sheet.webp" }] });
+  const file = form.get("files[0]") as File;
+  expect(file.name).toBe("sheet.webp");
+  expect([...new Uint8Array(await file.arrayBuffer())]).toEqual([1, 2, 3]);
+});
+
 test("startThread adds the owner, reports an owner Discord already joined, and returns a failed add instead of hiding it", async () => {
   const run = async (member: number, put: number) => {
     const { http, seen } = fakeHttp((req) => req.url.endsWith("/threads") ? ok({ id: "T1" }, 201)
