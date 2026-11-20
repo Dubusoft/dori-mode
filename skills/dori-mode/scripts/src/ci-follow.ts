@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
@@ -271,7 +272,7 @@ type PrView = {
   readonly isDraft?: boolean;
   readonly mergeable?: string;
   readonly mergeStateStatus?: string;
-  readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+  readonly statusCheckRollup?: readonly RollupCheck[];
   readonly mergeCommit?: { readonly oid?: string } | null;
   readonly isCrossRepository?: boolean;
 };
@@ -309,8 +310,8 @@ const waitsOnMerge = (lane: Lane, pull: Pick<OpenPull, "repo" | "number">): bool
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
  * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
- * conflict; `wait` (with why) otherwise. Green needs at least one check that passed: a rollup of only SKIPPED or NEUTRAL
- * checks is treated like no checks at all.
+ * conflict; `wait` (with why) otherwise. Each check is judged by its newest run (check-rollup.ts). Green needs at least
+ * one check that passed: a rollup of only SKIPPED or NEUTRAL checks is treated like no checks at all.
  */
 export const mergeGate = (view: PrView, sha: string, base: string): { readonly verdict: "merge" | "conflict" | "wait"; readonly why: string } => {
   if (view.state !== "OPEN") return { verdict: "wait", why: `state ${view.state ?? "unknown"}` };
@@ -319,7 +320,7 @@ export const mergeGate = (view: PrView, sha: string, base: string): { readonly v
   if (view.isCrossRepository !== false) return { verdict: "wait", why: "head is not a branch of this repo" };
   if (view.isDraft) return { verdict: "wait", why: "draft" };
   if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") return { verdict: "conflict", why: `mergeable ${view.mergeable} state ${view.mergeStateStatus}` };
-  const checks = view.statusCheckRollup ?? [];
+  const checks = latestChecks(view.statusCheckRollup ?? []);
   if (!checks.length) return { verdict: "wait", why: "no checks" };
   const red = checks.filter((c) => c.__typename === "StatusContext" ? c.state !== "SUCCESS" : c.status !== "COMPLETED" || !CHECK_OK.has(c.conclusion ?? ""));
   if (red.length) return { verdict: "wait", why: `${red.length} check(s) not green` };

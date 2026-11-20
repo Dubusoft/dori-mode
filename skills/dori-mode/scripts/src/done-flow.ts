@@ -24,6 +24,7 @@ import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCle
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
 import { OUTCOME_LINE_MAX } from "./lane-outcomes.ts";
 import { type AutoReportPost, openAsks, writtenIn } from "./auto-report.ts";
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -542,16 +543,17 @@ const WAIT_FIELDS = "state,headRefOid,isDraft,mergeable,mergeStateStatus,statusC
 const CHECK_FAILED = new Set(["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
 type WaitView = {
   readonly state?: string; readonly headRefOid?: string; readonly isDraft?: boolean; readonly mergeable?: string; readonly mergeStateStatus?: string;
-  readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+  readonly statusCheckRollup?: readonly RollupCheck[];
 };
 
+/** The PR's failed checks, judged by each check's newest run (check-rollup.ts): a run a newer one replaced never counts. */
 const failedChecks = (view: WaitView) =>
-  (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+  latestChecks(view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
 const conflicting = (view: WaitView): boolean => view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY";
 
 /** The PR's checks in one word: a failed one wins, then one still running; a PR with no checks reads none, never green. */
 const checksWord = (view: WaitView): string => {
-  const rollup = view.statusCheckRollup ?? [];
+  const rollup = latestChecks(view.statusCheckRollup ?? []);
   if (failedChecks(view).length) return "failed";
   if (rollup.some((c) => c.__typename === "StatusContext" ? c.state === "PENDING" || c.state === "EXPECTED" : c.status !== "COMPLETED")) return "pending";
   return rollup.length ? "green" : "none";

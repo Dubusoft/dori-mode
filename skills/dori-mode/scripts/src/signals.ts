@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
 import type { Ran, Runner } from "./run.ts";
 
@@ -221,7 +222,7 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
       const r = await run(["gh", "pr", "list", "--repo", sig.repo, "--head", sig.branch, "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"]);
       const failure = ghFailure(s, r);
       if (failure) return failure;
-      type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: { conclusion?: string; state?: string }[] | null };
+      type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: RollupCheck[] | null };
       let prs: Pr[];
       try {
         prs = JSON.parse(r.out) as Pr[];
@@ -240,7 +241,8 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
       if (latest.state === "MERGED") return { signal: s, ok: true, detail: `MERGED ${url}` };
       if (latest.state !== "OPEN") return { signal: s, ok: false, detail: `${latest.state ?? "no state"} ${url}` };
       if (latest.isDraft) return { signal: s, ok: false, detail: `OPEN draft ${url}` };
-      const checks = latest.statusCheckRollup ?? [];
+      // A check that ran twice at this head is judged by its newest run, so a superseded CANCELLED run is not red.
+      const checks = latestChecks(latest.statusCheckRollup ?? []);
       if (!checks.length) return { signal: s, ok: false, detail: `OPEN with no checks yet ${url}` };
       const notGreen = checks.filter((c) => !["SUCCESS", "SKIPPED", "NEUTRAL"].includes(c.conclusion || c.state || "")).length;
       return notGreen

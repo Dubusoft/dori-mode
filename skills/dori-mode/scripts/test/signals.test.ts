@@ -157,6 +157,14 @@ test("a pr signal is not live while a check is pending, before any check exists,
   }
 });
 
+test("a pr signal judges each check by its newest run at the head: a superseded CANCELLED run is not red, a newest one is", async () => {
+  const preview = (conclusion: string, startedAt: string) => ({ __typename: "CheckRun", name: "preview", workflowName: "Deploy", status: "COMPLETED", conclusion, startedAt });
+  const rerun = [preview("CANCELLED", "2026-11-20T01:00:00Z"), preview("SUCCESS", "2026-11-20T01:00:05Z")];
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([pr({ statusCheckRollup: rerun })]).fake, io)).toMatchObject({ ok: true, detail: `OPEN, 1 checks green ${URL7}` });
+  const lastCancelled = [preview("SUCCESS", "2026-11-20T01:00:00Z"), preview("CANCELLED", "2026-11-20T01:00:05Z")];
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([pr({ statusCheckRollup: lastCancelled })]).fake, io)).toMatchObject({ ok: false, detail: `OPEN, 1 of 1 checks not green ${URL7}` });
+});
+
 test("a pr signal judges the newest PR, so an old merged PR from a reused branch name does not count", async () => {
   const newer = "https://github.com/acme/app/pull/9";
   const prs = [pr({ state: "MERGED", createdAt: "2026-10-01T00:00:00Z" }), pr({ number: 9, url: newer, createdAt: "2026-11-05T00:00:00Z", statusCheckRollup: [{ conclusion: "" }] })];
