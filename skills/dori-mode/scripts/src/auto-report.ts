@@ -14,6 +14,12 @@ import { factLanguage } from "./task-finish.ts";
  * owner's language (writtenIn) and nothing is open on the lane for the lead (openAsks); done-flow.ts adds the rest.
  */
 
+/**
+ * The `autoReported` mark (and `report=` in LANE_DONE_AUTO_REPORTED) of a claim of a lane config `reportQuietLanes`
+ * names: recorded reported with nothing posted, because the lane posts its own results (done-flow.ts).
+ */
+export const QUIET_REPORT = "quiet";
+
 /** Posts lane `lane`'s auto report of `claim` and records it reported; returns the message id. Throws when nothing was posted. */
 export type AutoReportPost = (lane: Lane, claim: Claim) => Promise<string>;
 

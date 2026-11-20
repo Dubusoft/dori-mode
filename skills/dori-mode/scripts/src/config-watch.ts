@@ -108,7 +108,7 @@ const strings = (v: unknown): boolean => Array.isArray(v) && v.every((s) => type
  * defaults these by spreading the file, so a reload checks them itself. Undefined when the config is usable.
  */
 export const configReloadError = (c: DoriConfig): string | undefined => {
-  for (const key of ["discordChannels", "githubIssueAuthors", "ignorePanes", "leadArgs"] as const) {
+  for (const key of ["discordChannels", "githubIssueAuthors", "ignorePanes", "leadArgs", "reportQuietLanes"] as const) {
     if (!strings(c[key])) return `${key} must be an array of strings`;
   }
   if (!strings(c.agentCommand) || c.agentCommand.length === 0) return "agentCommand must be a non-empty array of strings";
