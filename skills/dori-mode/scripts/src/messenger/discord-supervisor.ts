@@ -127,7 +127,7 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       contentWarned = true;
       log('DISCORD_INBOUND_WARNING a message arrived with no content: enable the privileged "Message Content Intent" in the Developer Portal (Bot tab); such messages are forwarded marked as content unavailable');
     },
-    onOwner: (channel, id) => {
+    onOwner: (channel, id, m) => {
       ownerMessages.delete(id);
       ownerMessages.set(id, channel);
       if (ownerMessages.size > 1_000) ownerMessages.delete(ownerMessages.keys().next().value ?? "");
@@ -136,7 +136,8 @@ export const supervisorDiscord = (deps: FlowDeps, options: SupervisorDiscordOpti
       catch { log(`THREAD_CLOSE_TIMER_ERROR cannot restart the close wait of ${channel}`); }
       try {
         // An answer in the decisions channel body (not in a thread) counts when exactly one decision there is waiting.
-        const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now())
+        // In a thread shared by several decisions, the reply target or a named id picks the one it answers.
+        const answer = recordOwnerAnswer(deps.config.stateDir, channel, id, deps.clock.now(), { ...(m.replyTo ? { replyTo: m.replyTo } : {}), content: m.content })
           ?? (channel === decisionsChannel() ? recordChannelAnswer(deps.config.stateDir, channel, id, deps.clock.now()) : undefined);
         if (answer?.first) {
           options.emit(answeredEventId(answer.decision.id), answeredLine(answer.decision)).catch(() => { log(`DECISION_ERROR cannot queue OWNER_DECISION_ANSWERED ${answer.decision.id}`); });
