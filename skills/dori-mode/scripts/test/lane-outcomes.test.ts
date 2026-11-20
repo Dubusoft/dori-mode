@@ -491,6 +491,31 @@ const autoClose = () => {
 
 const HOUR = 60 * MIN;
 
+test("a quiet lane's claim (reportQuietLanes) is owed nothing and leaves the thread's close button to the thread's real reports", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("blog-draft-1", { thread: "discord:100/200" }));
+  // done-flow.ts writes the quiet receipt (no message, no thread) before announcing the claim.
+  recordReported(f.state.dir, "blog-draft-1", f.clock.now(), "reportQuietLanes: the lane posts its own results");
+  f.supervisor.enqueue("done-claim:blog-draft-1:1", "LANE_DONE_AUTO_REPORTED blog-draft-1 w:p1 merged acme/app#1 | verified: pr=none sig=ok report=quiet");
+  f.clock.at += 10 * MIN;
+  await f.tick();
+  await f.close("blog-draft-1");
+  f.supervisor.enqueue("closed:blog-draft-1", "LANE_CLOSED blog-draft-1 closed seen-claim toodo=no-task");
+  f.clock.at += 10 * MIN;
+  await f.tick();
+  expect(f.unreported()).toEqual([]);
+  expect(readJournal(f.state.dir).outcomes).toMatchObject([{ lane: "blog-draft-1", reportedAt: T0, quiet: ["closed:blog-draft-1"] }]);
+  expect(readJournal(f.state.dir).outcomes[0].thread).toBeUndefined();
+  expect(f.posts).toEqual([]);
+  expect(f.buttons).toEqual([]);
+  // A real report into the thread still gets the close button as before.
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200", closedAt: new Date(f.clock.now()).toISOString() }));
+  f.report("beta", { message: "r1" });
+  await f.tick();
+  expect(f.buttons).toEqual(["live 200/r1"]);
+  f.supervisor.close();
+});
+
 test("a finished thread gets the close button on its last report instead of closing, and closes threadCloseAfterHours later", async () => {
   const f = autoClose();
   await f.deps.registry.write(lane("alpha", { thread: "discord:100/200", closedAt: new Date(T0).toISOString() }));

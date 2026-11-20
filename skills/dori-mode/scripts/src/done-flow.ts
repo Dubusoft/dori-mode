@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import type { DoriConfig } from "./config.ts";
+import { type DoriConfig, reportQuietLane } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type Claim, type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
@@ -22,8 +22,8 @@ import type { Tunables } from "./tunables.ts";
 import { type Act, actRecorded, type LaneRead, probeWorktree, readLane, type Step, withOperations } from "./flow-io.ts";
 import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCleanup, QUEUED_WORKTREE, remoteWorktrees } from "./closed-cleanup.ts";
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
-import { OUTCOME_LINE_MAX } from "./lane-outcomes.ts";
-import { type AutoReportPost, openAsks, writtenIn } from "./auto-report.ts";
+import { OUTCOME_LINE_MAX, recordReported } from "./lane-outcomes.ts";
+import { type AutoReportPost, openAsks, QUIET_REPORT, writtenIn } from "./auto-report.ts";
 import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 
 export type FlowDeps = {
@@ -623,19 +623,33 @@ const autoReportable = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: b
 };
 
 /**
- * The auto report of a fresh claim: its message id once posted (kept on the claim right away, so a pass repeated after a
- * crash never posts it twice), the urgent LANE_AUTO_REPORT_FAILED line when the post failed (the claim then wakes the
+ * Whether a claim is reported quietly: config `reportQuietLanes` names the lane (it posts its own results to the owner),
+ * it is no review lane, and it has no objection on record and nothing open for the lead (openAsks). Its done text, its
+ * language and the preverify snapshot do not matter: nothing is posted, and the close still re-reads the Done signals,
+ * so a failing one comes back to the lead as LANE_NOT_DONE.
+ */
+const quietReportable = (deps: FlowDeps, lane: Lane): boolean =>
+  reportQuietLane(deps.config, lane.key) && !lane.review && !lane.objection && !openAsks(deps.config.stateDir, lane.key).length;
+
+/**
+ * The auto report of a fresh claim: its message id once posted, or QUIET_REPORT once a quiet lane's receipt is written
+ * (kept on the claim right away, so a pass repeated after a crash never posts or records it twice), the urgent LANE_AUTO_REPORT_FAILED line when the post failed (the claim then wakes the
  * lead as before), or undefined when the claim is not one the supervisor reports.
  */
 const autoReportClaim = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: boolean): Promise<{ readonly message: string } | { readonly failed: string } | undefined> => {
   if (claim.autoReported) return { message: claim.autoReported };
-  if (!deps.autoReport || !(await autoReportable(deps, lane, claim, clean))) return undefined;
-  const post = deps.autoReport;
   let message: string;
-  try {
-    message = await post(lane, claim);
-  } catch (e) {
-    return { failed: `LANE_AUTO_REPORT_FAILED ${lane.key} ${eventText((e instanceof Error ? e.message : String(e)).replace(/\s+/g, " "), 200)}: the claim was not reported to the owner; report it yourself (dori reported ${lane.key} --text TEXT)` };
+  if (quietReportable(deps, lane)) {
+    // The lane posts its own results: the receipt is written with no post, so no thread or message is recorded for it.
+    recordReported(deps.config.stateDir, lane.key, deps.clock.now(), "reportQuietLanes: the lane posts its own results");
+    message = QUIET_REPORT;
+  } else {
+    if (!deps.autoReport || !(await autoReportable(deps, lane, claim, clean))) return undefined;
+    try {
+      message = await deps.autoReport(lane, claim);
+    } catch (e) {
+      return { failed: `LANE_AUTO_REPORT_FAILED ${lane.key} ${eventText((e instanceof Error ? e.message : String(e)).replace(/\s+/g, " "), 200)}: the claim was not reported to the owner; report it yourself (dori reported ${lane.key} --text TEXT)` };
+    }
   }
   const at = claim.at;
   await deps.registry.patch(lane.key, (current) => (current.claim?.at === at ? { claim: { ...current.claim, autoReported: message } } : undefined));

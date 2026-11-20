@@ -11,7 +11,7 @@ import type { DoriConfig } from "../src/config.ts";
 import { UNRESOLVED_FILE } from "../src/decision-obligations.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
-import { OUTCOME_LINE_MAX } from "../src/lane-outcomes.ts";
+import { OUTCOME_LINE_MAX, pendingReported } from "../src/lane-outcomes.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
 import { type Lane, statusOf, withStatus } from "../src/registry.ts";
 import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
@@ -899,6 +899,30 @@ for (const [name, claim] of notReported) {
     expect(posts).toEqual([]);
   });
 }
+
+test("a claim of a lane reportQuietLanes names is recorded reported with no post and reaches the lead as digest; other lanes still wake it", async () => {
+  livePane();
+  const { posts, post } = recordingPost();
+  const quiet = { reportQuietLanes: ["blog-topics-*", "blog-draft-*"] };
+  const never = () => false;
+  const blog: Lane = { ...lane, key: "blog-draft-20261120" };
+  await at(T0).registry.write(blog);
+  // An English done text of a lane no autopilot attempt names: only the pattern decides.
+  await claimDone(reporting(at(T0), post, quiet), blog, "merged acme/app#1 abc123", undefined, "draft preview posted");
+  const lines = await watchTick(reporting(at(T0), post, quiet, never));
+  expect(lines).toEqual(["LANE_DONE_AUTO_REPORTED blog-draft-20261120 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok report=quiet"]);
+  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
+  expect(posts).toEqual([]);
+  // The receipt names no message or thread, so it never arms or moves the thread's close button.
+  expect(pendingReported(state.dir).map(({ path: _, ...r }) => r)).toEqual([{ lane: "blog-draft-20261120", at: T0, note: "reportQuietLanes: the lane posts its own results" }]);
+  expect((await watchTick(reporting(at(T0 + 5 * MIN + 1), post, quiet, never)))[0]).toBe("LANE_CLOSED blog-draft-20261120 closed seen-claim");
+  expect(pendingReported(state.dir)).toHaveLength(1);
+  // A lane the patterns do not name reports as before.
+  const other: Lane = { ...lane, key: "blog-publish-1" };
+  await at(T0).registry.write(other);
+  await claimDone(reporting(at(T0), post, quiet), other, "merged acme/app#1 abc123", undefined, KO_TEXT);
+  expect(await watchTick(reporting(at(T0), post, quiet))).toEqual(["LANE_DONE_CLAIMED blog-publish-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
+});
 
 test("autoReport all covers any lane: a clean PR snapshot is auto-reported, pending checks wake the lead", async () => {
   const { posts, post } = recordingPost();

@@ -29,7 +29,10 @@ export type Claim = {
   readonly pulls?: readonly ClaimedPull[];
   /** The lane's own done text (`dori report <key> done --text`): the body of the supervisor's auto report (done-flow.ts). */
   readonly text?: string;
-  /** The message id of the supervisor's auto report of this claim: the claim was reported to the owner without the lead. */
+  /**
+   * The message id of the supervisor's auto report of this claim: the claim was reported to the owner without the lead.
+   * `quiet` (auto-report.ts QUIET_REPORT): recorded reported with no post, the lane posts its own results.
+   */
   readonly autoReported?: string;
 };
 export type ClaimedPull = { readonly repo: string; readonly number: number; readonly sha: string };
