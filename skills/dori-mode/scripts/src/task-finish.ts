@@ -15,8 +15,9 @@ import type { ToodoWriter } from "./toodo-client.ts";
  * read back nothing is appended and the task is left to the lead.
  *
  * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
- * supervisor completed the task (finishedOutcome). A repo-less autopilot lane has no PR: the report its claim installed
- * stands in for the merge (reportFinish). An autopilot lane that closed not adopted (no PR, its `not-adopted.md`
+ * supervisor completed the task (finishedOutcome). A repo-less autopilot lane has no PR, nor has a repo lane that closed
+ * on its report (work with no PR to make, its `report.md` installed; done-flow.ts): the report its claim installed stands
+ * in for the merge (reportFinish). An autopilot lane that closed not adopted (no PR, its `not-adopted.md`
  * installed; done-flow.ts) has its task concluded `not_adopted` with that conclusion as the note (notAdoptedFinish), and
  * its AUTOPILOT_LANE_DONE is rewritten `toodo=not-adopted` (digest). An autopilot task the supervisor did not finish, or whose lane closed
  * cancelled, gets a blocker note (taskBlocker, read back) and its one failure line says so; done-flow.ts marks the
@@ -49,7 +50,8 @@ export type TaskFinisherDeps = {
 
 /**
  * The merges of a closed lane (done-flow.ts laneMerges), or why none was read back; for a repo-less autopilot lane, the
- * lead-host path of the report its claim installed (done-flow.ts laneReport), which stands in for the merge; for an
+ * lead-host path of the report its claim installed (done-flow.ts laneReport), which stands in for the merge (also for a
+ * repo lane closed on its report); for an
  * autopilot lane closed not adopted, the lead-host path of the `not-adopted.md` its claim installed.
  */
 export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly report: string } | { readonly notAdopted: string } | { readonly why: string };
@@ -159,13 +161,14 @@ const unmergedFinish = async (writer: Pick<ToodoWriter, "read">, lane: Lane, tas
 };
 
 /**
- * A repo-less autopilot lane closed with its report installed: each pending manual criterion is checked with the report
- * as evidence and the task is completed, then its report gets the task-done fact line (no merge part).
+ * An autopilot lane closed with its report installed and no PR (repo-less, or a repo lane closed on its report): each
+ * pending manual criterion is checked with the report as evidence and the task is completed, then its report gets the
+ * task-done fact line (no merge part).
  */
 const reportFinish = async (deps: TaskFinisherDeps, lane: Lane, task: number, report: string): Promise<TaskFinish> => {
   try {
     const record = await deps.writer.read(task);
-    const evidence = `report ${report} (lane ${lane.key} closed after its Done signals read back live)`;
+    const evidence = `report ${report} (lane ${lane.key} closed with its report installed)`;
     for (const criterion of record.criteria) {
       if (criterion.kind === "manual" && criterion.state !== "met") await deps.writer.checkCriterion(task, criterion.id, evidence);
     }
