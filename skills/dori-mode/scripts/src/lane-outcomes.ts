@@ -28,7 +28,7 @@ import type { Event, Journal, JournalCore, LaneOutcome } from "./supervise-journ
  * quiet and wakes no one (supervise-delivery.ts); it rides along with the next delivery. That is a claimed lane's first
  * CI_MERGED, or one at a PR head the row already saw merged: the claim already woke the lead, and the merge closes the
  * lane at once (done-flow.ts mergeConfirmed). Once an event of the row has woken the lead, a close whose Toodo task the
- * supervisor finished (`toodo=done`, task-finish.ts) or that has none (`toodo=no-task`) and the lane's
+ * supervisor finished (`toodo=done`, or `toodo=not-adopted` for a lane closed not adopted; task-finish.ts) or that has none (`toodo=no-task`) and the lane's
  * AUTOPILOT_LANE_DONE are quiet too: one lane result wakes the lead once. A claim, a close the lead still has work on, and a merge at another PR head always wake; so do the
  * failure lines (LANE_NOT_DONE, TOODO_TASK_NOT_COMPLETED, AUTOPILOT_LANE_FAILED), which never join a row.
  *
@@ -59,7 +59,7 @@ const REJECTED = "LANE_NOT_DONE ";
 const MERGED = "CI_MERGED ";
 const AUTOPILOT_DONE = "AUTOPILOT_LANE_DONE ";
 /** A close after which nothing is left for the lead: the supervisor finished the lane's Toodo task, or it has none. */
-const FINISHED_CLOSE = /^LANE_CLOSED \S+ closed\b.* toodo=(?:done|no-task)(?= |$)/;
+const FINISHED_CLOSE = /^LANE_CLOSED \S+ closed\b.* toodo=(?:done|not-adopted|no-task)(?= |$)/;
 
 /** The PR head a `CI_MERGED ... head=<sha> ...` line names. */
 const mergedHead = (line: string): string | undefined => (line.startsWith(MERGED) ? / head=(\S+)/.exec(line)?.[1] : undefined);

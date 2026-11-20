@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { LANE_DONE_EVENT, LANE_FAILED_EVENT } from "./autopilot.ts";
 import type { Lane } from "./registry.ts";
 import type { ToodoWriter } from "./toodo-client.ts";
@@ -14,7 +16,9 @@ import type { ToodoWriter } from "./toodo-client.ts";
  *
  * An autopilot lane's close is told the same way: its AUTOPILOT_LANE_DONE is rewritten `toodo=done` (digest) once the
  * supervisor completed the task (finishedOutcome). A repo-less autopilot lane has no PR: the report its claim installed
- * stands in for the merge (reportFinish). An autopilot task the supervisor did not finish, or whose lane closed
+ * stands in for the merge (reportFinish). An autopilot lane that closed not adopted (no PR, its `not-adopted.md`
+ * installed; done-flow.ts) has its task concluded `not_adopted` with that conclusion as the note (notAdoptedFinish), and
+ * its AUTOPILOT_LANE_DONE is rewritten `toodo=not-adopted` (digest). An autopilot task the supervisor did not finish, or whose lane closed
  * cancelled, gets a blocker note (taskBlocker, read back) and its one failure line says so; done-flow.ts marks the
  * launch attempt (autopilot.ts markLaneToodo) so the task is written to and told about once, and never relaunched.
  */
@@ -26,16 +30,17 @@ export type LaneMerge = { readonly repo: string; readonly number: number; readon
  * What a close says about its task, as `toodo=<tag>` on the close line: `done` (completed and read back; the report was
  * appended, or there was nothing it could be appended to without a new post; or, with no merge read back, the task
  * already reads done and completed), `append-failed` (completed, the append failed), `failed` (not completed),
- * `unmerged` (no merge read back and the task not read done, so not completed), `no-task`.
+ * `unmerged` (no merge read back and the task not read done, so not completed), `no-task`, `not-adopted` (concluded
+ * not adopted and read back, or it already read done).
  */
-export type TaskFinishTag = "done" | "append-failed" | "failed" | "unmerged" | "no-task";
+export type TaskFinishTag = "done" | "append-failed" | "failed" | "unmerged" | "no-task" | "not-adopted";
 export type TaskFinish = { readonly tag: TaskFinishTag; readonly lines: readonly string[] };
 
 /** How an append ended: `appended`, or `skipped` with why (a closed thread, no report message, too long). Throws on a failed edit. */
 export type AppendOutcome = { readonly appended: true; readonly message: string } | { readonly appended: false; readonly why: string };
 
 export type TaskFinisherDeps = {
-  readonly writer: Pick<ToodoWriter, "read" | "checkCriterion" | "completeTask">;
+  readonly writer: Pick<ToodoWriter, "read" | "checkCriterion" | "completeTask" | "concludeNotAdopted">;
   /** Appends `text` to `lane`'s last report (thread-followup.ts appendFollowUp). */
   readonly append: (lane: Lane, text: string) => Promise<AppendOutcome>;
   /** The owner's language (config ownerLanguage), read at each finish so a config reload applies. */
@@ -44,9 +49,10 @@ export type TaskFinisherDeps = {
 
 /**
  * The merges of a closed lane (done-flow.ts laneMerges), or why none was read back; for a repo-less autopilot lane, the
- * lead-host path of the report its claim installed (done-flow.ts laneReport), which stands in for the merge.
+ * lead-host path of the report its claim installed (done-flow.ts laneReport), which stands in for the merge; for an
+ * autopilot lane closed not adopted, the lead-host path of the `not-adopted.md` its claim installed.
  */
-export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly report: string } | { readonly why: string };
+export type LaneMergeRead = { readonly merges: readonly LaneMerge[] } | { readonly report: string } | { readonly notAdopted: string } | { readonly why: string };
 
 /** `task` is undefined for a lane with no Toodo task: only the merge fact line is appended. */
 export type TaskFinisher = (lane: Lane, task: number | undefined, read: LaneMergeRead) => Promise<TaskFinish>;
@@ -55,10 +61,10 @@ const flat = (text: string, max = 200): string => text.replace(/\s+/g, " ").trim
 const errorText = (e: unknown): string => flat(e instanceof Error ? e.message : String(e));
 
 const FACT_WORDS = {
-  ko: { merged: "머지", done: (task: number) => `Toodo #${task} 완료` },
-  ja: { merged: "マージ", done: (task: number) => `Toodo #${task} 完了` },
-  zh: { merged: "已合并", done: (task: number) => `Toodo #${task} 已完成` },
-  en: { merged: "Merged", done: (task: number) => `Toodo #${task} done` },
+  ko: { merged: "머지", done: (task: number) => `Toodo #${task} 완료`, notAdopted: (task: number) => `Toodo #${task} not adopted로 마무리` },
+  ja: { merged: "マージ", done: (task: number) => `Toodo #${task} 完了`, notAdopted: (task: number) => `Toodo #${task} 不採用で終了` },
+  zh: { merged: "已合并", done: (task: number) => `Toodo #${task} 已完成`, notAdopted: (task: number) => `Toodo #${task} 未采纳` },
+  en: { merged: "Merged", done: (task: number) => `Toodo #${task} done`, notAdopted: (task: number) => `Toodo #${task} not adopted` },
 } as const;
 
 /** The owner's language (config ownerLanguage) as one of the languages dori writes fixed text in; anything else is English. */
@@ -115,17 +121,19 @@ export const taskBlocker = (writer: Pick<ToodoWriter, "reportBlocker">): TaskBlo
   }
 };
 
-/** Tags whose task the supervisor completed and read back. */
-export const taskCompleted = (finish: TaskFinish | undefined): boolean => finish?.tag === "done" || finish?.tag === "append-failed";
+/** Tags whose task the supervisor finished (completed, or concluded not adopted) and read back. */
+export const taskCompleted = (finish: TaskFinish | undefined): boolean => finish?.tag === "done" || finish?.tag === "append-failed" || finish?.tag === "not-adopted";
 
 /**
  * An autopilot outcome line after its lane's task follow-up: AUTOPILOT_LANE_DONE asks the lead to complete the task only
  * while the supervisor has not (`toodo=done` otherwise, which is digest). Any other line is returned as is.
  */
-export const finishedOutcome = (line: string, finish: TaskFinish | undefined): string =>
-  line.startsWith(`${LANE_DONE_EVENT} `) && taskCompleted(finish)
-    ? line.replace(/: complete toodo task (#\d+)$/, " toodo=done: toodo task $1 completed and read back by the supervisor")
-    : line;
+export const finishedOutcome = (line: string, finish: TaskFinish | undefined): string => {
+  if (!line.startsWith(`${LANE_DONE_EVENT} `) || !taskCompleted(finish)) return line;
+  return finish?.tag === "not-adopted"
+    ? line.replace(/: complete toodo task (#\d+)$/, " toodo=not-adopted: toodo task $1 concluded not adopted and read back by the supervisor")
+    : line.replace(/: complete toodo task (#\d+)$/, " toodo=done: toodo task $1 completed and read back by the supervisor");
+};
 
 /** An AUTOPILOT_LANE_FAILED line with what was recorded on its task (`said`, from TaskBlocker) and `toodo=blocked`. */
 export const blockedOutcome = (line: string, said: string): string =>
@@ -173,9 +181,35 @@ const reportFinish = async (deps: TaskFinisherDeps, lane: Lane, task: number, re
   }
 };
 
+/** The conclusion text kept in the task's note, capped so a long file still fits one toodo note. */
+const CONCLUSION_MAX = 4000;
+
+/**
+ * An autopilot lane closed not adopted: its task is concluded `not_adopted` with the lane's conclusion as the note, then
+ * its report gets the not-adopted fact line. A task already done (the lead finished it first) is left as it is.
+ */
+const notAdoptedFinish = async (deps: TaskFinisherDeps, lane: Lane, task: number, file: string): Promise<TaskFinish> => {
+  const head = `TOODO_TASK_NOT_ADOPTED ${lane.key} #${task} conclusion=${file}`;
+  try {
+    const record = await deps.writer.read(task);
+    if (record.status === "done") return { tag: record.resolution === "not_adopted" ? "not-adopted" : "done", lines: [] };
+    const text = readFileSync(file, "utf8").trim();
+    const conclusion = text.length > CONCLUSION_MAX ? `${text.slice(0, CONCLUSION_MAX - 1)}…` : text;
+    await deps.writer.concludeNotAdopted(task, [conclusion, `Conclusion: ${file}. Concluded not adopted by the dori supervisor when lane ${lane.key} closed without a PR.`].filter(Boolean).join("\n\n"));
+  } catch (e) {
+    return { tag: "failed", lines: [`TOODO_TASK_NOT_COMPLETED ${lane.key} #${task} toodo: ${errorText(e)}; finish it yourself (conclude_task not_adopted with the conclusion ${file})`] };
+  }
+  try {
+    return { tag: "not-adopted", lines: [`${head}; report ${appendedText(await deps.append(lane, FACT_WORDS[factLanguage(deps.language?.())].notAdopted(task)))}`] };
+  } catch (e) {
+    return { tag: "not-adopted", lines: [`${head}; report not appended: ${errorText(e)}; append it with ${appendYourself(lane)}`] };
+  }
+};
+
 export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lane, task, read) => {
   if (task === undefined) return "merges" in read ? { tag: "no-task", lines: [await appendMergeFact(deps, lane, read.merges)] } : { tag: "no-task", lines: [] };
   if ("report" in read) return reportFinish(deps, lane, task, read.report);
+  if ("notAdopted" in read) return notAdoptedFinish(deps, lane, task, read.notAdopted);
   if ("why" in read) return unmergedFinish(deps.writer, lane, task, read.why);
   const { merges } = read;
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");
