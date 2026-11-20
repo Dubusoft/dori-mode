@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { Clock } from "../run.ts";
 import { guardText, type Http, MessengerError, withBackoff } from "./http.ts";
-import { splitDiscordMessage } from "./discord-split.ts";
+import { realNewlines, splitDiscordMessage } from "./discord-split.ts";
 
 const retryAfter = (body: string): number | undefined => {
   try {
@@ -67,7 +67,7 @@ export class Discord {
     extra: { readonly components?: readonly unknown[]; readonly flags?: number; readonly files?: readonly DiscordFile[] }): Promise<string> {
     let first: string | undefined;
     const path = `/channels/${channelId}/messages`;
-    const chunks = splitDiscordMessage(guardText(content));
+    const chunks = splitDiscordMessage(guardText(realNewlines(content)));
     for (const [index, chunk] of chunks.entries()) {
       const nonce = createHash("sha256").update(JSON.stringify([channelId, stableId ?? content, index])).digest("hex").slice(0, 25);
       const last = index === chunks.length - 1;
@@ -97,7 +97,7 @@ export class Discord {
   async executeWebhook(webhookUrl: string, content: string, identity: { readonly username: string; readonly avatarUrl?: string }): Promise<string> {
     if (!/^https:\/\/(?:[a-z]+\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(webhookUrl)) throw new MessengerError("discord webhook: not a Discord webhook URL", 0);
     const body = JSON.stringify({
-      content: guardText(content), username: identity.username.slice(0, 80), allowed_mentions: { parse: [] },
+      content: guardText(realNewlines(content)), username: identity.username.slice(0, 80), allowed_mentions: { parse: [] },
       ...(identity.avatarUrl ? { avatar_url: identity.avatarUrl } : {}),
     });
     const res = await withBackoff(this.http, this.clock, { method: "POST", url: `${webhookUrl}?wait=true`, headers: { "Content-Type": "application/json" }, body }, undefined, retryAfter);
@@ -108,7 +108,7 @@ export class Discord {
   }
 
   async edit(channelId: string, messageId: string, content: string): Promise<void> {
-    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
+    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(realNewlines(content)) });
   }
 
   async editComponents(channelId: string, messageId: string, components: readonly unknown[]): Promise<void> {
