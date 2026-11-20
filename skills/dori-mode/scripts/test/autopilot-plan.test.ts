@@ -159,6 +159,7 @@ test("the brief carries the title, description, criteria, dependencies, refs, gu
     "",
     "## 실행 계약",
     "- 저장소 dubusoft/dori-mode. origin/dev에서 브랜치 feat/x를 만들어 dev로 PR을 연다. PR 전에 origin/dev로 리베이스한다.",
+    "- 조사 결과 수정할 것이 없으면(not adopted) PR을 열지 않고 브랜치도 푸시하지 않는다. DORI_LANE_OUT/not-adopted.md에 결론과 근거(확인한 내용, 파일, 링크)를 쓰고 done을 보고한다. 그 파일이 있고 feat/x에서 연 PR이 없으면 레인은 Done의 PR 대신 그 결론으로 닫히고 태스크는 not_adopted로 마무리된다.",
     "- Done = pr dubusoft/dori-mode feat/x",
     "- 모드 ulw",
     `- 계약 버전 ${contract.version}, 가이드라인 스냅샷 ${contract.guidelines.hash}`,

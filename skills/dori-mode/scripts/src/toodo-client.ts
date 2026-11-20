@@ -343,4 +343,9 @@ export class ToodoWriter {
       id, refs, ...(opts.note === undefined ? {} : { note: opts.note }),
     });
   }
+
+  /** Concludes the task not adopted (`done`, `not_adopted`) with its required note; already written when it reads so. */
+  concludeNotAdopted(id: number, note: string): Promise<ToodoWrite> {
+    return this.write(id, (t) => t.status === "done" && t.resolution === "not_adopted", "conclude_task", { id, note: note.trim(), outcome: "not_adopted" });
+  }
 }

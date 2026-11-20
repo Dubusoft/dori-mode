@@ -330,6 +330,10 @@ export const laneOutputDir = (stateDir: string, key: string): string => join(dir
 export const LANE_REPORT_NAME = "report.md";
 /** Where a lane's `report.md` lands on the lead host once its claim's files are installed: the Done of a repo-less lane. */
 export const laneReportFile = (stateDir: string, key: string): string => join(laneOutputDir(stateDir, key), LANE_REPORT_NAME);
+/** The conclusion an autopilot lane writes in DORI_LANE_OUT when its investigation finds no change to make (autopilot-plan.ts). */
+export const LANE_NOT_ADOPTED_NAME = "not-adopted.md";
+/** Where a lane's `not-adopted.md` lands on the lead host: it closes the lane not adopted instead of on its PR (done-flow.ts). */
+export const laneNotAdoptedFile = (stateDir: string, key: string): string => join(laneOutputDir(stateDir, key), LANE_NOT_ADOPTED_NAME);
 const unsafeDestination = (key: string, path: string): LaneFileError => new LaneFileError("LANE_REPORT_DESTINATION_UNSAFE", key,
   `collection destination ${JSON.stringify(path)} is not a safe dori-managed directory; move the conflicting path aside and retry the claim`);
 const ownerSafe = (path: string, st: Stats): boolean => {
