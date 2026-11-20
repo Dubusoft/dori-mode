@@ -397,14 +397,16 @@ test("a lane question whose lane thread sits in decisionsChannel is asked in tha
   expect(recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200)).toBeUndefined();
 });
 
-test("a second question in the same lane thread takes the next answer, and a lane thread outside decisionsChannel still gets its own thread", async () => {
+test("a second question in the same lane thread takes only the answer that replies to it, and a lane thread outside decisionsChannel still gets its own thread", async () => {
   const dir = stateDir();
   const fake = fakeTransport();
   const ctx = context(dir, fake.transport);
   await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-1", text: serializeDecisionText(choices) });
   recordOwnerAnswer(dir, "777", "owner-1", 1_800_000_000_100);
-  await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
-  const second = recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200);
+  const followUp = await openLaneDecision(ctx, { key: "ap-925-1", thread: "discord:555/777" }, { id: "row-2", text: serializeDecisionText({ ...choices, question: "And the follow-up?" }) });
+  // Two questions wait in the thread: a message naming neither answers neither (the lead reads it and picks).
+  expect(recordOwnerAnswer(dir, "777", "owner-2", 1_800_000_000_200, { content: "sounds good" })).toBeUndefined();
+  const second = recordOwnerAnswer(dir, "777", "owner-3", 1_800_000_000_300, { replyTo: followUp?.decision.message, content: "sounds good" });
   expect(second).toMatchObject({ first: true, decision: { id: "d2", state: "answered" } });
   const other = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-3", text: serializeDecisionText(choices) });
   expect(other?.decision).toMatchObject({ channel: "555", thread: "1000" });
@@ -425,7 +427,7 @@ test("a question of a lane or task with an open blocking decision joins that thr
   expect(lead.decision).toMatchObject({ id: "d3", thread: "1000", attachedTo: "d2" });
   expect(fake.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
   const followUp = String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "1000").at(1)?.args[1]);
-  expect(followUp).toContain("d1에 이어서");
+  expect(followUp).toContain("별도 건(d1 스레드에 함께 올림)");
   for (const id of ["d1", "d2"]) {
     const closed = await closeOwnerDecision(ctx, id, { text: "done", choice: 1 });
     expect(closed.archivePending).toBeUndefined();
@@ -435,6 +437,27 @@ test("a question of a lane or task with an open blocking decision joins that thr
   await closeOwnerDecision(ctx, "d3", { text: "done", choice: 1 });
   expect(String(fake.calls.filter((call) => call.method === "send").at(-1)?.args[1])).toContain("스레드를 닫습니다");
   expect(fake.archived.get("1000")).toBe(true);
+});
+
+test("in a shared thread an owner message answers only the decision it replies to or names, never one that already holds it", async () => {
+  const dir = stateDir();
+  const fake = fakeTransport();
+  const ctx = context(dir, fake.transport);
+  const first = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-1", text: serializeDecisionText(choices) });
+  const second = await openLaneDecision(ctx, { key: "ap-926-1", thread: "discord:111/888" }, { id: "row-2", text: serializeRequestText({ need: "The store login code", reason: "Only you get it", waiting: "Upload", blocking: true }) });
+  expect(second?.decision).toMatchObject({ id: "d2", kind: "request", thread: "1000", attachedTo: "d1" });
+  const start = String(fake.calls.filter((call) => call.method === "send" && call.args[0] === "1000").at(1)?.args[1]);
+  expect(start).toContain("이 메시지에 답장(reply)해서");
+  // Names neither: no decision takes it, so no OWNER_DECISION_ANSWERED goes out for the wrong one.
+  expect(recordOwnerAnswer(dir, "1000", "41", 1_800_000_000_100, { content: "There is no pricing page" })).toBeUndefined();
+  // A reply to d1's question and a message naming d2 each answer that one, even with the other one newer or older.
+  expect(recordOwnerAnswer(dir, "1000", "42", 1_800_000_000_200, { replyTo: first?.decision.message, content: "1" })).toMatchObject({ first: true, decision: { id: "d1" } });
+  const named = recordOwnerAnswer(dir, "1000", "43", 1_800_000_000_300, { content: "d2: 123456" });
+  expect(named).toMatchObject({ first: true, decision: { id: "d2" } });
+  // d2 closes; the same message seen again (REST catch-up) stays d2's and is not taken by d1, now alone in the thread.
+  await closeOwnerDecision(ctx, "d2", { text: "got it" });
+  expect(recordOwnerAnswer(dir, "1000", "43", 1_800_000_000_400, { content: "d2: 123456" })).toMatchObject({ first: false, decision: { id: "d2" } });
+  expect(readDecisions(dir).decisions.find((d) => d.id === "d1")?.answers?.map((a) => a.message)).toEqual(["42"]);
 });
 
 test("a lane launched for a task under an ordinary key joins that task's open blocking decision", async () => {
