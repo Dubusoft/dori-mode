@@ -37,6 +37,17 @@ test("text carrying a $( substitution is refused before any request goes out", a
   expect(seen).toHaveLength(0);
 });
 
+test("a literal backslash-n becomes a real line break in sent, edited and webhook text, except inside code", async () => {
+  const { http, seen } = fakeHttp(() => ok({ id: "M1" }));
+  const dc = new Discord(http, sleeps().clock, "b");
+  const typed = "done\\nnext: `a\\nb`\\r\\nC:\\\\new\n```\nx\\ny\n```";
+  const shown = "done\nnext: `a\\nb`\nC:\\\\new\n```\nx\\ny\n```";
+  await dc.send("C1", typed);
+  await dc.edit("C1", "M1", "a\\nb");
+  await dc.executeWebhook("https://discord.com/api/webhooks/1/t", "a\\nb", { username: "lane" });
+  expect(seen.map((r) => JSON.parse(String(r.body)).content)).toEqual([shown, "a\nb", "a\nb"]);
+});
+
 test("Discord messages are sent without pinging anyone and edited in place; threads are named and archived", async () => {
   const { http, seen } = fakeHttp((req) => ok(req.method === "POST" && req.url.endsWith("/messages") ? { id: "M1" } : { id: "T1" }));
   const dc = new Discord(http, sleeps().clock, "b");
