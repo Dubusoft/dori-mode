@@ -312,7 +312,7 @@ test("a repo-less autopilot lane without its report leaves the task open with a 
   const task = inProgress([manual(1)]);
   const { report, finish } = await finishRepoless(task, fakeDiscord().discord);
   expect(finish?.tag).toBe("unmerged");
-  expect(finish?.lines[0]).toContain(`no report of the repo-less lane at ${report}`);
+  expect(finish?.lines[0]).toContain(`no report of the lane at ${report}`);
   expect(task.status).toBe("in_progress");
   expect(task.notes.map((n) => n.kind)).toEqual(["blocker"]);
 });
@@ -335,17 +335,18 @@ test("a repo-less autopilot lane is completed with its installed report as evide
 
 /**
  * Autopilot lane `ap-951-1` (Done = a PR from autopilot/951) claims done with no PR, with or without the `not-adopted.md`
- * its claim installs, and the claim settles five minutes later with the supervisor's finisher.
+ * and `report.md` its claim installs, and the claim settles five minutes later with the supervisor's finisher.
  */
-const settleNoPr = async (task: Task, conclusion?: string) => {
+const settleNoPr = async (task: Task, conclusion?: string, report?: string) => {
   reserveAutopilot();
   const subject: Lane = { ...apLane, done: "pr acme/app autopilot/951" };
   // The research dir beside the state dir is shared by this file's tests: start from no installed files.
   const file = laneNotAdoptedFile(at(T0).config.stateDir, subject.key);
   rmSync(dirname(file), { recursive: true, force: true });
-  if (conclusion !== undefined) {
-    mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, conclusion);
+  for (const [path, text] of [[file, conclusion], [laneReportFile(at(T0).config.stateDir, subject.key), report]] as const) {
+    if (text === undefined) continue;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
   }
   recordLastReport(state.dir, subject.key, { channel: "900", message: "m1", at: T0 });
   world.prList = [];
@@ -383,6 +384,33 @@ test("an autopilot lane that concludes not adopted with no PR closes without an 
   expect(closed?.receipt).toMatchObject({ notAdopted: { conclusion } });
   expect(edits).toEqual([["900", "m1", "report\nToodo #951 not adopted로 마무리"]]);
   expect(attemptData()).toMatchObject({ outcome: "done", toodo: "not-adopted" });
+});
+
+test("an autopilot lane that finished its work with no PR closes on its report and its task is completed, not concluded not_adopted", async () => {
+  const task = inProgress([manual(1), manual(2)]);
+  const { announced, lines, edits, lane: closed } = await settleNoPr(task, undefined, "# Report\n1. done\n2. done\n");
+  expect(announced[0]).toEndWith("| verified: pr=none sig=reported");
+  const report = laneReportFile(at(T0).config.stateDir, "ap-951-1");
+  expect(lines).toEqual([
+    "LANE_CLOSED ap-951-1 closed seen-claim toodo=done",
+    `TOODO_TASK_COMPLETED ap-951-1 #951 report=${report}; report appended (m1)`,
+    "AUTOPILOT_LANE_DONE #951 lane=ap-951-1 attempt=1 toodo=done: toodo task #951 completed and read back by the supervisor",
+  ]);
+  for (const line of lines) expect(eventClass(line)).toBe("lead-digest");
+  expect(task.status).toBe("done");
+  expect(task.resolution).toBe("completed");
+  expect(task.criteria.map((c) => [c.state, c.evidence?.startsWith(`report ${report} `) ?? false])).toEqual([["met", true], ["met", true]]);
+  expect(task.notes.map((n) => n.kind)).toEqual([]);
+  expect(closed?.receipt).toMatchObject({ reported: { report } });
+  expect(edits).toEqual([["900", "m1", "report\nToodo #951 완료"]]);
+  expect(attemptData()).toMatchObject({ outcome: "done", toodo: "done" });
+});
+
+test("a lane that installed both not-adopted.md and report.md is concluded not_adopted", async () => {
+  const task = inProgress([manual(1)]);
+  const { lines } = await settleNoPr(task, "nothing to change", "# Report\n");
+  expect(lines[0]).toBe("LANE_CLOSED ap-951-1 closed seen-claim toodo=not-adopted");
+  expect(task.resolution).toBe("not_adopted");
 });
 
 test("a not-adopted lane whose task the lead already finished closes with toodo=done and writes nothing", async () => {
