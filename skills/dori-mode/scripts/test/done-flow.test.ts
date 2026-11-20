@@ -434,7 +434,7 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
 
 test("a fresh claim is read once before it wakes the lead: a conflict, a failed check, a moved head or unpushed work is objected to instead", async () => {
   world.prState = "OPEN";
-  const view = { mergeable: "MERGEABLE", head: "a".repeat(40), checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] as { status: string; conclusion?: string }[] };
+  const view = { mergeable: "MERGEABLE", head: "a".repeat(40), checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] as { status: string; conclusion?: string; name?: string; startedAt?: string }[] };
   const { bound, deps } = mergeOnly({ state: "OPEN", checks: [] });
   const live = (ms: number): FlowDeps => {
     const base = deps(ms);
@@ -465,9 +465,11 @@ test("a fresh claim is read once before it wakes the lead: a conflict, a failed 
   world.aheadCount = "1";
   await claim(T0 + 3 * MIN);
   expect(await reasons()).toEqual([`unpushed work in ${WT}`]);
-  // None of these woke the lead with a claim; a clean read does, with its snapshot.
+  // None of these woke the lead with a claim; a clean read does, with its snapshot. A check that ran twice at the head
+  // reads by its newest run, so the CANCELLED run a later SUCCESS replaced is no failed check.
   world.aheadCount = "0";
-  expect(await claim(T0 + 4 * MIN)).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 claim ${T0 + 4 * MIN} | verified: pr=#1 head=aaaaaaa checks=none conflict=no sig=0/1`]);
+  view.checks = [{ name: "preview", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-01-01T12:00:00Z" }, { name: "preview", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-01-01T12:00:05Z" }];
+  expect(await claim(T0 + 4 * MIN)).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 claim ${T0 + 4 * MIN} | verified: pr=#1 head=aaaaaaa checks=green conflict=no sig=0/1`]);
 });
 
 test("a PR GitHub cannot be read for at the claim is UNREAD in the snapshot, never green and never an objection", async () => {

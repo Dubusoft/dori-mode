@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import { claimGate } from "./ci-follow.ts";
 import type { DoriConfig } from "./config.ts";
 import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
@@ -96,10 +97,11 @@ export type PrInfo = {
   readonly checks?: "green" | "pending" | "red";
 };
 
-type Rollup = readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+type Rollup = readonly RollupCheck[];
 const CHECK_FAILED = new Set(["FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"]);
-/** A check rollup as green, pending (something still runs) or red (any check failed). */
-const rollupOf = (checks: Rollup): "green" | "pending" | "red" => {
+/** A check rollup as green, pending (something still runs) or red (any check's newest run failed). */
+const rollupOf = (rollup: Rollup): "green" | "pending" | "red" => {
+  const checks = latestChecks(rollup);
   if (checks.some((c) => (c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? "")))) return "red";
   return checks.every((c) => (c.__typename === "StatusContext" ? c.state === "SUCCESS" : c.status === "COMPLETED")) ? "green" : "pending";
 };
