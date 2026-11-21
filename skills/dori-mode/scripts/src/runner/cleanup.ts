@@ -293,14 +293,16 @@ export type ClosedLane = { readonly key: string; readonly closedAt: number; read
 
 /**
  * The closed lanes of one host from registry records: `machine` undefined for the supervisor's own host (local lanes
- * carry no machine), else that machine's label. Each lane's worktrees are its cwd and its recorded worktrees; a record
- * without a readable `closedAt` is not closed and never listed.
+ * carry no machine), else that machine's label. Each lane's worktrees are its directory (`cwd` for a local lane,
+ * `remoteCwd` for a remote one, which never records `cwd`) and its recorded worktrees; a record without a readable
+ * `closedAt` is not closed and never listed.
  */
 export const closedLanesOf = (lanes: readonly Lane[], machine: string | undefined): ClosedLane[] =>
   lanes.flatMap((lane) => {
     const closedAt = Date.parse(lane.closedAt ?? "");
     if (!Number.isFinite(closedAt) || lane.machine !== machine) return [];
-    const worktrees = [...new Set([...(lane.cwd ? [lane.cwd] : []), ...(lane.worktrees ?? [])])];
+    const dir = machine === undefined ? lane.cwd : lane.remoteCwd;
+    const worktrees = [...new Set([...(dir ? [dir] : []), ...(lane.worktrees ?? [])])];
     return worktrees.length ? [{ key: lane.key, closedAt, worktrees }] : [];
   });
 export type CleanupReport = {
