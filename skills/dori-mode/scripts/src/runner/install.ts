@@ -144,6 +144,32 @@ export const bundleVersion = (bundle: string): string => createHash("sha256").up
 const quote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 
 /**
+ * The awk program a macOS install runs as `awk <program> <old plist> <new plist>`: it prints the new plist with every
+ * one-line string entry of the old plist's EnvironmentVariables that the new one lacks added at the end of that dict.
+ * An operator's own variables (`DORI_CLEANUP_TARGETS` and the like) thus survive a reinstall or upgrade, while the
+ * template's keys (PATH, LANG) always take the new values.
+ */
+export const PLIST_ENV_KEEP = String.raw`function key(s) { sub(/^[ \t]*<key>/, "", s); sub(/<\/key>.*$/, "", s); return s }
+FNR == NR {
+  if (e == 0 && $0 ~ /<key>EnvironmentVariables<\/key>/) { e = 1; next }
+  if (e == 1 && $0 ~ /<dict>/) { e = 2; next }
+  if (e != 2) next
+  if ($0 ~ /<\/dict>/) { e = 3; next }
+  if ($0 ~ /^[ \t]*<key>[^<]*<\/key>[ \t]*$/) { k = key($0); next }
+  if (k != "" && $0 ~ /^[ \t]*<string>[^<]*<\/string>[ \t]*$/) { v = $0; sub(/^[ \t]*/, "", v); sub(/[ \t]*$/, "", v); n++; ks[n] = k; vs[n] = v }
+  k = ""
+  next
+}
+f == 0 && $0 ~ /<key>EnvironmentVariables<\/key>/ { f = 1 }
+f == 1 && $0 ~ /<dict>/ { f = 2; print; next }
+f == 2 && $0 ~ /^[ \t]*<key>[^<]*<\/key>/ { have[key($0)] = 1 }
+f == 2 && $0 ~ /<\/dict>/ {
+  for (i = 1; i <= n; i++) if (!(ks[i] in have)) { have[ks[i]] = 1; print "    <key>" ks[i] "</key>"; print "    " vs[i] }
+  f = 3
+}
+{ print }`;
+
+/**
  * The unit text for `label` and `listenAddress`; `@BUN@` and `@PATH@` are filled on the remote host by the script. The
  * template uses `@NAME@` markers rather than setup's `{{NAME}}`, because setup does not render it.
  */
@@ -272,8 +298,15 @@ export const installScript = (
     `PL="$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
     `${body(plist)}${HEREDOC}`,
-    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$PL" || exit 1`,
+    `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g" -e "s|@HOME@|$HOME|g" "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" > "$R/${RUNNER_LAUNCHD_LABEL}.plist.new" || exit 1`,
     `rm -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp"`,
+    // Variables an operator added to the old plist's EnvironmentVariables are carried over (PLIST_ENV_KEEP); plutil
+    // turns a binary plist into XML first. When that fails the new plist is written as it is and the loss is printed.
+    'if [ -f "$PL" ]; then',
+    `  { plutil -convert xml1 -o "$R/${RUNNER_LAUNCHD_LABEL}.plist.old" "$PL" 2>/dev/null || cp "$PL" "$R/${RUNNER_LAUNCHD_LABEL}.plist.old"; } && awk ${quote(PLIST_ENV_KEEP)} "$R/${RUNNER_LAUNCHD_LABEL}.plist.old" "$R/${RUNNER_LAUNCHD_LABEL}.plist.new" > "$R/${RUNNER_LAUNCHD_LABEL}.plist.kept" && mv -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.kept" "$R/${RUNNER_LAUNCHD_LABEL}.plist.new" || printf 'RUNNER_PLIST_ENV_LOST %s: its own EnvironmentVariables could not be read and are not kept\\n' "$PL"`,
+    `  rm -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.old" "$R/${RUNNER_LAUNCHD_LABEL}.plist.kept"`,
+    "fi",
+    `mv -f "$R/${RUNNER_LAUNCHD_LABEL}.plist.new" "$PL" || exit 1`,
     'chmod 644 "$PL"',
     // launchd appends the agent's output here; created 0600 beforehand so the runner's directory check accepts it.
     ': >> "$R/runner.log" && chmod 600 "$R/runner.log" || exit 1',

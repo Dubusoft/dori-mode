@@ -453,7 +453,10 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   machine. A worker that already has `~/.dori/runner/keys/supervisor.pub` skips enrollment: a reinstall or an upgrade
   keeps its keys.
 - On macOS, the launchd user agent `~/Library/LaunchAgents/com.dori.runner.plist` (from
-  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials. While it
+  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials. A reinstall or
+  upgrade rewrites the plist from the template but keeps the string entries an operator added to its
+  `EnvironmentVariables` (such as `DORI_CLEANUP_TARGETS`); the template's own `PATH` and `LANG` always take the new
+  values. When the old plist cannot be read, the install prints `RUNNER_PLIST_ENV_LOST <plist>`. While it
   serves, the runner holds `caffeinate -i -s -w <its pid>` so an idle Mac does not sleep: asleep, it runs the runner
   only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
   keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
@@ -749,7 +752,8 @@ Each target runs in one of three modes: `on` removes (sessions are moved), `repo
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
 Every target defaults to `on` except `closedNodeModules`, the build-output targets, `metroCache` and the developer-cache targets, which start at `report`; a target added later starts at
 `report` until its reports have been read. The runner's
-environment sets them, read at each sweep:
+environment sets them, read at each sweep (on a macOS worker, in the agent plist's `EnvironmentVariables`, which a
+reinstall or upgrade keeps):
 
 | Variable | Effect |
 |---|---|
