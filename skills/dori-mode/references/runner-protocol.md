@@ -458,7 +458,8 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   `EnvironmentVariables` (such as `DORI_CLEANUP_TARGETS`); the template's own `PATH` and `LANG` always take the new
   values. When the old plist cannot be read, the install prints `RUNNER_PLIST_ENV_LOST <plist>`. While it
   serves, the runner holds `caffeinate -i -s -w <its pid>` so an idle Mac does not sleep: asleep, it runs the runner
-  only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
+  only in short DarkWake windows, heartbeats stop and the supervisor closes the link after 120 s without a frame
+  (`RUNNER_SILENT`, see Liveness and restarts), so it redials each time the Mac wakes. `-s` is what
   keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
   the Mac still sleeps. When `caffeinate` cannot start or exits, the runner logs `RUNNER_AWAKE_FAILED` and keeps serving.
   Before each `lane.start` a macOS runner also checks BrowserSkill once, outside the lane sandbox and without holding
@@ -850,6 +851,15 @@ nullable `commands.result_json` column in protocol 3.
 
 The supervisor judges each runner by when its heartbeats arrive, on its own monotonic clock; a runner's wall clock is
 never used. A supervisor start counts as the last time it saw each runner it knows.
+
+The link itself has its own, shorter watch. A connection that carries no frame for 120 s (`RUNNER_SILENT_CLOSE_MS`;
+heartbeats come every 15 s) is closed by the supervisor with `RUNNER_SILENT runner=<label> ...` and, once admitted,
+`RUNNER_DISCONNECTED runner=<label>`. A TCP link that died without a FIN (sleep, a network change, a reboot) would
+otherwise look open: the supervisor would not redial the worker, and the runner's next hello at the same gen would be
+refused as `RUNNER_CONFLICT`. Once it is closed the supervisor redials and the same-gen hello is admitted. On the
+worker side the listening socket pings a link that has been idle for 120 s and closes it when the ping goes unanswered
+(a few minutes in all), so a worker does not keep refusing the redial as `runner already connected` behind a dead
+link.
 
 | Silent for | What happens |
 |---|---|

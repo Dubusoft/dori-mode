@@ -6,10 +6,11 @@ import { join } from "node:path";
 import { RunnerAuth } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { runStartupCheck } from "../src/runner/fs-safety.ts";
-import { HUB_FILE, readRunnerRows, RunnerHub } from "../src/runner/hub.ts";
+import { HUB_FILE, readRunnerRows, RUNNER_OFFLINE_MS, RUNNER_SILENT_CLOSE_MS, RunnerHub } from "../src/runner/hub.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import { acceptRunners, drainRunnerAdmin, loadIdentity, type ObservedLane, queueRunnerAdmin, runnerAdminResult, serveRunner, trackedConnector } from "../src/runner/serve.ts";
-import { encodeFrame, MAX_FRAME_BYTES, runnerControl } from "../src/runner/protocol.ts";
+import { decodeFrame, encodeFrame, MAX_FRAME_BYTES, runnerControl } from "../src/runner/protocol.ts";
+import type { Timers } from "../src/runner/call.ts";
 import { memoryNetwork } from "./support/memory-transport.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { connectUnix, controlSocketPath } from "../src/runner/unix-transport.ts";
@@ -46,6 +47,82 @@ test.each([8, 9])("direct and queued file operations pass admitted proto %i and 
   expect(() => accept.command("box", "lane.start", { ...start, briefText: "x".repeat(786432) })).toThrow("LANE_FILES_FRAME_TOO_LARGE");
   expect(hub.runner("box")?.cmdSeq).toBe(2);
   expect(() => accept.command("box", "job.run", { cmdId: "big", opKey: "o", name: "n", command: ["x".repeat(MAX_FRAME_BYTES)], cwd: "/repo", timeoutSec: 1, heavy: false })).toThrow("frame-too-large");
+});
+
+/** Timers on a manual clock: `advance` fires, in due order, every timer that is due by then. */
+const manualTimers = () => {
+  let at = 0;
+  const due: { at: number; fn: () => void }[] = [];
+  const api: Timers = {
+    set: (fn, ms) => { const t = { at: at + ms, fn }; due.push(t); return t; },
+    clear: (t) => { const i = due.indexOf(t as typeof due[number]); if (i >= 0) due.splice(i, 1); },
+  };
+  const advance = (ms: number): void => {
+    at += ms;
+    for (const t of due.filter((x) => x.at <= at).sort((a, b) => a.at - b.at)) { due.splice(due.indexOf(t), 1); t.fn(); }
+  };
+  return { api, advance, pending: () => due.length };
+};
+
+/** A hub served over a memory network with manual timers; `link()` opens a runner connection that says hello at `gen`. */
+const silenceWorld = () => {
+  const tmp = withState(); cleanups.push(tmp.done);
+  const hub = new RunnerHub({ stateDir: tmp.dir, now: () => 1000, monotonic: () => 1000, epoch: 1, commit: () => true });
+  cleanups.push(() => hub.close());
+  const network = memoryNetwork();
+  const timers = manualTimers();
+  const logs: string[] = [];
+  const accept = acceptRunners(hub, network.listener, { timers: timers.api, log: (line) => { logs.push(line); } }); cleanups.push(accept);
+  const link = async (gen: number) => {
+    const transport = await network.connect();
+    const pair = network.pairs.at(-1)!;
+    const replies: string[] = [];
+    transport.onLine((line) => { replies.push(decodeFrame(line, "supervisor").type); });
+    const head = { runner: "box", gen, epoch: 1 };
+    transport.send(encodeFrame(runnerControl(head, "hello", { label: "box", hostId: "host", gen, proto: 9, cmdAck: 0 })));
+    pair.pump();
+    return { transport, replies, heartbeat: () => { transport.send(encodeFrame(runnerControl(head, "heartbeat", {}))); pair.pump(); } };
+  };
+  return { accept, timers, logs, link };
+};
+
+test("the supervisor closes an admitted connection that sends no frame for RUNNER_SILENT_CLOSE_MS and logs RUNNER_DISCONNECTED", async () => {
+  expect(RUNNER_SILENT_CLOSE_MS).toBeLessThanOrEqual(RUNNER_OFFLINE_MS);
+  const w = silenceWorld();
+  const a = await w.link(1);
+  expect(a.replies).toEqual(["hello.ok"]);
+  // Heartbeats re-arm the watchdog: a link that keeps talking is never closed.
+  w.timers.advance(RUNNER_SILENT_CLOSE_MS - 1000);
+  a.heartbeat();
+  w.timers.advance(RUNNER_SILENT_CLOSE_MS - 1);
+  expect(w.accept.connected("box")).toBe(true);
+  expect(w.logs.some((line) => line.startsWith("RUNNER_SILENT"))).toBe(false);
+  // Then the runner goes quiet (its TCP died without a FIN): the next millisecond closes the link.
+  w.timers.advance(1);
+  expect(a.transport.open).toBe(false);
+  expect(w.accept.connected("box")).toBe(false);
+  expect(w.logs.slice(-2)).toEqual([
+    `RUNNER_SILENT runner=box no frame for ${RUNNER_SILENT_CLOSE_MS / 1000} s: closing the link so the runner reconnects`,
+    "RUNNER_DISCONNECTED runner=box",
+  ]);
+  expect(w.timers.pending()).toBe(0);
+});
+
+test("a same-gen hello while the old link still looks open is a conflict, and admitted once the silence closed that link", async () => {
+  const w = silenceWorld();
+  await w.link(1);
+  const early = await w.link(1);
+  // The memory pair drops lines still queued when a side closes, so the refusal shows in the log and the closed link.
+  expect(early.transport.open).toBe(false);
+  expect(w.logs.at(-1)).toStartWith("RUNNER_CONFLICT runner=box");
+  expect(w.accept.connected("box")).toBe(true);
+  w.timers.advance(RUNNER_SILENT_CLOSE_MS);
+  expect(w.logs.at(-1)).toBe("RUNNER_DISCONNECTED runner=box");
+  const again = await w.link(1);
+  expect(again.replies).toEqual(["hello.ok"]);
+  expect(w.accept.connected("box")).toBe(true);
+  expect(w.logs.at(-1)).toBe("RUNNER_CONNECTED runner=box gen=1 eventAck=0");
+  expect(w.timers.pending()).toBe(1);
 });
 
 test("a local runner over the real unix socket says hello, replays its outbox, heartbeats and shows as RUNNER local connected", async () => {

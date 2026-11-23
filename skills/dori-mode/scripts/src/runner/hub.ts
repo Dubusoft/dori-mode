@@ -24,6 +24,11 @@ export const HUB_FILE = "runners.sqlite";
 export const RUNNER_STALE_MS = 60_000;
 /** No heartbeat for this long: the runner is offline. */
 export const RUNNER_OFFLINE_MS = 180_000;
+/**
+ * No frame at all on a connection for this long (eight missed heartbeats): the supervisor closes it (serve.ts
+ * `acceptRunners`), so a link whose TCP died without a FIN does not stay open and refuse the runner's reconnect.
+ */
+export const RUNNER_SILENT_CLOSE_MS = 120_000;
 
 /**
  * Commits one event to the journal; returns false when the id is already there (a duplicate, still committed). It

@@ -87,7 +87,7 @@ export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEve
   readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
   readonly hostId?: string;
-  /** The call/query timeout timers (default real timers). */
+  /** The call/query timeout and link silence timers (default real timers). */
   readonly timers?: Timers;
   /** A runner machine's herdr went down or came back (`HERDR_DOWN` / `HERDR_UP`), already saved on its hub row. */
   readonly onHerdr?: (id: string, line: string) => void;
@@ -166,6 +166,7 @@ export const openRunnerHub = (
     onStatus: (label, frame) => { calls?.onStatus(label, frame); },
     onDisconnected: (label) => { protos.delete(label); calls?.disconnected(label); },
     auth,
+    timers: options.timers ?? realTimers,
     log,
   });
   calls = new RunnerCalls({
