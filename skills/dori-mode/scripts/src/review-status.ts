@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
 import { displayTime } from "./display-time.ts";
+import { isRecord, readJsonState } from "./durable-write.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { type MergePause, mergePausedText, readMergePause } from "./merge-pause.ts";
 import type { LaneReportStore } from "./lane-report-store.ts";
@@ -37,6 +37,8 @@ export type ReviewMerge = {
 };
 
 type StatusFile = { readonly merges: readonly ReviewMerge[]; readonly shown: Readonly<Record<string, string>> };
+const isStatusFile = (v: unknown): v is StatusFile =>
+  isRecord(v) && Array.isArray(v.merges) && v.merges.every(isRecord) && isRecord(v.shown) && Object.values(v.shown).every((t) => typeof t === "string");
 
 /**
  * `review-status.json`: the merges the supervisor made (for the `머지 완료` line) and, per lane, the review lines last
@@ -49,13 +51,12 @@ export class ReviewStatusStore {
     this.path = join(stateDir, REVIEW_STATUS_FILE);
     this.lock = join(stateDir, REVIEW_STATUS_LOCK);
   }
-  private read(): StatusFile {
-    if (!existsSync(this.path)) return { merges: [], shown: {} };
-    const v = JSON.parse(readFileSync(this.path, "utf8")) as Partial<StatusFile>;
-    return { merges: v.merges ?? [], shown: v.shown ?? {} };
+  /** A corrupt file is moved aside and the store starts empty: the status lines are written again and earlier merges lose their line. */
+  private read(locked = false): StatusFile {
+    return readJsonState(this.path, "REVIEW_STATUS", isStatusFile, "no recorded merges or shown lines", locked ? undefined : this.lock) ?? { merges: [], shown: {} };
   }
   private update(act: (f: StatusFile) => StatusFile): void {
-    withStateLockSync(this.lock, () => { saveJsonFile(this.path, act(this.read())); });
+    withStateLockSync(this.lock, () => { saveJsonFile(this.path, act(this.read(true))); });
   }
   merges(): readonly ReviewMerge[] { return this.read().merges; }
   recordMerge(m: ReviewMerge): void {

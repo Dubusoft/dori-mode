@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { replaceFileAtomic } from "./durable-write.ts";
+import { isRecord, readJsonState, replaceFileAtomic } from "./durable-write.ts";
 import { githubRepoFromRemote } from "./git-remote.ts";
 import type { Runner } from "./run.ts";
 import type { EventMeta } from "./supervise-journal.ts";
@@ -40,15 +40,21 @@ export type AutoUpdateState = {
 };
 export type UpdateResult = { readonly at: number; readonly code: number; readonly lines: readonly string[] };
 
-const readJson = <T>(path: string): T | undefined => {
-  if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8")) as T;
-};
+const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((s) => typeof s === "string");
+const isState = (v: unknown): v is AutoUpdateState =>
+  isRecord(v) &&
+  (v.pending === undefined || isStrings(v.pending)) &&
+  (v.running === undefined || (isRecord(v.running) && typeof v.running.at === "number" && isStrings(v.running.merges))) &&
+  (v.blocked === undefined || (isRecord(v.blocked) && Object.values(v.blocked).every((b) => isRecord(b) && typeof b.since === "number")));
+const isResult = (v: unknown): v is UpdateResult =>
+  isRecord(v) && typeof v.at === "number" && typeof v.code === "number" && isStrings(v.lines);
 const writeJson = (path: string, value: unknown): void => {
   replaceFileAtomic(path, `${JSON.stringify(value)}\n`, 0o666);
 };
 
-export const readAutoUpdateState = (stateDir: string): AutoUpdateState => readJson<AutoUpdateState>(join(stateDir, AUTO_UPDATE_STATE)) ?? {};
+/** A corrupt state file is moved aside and read as empty: merges it held wait for the next noted one. */
+export const readAutoUpdateState = (stateDir: string): AutoUpdateState =>
+  readJsonState(join(stateDir, AUTO_UPDATE_STATE), "AUTO_UPDATE_STATE", isState, "no pending or running update") ?? {};
 
 /** Records a merge into dev of dori's own repo; the next auto-update run covers it (once, however many are recorded). */
 export const noteDevMerge = (stateDir: string, ref: string): void => {
@@ -146,7 +152,8 @@ export class AutoUpdate {
 
   /** Reports a result the unit left, if any, and forgets its run. Returns the state as it now stands. */
   private async report(state: AutoUpdateState, emit: AutoUpdateEmit): Promise<AutoUpdateState> {
-    const result = readJson<UpdateResult>(this.resultPath);
+    // A corrupt result is moved aside; a run waiting on it then ends as AUTO_UPDATE_FAILED without a result.
+    const result = readJsonState(this.resultPath, "AUTO_UPDATE_RESULT", isResult, "no update result");
     if (!result) return state;
     // Journaled before the files change: a crash in between re-emits the same id, which the journal dedupes.
     await emit(autoUpdateLine(result, state.running?.merges ?? []), `auto-update:${result.at}`);

@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { isRecord, readJsonState } from "./durable-write.ts";
 import { isRepoRelativePath, type ReviewSnapshot, snapshotKey } from "./review-receipt.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import { saveJsonFile } from "./store.ts";
@@ -282,6 +282,9 @@ export const isExemptFor = (r: ExemptReceipt, observed: ReviewSnapshot): boolean
 export const REVIEW_EXEMPT_FILE = "review-exempt.json";
 const REVIEW_EXEMPT_LOCK = "review-exempt.lock.sqlite";
 
+type ExemptFile = { readonly decisions: Record<string, ExemptDecision> };
+const isExemptFile = (v: unknown): v is ExemptFile => isRecord(v) && isRecord(v.decisions) && Object.values(v.decisions).every(isRecord);
+
 /** `review-exempt.json`: one decision per snapshot key, written once (the first decision for a key stands). */
 export class ReviewExemptions {
   readonly path: string;
@@ -290,15 +293,16 @@ export class ReviewExemptions {
     this.path = join(stateDir, REVIEW_EXEMPT_FILE);
     this.lock = join(stateDir, REVIEW_EXEMPT_LOCK);
   }
-  private read(): Record<string, ExemptDecision> {
-    return existsSync(this.path) ? (JSON.parse(readFileSync(this.path, "utf8")) as { decisions: Record<string, ExemptDecision> }).decisions : {};
+  /** A corrupt file is moved aside and the store starts empty: each PR is classified again on its next pass. */
+  private read(locked = false): Record<string, ExemptDecision> {
+    return readJsonState(this.path, "REVIEW_EXEMPT", isExemptFile, "no exemption decisions; PRs are classified again", locked ? undefined : this.lock)?.decisions ?? {};
   }
   get(key: string): ExemptDecision | undefined { return this.read()[key]; }
   list(): ExemptDecision[] { return Object.values(this.read()); }
   /** Stores `decision` unless its key already has one; returns the decision that stands. */
   record(decision: ExemptDecision): ExemptDecision {
     return withStateLockSync(this.lock, () => {
-      const all = this.read();
+      const all = this.read(true);
       const known = all[decision.key];
       if (known) return known;
       all[decision.key] = decision;

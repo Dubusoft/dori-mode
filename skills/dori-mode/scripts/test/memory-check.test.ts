@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -307,6 +307,20 @@ test("a state written before the daily-only sweep does not repeat the line it al
   expect(await memorySweep({ ...deps, clock: fakeClock(T0 - MIN) }, "/home/test")).toEqual([]);
   expect(await memorySweep({ ...deps, clock: fakeClock(T0) }, "/home/test")).toEqual([]);
   expect(JSON.parse(readFileSync(join(deps.config.stateDir, "memory-check.json"), "utf8"))).toEqual({ at: T0, bytes: expect.any(Number), over: false, stale: ["closed lane dori-ack", "closed lane hsj-dead", "merged PR acme/app#7", "merged PR acme/app#9"] });
+});
+
+test.each([["{"], [""], ['{"at":"soon"}']])("corrupt memory-check.json and memory-size.json (%p) are moved aside and the checks run from empty", async (text) => {
+  const errors: string[] = [];
+  const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
+  try {
+    const { deps } = await setup();
+    mkdirSync(deps.config.stateDir, { recursive: true });
+    for (const f of ["memory-check.json", "memory-size.json"]) writeFileSync(join(deps.config.stateDir, f), text === '{"at":"soon"}' && f === "memory-size.json" ? '{"human":"big"}' : text);
+    expect(await memorySweep(deps, "/home/test")).toHaveLength(1);
+    expect(await memorySizeTrigger(deps, "/home/test")).toEqual([]);
+    expect(errors.map((e) => e.split(" ")[0])).toEqual(["MEMORY_CHECK_CORRUPT", "MEMORY_SIZE_CORRUPT"]);
+    expect(readdirSync(deps.config.stateDir).filter((f) => f.includes(".corrupt-"))).toHaveLength(2);
+  } finally { spy.mockRestore(); }
 });
 
 test("a finding that comes back after a clean check is sent again", async () => {

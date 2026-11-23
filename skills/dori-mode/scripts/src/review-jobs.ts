@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { isRecord, readJsonState } from "./durable-write.ts";
 import { receiptSnapshot, SNAPSHOT_IDENTITY_FIELDS, snapshotKey, type ReviewErrorCode, type ReviewJob, type ReviewReceipt, type ReviewSnapshot } from "./review-receipt.ts";
 import { saveJsonFile } from "./store.ts";
 import { withStateLockSync } from "./state-lock.ts";
@@ -141,6 +141,10 @@ const matches = (r: ReviewJobRecord, f: ReviewJobFilter): boolean =>
 const byCreated = (a: ReviewJobRecord, b: ReviewJobRecord): number =>
   a.job.createdAt - b.job.createdAt || (a.job.jobId < b.job.jobId ? -1 : a.job.jobId > b.job.jobId ? 1 : 0);
 
+type JobsFile = { readonly jobs: Record<string, ReviewJobRecord> };
+const isJobsFile = (v: unknown): v is JobsFile =>
+  isRecord(v) && isRecord(v.jobs) && Object.values(v.jobs).every((r) => isRecord(r) && isRecord(r.job) && isRecord(r.job.snapshot) && isRecord(r.execution));
+
 /** `review-jobs.json`: rewritten whole under its own state lock; every mutation is one locked read-modify-write. */
 export class ReviewJobs {
   readonly path: string;
@@ -150,9 +154,9 @@ export class ReviewJobs {
     this.lock = join(stateDir, REVIEW_JOBS_LOCK);
   }
   /** The stored records, each `key` derived again from its snapshot so a record stored under an older key format matches. */
-  private read(): Record<string, ReviewJobRecord> {
-    if (!existsSync(this.path)) return {};
-    const { jobs } = JSON.parse(readFileSync(this.path, "utf8")) as { jobs: Record<string, ReviewJobRecord> };
+  private read(locked = false): Record<string, ReviewJobRecord> {
+    // Corrupt-file policy: move it aside and start empty, not an error: a PR without a record is only reviewed again, while an error would stop every merge each tick.
+    const jobs = readJsonState(this.path, "REVIEW_JOBS", isJobsFile, "no review jobs; open PRs are reviewed again", locked ? undefined : this.lock)?.jobs ?? {};
     for (const [id, r] of Object.entries(jobs)) jobs[id] = { ...r, key: snapshotKey(r.job.snapshot) };
     return jobs;
   }
@@ -168,7 +172,7 @@ export class ReviewJobs {
    */
   transact<T>(act: (records: Readonly<Record<string, ReviewJobRecord>>, put: (r: ReviewJobRecord) => void) => T): T {
     return withStateLockSync(this.lock, () => {
-      const jobs = this.read();
+      const jobs = this.read(true);
       let dirty = false;
       const result = act(jobs, (r) => { jobs[r.job.jobId] = r; dirty = true; });
       if (dirty) saveJsonFile(this.path, { jobs });

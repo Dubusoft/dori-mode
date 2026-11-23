@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
-import { replaceFileDurable } from "./durable-write.ts";
+import { isRecord, readJsonState, replaceFileDurable } from "./durable-write.ts";
 import type { DoriConfig } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { Repos } from "./repos.ts";
@@ -246,6 +246,11 @@ type SweepState = {
   readonly sent?: string;
 };
 
+const fieldIs = (v: Record<string, unknown>, key: string, type: "number" | "boolean" | "string"): boolean => v[key] === undefined || typeof v[key] === type;
+const isSweepState = (v: unknown): v is SweepState =>
+  isRecord(v) && fieldIs(v, "at", "number") && fieldIs(v, "bytes", "number") && fieldIs(v, "over", "boolean") && fieldIs(v, "system", "number") &&
+  fieldIs(v, "systemOver", "boolean") && fieldIs(v, "sent", "string") && (v.stale === undefined || (Array.isArray(v.stale) && v.stale.every((s) => typeof s === "string")));
+
 const saveState = (path: string, state: SweepState): void => {
   replaceFileDurable(path, JSON.stringify(state), 0o600, `${path}.${process.pid}.tmp`);
 };
@@ -261,7 +266,8 @@ const saveState = (path: string, state: SweepState): void => {
 export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[]> => {
   const path = join(deps.config.stateDir, "memory-check.json");
   const now = deps.clock.now();
-  const state: SweepState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as SweepState : {};
+  // A corrupt state is moved aside and read as empty: the check runs now and a standing finding is said again.
+  const state = readJsonState(path, "MEMORY_CHECK", isSweepState, "no memory check baseline") ?? {};
   if (now - (state.at ?? -Infinity) < MEMORY_CHECK_EVERY_MS) return [];
   const kept: SweepState = state.systemOver ? { system: state.system, systemOver: true } : {};
   const base: SweepState = state.bytes === undefined ? kept : { bytes: state.bytes, over: state.over, stale: state.stale, ...kept };
@@ -298,6 +304,7 @@ export const memorySweep = async (deps: FlowDeps, home: string): Promise<string[
 
 /** Per measure, the size the last MEMORY_SIZE named it at, lowered while it shrinks; absent while under its trigger. */
 type TriggerState = { readonly human?: number; readonly system?: number };
+const isTriggerState = (v: unknown): v is TriggerState => isRecord(v) && fieldIs(v, "human", "number") && fieldIs(v, "system", "number");
 
 /**
  * The size trigger, every sweep round: human.md over `triggerPct` of `humanMaxKb`, or system/ over `triggerPct` of
@@ -321,7 +328,8 @@ export const memorySizeTrigger = async (deps: FlowDeps, home: string): Promise<s
   const { system } = await systemOrError(deps.run, paths.repo);
   const systemTrigger = Math.floor(m.systemMaxTokens * pct);
   const path = join(deps.config.stateDir, "memory-size.json");
-  const state: TriggerState = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as TriggerState : {};
+  // A corrupt state is moved aside and read as empty: a measure over its trigger is named again.
+  const state = readJsonState(path, "MEMORY_SIZE", isTriggerState, "no memory size baseline") ?? {};
   // Per measure: whether it fires, and its next baseline (undefined: under its trigger). Unmeasured keeps the baseline.
   const step = (value: number | undefined, over: boolean, last: number | undefined): { readonly fire: boolean; readonly next?: number } => {
     if (value === undefined) return { fire: false, ...(last !== undefined ? { next: last } : {}) };

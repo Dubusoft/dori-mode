@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { eventClass } from "../src/event-policy.ts";
@@ -145,6 +145,23 @@ test("a unit that ended without a result, or could not start, wakes the lead", a
   await auto().tick(emit);
   expect(events[1]![1]).toBe("AUTO_UPDATE_FAILED after Dubusoft/dori-mode#6: systemd-run exit 1: Failed to connect to bus; run dori update --dev by hand");
   expect(readAutoUpdateState(dir)).toEqual({ pending: [] });
+});
+
+test("a corrupt result is moved aside and its run ends as AUTO_UPDATE_FAILED instead of failing every tick", async () => {
+  const errors: string[] = [];
+  const spy = spyOn(console, "error").mockImplementation((...args: unknown[]) => { errors.push(args.join(" ")); });
+  try {
+    noteDevMerge(dir, "Dubusoft/dori-mode#5");
+    await auto().tick(emit);
+    writeFileSync(join(dir, AUTO_UPDATE_RESULT), '{"at":');
+    unit = "failed";
+    await auto().tick(emit);
+    await auto().tick(emit);
+    expect(events.map(([, l]) => l)).toEqual([`AUTO_UPDATE_FAILED after Dubusoft/dori-mode#5: unit ${AUTO_UPDATE_UNIT} ended without a result; log: journalctl --user -u ${AUTO_UPDATE_UNIT}; run dori update --dev by hand`]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toStartWith(`AUTO_UPDATE_RESULT_CORRUPT moved ${join(dir, AUTO_UPDATE_RESULT)} to `);
+    expect(existsSync(join(dir, AUTO_UPDATE_RESULT))).toBe(false);
+  } finally { spy.mockRestore(); }
 });
 
 test("a lane holding the update back past staleAfterMs is checked every STALE_RECHECK_MS, and the lead hears of it once, across restarts too", async () => {
