@@ -7,6 +7,7 @@ import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import { claimGate } from "./ci-follow.ts";
 import type { DoriConfig } from "./config.ts";
 import { closeLane, type FlowDeps, objectDone } from "./done-flow.ts";
+import { ghJson } from "./gh-json.ts";
 import type { OpenPull } from "./github-events.ts";
 import { briefBody } from "./lane-files.ts";
 import { FILE_LIMITS } from "./lane-file-contract.ts";
@@ -152,7 +153,7 @@ export type ReviewGateIo = {
   readonly objectAuthor: (lane: Lane, reasons: readonly string[]) => Promise<void>;
 };
 
-const ghJson = async (deps: FlowDeps, argv: readonly string[]): Promise<string> => {
+const ghText = async (deps: FlowDeps, argv: readonly string[]): Promise<string> => {
   const r = await deps.run(["gh", ...argv], { timeoutMs: 30_000 });
   if (r.code !== 0) throw new Error(`gh ${argv.slice(0, 3).join(" ")} exit ${r.code}: ${oneLine(r.err || r.out, 160)}`);
   return r.out;
@@ -165,20 +166,22 @@ const readTextFile = (path: string): string | undefined => {
 /** The production io: gh api reads through deps.run, the review-snapshot helpers, launchReviewLane and closeLane. */
 export const defaultReviewGateIo = (deps: FlowDeps): ReviewGateIo => ({
   prInfo: async (repo, n) => {
-    const v = JSON.parse(await ghJson(deps, ["pr", "view", String(n), "-R", repo, "--json", "state,baseRefName,headRefOid,title,body,statusCheckRollup"])) as {
-      state?: string; baseRefName?: string; headRefOid?: string; title?: string; body?: string; statusCheckRollup?: Rollup | null;
-    };
+    const argv = ["pr", "view", String(n), "-R", repo, "--json", "state,baseRefName,headRefOid,title,body,statusCheckRollup"];
+    const r = await ghJson<{ state?: string; baseRefName?: string; headRefOid?: string; title?: string; body?: string; statusCheckRollup?: Rollup | null }>(
+      deps.run, ["gh", ...argv], "object", { timeoutMs: 30_000 });
+    if (!r.ok) throw new Error(`gh ${argv.slice(0, 3).join(" ")}${r.code ? ` exit ${r.code}` : ""}: ${r.error}`);
+    const v = r.value;
     return {
       state: v.state ?? "UNKNOWN", baseRef: v.baseRefName ?? "", headSha: v.headRefOid ?? "", title: v.title ?? "", body: v.body ?? "",
       checks: rollupOf(v.statusCheckRollup ?? []),
     };
   },
-  branchSha: async (repo, ref) => (await ghJson(deps, ["api", `repos/${repo}/branches/${ref}`, "--jq", ".commit.sha"])).trim(),
-  mergeBase: async (repo, base, head) => (await ghJson(deps, ["api", `repos/${repo}/compare/${base}...${head}`, "--jq", ".merge_base_commit.sha"])).trim(),
-  diff: (repo, mergeBase, head) => ghJson(deps, ["api", "-H", "Accept: application/vnd.github.diff", `repos/${repo}/compare/${mergeBase}...${head}`]),
+  branchSha: async (repo, ref) => (await ghText(deps, ["api", `repos/${repo}/branches/${ref}`, "--jq", ".commit.sha"])).trim(),
+  mergeBase: async (repo, base, head) => (await ghText(deps, ["api", `repos/${repo}/compare/${base}...${head}`, "--jq", ".merge_base_commit.sha"])).trim(),
+  diff: (repo, mergeBase, head) => ghText(deps, ["api", "-H", "Accept: application/vnd.github.diff", `repos/${repo}/compare/${mergeBase}...${head}`]),
   fileAt: (repo, sha, path) =>
-    ghJson(deps, ["api", "-H", "Accept: application/vnd.github.raw", `repos/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${sha}`]),
-  mergeParent: async (repo, mergeSha) => (await ghJson(deps, ["api", `repos/${repo}/commits/${mergeSha}`, "--jq", ".parents[0].sha"])).trim(),
+    ghText(deps, ["api", "-H", "Accept: application/vnd.github.raw", `repos/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${sha}`]),
+  mergeParent: async (repo, mergeSha) => (await ghText(deps, ["api", `repos/${repo}/commits/${mergeSha}`, "--jq", ".parents[0].sha"])).trim(),
   fetchHead: async (repoDir, sha) => {
     const r = await deps.run(["git", "-C", repoDir, "fetch", "--quiet", "origin", sha], { timeoutMs: 120_000 });
     if (r.code !== 0) throw new Error(`git fetch origin ${short(sha)} exit ${r.code}: ${oneLine(r.err || r.out, 160)}`);

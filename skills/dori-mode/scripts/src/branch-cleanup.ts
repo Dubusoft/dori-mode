@@ -1,5 +1,6 @@
 import type { LaneOps, LaneRef } from "./lane-ops.ts";
 import type { Lane } from "./registry.ts";
+import { ghJson } from "./gh-json.ts";
 import type { Ran, Runner } from "./run.ts";
 import type { Operation, OperationState, OperationStore, ReadBack } from "./operations.ts";
 import { parseSignal, splitDone } from "./signals.ts";
@@ -57,11 +58,11 @@ export const readBindings = async (done: string, run: Runner): Promise<(Binding 
     try { parsed = parseSignal(part); } catch { continue; }
     if (parsed.kind !== "merged") continue;
     const sig = parsed;
-    const r = await run(["gh", "pr", "view", sig.n, "--repo", sig.repo, "--json", "state,headRefName,headRefOid,baseRefName,isCrossRepository"]);
+    const r = await ghJson<{ state?: string; headRefName?: string; headRefOid?: string; baseRefName?: string; isCrossRepository?: boolean }>(
+      run, ["gh", "pr", "view", sig.n, "--repo", sig.repo, "--json", "state,headRefName,headRefOid,baseRefName,isCrossRepository"], "object");
     const unbound = (error: string): Unbound => ({ repo: sig.repo, n: sig.n, error: error.replace(/\s+/g, " ").slice(0, 160) });
-    if (r.code !== 0 || r.timedOut) { out.push(unbound(r.err || `gh exited ${r.code}`)); continue; }
-    let j: { state?: string; headRefName?: string; headRefOid?: string; baseRefName?: string; isCrossRepository?: boolean };
-    try { j = JSON.parse(r.out); } catch { out.push(unbound("unreadable gh answer")); continue; }
+    if (!r.ok) { out.push(unbound(r.error)); continue; }
+    const j = r.value;
     if (j.state !== "MERGED") out.push(unbound(`PR is ${j.state ?? "unknown"}`));
     else if (j.isCrossRepository) out.push(unbound("head branch is in a fork"));
     else if (!j.headRefName || !j.baseRefName || !SHA.test(j.headRefOid ?? "")) out.push(unbound("PR head or base missing"));
@@ -98,14 +99,11 @@ export const readBranchBindings = async (
     const repo = wt.origin ? repoFromRemote(wt.origin) : undefined;
     if (!repo) continue;
     if (bindings.some((b) => b.repo.toLowerCase() === repo.toLowerCase() && b.branch === branch)) continue;
-    const r = await run(["gh", "pr", "list", "--repo", repo, "--state", "merged", "--base", base, "--head", branch,
-      "--json", "number,headRefName,headRefOid,baseRefName,isCrossRepository", "--limit", "20"]);
+    const r = await ghJson<MergedPull[]>(run, ["gh", "pr", "list", "--repo", repo, "--state", "merged", "--base", base, "--head", branch,
+      "--json", "number,headRefName,headRefOid,baseRefName,isCrossRepository", "--limit", "20"], "array");
     const note = (why: string) => notes.push(`branch cleanup skipped for ${repo} branch ${branch}: ${why.replace(/\s+/g, " ").slice(0, 160)}`);
-    if (r.code !== 0 || r.timedOut) { note(r.err || `gh exited ${r.code}`); continue; }
-    let pulls: MergedPull[];
-    try { pulls = JSON.parse(r.out) as MergedPull[]; } catch { note("unreadable gh answer"); continue; }
-    if (!Array.isArray(pulls)) { note("unreadable gh answer"); continue; }
-    const ours = pulls.filter((p) => !p.isCrossRepository && p.headRefName === branch && p.baseRefName === base && typeof p.number === "number" && SHA.test(p.headRefOid ?? ""));
+    if (!r.ok) { note(r.error); continue; }
+    const ours = r.value.filter((p) => !p.isCrossRepository && p.headRefName === branch && p.baseRefName === base && typeof p.number === "number" && SHA.test(p.headRefOid ?? ""));
     if (!ours.length) continue;
     const exact = wt.head ? ours.find((p) => p.headRefOid === wt.head) : undefined;
     const pick = exact ?? ours[0];

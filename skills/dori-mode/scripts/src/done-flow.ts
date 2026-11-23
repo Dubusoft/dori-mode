@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { type DoriConfig, reportQuietLane } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type Claim, type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
+import { ghJson } from "./gh-json.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { OPEN_STATES, openOperations, type Operation, operationId, type OperationStore, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
@@ -152,19 +153,17 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
     if (row.isCrossRepository !== false || row.state !== "OPEN" || typeof row.number !== "number" || typeof row.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(row.headRefOid)) return;
     found.set(`${repo}#${row.number}`, { repo, number: row.number, sha: row.headRefOid });
   };
-  const read = async (repo: string, argv: readonly string[]): Promise<void> => {
-    const r = await run([...argv], { timeoutMs: 20_000 });
-    try {
-      if (r.code !== 0) throw new Error(`exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
-      const body: unknown = JSON.parse(r.out);
-      for (const row of Array.isArray(body) ? body : [body]) if (row && typeof row === "object") add(repo, row as PrRow);
-    } catch (e) {
-      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${e instanceof Error ? e.message : String(e)}`);
+  const read = async (repo: string, argv: readonly string[], shape: "object" | "array"): Promise<void> => {
+    const r = await ghJson<PrRow | readonly PrRow[]>(run, argv, shape, { timeoutMs: 20_000 });
+    if (!r.ok) {
+      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${r.code ? `exit ${r.code}: ` : ""}${r.error}`);
+      return;
     }
+    for (const row of Array.isArray(r.value) ? r.value : [r.value]) if (row && typeof row === "object") add(repo, row);
   };
   for (const [repo, targets] of await githubTargets([lane], ops)) {
-    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
-    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS]);
+    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS], "object");
+    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS], "array");
   }
   return [...found.values()];
 };
@@ -645,9 +644,8 @@ const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly sn
   let clean = pulls.length <= SNAPSHOT_PRS;
   for (const bound of pulls.slice(0, SNAPSHOT_PRS)) {
     const ref = `${bound.repo}#${bound.number}`;
-    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
-    let view: WaitView | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
+    const r = await ghJson<WaitView>(deps.run, ["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], "object", { timeoutMs: 20_000 });
+    const view = r.ok ? r.value : undefined;
     if (!view) { parts.push(`pr=#${bound.number} head=${bound.sha.slice(0, 7)} checks=UNREAD conflict=UNREAD`); clean = false; continue; }
     const head = view.headRefOid ?? bound.sha;
     if (view.state !== "OPEN") { parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} state=${view.state ?? "UNREAD"}`); clean = false; continue; }
@@ -750,10 +748,9 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
     const ref = `${s.repo}#${s.n}`;
     const bound = (lane.claim?.pulls ?? []).find((p) => p.repo.toLowerCase() === s.repo.toLowerCase() && String(p.number) === s.n);
     if (!bound) { why.push(`${ref} was not open at a head the claim recorded, so it is not merged for this claim (push, then claim again)`); continue; }
-    const r = await deps.run(["gh", "pr", "view", s.n, "-R", s.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
-    let view: WaitView | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
-    if (!view) continue;
+    const r = await ghJson<WaitView>(deps.run, ["gh", "pr", "view", s.n, "-R", s.repo, "--json", WAIT_FIELDS], "object", { timeoutMs: 20_000 });
+    if (!r.ok) continue;
+    const view = r.value;
     const failed = failedChecks(view);
     if (view.state !== "OPEN") why.push(`${ref} is ${view.state ?? "unknown"}`);
     else if (view.headRefOid !== bound.sha) why.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
@@ -777,10 +774,9 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
 const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
   if (deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000) return false;
   for (const bound of lane.claim?.pulls ?? []) {
-    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], { timeoutMs: 20_000 });
-    let view: (WaitView & { readonly baseRefName?: string }) | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView & { readonly baseRefName?: string }) : undefined; } catch { view = undefined; }
-    if (!view) return true;
+    const r = await ghJson<WaitView & { readonly baseRefName?: string }>(deps.run, ["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], "object", { timeoutMs: 20_000 });
+    if (!r.ok) return true;
+    const view = r.value;
     if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
     if (conflicting(view)) continue;
     if (!failedChecks(view).length) return true;
@@ -929,10 +925,10 @@ export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<LaneMergeR
   if (!pulls.size) return { why: "no PR of the lane is recorded (no claimed or supervisor-merged PR)" };
   const merges: LaneMerge[] = [];
   for (const { repo, number } of pulls.values()) {
-    const r = await deps.run(["gh", "pr", "view", String(number), "-R", repo, "--json", "state,url,baseRefName,mergeCommit"], { timeoutMs: 20_000 });
-    let view: { readonly state?: string; readonly url?: string; readonly baseRefName?: string; readonly mergeCommit?: { readonly oid?: string } | null } | undefined;
-    try { view = r.code === 0 ? JSON.parse(r.out) : undefined; } catch { view = undefined; }
-    if (!view) return { why: `${repo}#${number} could not be read: ${(r.err || r.out).replace(/\s+/g, " ").slice(0, 120)}` };
+    type MergeView = { readonly state?: string; readonly url?: string; readonly baseRefName?: string; readonly mergeCommit?: { readonly oid?: string } | null };
+    const r = await ghJson<MergeView>(deps.run, ["gh", "pr", "view", String(number), "-R", repo, "--json", "state,url,baseRefName,mergeCommit"], "object", { timeoutMs: 20_000 });
+    if (!r.ok) return { why: `${repo}#${number} could not be read: ${r.error}` };
+    const view = r.value;
     const sha = view.mergeCommit?.oid;
     if (view.state !== "MERGED" || !sha) return { why: `${repo}#${number} reads ${view.state ?? "unknown"}${sha ? "" : " with no merge commit"}` };
     merges.push({ repo, number, url: view.url ?? `https://github.com/${repo}/pull/${number}`, base: view.baseRefName ?? "its base", sha });
