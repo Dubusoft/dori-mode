@@ -3,7 +3,7 @@ import { expect, test } from "bun:test";
 import type { Ran, Runner } from "../src/run.ts";
 import {
   goalCommand, lastLines, PAUSED_SHOWN, pause, paneShell, resolveTargetPane, resume, RESUME_TEXT, resumeArgv, startupFailure, startupPoll, stopTurn,
-  STARTUP_POLLS, TargetError,
+  TargetError,
 } from "../src/runner/lane-control.ts";
 import { fakeClock, fakeRunner, newWorld, type World } from "./fakes.ts";
 
@@ -202,14 +202,36 @@ test("startupPoll: a failure word on an idle screen is an error at once", async 
   expect(await startupPoll(deps(w), "p1")).toEqual({ verdict: "error", detail: "No API key" });
 });
 
-test("startupPoll: never ready is unconfirmed with why and the last lines", async () => {
-  const w = world("blocked");
+test.each([false, true])("startupPoll confirms readiness past the old window without resending (worked earlier=%s)", async (workedEarlier) => {
+  const w = world("unknown");
+  const clock = fakeClock(T0);
+  const sleep = async (ms: number) => {
+    clock.at += ms;
+    w.panes[0]!.agent_status = clock.at > T0 + 20_000 ? (workedEarlier ? "idle" : "working")
+      : workedEarlier && clock.at === T0 + 2_000 ? "working" : "unknown";
+  };
+  expect(await startupPoll({ run: fakeRunner(w), clock: { ...clock, sleep } }, "p1", async () => false)).toEqual({ verdict: "ok", detail: "ready" });
+  expect(clock.at - T0).toBe(24_000);
+  expect(sentText(w)).toEqual([]);
+});
+
+test("startupPoll counts slow herdr calls against the budget and leaves permanent unknown unconfirmed", async () => {
+  const w = world("unknown");
   w.screen = "loading\nstill loading\n❯ ";
   const clock = fakeClock(T0);
-  const slept: number[] = [];
-  const v = await startupPoll({ run: fakeRunner(w), clock: { ...clock, sleep: async (ms: number) => { slept.push(ms); } } }, "p1");
-  expect(v).toEqual({ verdict: "unconfirmed", detail: "no ready agent status (blocked); last lines: loading / still loading / ❯" });
-  expect(slept.length).toBe(STARTUP_POLLS);
+  const sleep = async (ms: number) => { clock.at += ms; };
+  const herdr = fakeRunner(w);
+  const run: Runner = async (argv, opts) => {
+    const limit = opts?.timeoutMs ?? Infinity;
+    expect(limit).toBeGreaterThan(0);
+    expect(clock.at - T0 + limit).toBeLessThanOrEqual(45_000);
+    clock.at += Math.min(limit, 3_000);
+    return herdr(argv);
+  };
+  const v = await startupPoll({ run, clock: { ...clock, sleep } }, "p1");
+  expect(v).toEqual({ verdict: "unconfirmed", detail: "no ready agent status (unknown); last lines: loading / still loading / ❯" });
+  expect(clock.at - T0).toBeWithin(40_000, 45_001);
+  expect(sentText(w)).toEqual([]);
 });
 
 test("startupFailure skips tips and brief echoes; lastLines masks home paths", () => {

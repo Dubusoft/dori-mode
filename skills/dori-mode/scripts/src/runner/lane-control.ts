@@ -1,5 +1,5 @@
 import { listPanes, readScreen, sendGuarded, statusLookup } from "../panes.ts";
-import type { Clock, Runner } from "../run.ts";
+import { RUN_KILL_GRACE_MS, RUN_TIMEOUT_CODE, type Clock, type Runner } from "../run.ts";
 import type { CommandResults, ExecutionOutcome, GoalOutcome, PauseStep, ProcessInfo, StartupVerdict } from "./protocol.ts";
 
 /**
@@ -208,10 +208,12 @@ export const inspectCreated = async (run: Runner, pane: string): Promise<{ reado
 // Startup confirmation
 // ---------------------------------------------------------------------------------------------------------------
 
-/** Startup confirmation: a check every 2 s, at most 10 times, and 2 consecutive ready reads. */
+/** Leave 45 s of the 90 s lane.start/recover reply budget for setup and reply delivery. */
+export const STARTUP_BUDGET_MS = 45_000;
 export const STARTUP_POLL_MS = 2_000;
-export const STARTUP_POLLS = 10;
+export const STARTUP_POLLS = Math.floor(STARTUP_BUDGET_MS / STARTUP_POLL_MS);
 export const STARTUP_READY_READS = 2;
+const STARTUP_PROCESS_PROBE_MS = 5_000;
 /** How many screen lines a startup check scans. */
 export const STARTUP_SCREEN_LINES = 40;
 
@@ -256,28 +258,47 @@ export const lastLines = (screen: string): string =>
   screen.split("\n").map((s) => s.trim()).filter(Boolean).slice(-3).join(" / ").replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)").slice(0, 240) || "(blank)";
 
 /**
- * Polls a just-started agent: `ok` after STARTUP_READY_READS ready reads in a row (so one early idle blip is not a
- * start), `error` with the failure word as soon as a non-working screen shows one (an agent that printed "No API key"
- * and stopped at its prompt reads idle but never started), else `unconfirmed` with why and the last screen lines.
+ * Polls a just-started agent, scanning non-working screens for startup errors. A process probe marks a fresh
+ * argv-prompt launch: require evidence of work, and use process ownership only to explain an unconfirmed start.
  */
-export const startupPoll = async (deps: ControlDeps, pane: string): Promise<StartupVerdict> => {
+export const startupPoll = async (deps: ControlDeps, pane: string, processAlive?: (run: Runner) => Promise<boolean>): Promise<StartupVerdict> => {
+  const deadline = deps.clock.now() + STARTUP_BUDGET_MS;
+  let until = deadline - (processAlive ? STARTUP_PROCESS_PROBE_MS : 0);
+  const remaining = () => until - deps.clock.now();
+  const run: Runner = async (argv) => {
+    const timeoutMs = remaining() - RUN_KILL_GRACE_MS;
+    if (timeoutMs <= 0) return { code: RUN_TIMEOUT_CODE, out: "", err: "startup confirmation budget exhausted", timedOut: true };
+    return deps.run(argv, { timeoutMs });
+  };
   let screen = "";
   let status: string | undefined;
   let error: string | undefined;
   let ready = 0;
-  for (let poll = 0; poll < STARTUP_POLLS; poll++) {
-    await deps.clock.sleep(STARTUP_POLL_MS);
-    ({ status, error } = await statusLookup(deps.run, pane));
-    if (status === "working") { ready++; } else {
-      screen = await readScreen(deps.run, pane, STARTUP_SCREEN_LINES);
+  let sawWorking = false;
+  for (let poll = 0; poll < STARTUP_POLLS && remaining() > RUN_KILL_GRACE_MS; poll++) {
+    await deps.clock.sleep(Math.min(STARTUP_POLL_MS, remaining() - RUN_KILL_GRACE_MS));
+    if (remaining() <= RUN_KILL_GRACE_MS) break;
+    ({ status, error } = await statusLookup(run, pane));
+    if (status === "working") sawWorking = true;
+    else if (remaining() > RUN_KILL_GRACE_MS) {
+      const lines = await readScreen(run, pane, STARTUP_SCREEN_LINES);
+      if (lines) screen = lines;
       const bad = startupFailure(screen);
       if (bad) return { verdict: "error", detail: bad };
-      ready = status === "idle" ? ready + 1 : 0;
     }
-    if (ready >= STARTUP_READY_READS) return { verdict: "ok", detail: "ready" };
+    ready = status === "working" || status === "idle" ? ready + 1 : 0;
+    if (ready >= STARTUP_READY_READS && (!processAlive || sawWorking)) {
+      return { verdict: "ok", detail: "ready" };
+    }
   }
-  if (!screen) screen = await readScreen(deps.run, pane, STARTUP_SCREEN_LINES);
-  const why = error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
+  until = deadline;
+  // An idle or unreported process may still be loading; never infer that its argv prompt was lost.
+  const alive = !sawWorking && processAlive && remaining() > RUN_KILL_GRACE_MS
+    && await processAlive(run).catch(() => false);
+  if (!screen && remaining() > RUN_KILL_GRACE_MS) screen = await readScreen(run, pane, STARTUP_SCREEN_LINES);
+  const why = alive ? `agent process is alive but was never observed working (${status ?? "none"}); inspect the pane before sending the start prompt manually`
+    : processAlive && !sawWorking && status === "idle" ? "no working status for the start prompt (idle)"
+    : error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
   return { verdict: "unconfirmed", detail: `${why}; last lines: ${lastLines(screen)}` };
 };
 
