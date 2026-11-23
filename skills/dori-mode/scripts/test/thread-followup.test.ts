@@ -7,8 +7,8 @@ import { Discord } from "../src/messenger/discord.ts";
 import type { Lane } from "../src/registry.ts";
 import { postLaneReport } from "../src/report-post.ts";
 import {
-  closedByOwner, forgetOwnerClosed, LAST_REPORTS_FILE, MalformedStateFileError, OWNER_CLOSED_FILE, pruneThreadFollowups, readLastReports, readOwnerClosed,
-  recordLastReport, recordOwnerClosed, THREAD_FOLLOWUP_KEEP_MS,
+  appendMarker, appendToMessage, closedByOwner, forgetOwnerClosed, type FollowUpDiscord, LAST_REPORTS_FILE, MalformedStateFileError, OWNER_CLOSED_FILE,
+  pruneThreadFollowups, readLastReports, readOwnerClosed, recordLastReport, recordOwnerClosed, THREAD_FOLLOWUP_KEEP_MS,
 } from "../src/thread-followup.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -85,6 +85,48 @@ test("a failed thread read of a recorded thread still fails and keeps the record
   recordOwnerClosed(state.dir, "902", T0 - 1);
   await expect(closedByOwner(state.dir, discordWith({}, 503), "902")).rejects.toThrow("503");
   expect(readOwnerClosed(state.dir)).toEqual({ "902": T0 - 1 });
+});
+
+/** A message store whose edit and re-archive fail when told to; `calls` lists what reached Discord. */
+const messageStore = (content: string, fail: { edit?: Error; archive?: Error } = {}) => {
+  const calls: string[] = [];
+  let text = content;
+  const discord: FollowUpDiscord = {
+    send: async () => "m-2",
+    content: async () => text,
+    edit: async (_channel, _message, next) => { if (fail.edit) throw fail.edit; calls.push("edit"); text = next; },
+    threadArchived: async () => true,
+    threadState: async () => ({ archived: true, parent: undefined }),
+    setThread: async (_thread, patch) => { if (patch.archived && fail.archive) throw fail.archive; calls.push(`archived=${patch.archived}`); },
+  };
+  return { discord, calls, text: () => text };
+};
+
+test("an append with a stable id is skipped only on its own retry; the same text under another id or no id lands again", async () => {
+  const store = messageStore("report");
+  expect(await appendToMessage(store.discord, "900", "m-1", "merged", false, "a")).toBe(true);
+  expect(await appendToMessage(store.discord, "900", "m-1", "later", false, "b")).toBe(true);
+  // The retry of "a" finds its line even though another append came after it.
+  expect(await appendToMessage(store.discord, "900", "m-1", "merged", false, "a")).toBe(true);
+  expect(await appendToMessage(store.discord, "900", "m-1", "merged", false, "c")).toBe(true);
+  expect(await appendToMessage(store.discord, "900", "m-1", "merged", false)).toBe(true);
+  expect(store.calls).toEqual(["edit", "edit", "edit", "edit"]);
+  expect(store.text()).toBe(`report\n${appendMarker("a")}merged\n${appendMarker("b")}later\n${appendMarker("c")}merged\nmerged`);
+});
+
+test("a failed re-archive is logged and never hides the edit's own error; after a landed edit the append still counts", async () => {
+  const errors = spyOn(console, "error").mockImplementation(() => {});
+  cleanups.push(() => errors.mockRestore());
+  const both = messageStore("report", { edit: new Error("edit 502"), archive: new Error("archive 503") });
+  await expect(appendToMessage(both.discord, "900", "m-1", "merged", true, "a")).rejects.toThrow("edit 502");
+  expect(both.calls).toEqual(["archived=false"]);
+  const landed = messageStore("report", { archive: new Error("archive 503") });
+  expect(await appendToMessage(landed.discord, "900", "m-1", "merged", true, "a")).toBe(true);
+  expect(landed.calls).toEqual(["archived=false", "edit"]);
+  expect(errors.mock.calls.map((c) => String(c[0]))).toEqual([
+    "THREAD_REARCHIVE_FAILED 900 archive 503; the thread is left open",
+    "THREAD_REARCHIVE_FAILED 900 archive 503; the thread is left open",
+  ]);
 });
 
 test("a report with --thread naming a configured channel does not make that channel the lane's thread", async () => {

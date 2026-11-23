@@ -552,7 +552,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   if (origin && closed.linkMessage) {
     try {
       if (await closedByOwner(stateDir, ctx.transport, origin)) linkNote = "origin thread closed by the owner; link line left as it is";
-      else if (!await appendToMessage(ctx.transport, origin, closed.linkMessage, decisionLinkClosedText(closed), await ctx.transport.threadArchived(origin))) linkNote = "link line too long to append";
+      else if (!await appendToMessage(ctx.transport, origin, closed.linkMessage, decisionLinkClosedText(closed), await ctx.transport.threadArchived(origin), `decision-link:${id}`)) linkNote = "link line too long to append";
     } catch (e) { linkNote = `link line not updated: ${errorText(e)}`; }
   }
   let answers: AnswerOutcome | undefined;

@@ -226,22 +226,41 @@ export const redirectHookPost = async (
 };
 
 /**
+ * The invisible tag an append with stable id `id` carries at the start of its line: U+2060 around 32 zero-width bits
+ * (U+200B = 0, U+200C = 1) of the id's hash, so a retry can find its own line wherever later appends moved it.
+ */
+export const appendMarker = (id: string): string =>
+  `\u2060${[...Bun.hash.crc32(id).toString(2).padStart(32, "0")].map((bit) => (bit === "0" ? "\u200b" : "\u200c")).join("")}\u2060`;
+
+/** Archives `channel` again after an edit; a failure is logged, not thrown (the edit already landed, or its own error wins). */
+const rearchive = async (discord: FollowUpDiscord, channel: string): Promise<void> => {
+  await discord.setThread(channel, { archived: true }).catch((e: unknown) => {
+    console.error(`THREAD_REARCHIVE_FAILED ${channel} ${e instanceof Error ? e.message : String(e)}; the thread is left open`);
+  });
+};
+
+/**
  * Appends `text` on a new line to message `message` in `channel` by editing it; no new message is posted. A thread
  * Discord archived on its own (not closed by the owner; check closedByOwner first) is unarchived for the edit and archived
- * again. A message that already ends with `text` (a retried append) is left as it is. Returns false, editing nothing,
- * when the result would not fit one Discord message.
+ * again; a failed re-archive is logged (THREAD_REARCHIVE_FAILED) and never hides the edit's own error. With `stableId`
+ * the line carries its appendMarker and a message that already holds it (a retried append) is left as it is; the same
+ * text under another id, or with no id, is appended again. Returns false, editing nothing, when the result would not
+ * fit one Discord message.
  */
-export const appendToMessage = async (discord: FollowUpDiscord, channel: string, message: string, text: string, archived: boolean): Promise<boolean> => {
+export const appendToMessage = async (discord: FollowUpDiscord, channel: string, message: string, text: string, archived: boolean, stableId?: string): Promise<boolean> => {
   const current = await discord.content(channel, message);
-  if (current.endsWith(`\n${text}`)) return true;
-  const next = `${current}\n${text}`;
+  const marker = stableId === undefined ? "" : appendMarker(stableId);
+  if (marker && current.includes(marker)) return true;
+  const next = `${current}\n${marker}${text}`;
   if (guardText(next).length > DISCORD_MESSAGE_LIMIT) return false;
   if (archived) await discord.setThread(channel, { archived: false });
   try {
     await discord.edit(channel, message, next);
-  } finally {
-    if (archived) await discord.setThread(channel, { archived: true });
+  } catch (e) {
+    if (archived) await rearchive(discord, channel);
+    throw e;
   }
+  if (archived) await rearchive(discord, channel);
   return true;
 };
 
@@ -256,6 +275,7 @@ export const appendFollowUp = async (stateDir: string, discord: FollowUpDiscord,
   if (!last) return { appended: false, why: "the lane has no report or status message" };
   if (await closedByOwner(stateDir, discord, last.channel)) return { appended: false, why: `thread ${last.channel} is closed` };
   const archived = await discord.threadArchived(last.channel).catch(() => false);
-  if (!(await appendToMessage(discord, last.channel, last.message, text, archived))) return { appended: false, why: "the report would pass Discord's message limit" };
+  // A fact line (a merge, a finished task) states one fact: the same text for the same lane is that fact again.
+  if (!(await appendToMessage(discord, last.channel, last.message, text, archived, `follow-up:${lane.key}:${text}`))) return { appended: false, why: "the report would pass Discord's message limit" };
   return { appended: true, message: last.message };
 };

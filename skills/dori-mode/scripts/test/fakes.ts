@@ -19,6 +19,9 @@ import type { Journal } from "../src/supervise.ts";
 import type { Wake } from "../src/lead-wakes.ts";
 import { BUILT_IN, builtInTunables, type Tunables } from "../src/tunables.ts";
 
+/** `text` as the owner sees it: without the invisible appendMarker tags (thread-followup.ts). */
+export const visible = (text: string): string => text.replace(/\u2060[\u200b\u200c]{32}\u2060/g, "");
+
 /** The supervisor journal as stored. */
 export const readJournal = (stateDir: string): any => {
   const store = new SqliteStore(join(stateDir, SQLITE_FILE));

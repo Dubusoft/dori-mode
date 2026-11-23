@@ -11,7 +11,7 @@ import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { mergeFactLine, taskBlocker, taskFinisher } from "../src/task-finish.ts";
 import { appendFollowUp, type FollowUpDiscord, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { ToodoWriter } from "../src/toodo-client.ts";
-import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, visible, withSqliteStore, withState, type World } from "./fakes.ts";
 
 type Criterion = { id: number; text: string; kind: string; state: string; evidence: string | null };
 type Task = { id: number; status: string; resolution: string | null; refs: string[]; notes: { kind: string; body: string }[]; criteria: Criterion[] };
@@ -68,7 +68,7 @@ const fakeDiscord = (archivedThreads: readonly string[] = []) => {
   const sends: string[][] = [];
   const discord: FollowUpDiscord = {
     send: async (channel, content) => { sends.push([channel, content]); return "new"; },
-    edit: async (channel, message, content) => { edits.push([channel, message, content]); contents.set(`${channel}/${message}`, content); },
+    edit: async (channel, message, content) => { edits.push([channel, message, visible(content)]); contents.set(`${channel}/${message}`, content); },
     content: async (channel, message) => contents.get(`${channel}/${message}`) ?? "",
     threadArchived: async (thread) => archivedThreads.includes(thread),
     threadState: async (thread) => ({ archived: archivedThreads.includes(thread), parent: "work" }),

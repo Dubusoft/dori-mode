@@ -2,7 +2,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 
 import { postOwnerLine, type FinishDiscord } from "../src/lane-finish.ts";
 import { MessengerError } from "../src/messenger/http.ts";
-import { recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
+import { appendMarker, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { depsFor, fakeClock, newWorld, readJournal, withState, writeJournal } from "./fakes.ts";
 
@@ -97,16 +97,19 @@ test("postOwnerLine in a lane thread appends to its last report or status messag
   // No report yet: the lane's [System] status message takes the line.
   const status = fakeDiscord({ content: "[System] status" });
   expect(await postOwnerLine(status.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("222");
-  expect(status.calls).toEqual(["archived? 222", "read 222 status-1", "edit 222 status-1 [System] status\n[System] merged"]);
+  expect(status.calls).toEqual(["archived? 222", "read 222 status-1", `edit 222 status-1 [System] status\n${appendMarker("m:1")}[System] merged`]);
   // The last report wins over the status message; a thread Discord archived on its own is unarchived for the edit only.
   recordLastReport(state.dir, "alpha", { channel: "222", message: "r-1", at: T0 });
   const archived = fakeDiscord({ archived: true, content: "alpha done" });
   expect(await postOwnerLine(archived.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("222");
-  expect(archived.calls).toEqual(["archived? 222", "read 222 r-1", 'set 222 {"archived":false}', "edit 222 r-1 alpha done\n[System] merged", 'set 222 {"archived":true}']);
-  // A retry after a crash finds its line already there.
-  const retried = fakeDiscord({ content: "alpha done\n[System] merged" });
+  expect(archived.calls).toEqual(["archived? 222", "read 222 r-1", 'set 222 {"archived":false}', `edit 222 r-1 alpha done\n${appendMarker("m:1")}[System] merged`, 'set 222 {"archived":true}']);
+  // A retry after a crash finds its line (tagged with its id) already there; the same text under a new id is a new line.
+  const retried = fakeDiscord({ content: `alpha done\n${appendMarker("m:1")}[System] merged` });
   await postOwnerLine(retried.discord, "main", "discord:111/222", "[System] merged", "m:1", options);
   expect(retried.calls).toEqual(["archived? 222", "read 222 r-1"]);
+  const repeated = fakeDiscord({ content: `alpha done\n${appendMarker("m:1")}[System] merged` });
+  await postOwnerLine(repeated.discord, "main", "discord:111/222", "[System] merged", "m:2", options);
+  expect(repeated.calls.at(-1)).toBe(`edit 222 r-1 alpha done\n${appendMarker("m:1")}[System] merged\n${appendMarker("m:2")}[System] merged`);
   // Too long to append: one line linking the thread goes to the main channel.
   const full = fakeDiscord({ content: "x".repeat(1995) });
   expect(await postOwnerLine(full.discord, "main", "discord:111/222", "[System] merged", "m:1", options)).toBe("main");
