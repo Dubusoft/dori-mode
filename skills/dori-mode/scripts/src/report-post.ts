@@ -102,8 +102,8 @@ export const postLaneReport = async (
   // A Discord ref posts there; a bare --to id posts on Discord only when the lane's bound thread is a Discord one.
   if (!isDiscord(ref) && (ref.includes(":") || !isDiscord(bound))) throw new ReportPostError(`cannot tell the platform of "${ref}"; use a thread ref such as discord:<channel>/<thread>`);
   const { to, thread } = resolveTarget("discord", ref, opts.thread);
-  // `discord:<thread>` and a bare thread id count as a thread too, unless the id is a configured channel.
-  const threadId = opts.thread ?? discordThreadOf(ref, deps.config.discordChannels);
+  // `discord:<thread>`, a bare thread id and --thread count as a thread too, unless the id is a configured channel.
+  const threadId = discordThreadOf(opts.thread ?? ref, deps.config.discordChannels);
   const closed = threadId === to ? await closedByOwner(deps.config.stateDir, deps.discord, to) : undefined;
   if (closed) return redirectReport(deps, lane.key, to, text, closed.parent, opts.note);
   const review = reviewFiles(deps.config.stateDir, lane.key);

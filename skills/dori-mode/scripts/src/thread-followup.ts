@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { replaceFileAtomic } from "./durable-write.ts";
+import { NotThreadError } from "./messenger/discord.ts";
 import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord-split.ts";
 import { guardText } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
@@ -79,12 +80,18 @@ export type FollowUpDiscord = {
 /**
  * Whether the owner closed `thread` and it is still closed: a close is recorded and Discord still reports the thread
  * archived. A recorded thread that is open again (the owner wrote in it) has its record dropped and counts as open.
- * A thread with no record is open without asking Discord. A closed thread comes back with its parent channel, where a
+ * A thread with no record is open without asking Discord. A recorded id Discord reports is not a thread (a plain channel)
+ * cannot be closed: its record is dropped and it counts as open. A closed thread comes back with its parent channel, where a
  * line redirected from it goes (undefined when Discord names none: the caller's owner channel then); an open one is undefined.
  */
 export const closedByOwner = async (stateDir: string, discord: Pick<FollowUpDiscord, "threadState">, thread: string): Promise<{ readonly parent: string | undefined } | undefined> => {
   if (readOwnerClosed(stateDir)[thread] === undefined) return undefined;
-  const state = await discord.threadState(thread);
+  let state: { readonly archived: boolean; readonly parent: string | undefined };
+  try { state = await discord.threadState(thread); } catch (e) {
+    if (!(e instanceof NotThreadError)) throw e;
+    forgetOwnerClosed(stateDir, thread);
+    return undefined;
+  }
   if (state.archived) return { parent: state.parent };
   forgetOwnerClosed(stateDir, thread);
   return undefined;

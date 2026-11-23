@@ -34,6 +34,11 @@ export const DISCORD_FILES_MAX = 10;
 /** How `Discord.startThread` left the owner: joined by the add, already a member, not configured, or the add's error. */
 export type ThreadMember = "added" | "already" | "skipped" | { readonly failed: string };
 
+/** A thread read (`Discord.threadState`) found a channel that is not a thread. */
+export class NotThreadError extends Error {
+  constructor(readonly channel: string) { super(`discord channel ${channel} is not a thread`); }
+}
+
 export class Discord {
   constructor(
     private readonly http: Http,
@@ -203,7 +208,7 @@ export class Discord {
   async threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined; readonly lastMessageId?: string | undefined }> {
     const channel = await this.call<{ thread_metadata?: { archived?: unknown }; parent_id?: unknown; last_message_id?: unknown }>("GET", `/channels/${threadId}`);
     const archived = channel.thread_metadata?.archived;
-    if (typeof archived !== "boolean") throw new Error(`discord channel ${threadId} is not a thread`);
+    if (typeof archived !== "boolean") throw new NotThreadError(threadId);
     return {
       archived, parent: typeof channel.parent_id === "string" && channel.parent_id ? channel.parent_id : undefined,
       lastMessageId: typeof channel.last_message_id === "string" && channel.last_message_id ? channel.last_message_id : undefined,

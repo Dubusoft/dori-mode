@@ -29,6 +29,7 @@ test("discordThreadOf: a channel/thread ref, a thread ref and a bare id name a t
   expect(discordThreadOf("discord:2", ["1"])).toBe("2");
   expect(discordThreadOf("2", ["1"])).toBe("2");
   expect(discordThreadOf("discord:1", ["1"])).toBeUndefined();
+  expect(discordThreadOf("discord:9/1", ["1"])).toBeUndefined();
   expect(discordThreadOf("other:1/2", [])).toBeUndefined();
 });
 
