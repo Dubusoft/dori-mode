@@ -41,6 +41,7 @@ import { realTimers } from "./messenger/typing.ts";
 import { transcribe, TranscriptionError } from "./messenger/voice.ts";
 import { supervise, SUPERVISE_STOP_DEADLINE_MS, watchSecretStore } from "./supervise-loop.ts";
 import { SecretStore, SecretStoreError } from "./secret-store.ts";
+import { MIN_KNOWN_SECRET } from "./redact.ts";
 import { lookupStatus } from "./status.ts";
 import { Waits } from "./waits.ts";
 import { requestLeadRestart } from "./lead-restart.ts";
@@ -562,6 +563,7 @@ try {
           }
           const entry = action === "add" ? await store.add(name, value) : await store.update(name, value);
           console.log(`${action === "add" ? "SECRET_ADDED" : "SECRET_UPDATED"} ${entry.name} backend=${entry.backend}`);
+          if (value.length < MIN_KNOWN_SECRET) console.error(`SECRET_NOT_MASKED ${entry.name}: values shorter than ${MIN_KNOWN_SECRET} characters are not masked in outbound text`);
         } else die(usage, 2);
       } catch (e) {
         if (e instanceof SecretStoreError) die(e.message);

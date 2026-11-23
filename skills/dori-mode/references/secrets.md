@@ -21,7 +21,7 @@ A name matches `^[A-Z][A-Z0-9_]{0,63}$` (uppercase, digits, underscore, starting
 | `dori secret list [--json]` | Prints names and backends (`plain` or `cred`). Never values. |
 | `dori secret delete NAME` | Removes the secret's file. |
 
-`add` and `update` read the value from stdin only, never from argv. On a terminal you get a hidden prompt; otherwise all of stdin is taken, minus one trailing newline. An empty value is `SECRET_VALUE_EMPTY`. They print `SECRET_ADDED NAME backend=plain` or `SECRET_UPDATED NAME backend=plain`; `delete` prints `SECRET_DELETED NAME`.
+`add` and `update` read the value from stdin only, never from argv. On a terminal you get a hidden prompt; otherwise all of stdin is taken, minus one trailing newline. An empty value is `SECRET_VALUE_EMPTY`. A value shorter than 8 characters is stored but not masked in outbound text, and they warn `SECRET_NOT_MASKED NAME` on stderr. They print `SECRET_ADDED NAME backend=plain` or `SECRET_UPDATED NAME backend=plain`; `delete` prints `SECRET_DELETED NAME`.
 
 ```sh
 printf %s "$TOKEN" | dori secret add NPM_TOKEN
