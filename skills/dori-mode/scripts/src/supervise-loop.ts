@@ -131,10 +131,14 @@ export const WATCHDOG_PET_MS = 60_000;
  * tasks keep running; past WATCHDOG_STALL_MS it withholds the watchdog as task:<name>, so systemd restarts the supervisor.
  */
 export const TASK_ALERT_MS = 5 * 60_000;
-/** The supervisor's independent tasks. */
-export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
+/**
+ * The supervisor's independent tasks. `delivery` hands queued events to the lead and nothing else; `notices` (the owner
+ * notices and the lead-side checks, several of which post to Discord) runs beside it, so a slow or failing Discord never
+ * holds back lead delivery.
+ */
+export const SUPERVISOR_TASKS = ["inbound", "delivery", "notices", "sweeps", "polling"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The fifth task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
+/** The sixth task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
 /** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
 export const AUTOPILOT_TASK = "autopilot";
@@ -508,8 +512,8 @@ const settle = async (tasks: Promise<unknown> | undefined): Promise<void> => {
 
 /**
  * Polling and sweeps enqueue independently of the single serialized lead delivery. There is no single loop: inbound,
- * delivery (with the owner notices and ack ticks), sweeps and GitHub/wait polling each run as their own task, so none
- * waits behind another; a stuck one is reported by name (TASK_STALLED) while the other three keep working, and each sweep
+ * lead delivery, the owner notices with the lead-side checks, sweeps and GitHub/wait polling each run as their own task,
+ * so none waits behind another; a stuck one is reported by name (TASK_STALLED) while the others keep working, and each sweep
  * is tracked by the watchdog. Each startup step up to READY=1 is timed by `probe` (STARTUP_TIMINGS, STARTUP_SLOW <step>),
  * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
  */
@@ -1055,13 +1059,17 @@ export const supervise = async (
         heartbeat();
       }),
       task("delivery", 5_000, async () => {
+        if (!retry.due) return;
+        // A fatal delivery error ends the supervisor, as in the loop.
+        try { await watchdog.track("delivery", retry.tick()); } catch (e) { deliveryError = e; stop.abort(); }
+      }),
+      // Owner notices and the lead-side checks post to Discord (each post can take minutes against a failing Discord), so
+      // they run beside lead delivery, never in front of it.
+      task("notices", 5_000, async () => {
         await noticeOverdue();
         await noticeUnacked();
         await noticeUnhandled();
         await checkReported();
-        if (!retry.due) return;
-        // A fatal delivery error ends the supervisor, as in the loop.
-        try { await watchdog.track("delivery", retry.tick()); } catch (e) { deliveryError = e; stop.abort(); }
       }),
       task("sweeps", 30_000, () => sweep()
         .catch((e: unknown) => { console.error(`SWEEP_ROUND_ERROR ${e instanceof Error ? e.message : String(e)}`); })
