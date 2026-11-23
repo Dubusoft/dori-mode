@@ -78,7 +78,7 @@ export interface JournalStore {
 }
 
 /** Rename only after the new contents reach disk; a crash leaves either complete version. */
-export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600, `${path}.tmp`);
+export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600);
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);

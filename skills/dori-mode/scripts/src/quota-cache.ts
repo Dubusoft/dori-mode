@@ -1,7 +1,8 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { lookupQuotaResults, type QuotaResult, type UsageLookup } from "./claude-quota.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 import { acquireStateLock, StateLockError } from "./state-lock.ts";
 import type { QuotaCacheNote } from "./quota-presentation.ts";
 
@@ -63,9 +64,7 @@ const readCache = (path: string): CacheFile | undefined => {
 
 const writeCache = (path: string, file: CacheFile): void => {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, JSON.stringify(file), { mode: 0o600 });
-  renameSync(tmp, path);
+  replaceFileAtomic(path, JSON.stringify(file), 0o600);
 };
 
 const backingOff = (file: CacheFile, now: number): boolean => Object.values(file.entries).some((e) => (e.backoffUntil ?? 0) > now);

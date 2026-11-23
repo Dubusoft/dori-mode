@@ -1,7 +1,8 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { GuardThresholds } from "./config.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 import { alertReasons } from "./host-guard.ts";
 import { herdrMachineList } from "./herdr-machines.ts";
 import { type Ran, RUN_TIMEOUT_CODE, type Runner } from "./run.ts";
@@ -187,9 +188,7 @@ export const loadMachineGuardState = (path: string): MachineGuardState => {
 /** Saves `state` to `path` through a temp file and a rename, so a crash never leaves a half-written file. */
 export const saveMachineGuardState = (path: string, state: MachineGuardState): void => {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(Object.fromEntries(state), null, 2)}\n`);
-  renameSync(tmp, path);
+  replaceFileAtomic(path, `${JSON.stringify(Object.fromEntries(state), null, 2)}\n`, 0o666);
 };
 
 const tag = (label: string): string => `machine=${label.replace(/\s/g, "_")}`;
