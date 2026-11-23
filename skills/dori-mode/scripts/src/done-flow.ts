@@ -768,20 +768,24 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
  * ends at its green PR (a `pr` signal is live while the PR is open), and the supervisor merges only a lane that is
  * still claimed (ci-follow.ts claimGate), so closing first would leave that PR unmerged. It waits while a bound PR into
  * `ciMergeBase` is OPEN at exactly the bound head, not a draft, not conflicting, with no failed check, for less than
- * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. Anything the
- * supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes the lane as before.
+ * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. A bound PR still open
+ * that conflicts with its base is `why` instead, whatever its base or the wait: the lane must resolve it, so closing
+ * would leave it unmerged. Anything else the supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes
+ * the lane as before.
  */
-const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
-  if (deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000) return false;
+const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<{ readonly waiting: boolean; readonly why: string[] }> => {
+  const waitOver = deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000;
+  const why: string[] = [];
+  let waiting = false;
   for (const bound of lane.claim?.pulls ?? []) {
     const r = await ghJson<WaitView & { readonly baseRefName?: string }>(deps.run, ["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], "object", { timeoutMs: 20_000 });
-    if (!r.ok) return true;
+    if (!r.ok) { waiting ||= !waitOver; continue; }
     const view = r.value;
-    if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
-    if (conflicting(view)) continue;
-    if (!failedChecks(view).length) return true;
+    if (view.state === "OPEN" && conflicting(view)) { why.push(`${bound.repo}#${bound.number} conflicts with its base`); continue; }
+    if (waitOver || view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
+    if (!failedChecks(view).length) waiting = true;
   }
-  return false;
+  return { waiting: waiting && !why.length, why };
 };
 
 /**
@@ -802,7 +806,11 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
     if (wait.waiting) return undefined;
     return { line: await objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]) };
   }
-  if (!noPr && (await boundMergeWait(deps, lane, start))) return undefined;
+  if (!noPr) {
+    const wait = await boundMergeWait(deps, lane, start);
+    if (wait.why.length) return { line: await objectDone(deps, lane, wait.why) };
+    if (wait.waiting) return undefined;
+  }
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
     const prior = store.get(closeId(lane.key));
