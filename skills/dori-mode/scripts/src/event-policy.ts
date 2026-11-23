@@ -64,8 +64,9 @@ const URGENT_KINDS = [
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
-  // A merged lane PR whose merge the supervisor could not read back, and an open one it has been unable to merge.
-  "MERGE_UNVERIFIED", "MERGE_STALLED",
+  // A merged lane PR whose merge the supervisor could not read back, an open one it has been unable to merge, and an open
+  // one whose follow-up keeps throwing (gh login, GitHub, the state store).
+  "MERGE_UNVERIFIED", "MERGE_STALLED", "CI_FOLLOW_STUCK",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
   // A clean claim the supervisor reports to the owner itself is digest LANE_DONE_AUTO_REPORTED (below); a failed auto
   // report wakes the lead, with the claim, so it reports the lane itself.
