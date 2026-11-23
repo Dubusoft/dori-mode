@@ -513,7 +513,7 @@ test("a PR GitHub cannot be read for at the claim is UNREAD in the snapshot, nev
 });
 
 /** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */
-const greenPrLane = (pr: { state: string; base: string }) => {
+const greenPrLane = (pr: { state: string; base: string; mergeable?: string }) => {
   const HEAD = "c".repeat(40);
   const bound: Lane = { ...lane, done: "pr acme/app feat/x" };
   const green = [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }];
@@ -524,7 +524,7 @@ const greenPrLane = (pr: { state: string; base: string }) => {
     const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
       const json = (body: unknown) => ({ code: 0, out: JSON.stringify(body), err: "" });
       if (argv[0] === "gh" && argv[2] === "list" && argv.includes("open")) return json(pr.state === "OPEN" ? [{ number: 7, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }] : []);
-      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: green });
+      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: pr.mergeable ?? "MERGEABLE", mergeStateStatus: pr.mergeable === "CONFLICTING" ? "DIRTY" : "CLEAN", statusCheckRollup: green });
       return base.run(argv, opts);
     };
     return { ...base, run };
@@ -565,6 +565,28 @@ test("a green PR the supervisor never merges (another base) does not hold the cl
   await watchTick(deps(T0 + 10 * MIN));
   expect(await watchTick(deps(T0 + 69 * MIN))).toEqual([]);
   expect((await watchTick(deps(T0 + 70 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+});
+
+test("a claimed PR that conflicts with its base by the settle is objected to, never closed verified-done, whatever its base or the merge wait", async () => {
+  livePane();
+  const pr: { state: string; base: string; mergeable?: string } = { state: "OPEN", base: "dev" };
+  const { bound, deps } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "https://github.com/acme/app/pull/7 green");
+  await watchTick(deps(T0));
+  // Clean at the claim; another merge into dev makes it conflict inside the window.
+  pr.mergeable = "CONFLICTING";
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual(["LANE_NOT_DONE demo-lane acme/app#7 conflicts with its base"]);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("not-done");
+  // Neither a base the supervisor never merges into nor a claim past mergeWaitMaxMin closes a conflicting PR.
+  pr.base = "main";
+  pr.mergeable = undefined;
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0 + 10 * MIN), bound, "PR into main green");
+  await watchTick(deps(T0 + 10 * MIN));
+  pr.mergeable = "CONFLICTING";
+  expect(await watchTick(deps(T0 + 80 * MIN))).toEqual(["LANE_NOT_DONE demo-lane acme/app#7 conflicts with its base"]);
+  expect(closedVia()).toHaveLength(0);
 });
 
 test("a watcher restarted inside the window keeps the original deadline and announces the claim once", async () => {
