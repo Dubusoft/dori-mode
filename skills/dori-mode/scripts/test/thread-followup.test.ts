@@ -12,12 +12,12 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 
-/** Discord over HTTP: `GET /channels/<id>` answers `channels[id]`; a post answers message m-1. */
-const discordWith = (channels: Record<string, unknown>) => new Discord(async (request) => {
+/** Discord over HTTP: `GET /channels/<id>` answers `channels[id]`; a post answers message m-1; anything else answers `miss`. */
+const discordWith = (channels: Record<string, unknown>, miss = 404) => new Discord(async (request) => {
   const id = /\/channels\/(\d+)$/.exec(request.url)?.[1];
   if (request.method === "GET" && id && id in channels) return { status: 200, headers: {}, body: JSON.stringify(channels[id]) };
   if (request.method === "POST") return { status: 200, headers: {}, body: JSON.stringify({ id: "m-1" }) };
-  return { status: 404, headers: {}, body: "{}" };
+  return { status: miss, headers: {}, body: "{}" };
 }, fakeClock(T0), "t");
 
 test("a plain channel recorded as closed by the owner counts as open and loses its record", async () => {
@@ -31,11 +31,20 @@ test("a plain channel recorded as closed by the owner counts as open and loses i
   expect(readOwnerClosed(state.dir)).toEqual({ "901": T0 - 1 });
 });
 
+test("a recorded thread Discord no longer knows (deleted) counts as open and loses its record", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  recordOwnerClosed(state.dir, "903", T0 - 1);
+  recordOwnerClosed(state.dir, "901", T0 - 1);
+  expect(await closedByOwner(state.dir, discordWith({}), "903")).toBeUndefined();
+  expect(readOwnerClosed(state.dir)).toEqual({ "901": T0 - 1 });
+});
+
 test("a failed thread read of a recorded thread still fails and keeps the record", async () => {
   const state = withState();
   cleanups.push(state.done);
   recordOwnerClosed(state.dir, "902", T0 - 1);
-  await expect(closedByOwner(state.dir, discordWith({}), "902")).rejects.toThrow();
+  await expect(closedByOwner(state.dir, discordWith({}, 503), "902")).rejects.toThrow("503");
   expect(readOwnerClosed(state.dir)).toEqual({ "902": T0 - 1 });
 });
 
