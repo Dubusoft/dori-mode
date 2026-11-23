@@ -189,16 +189,36 @@ export class OwnerDecisionError extends Error {
 
 const EMPTY: DecisionsFile = { nextSeq: 1, decisions: [] };
 
-const parseFile = (text: string): DecisionsFile => {
-  const value = JSON.parse(text) as Partial<DecisionsFile>;
-  if (typeof value !== "object" || value === null || !Array.isArray(value.decisions) || typeof value.nextSeq !== "number") throw new Error("decisions.json is malformed");
-  // Retired credential requests must not resume or block ordinary owner decisions.
-  return { nextSeq: value.nextSeq, decisions: value.decisions.filter((d) => !("secretRequest" in d) && !d.sourceRef?.startsWith("secret:")) };
+const warned = new Set<string>();
+const warnOnce = (line: string): void => {
+  if (warned.has(line)) return;
+  warned.add(line);
+  console.error(line);
 };
 
-/** decisions.json as it is now; no file or an unreadable one reads as no decisions (for readers: status, inbox, list). */
+/** A decision entry that is not an object is dropped, named in one DECISIONS_ENTRY_DROPPED line, instead of failing the whole file. */
+const parseFile = (path: string, text: string): DecisionsFile => {
+  const value = JSON.parse(text) as Partial<DecisionsFile>;
+  if (typeof value !== "object" || value === null || !Array.isArray(value.decisions) || typeof value.nextSeq !== "number") throw new Error("decisions.json is malformed");
+  const entries = value.decisions as readonly unknown[];
+  const dropped = entries.flatMap((d, i) => (typeof d === "object" && d !== null && !Array.isArray(d) ? [] : [i]));
+  if (dropped.length) warnOnce(`DECISIONS_ENTRY_DROPPED ${path}: entries ${dropped.join(", ")} are not objects and are ignored`);
+  const decisions = entries.filter((_, i) => !dropped.includes(i)) as OwnerDecision[];
+  // Retired credential requests must not resume or block ordinary owner decisions.
+  return { nextSeq: value.nextSeq, decisions: decisions.filter((d) => !("secretRequest" in d) && !d.sourceRef?.startsWith("secret:")) };
+};
+
+/**
+ * decisions.json as it is now, for readers (status, inbox, list). No file reads as no decisions; a file that cannot be read
+ * or parsed also reads as none, but is named in one DECISIONS_UNREADABLE line per path and error (writers refuse it).
+ */
 export const readDecisions = (stateDir: string): DecisionsFile => {
-  try { return parseFile(readFileSync(join(stateDir, DECISIONS_FILE), "utf8")); } catch { return EMPTY; }
+  const path = join(stateDir, DECISIONS_FILE);
+  try { return parseFile(path, readFileSync(path, "utf8")); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return EMPTY;
+    warnOnce(`DECISIONS_UNREADABLE ${path}: ${e instanceof Error ? e.message : String(e)}; reading as no decisions until it is fixed`);
+    return EMPTY;
+  }
 };
 
 /**
@@ -208,7 +228,7 @@ export const readDecisions = (stateDir: string): DecisionsFile => {
 export const updateDecisions = <T>(stateDir: string, act: (file: DecisionsFile) => { readonly file?: DecisionsFile; readonly result: T }): T =>
   withStateLockSync(join(stateDir, DECISIONS_LOCK), () => {
     const path = join(stateDir, DECISIONS_FILE);
-    const file = existsSync(path) ? parseFile(readFileSync(path, "utf8")) : EMPTY;
+    const file = existsSync(path) ? parseFile(path, readFileSync(path, "utf8")) : EMPTY;
     const { file: next, result } = act(file);
     if (next && next !== file) saveJsonFile(path, next);
     return result;
