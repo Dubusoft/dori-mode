@@ -91,6 +91,26 @@ test("a non-boolean autopilot or a non-string dueDate is ToodoUnreadable", async
   }
 });
 
+test("a task list skips and logs an unmarked task it cannot read; a marked or unmarkable one still fails closed", async () => {
+  const broken = [
+    { ...wire(task(13, { autopilot: false, workspaceId: 9 })), status: "archived" },
+    { ...wire(task(14)), id: "x", autopilot: undefined, criteria: "none" },
+  ];
+  const lines: string[] = [];
+  const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [wire(task(12)), ...broken, wire(task(15))]), log: (l) => lines.push(l) });
+  expect((await client.flaggedTasks()).map((t) => t.id)).toEqual([12, 15]);
+  expect((await client.tasksByIds([12, 13, 15])).map((t) => t.id)).toEqual([12, 15]);
+  expect(lines.slice(0, 2)).toEqual([
+    'TOODO_TASK_SKIPPED #13 not marked for autopilot: toodo-server returned a task with status "archived" (#13)',
+    "TOODO_TASK_SKIPPED (no id) not marked for autopilot: toodo-server returned a task with no id",
+  ]);
+  for (const bad of [{ ...wire(task(16)), status: "archived" }, "not a task"]) {
+    const strict = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [wire(task(12)), bad]), log: (l) => lines.push(l) });
+    expect(await strict.flaggedTasks().catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
+  }
+  expect(lines).toHaveLength(4);
+});
+
 test("get_task returns undefined on 404", async () => {
   const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(404, { error: "not found" }) });
   expect(await client.task(99)).toBeUndefined();
