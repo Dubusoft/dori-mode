@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { freshnessTick } from "../src/freshness.ts";
 import { CONFIRM_BACKOFF_MS, sendGuarded, sendVerified } from "../src/panes.ts";
@@ -8,7 +9,8 @@ import { pauseLane, resumeLane } from "../src/pause.ts";
 import type { LaneRef } from "../src/lane-ops.ts";
 import { type Lane, Registry, statusOf, withStatus } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
-import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
+import { recoverLanes } from "../src/recover.ts";
+import { depsFor, fakeClock, fakeRunner, newWorld, sent, withSqliteStore, withState, type World } from "./fakes.ts";
 
 // Issue #11: telling Dori to wait must stick. One paused state silences the freshness sweep and pauses the goal,
 // and the lane is marked paused only once the pane shows the goal paused.
@@ -109,6 +111,50 @@ test("a resume the runner cannot confirm leaves the lane paused, and an unreacha
   const fresh: Lane = { ...working, key: "other-lane" };
   await deps(T0).registry.write(fresh);
   expect(await pauseLane(deps(T0 + 4 * MIN), fresh, "wait")).toMatchObject({ code: 3, lines: ["PAUSE_UNVERIFIED other-lane /goal pause failed; lane left working"] });
+});
+
+test("resume relaunches a paused lane whose agent is gone (its pane left with only a shell) in its own session and returns RESUMED", async () => {
+  withSqliteStore(state.dir);
+  world.prState = "OPEN";
+  const brief = join(state.dir, "brief.md");
+  await Bun.write(brief, "Execute the task.");
+  // Paused from working; the agent exited since, so the pane runs only its shell. Old recoveries do not count against it.
+  await deps(T0).registry.write({ ...working, brief, cwd: state.dir, session: "sess-1", status: "paused", pausedFrom: "working", recoveryAttempts: 3 });
+  world.panes = [{ pane_id: "w:p7", tab_id: "w:t7", workspace_id: "w" }];
+  world.inspection = { process: { foreground_processes: [{ pid: 42, argv: ["zsh"] }] } };
+  const d = deps(T0 + 90 * MIN);
+  // The shell refuses the typed `/goal resume`; the relaunched agent confirms it.
+  const resumes: string[] = [];
+  const ops = {
+    ...d.ops,
+    resume: async (lane: LaneRef) => { resumes.push(lane.pane ?? "-"); return lane.pane === "w:p7" ? { goal: "failed" as const } : { goal: "confirmed" as const, execution: "running" as const }; },
+    recover: async (lane: LaneRef, opts?: { readonly session?: string }) => {
+      world.ops.push({ op: "recover", key: lane.key, args: { ...(opts ? { opts } : {}) } });
+      world.panes = [{ pane_id: "w:p8", tab_id: "w:t8", workspace_id: "w", agent: "omo", agent_status: "working" }];
+      return { pane: "w:p8", tab: "w:t8", relaunched: true, resumed: opts?.session !== undefined, startup: { verdict: "ok" as const, detail: "ready" } };
+    },
+  };
+
+  // Recovery by key leaves a paused lane to dori resume and says so.
+  expect(await recoverLanes({ ...d, ops }, working.key)).toEqual(["LANE_PAUSED_NOT_RECOVERED waiting-lane is paused; dori resume waiting-lane resumes it and relaunches its agent if it is gone"]);
+  expect(world.ops.some((e) => e.op === "recover")).toBe(false);
+
+  const r = await resumeLane({ ...d, ops }, (await stored()) as Lane, "owner said go");
+
+  expect(r.code).toBe(0);
+  expect(r.lines).toEqual([
+    "RESUMED waiting-lane as working, its agent was gone and was relaunched in w:p8; /goal resume confirmed",
+    "LANE_RECOVERED waiting-lane w:p8 agent-gone session-resumed",
+    "STARTUP_OK waiting-lane w:p8",
+  ]);
+  expect(world.ops.find((e) => e.op === "recover")?.args).toMatchObject({ opts: { session: "sess-1" } });
+  expect(resumes).toEqual(["w:p7", "w:p8"]);
+  const lane = (await stored()) as Lane & { resuming?: string };
+  expect(statusOf(lane)).toBe("working");
+  expect(lane).toMatchObject({ key: "waiting-lane", pane: "w:p8", brief, cwd: state.dir, recoveryAttempts: 1 });
+  expect(lane.pausedFrom).toBeUndefined();
+  expect(lane.resuming).toBeUndefined();
+  expect(world.ops.at(-1)).toMatchObject({ op: "notify", key: "waiting-lane", args: { status: "working" } });
 });
 
 test("a goal resumed while the session stays held is RESUME_UNVERIFIED: the lane stays paused and its goal is paused again", async () => {
