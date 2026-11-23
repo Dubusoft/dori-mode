@@ -29,8 +29,8 @@ export type LaneMerge = { readonly repo: string; readonly number: number; readon
 
 /**
  * What a close says about its task, as `toodo=<tag>` on the close line: `done` (completed and read back; the report was
- * appended, or there was nothing it could be appended to without a new post; or, with no merge read back, the task
- * already reads done and completed), `append-failed` (completed, the append failed), `failed` (not completed),
+ * appended, or there was nothing it could be appended to without a new post; or the task already reads done and
+ * completed, with or without a merge read back), `append-failed` (completed, the append failed), `failed` (not completed),
  * `unmerged` (no merge read back and the task not read done, so not completed), `no-task`, `not-adopted` (concluded
  * not adopted and read back, or it already read done).
  */
@@ -218,6 +218,9 @@ export const taskFinisher = (deps: TaskFinisherDeps): TaskFinisher => async (lan
   const merged = merges.map((m) => `${m.url} merged into ${m.base} as ${m.sha}`).join("; ");
   try {
     const record = await deps.writer.read(task);
+    // The lead already completed it (with its own refs): toodo refuses to complete a done task, and nothing is left to do
+    // but append the merge, without the Toodo part since the supervisor did not complete it.
+    if (record.status === "done" && record.resolution === "completed") return { tag: "done", lines: [await appendMergeFact(deps, lane, merges)] };
     const evidence = `${merged} (lane ${lane.key} closed after its Done signals read back live)`;
     for (const criterion of record.criteria) {
       // A URL criterion is checked by toodo itself when the task completes.
