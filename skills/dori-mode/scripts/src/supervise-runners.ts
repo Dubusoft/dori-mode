@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { addKnownSecrets } from "./redact.ts";
@@ -25,7 +24,7 @@ import { scrubForThread } from "./freshness.ts";
 import { readGuardMachines } from "./remote-guard.ts";
 import type { OperationStore } from "./operations.ts";
 import type { LaneReportStore } from "./lane-report-store.ts";
-import { laneEventReader, openRunnerHub, readBackRunnerStarts, RUNNER_LANE_CURSOR_FILE, type RunnerHubHandle } from "./supervise-hub.ts";
+import { laneEventReader, openRunnerHub, readBackRunnerStarts, readLaneCursor, type RunnerHubHandle } from "./supervise-hub.ts";
 
 /** How often the runners task tries to open a runner hub that failed to open. */
 export const RUNNER_HUB_RETRY_MS = 30_000;
@@ -125,11 +124,8 @@ export class SupervisorRunners {
     catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
     if (deps.clock.now() - this.lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
       this.lastJournalPrune = deps.clock.now();
-      let cursor = 0;
-      try {
-        const value: unknown = JSON.parse(readFileSync(join(deps.config.stateDir, RUNNER_LANE_CURSOR_FILE), "utf8"));
-        if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) cursor = value;
-      } catch {}
+      // Rows at or past the cursor are never pruned, so an unreadable cursor keeps the whole journal.
+      const cursor = readLaneCursor(deps.config.stateDir, "pruning no runner journal rows") ?? 0;
       handle.journal.prune(this.lastJournalPrune, cursor);
     }
   }
