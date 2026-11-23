@@ -3,7 +3,6 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Ran } from "../src/run.ts";
-import { NEEDS_PROTO, RunnerCalls, RunnerUnavailable } from "../src/runner/call.ts";
 import { HERDR_PAUSED_FILE, herdrPaused, hostHerdr } from "../src/runner/herdr-control.ts";
 import { HerdrWatch, startManagedHerdr } from "../src/runner/herdr-watch.ts";
 import { runnerEffects } from "../src/runner/main.ts";
@@ -146,21 +145,11 @@ test("macOS: a herdr unit booted out by stop is bootstrapped again before the ki
   ]);
 });
 
-test("host.herdr is a proto-4 command: its frame validates, an unknown action does not, and a proto-3 runner is refused before sending", async () => {
+test("host.herdr's frame validates and an unknown action does not", () => {
   const head = { runner: "worker-a", gen: 1, epoch: 1 };
   const frame = supervisorCommand(head, 7, "host.herdr", { cmdId: "c1", action: "restart" });
   expect(decodeFrame(encodeFrame(frame), "supervisor")).toEqual(frame);
   expect(() => decodeFrame(encodeFrame({ ...frame, body: { cmdId: "c1", action: "kill" } } as never), "supervisor")).toThrow(ProtocolError);
-  expect(NEEDS_PROTO["host.herdr"]).toBe(4);
-  const sent: string[] = [];
-  const calls = new RunnerCalls({
-    accept: { connected: () => true, command: (label, type) => { sent.push(`${label} ${type}`); return 1; }, control: () => true },
-    proto: () => 3, now: () => 0, timers: { set: () => 0, clear: () => {} }, log: () => {},
-  });
-  const refused = await calls.call("worker-a", "host.herdr", { action: "status" }).catch((e: unknown) => e);
-  expect(refused).toBeInstanceOf(RunnerUnavailable);
-  expect((refused as RunnerUnavailable).why).toBe("outdated");
-  expect(sent).toEqual([]);
 });
 
 test("the runner routes host.herdr to its herdr control and answers with the structured result", async () => {

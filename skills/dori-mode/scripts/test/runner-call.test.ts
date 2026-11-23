@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { RunnerCalls, RunnerUnavailable, QueryFailed } from "../src/runner/call.ts";
 import type { RunnerCallsDeps, Timers } from "../src/runner/call.ts";
-import type { AnyRunnerEvent, RunnerControl } from "../src/runner/protocol.ts";
+import { MIN_PROTO, type AnyRunnerEvent, type RunnerControl } from "../src/runner/protocol.ts";
 
 type Timer = { fn: () => void; ms: number; live: boolean };
 const fakeTimers = () => {
@@ -26,7 +26,7 @@ const setup = (over: { connected?: boolean; proto?: number; lowRefusal?: Error }
       control: ((label: string, type: string, body: Record<string, unknown>) => { if (!connected) return false; controls.push({ label, type, body }); return true; }) as never,
       connected: () => connected,
     },
-    proto: () => "proto" in over ? over.proto : 5,
+    proto: () => "proto" in over ? over.proto : MIN_PROTO,
     now: () => 1000,
     timers: t.api,
     log: (l) => logs.push(l),
@@ -48,17 +48,6 @@ describe("RunnerCalls.call", () => {
     expect(err.why).toBe("disconnected");
     expect(s.sent).toHaveLength(0);
     expect(s.calls.pending()).toBe(0);
-  });
-
-  test("a command newer than the runner's proto is outdated, a proto-2 command still goes", async () => {
-    const s = setup({ proto: 2 });
-    const err = await s.calls.call("w1", "lane.pause", { key: "a" }).catch((e) => e);
-    expect(err.why).toBe("outdated");
-    expect(s.sent).toHaveLength(0);
-    const p = s.calls.call("w1", "lane.stop", { key: "a" });
-    expect(s.sent).toHaveLength(1);
-    s.calls.onEvent("w1", result(s.sent[0]!.body.cmdId as string, "verified", "ok", { closed: "tab", gone: true }));
-    expect((await p).state).toBe("verified");
   });
 
   test("resolves on the matching cmd.result with the structured result", async () => {
@@ -111,9 +100,8 @@ describe("RunnerCalls.call", () => {
 });
 
 describe("RunnerCalls.query", () => {
-  test("throws at once when not connected or outdated", async () => {
+  test("throws at once when not connected", async () => {
     expect((await setup({ connected: false }).calls.query("local", "q.panes", {}).catch((e) => e)).why).toBe("disconnected");
-    expect((await setup({ proto: 2 }).calls.query("w1", "q.panes", {}).catch((e) => e)).why).toBe("outdated");
   });
 
   test("resolves on q.result and sends a control frame with a qid", async () => {
@@ -159,11 +147,9 @@ describe("RunnerCalls.query", () => {
   });
 });
 
-test.each([undefined, 4])("file operations fail closed for proto %s before attempts, sends or timers", async (proto) => {
-  const s = setup({ proto });
-  const detail = proto === undefined
-    ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
-    : "lane files require proto 5 (runner proto 4); run dori runner update";
+test("file operations fail closed for an unknown proto before attempts, sends or timers", async () => {
+  const s = setup({ proto: undefined });
+  const detail = "lane files need the runner's proto (unknown); wait for its hello and retry";
   for (const type of ["lane.start", "lane.recover", "q.lane.files"] as const) {
     const p = type === "q.lane.files" ? s.calls.query("box", type, { key: "a" }) : s.calls.call("box", type, { key: "a" } as never);
     await expect(p).rejects.toMatchObject({ why: "outdated", message: `RUNNER_UNAVAILABLE runner=box outdated: ${detail}` });
@@ -171,7 +157,7 @@ test.each([undefined, 4])("file operations fail closed for proto %s before attem
   expect([s.sent.length, s.controls.length, s.attempts.length, s.t.timers.length, s.calls.pending()]).toEqual([0, 0, 0, 0, 0]);
 });
 
-test("unknown proto retains existing host.herdr and ordinary query behavior; known proto 3 retains its minimum", async () => {
+test("an unknown proto still sends host.herdr and ordinary queries", async () => {
   const s = setup({ proto: undefined });
   const command = s.calls.call("box", "host.herdr", {} as never);
   s.calls.onEvent("box", result(s.sent[0]!.body.cmdId as string, "verified", "ok", {}));
@@ -179,11 +165,10 @@ test("unknown proto retains existing host.herdr and ordinary query behavior; kno
   const query = s.calls.query("box", "q.panes", {});
   s.calls.onControl("box", qresult(s.controls[0]!.body.qid as string, true, "", { panes: [] }));
   expect(await query).toEqual({ panes: [] });
-  await expect(setup({ proto: 3 }).calls.call("box", "host.herdr", {} as never)).rejects.toThrow("host.herdr needs runner proto 4, the runner speaks 3");
 });
 
 test("a low-level gate change settles the never-sent attempt and removes its waiter and timer", async () => {
-  const refusal = new RunnerUnavailable("box", "outdated", "lane files require proto 5 (runner proto 4); run dori runner update");
+  const refusal = new RunnerUnavailable("box", "disconnected", "no admitted connection for lane.start");
   const s = setup({ lowRefusal: refusal });
   await expect(s.calls.call("box", "lane.start", { key: "a" } as never)).rejects.toBe(refusal);
   expect(s.attempts).toEqual(["lane-start:a:1000"]);

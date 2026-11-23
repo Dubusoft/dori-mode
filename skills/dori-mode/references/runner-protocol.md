@@ -319,9 +319,9 @@ the hello `unknown-field`, so update the supervisor before its runners.
 A wait (`dori wait --machine`), poll source or command schedule (`--machine`) that names a runner is carried out on
 it. The supervisor keeps the scheduling, dedupe and journal; it sends each check or run over `RunnerCall` and waits
 for the `cmd.result`. A runner that is not connected fails the call at once with `RUNNER_UNAVAILABLE`. Both commands
-need protocol 5 (`NEEDS_PROTO`); there is no protocol bump. A runner without the handler answers `cmd.result failed
-RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and `cwd` must be absolute,
-existing and under `allowedRoots`.
+came with protocol 5, so every admitted runner carries them; there is no protocol bump. A runner without the handler
+answers `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and
+`cwd` must be absolute, existing and under `allowedRoots`.
 
 | Command | Body | `cmd.result` result |
 | --- | --- | --- |
@@ -853,8 +853,10 @@ Historical note (runners below protocol 8 can no longer connect): protocol 3 add
 `result` and the other protocol 3 fields above, and the runner's `state.sqlite` gained the nullable
 `commands.result_json` column; protocol 4 added herdr state and `host.herdr`; protocol 5 added the runner file
 operations, `wait.check` and `job.run`; protocol 6 added the four secret control frames (see
-[Secrets over the link](#secrets-over-the-link)); protocol 7 added `lane.attach`. The per-feature proto checks left in
-the code (`NEEDS_PROTO`, `secretsSupported`, the `host.herdr` proto check) date from those versions and never refuse a
+[Secrets over the link](#secrets-over-the-link)); protocol 7 added `lane.attach`. The supervisor keeps no per-command
+proto table: a connected runner speaks at least `MIN_PROTO` (`PROTO - 1`), which carries every command and query, and
+only lane file operations fail closed while a connected runner's proto is not known yet. The remaining per-feature
+checks (`secretsSupported`, the `host.herdr` check on a stored runner row) date from those versions and never refuse a
 runner the current window accepts.
 
 ## Liveness and restarts

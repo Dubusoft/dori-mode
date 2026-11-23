@@ -48,15 +48,11 @@ test("stop and restart with --yes list the lanes and then send; the lead host na
   expect(c.sent).toEqual([{ label: "local", type: "host.herdr", body: { action: "stop" } }]);
 });
 
-test("a proto-3 runner is refused with the upgrade command before anything is sent", async () => {
+test("a runner row still at proto 3 is refused with the upgrade command before anything is sent", async () => {
   const c = cli({ proto: 3 });
   expect(await runnerHerdrMain({ action: "start", machine: "worker-a", yes: false }, c.deps)).toBe(2);
   expect(c.err).toEqual(["RUNNER_HERDR_UNSUPPORTED machine=worker-a the runner speaks proto 3; host.herdr needs proto 4: dori runner install --machine worker-a upgrades it"]);
   expect(c.sent).toEqual([]);
-  // The relay's own gate (the hub's proto, newer than this process's read) says the same.
-  const gated = cli({ throws: new RunnerUnavailable("worker-a", "outdated", "host.herdr needs runner proto 4, the runner speaks 3") });
-  expect(await runnerHerdrMain({ action: "start", machine: "worker-a", yes: false }, gated.deps)).toBe(2);
-  expect(gated.err[0]).toStartWith("RUNNER_HERDR_UNSUPPORTED machine=worker-a");
 });
 
 test("a failed action exits 1 with the runner's detail; an unknown action is usage", async () => {

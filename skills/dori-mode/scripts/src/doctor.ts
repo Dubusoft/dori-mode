@@ -26,7 +26,7 @@ import { readRunnerRows } from "./runner/hub.ts";
 import { readRunnerEndpoints } from "./runner/endpoints.ts";
 import { RESTART_CIRCUIT_MAX, RESTART_CIRCUIT_WINDOW_MS } from "./runner/liveness.ts";
 import { OUTBOX_LARGE_AGE_MS, OUTBOX_LARGE_ROWS } from "./runner/outbox.ts";
-import { LABEL_PATTERN, PROTO } from "./runner/protocol.ts";
+import { LABEL_PATTERN, MIN_PROTO, PROTO } from "./runner/protocol.ts";
 import { CREDENTIAL_DENY, installedLaneSandbox, LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE, laneSandboxScript } from "./lane-sandbox-install.ts";
 import { isWindowsOs, unsandboxedReason } from "./runner-sandbox.ts";
 import { SecretStore, SecretStoreError, type SecretEntry } from "./secret-store.ts";
@@ -556,9 +556,9 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
   for (const row of rows) {
     const id = `runner ${row.label}`;
     const problems: string[] = [];
-    if (row.proto !== undefined && row.proto !== PROTO && row.proto !== PROTO - 1) problems.push(`proto ${row.proto} is not ${PROTO} or ${PROTO - 1}`);
+    if (row.proto !== undefined && row.proto !== PROTO && row.proto !== MIN_PROTO) problems.push(`proto ${row.proto} is not ${PROTO} or ${MIN_PROTO}`);
     // Proto 9 adds lanes.closed: the previous proto still runs lanes and secrets but its cleanup sweep has no closed lanes to look at.
-    else if (row.proto === PROTO - 1) problems.push(`proto ${row.proto} skips the closed lanes' node_modules cleanup (it needs proto ${PROTO})`);
+    else if (row.proto === MIN_PROTO) problems.push(`proto ${row.proto} skips the closed lanes' node_modules cleanup (it needs proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
     if (row.herdr === "down" || row.herdr === "hung" || row.herdr === "elevated") {
