@@ -198,13 +198,19 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
     return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
   }
+  const notClaimed = `LANE_DONE_NOT_CLAIMED ${lane.key} is closed`;
+  if (recorded?.closedAt) return notClaimed;
   const pulls = await claimBindings(deps.run, deps.ops, lane);
   const at = iso(deps.clock);
+  let closed = false;
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
       throw stale();
+    // Closed meanwhile: the archived record keeps the claim it closed on (or none), not this one.
+    if (current?.closedAt) { closed = true; return undefined; }
     return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls, ...(text ? { text } : {}) } });
   });
+  if (closed) return notClaimed;
   // `dori lane status` inside the lane answers from what its runner was told (D16).
   await deps.ops.notify(lane, { status: "done-claimed", claim: { at, evidence } });
   if (lane.pane) {
@@ -245,7 +251,13 @@ const steerLane = async (deps: FlowDeps, lane: Lane, kind: "claim" | "not-done",
 
 export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly string[]): Promise<string> => {
   const at = iso(deps.clock);
-  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } }));
+  let closed = false;
+  await deps.registry.update(lane.key, (current) => {
+    // An objection that reaches a closed lane is not recorded: the archived record stays as the close left it.
+    if (current?.closedAt) { closed = true; return undefined; }
+    return withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } });
+  });
+  if (closed) return `LANE_NOT_DONE_SKIPPED ${lane.key} is closed; the objection was not recorded`;
   // The reasons reach the lane through its runner (`dori lane status`, D16), before the lane is told to read them.
   await deps.ops.notify(lane, { status: "not-done", objection: { at, reasons } });
   // The reasons are never typed: they carry command output and paths, and a pane is a shell line. The lane reads them.

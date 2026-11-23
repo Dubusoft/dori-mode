@@ -76,10 +76,13 @@ export const pauseLane = async (deps: FlowDeps & Ops, lane: Lane, note: string):
   if (goal !== "confirmed") return { lane, lines: [`PAUSE_UNVERIFIED ${lane.key} /goal pause ${goal}; lane left ${status}`], code: 3 };
   const at = new Date(deps.clock.now()).toISOString();
   let paused: Lane = lane;
+  let closed: Lane | undefined;
   await deps.registry.update(lane.key, (current) => {
-    const fresh = current ?? lane;
-    return (paused = withStatus(fresh, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
+    // Closed while its goal was being paused: the archived record stays as the close left it.
+    if (current?.closedAt) { closed = current; return undefined; }
+    return (paused = withStatus(current ?? lane, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
   });
+  if (closed) return { lane: closed, lines: [`NOT_PAUSED ${lane.key} is closed, not working`], code: 2 };
   const running = await isWorking(deps.ops, lane);
   if (running && !(await stopTurn(deps.ops, lane))) {
     // The goal is paused, so the lane stays paused and the freshness sweep keeps interrupting it.

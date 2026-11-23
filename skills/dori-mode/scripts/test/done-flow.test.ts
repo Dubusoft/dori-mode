@@ -13,7 +13,7 @@ import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { OUTCOME_LINE_MAX, pendingReported } from "../src/lane-outcomes.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
-import { type Lane, statusOf, withStatus } from "../src/registry.ts";
+import { type Lane, Registry, statusOf, withStatus } from "../src/registry.ts";
 import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World, WT, withSqliteStore } from "./fakes.ts";
@@ -181,6 +181,35 @@ test("after an objection the same evidence claims again", async () => {
   const after = await at(T0).registry.read("demo-lane");
   expect(after && statusOf(after)).toBe("done-claimed");
   expect(after?.claim?.at).toBe(new Date(T0 + 2 * MIN).toISOString());
+});
+
+test("a claim or an objection whose lane closes just before it is written is reported closed and leaves the archived record as it was", async () => {
+  livePane();
+  const closedAt = new Date(T0).toISOString();
+  // The close lands between the caller's read of the lane and its registry update.
+  const closing = (): FlowDeps => ({ ...at(T0 + MIN), registry: new (class extends Registry {
+    override async update(...args: Parameters<Registry["update"]>) {
+      if (!(await this.read(lane.key))?.closedAt) await this.write(withStatus(lane, "closed", "Done", closedAt, { closedAt }));
+      return super.update(...args);
+    }
+  })(state.dir) });
+  const archive = () => readFileSync(at(T0).registry.archivePath(lane.key), "utf8");
+
+  const claimed = closing();
+  expect(await claimDone(claimed, lane, "merged acme/app#1")).toBe("LANE_DONE_NOT_CLAIMED demo-lane is closed");
+  const closed = archive();
+  expect(JSON.parse(closed)).toMatchObject({ status: "closed", version: 2 });
+  expect(JSON.parse(closed).claim).toBeUndefined();
+  expect(await objectDone(claimed, lane, ["tests red"])).toBe("LANE_NOT_DONE_SKIPPED demo-lane is closed; the objection was not recorded");
+  expect(archive()).toBe(closed);
+
+  await at(T0).registry.write({ ...lane, closedAt: undefined, status: "working" });
+  expect(await objectDone(closing(), lane, ["tests red"])).toBe("LANE_NOT_DONE_SKIPPED demo-lane is closed; the objection was not recorded");
+  const reclosed = JSON.parse(archive()) as Lane;
+  expect(statusOf(reclosed)).toBe("closed");
+  expect(reclosed.objection).toBeUndefined();
+  // The lane was told nothing: no status notice, no claim or objection message.
+  expect(world.ops.filter((e) => e.op === "notify" || e.op === "send")).toEqual([]);
 });
 
 test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
