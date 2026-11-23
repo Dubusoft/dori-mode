@@ -254,6 +254,16 @@ test("placement refuses a non-object and a malformed fallback", async () => {
   }
 });
 
+test("placement.maxLanes maps trimmed machines to positive integers and refuses anything else", async () => {
+  const path = join(state.dir, "placement-lanes.json");
+  await Bun.write(path, JSON.stringify({ placement: { maxLanes: { local: 4, " mini ": 8 } } }));
+  expect((await loadConfig(path, "/home/ana")).placement).toEqual({ defaultMachine: "local", fallback: [], maxLanes: { local: 4, mini: 8 } });
+  for (const maxLanes of [4, [4], null, { local: 0 }, { local: 1.5 }, { local: "4" }, { " ": 4 }]) {
+    await Bun.write(path, JSON.stringify({ placement: { maxLanes } }));
+    await expect(loadConfig(path, "/home/ana")).rejects.toThrow("placement.maxLanes must map machine names to positive integers");
+  }
+});
+
 test("alertsChannel routes system notices when set; unset or blank falls back to the first discordChannels entry", async () => {
   const path = join(state.dir, "alerts.json");
   const load = async (raw: Record<string, unknown>) => { await Bun.write(path, JSON.stringify(raw)); return loadConfig(path, "/home/ana"); };

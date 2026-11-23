@@ -207,6 +207,29 @@ test("a default machine filled by pending launches tries fallback and uses the r
   expect(placed.lines.join("\n")).toContain("PLACEMENT_FALLBACK local -> box (launch slots 0");
 });
 
+test("a lane cap counts the machine's open lanes and pending launches once by key, never the candidate's own key", async () => {
+  const h = world(), capped = { ...check(), laneCap: 3 };
+  await h.deps.registry.write(lane("open-1"));
+  await h.deps.registry.write(lane("open-2", { machine: "local" }));
+  await h.deps.registry.write(lane("closed-1", { status: "closed", closedAt: new Date(T0).toISOString() }));
+  await h.deps.registry.write(lane("remote-1", { machine: "box" }));
+  expect(claimSlot(h.state.dir, check(), "open-1", T0).ok).toBe(true);
+  expect(precheckSlots(h.state.dir, capped, T0, "next-1")).toMatchObject({ verdict: { ok: true }, free: 1 });
+  expect(claimSlot(h.state.dir, capped, "next-1", T0).ok).toBe(true);
+  expect(claimSlot(h.state.dir, capped, "next-1", T0 + 1).ok).toBe(true);
+  expect(claimSlot(h.state.dir, capped, "next-2", T0)).toEqual({ ok: false, reasons: ["lanes 3 >= maxLanes 3 on machine local"] });
+  expect(precheckSlots(h.state.dir, { ...check(), laneCap: 1, machine: "box" }, T0).verdict.reasons).toEqual(["lanes 1 >= maxLanes 1 on machine box"]);
+});
+
+test("a default machine at its placement.maxLanes falls back to the next machine", async () => {
+  const h = world();
+  await h.deps.registry.write(lane("open-1"));
+  const deps = { ...h.deps, config: { ...h.deps.config, placement: { defaultMachine: "local", fallback: ["box"], maxLanes: { local: 1 } } } };
+  const input = { ...h.input("capped-1"), done: "" }, placed = await placeLaunch(deps, input);
+  expect(placed.target).toBe("box");
+  expect(placed.lines.join("\n")).toContain("PLACEMENT_FALLBACK local -> box (lanes 1 >= maxLanes 1 on machine local)");
+});
+
 test("autopilot plans 19 lanes and de-duplicates shared ledger claims against pending reservations by key", async () => {
   const h = world(), store = new SqliteOperations(storePath(h.state.dir));
   cleanups.push(() => store.close());

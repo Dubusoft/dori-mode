@@ -145,6 +145,8 @@ export type PlacementConfig = {
   readonly defaultMachine: string;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
+  /** Open lanes (plus pending launches) a machine ("local" or a label) may hold; a machine absent here has no lane cap. */
+  readonly maxLanes?: Readonly<Record<string, number>>;
 };
 
 export type DiscordConfig = {
@@ -501,16 +503,21 @@ const buttonHooks = (raw: unknown, path: string): Readonly<Record<string, ArgvTe
   return Object.fromEntries(valid) as Record<string, string[]>;
 };
 
-/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
+/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback` or `maxLanes`. */
 const placement = (raw: unknown): PlacementConfig => {
   if (raw === undefined) return { defaultMachine: "local", fallback: [] };
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
   const o = raw as Record<string, unknown>;
   const fallback = o.fallback ?? [];
   if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
+  const maxLanes = o.maxLanes;
+  if (maxLanes !== undefined && (!isRecord(maxLanes) || Object.entries(maxLanes).some(([m, n]) => !m.trim() || typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0))) {
+    throw new TypeError("placement.maxLanes must map machine names to positive integers");
+  }
   return {
     defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
     fallback: (fallback as string[]).map((m) => m.trim()),
+    ...(maxLanes === undefined ? {} : { maxLanes: Object.fromEntries(Object.entries(maxLanes).map(([m, n]) => [m.trim(), n as number])) }),
   };
 };
 
