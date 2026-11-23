@@ -206,7 +206,10 @@ export class SqliteStore implements JournalStore {
       const check = this.db.query("PRAGMA quick_check").get() as { quick_check?: string } | null;
       if (check?.quick_check !== "ok") throw new StoreError(`STORE_CORRUPT ${path}: ${check?.quick_check ?? "no result"}`);
       this.db.exec(SCHEMA);
-      const version = Number(this.meta("schema_version") ?? 1);
+      // A version that is not a positive integer would pass both checks below as NaN and silently skip every migration.
+      const stored = this.meta("schema_version") ?? "1";
+      if (!/^[1-9][0-9]*$/.test(stored)) throw new StoreError(`STORE_SCHEMA ${path}: unreadable version ${JSON.stringify(stored)}`);
+      const version = Number(stored);
       if (version > SCHEMA_VERSION) throw new StoreError(`STORE_SCHEMA ${path}: version ${version}, this code reads ${SCHEMA_VERSION}`);
       for (const [to, ddl] of MIGRATIONS) {
         if (to > version) this.db.transaction(() => { if (typeof ddl === "string") this.db.exec(ddl); else ddl(this.db); this.setMeta("schema_version", String(to)); })();
