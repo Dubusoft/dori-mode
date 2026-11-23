@@ -6,7 +6,9 @@ import type { ToodoTask } from "./autopilot.ts";
  * The toodo-server clients. ToodoClient reads for autopilot: `list_tasks`, `get_task` and `list_guidelines` over `POST <url>/api/rpc/<command>` with
  * the bearer token read from `tokenFile` (the same url and token file as the toodo event stream). Every failure (token
  * file missing or empty, network error, timeout, non-200, a reply that is not a task list) throws ToodoUnreadable, so a
- * caller maps any of them to `toodo-unreadable`. A missing task on `get_task` (404) is undefined, not an error.
+ * caller maps any of them to `toodo-unreadable`. A missing task on `get_task` (404) is undefined, not an error. In a task
+ * list, a task not marked for autopilot whose shape the predicate cannot read is left out with a TOODO_TASK_SKIPPED log
+ * line instead (it reads as absent, and an absent prerequisite is not satisfied); a marked one still throws.
  * ToodoWriter (below) writes to a task over the MCP endpoint and reads every write back.
  */
 
@@ -81,6 +83,18 @@ const toTask = (raw: unknown): ToodoTask => {
   };
 };
 
+/** The tasks of a `list_tasks` reply; one that toTask cannot read is skipped and logged unless it is (or may be) marked for autopilot. */
+const toTasks = (reply: readonly unknown[], log: (line: string) => void): ToodoTask[] => {
+  const out: ToodoTask[] = [];
+  for (const raw of reply) {
+    try { out.push(toTask(raw)); } catch (e) {
+      if (!(e instanceof ToodoUnreadable) || !isRecord(raw) || (raw.autopilot ?? false) !== false) throw e;
+      log(`TOODO_TASK_SKIPPED ${isId(raw.id) ? `#${raw.id}` : "(no id)"} not marked for autopilot: ${e.message}`);
+    }
+  }
+  return out;
+};
+
 /** A workspace guideline as `list_guidelines` returns it: a `rule` agents follow or a `memory` recorded for the workspace. */
 export type ToodoGuideline = {
   readonly id: number;
@@ -105,10 +119,16 @@ const toGuideline = (raw: unknown): ToodoGuideline => {
 export class ToodoClient {
   private readonly fetch: ToodoFetch;
   private readonly timeoutMs: number;
+  private readonly log: (line: string) => void;
 
-  constructor(private readonly config: ToodoClientConfig, deps: { readonly fetch?: ToodoFetch; readonly timeoutMs?: number } = {}) {
+  /** `log` receives the TOODO_TASK_SKIPPED lines (default: stderr). */
+  constructor(
+    private readonly config: ToodoClientConfig,
+    deps: { readonly fetch?: ToodoFetch; readonly timeoutMs?: number; readonly log?: (line: string) => void } = {},
+  ) {
     this.fetch = deps.fetch ?? ((url, init) => fetch(url, init));
     this.timeoutMs = deps.timeoutMs ?? TOODO_TIMEOUT_MS;
+    this.log = deps.log ?? ((line) => { console.error(line); });
   }
 
   private token(): string {
@@ -144,7 +164,7 @@ export class ToodoClient {
     for (let i = 0; i < unique.length; i += TOODO_MAX_IDS) {
       const reply = await this.call("list_tasks", { filter: { ids: unique.slice(i, i + TOODO_MAX_IDS) } });
       if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_tasks did not answer a task list");
-      out.push(...reply.map(toTask));
+      out.push(...toTasks(reply, this.log));
     }
     return out;
   }
@@ -156,7 +176,7 @@ export class ToodoClient {
   async flaggedTasks(): Promise<ToodoTask[]> {
     const reply = await this.call("list_tasks", { filter: { statuses: ["planned"] } });
     if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_tasks did not answer a task list");
-    return reply.map(toTask).filter((t) => t.autopilot);
+    return toTasks(reply, this.log).filter((t) => t.autopilot);
   }
 
   /** One task, or undefined when toodo-server has no such task (missing or archived). */
