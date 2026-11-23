@@ -127,11 +127,12 @@ export const TASK_ALERT_MS = 5 * 60_000;
 /**
  * The supervisor's independent tasks. `delivery` hands queued events to the lead and nothing else; `notices` (the owner
  * notices and the lead-side checks, several of which post to Discord) runs beside it, so a slow or failing Discord never
- * holds back lead delivery.
+ * holds back lead delivery. `reports` routes lane reports apart from `polling`, so a slow GitHub poll never holds a
+ * lane question back.
  */
-export const SUPERVISOR_TASKS = ["inbound", "delivery", "notices", "sweeps", "polling"] as const;
+export const SUPERVISOR_TASKS = ["inbound", "delivery", "notices", "sweeps", "polling", "reports"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The sixth task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
+/** The seventh task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
 /** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
 export const AUTOPILOT_TASK = "autopilot";
@@ -730,8 +731,9 @@ type LaneReportParts = {
 };
 
 /**
- * Routes lane reports, in the 5 s polling pass, so a question reaches the lead within one pass and one delivery tick of
- * being written. A lane question with choices opens an owner decision thread; failures are logged, never thrown.
+ * Routes lane reports, as the 5 s reports task's pass, so a question reaches the lead within one pass and one delivery
+ * tick of being written, however long a GitHub poll takes. A lane question with choices opens an owner decision
+ * thread; failures are logged, never thrown.
  */
 const laneReportsPass = (p: LaneReportParts): (() => Promise<void>) => {
   const { deps, reports, transport, decisions, home, enqueue } = p;
@@ -843,11 +845,10 @@ type PollingParts = {
   readonly enqueueSweep: SourceEnqueue;
   readonly pollGithub: () => Promise<void>;
   readonly follow: CiFollowUp;
-  readonly routeLaneReports: () => Promise<void>;
   readonly watchdog: Watchdog;
 };
 
-/** The polling task's pass: waits, the GitHub poll when due, queued lane messages when due, the sources and lane reports. */
+/** The polling task's pass: waits, the GitHub poll when due, queued lane messages when due, and the sources. */
 const pollingPass = (p: PollingParts): (() => Promise<void>) => {
   const { deps, registry, watchdog } = p;
   let lastGitHub = -Infinity;
@@ -866,7 +867,7 @@ const pollingPass = (p: PollingParts): (() => Promise<void>) => {
         .catch((e: unknown) => { console.error(`LANE_MESSAGE_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
     }
     polls.push(watchdog.track("sources", registry.tick())
-      .catch((e: unknown) => { console.error(`SOURCES_ERROR ${e instanceof Error ? e.message : String(e)}`); }), p.routeLaneReports());
+      .catch((e: unknown) => { console.error(`SOURCES_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
     await Promise.all(polls);
   };
 };
@@ -1075,7 +1076,9 @@ export const supervise = async (
       // they run beside lead delivery, never in front of it.
       task("notices", 5_000, notices),
       task("sweeps", 30_000, sweep),
-      task("polling", 5_000, pollingPass({ deps, registry, waits, enqueueWait, enqueueSweep, pollGithub, follow, routeLaneReports, watchdog })),
+      task("polling", 5_000, pollingPass({ deps, registry, waits, enqueueWait, enqueueSweep, pollGithub, follow, watchdog })),
+      // Lane reports ride their own loop: a GitHub call can hold a polling pass for its whole timeout.
+      task("reports", 5_000, routeLaneReports),
       task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, autopilot.pass),
       task(RUNNERS_TASK, RUNNERS_PASS_MS, () => hub.pass()),
     ]);
