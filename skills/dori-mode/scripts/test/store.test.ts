@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { recordHandled } from "../src/ack.ts";
 import { readCarried, takeAwaitingReminders, writeCarried } from "../src/inbox.ts";
 import type { Runner } from "../src/run.ts";
-import { PRE_SQLITE_FILE, SQLITE_FILE, SqliteStore } from "../src/store.ts";
+import { hasColumn, PRE_SQLITE_FILE, SCHEMA_VERSION, SQLITE_FILE, SqliteStore, StoreError } from "../src/store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { Supervisor } from "../src/supervise.ts";
 import { acquireSupervisor } from "../src/supervise-loop.ts";
@@ -256,4 +256,69 @@ test("extra columns from an older database do not affect load and save", () => {
     reopened.save({ ...journal, leadBusySince: T0 + 1 }, "full");
     expect(reopened.load()).toEqual({ ...baseline, leadBusySince: T0 + 1 });
   } finally { reopened.close(); }
+});
+
+/** A current database at `path` whose stored schema_version is then set to `version` with `sql` run first. */
+const storedAt = async (path: string, version: string, sql = ""): Promise<void> => {
+  new SqliteStore(path, { create: true }).close();
+  const raw = new (await import("bun:sqlite")).Database(path);
+  try { if (sql) raw.exec(sql); raw.query("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(version); } finally { raw.close(); }
+};
+
+const storedVersion = async (path: string): Promise<unknown> => {
+  const raw = new (await import("bun:sqlite")).Database(path, { readonly: true });
+  try { return (raw.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string } | null)?.value; } finally { raw.close(); }
+};
+
+test("a database from a newer release is refused with STORE_SCHEMA and left at its version", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  const newer = String(SCHEMA_VERSION + 1);
+  await storedAt(path, newer);
+  expect(() => new SqliteStore(path)).toThrow(StoreError);
+  expect(() => new SqliteStore(path)).toThrow(`STORE_SCHEMA ${path}: version ${newer}, this code reads ${SCHEMA_VERSION}`);
+  expect(await storedVersion(path)).toBe(newer);
+});
+
+test.each(["abc", "", "0", "-1", "2.5", "1e1", " 9", "9x"])("a stored schema_version of %p is refused with STORE_SCHEMA and no migration runs", async (version) => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  await storedAt(path, version, "ALTER TABLE owner_messages DROP COLUMN awaiting_note");
+  expect(() => new SqliteStore(path)).toThrow(StoreError);
+  expect(() => new SqliteStore(path)).toThrow(`STORE_SCHEMA ${path}: unreadable version ${JSON.stringify(version)}`);
+  expect(await storedVersion(path)).toBe(version);
+  const raw = new (await import("bun:sqlite")).Database(path, { readonly: true });
+  try { expect(hasColumn(raw, "owner_messages", "awaiting_note")).toBe(false); } finally { raw.close(); }
+});
+
+test("a migration that fails mid-way rolls back its own step, keeps the steps before it, and resumes from there on the next open", async () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const path = join(state.dir, SQLITE_FILE);
+  // Given a version 6 database whose gh_prs is a view, so migration 8 (ADD COLUMN head_repo) cannot apply.
+  await storedAt(path, "6", `ALTER TABLE lead_state DROP COLUMN pending;
+    ALTER TABLE owner_messages DROP COLUMN awaiting_owner_at; ALTER TABLE owner_messages DROP COLUMN awaiting_note;
+    DROP TABLE gh_prs; CREATE VIEW gh_prs AS SELECT 'o/r' AS repo, 1 AS number;`);
+  // When this code opens it, the open fails at migration 8.
+  expect(() => new SqliteStore(path)).toThrow();
+  // Then migration 7 stays committed, 8 left nothing behind, and 9 never ran.
+  expect(await storedVersion(path)).toBe("7");
+  const raw = new (await import("bun:sqlite")).Database(path);
+  try {
+    expect(hasColumn(raw, "lead_state", "pending")).toBe(true);
+    expect(hasColumn(raw, "gh_prs", "head_repo")).toBe(false);
+    expect(hasColumn(raw, "owner_messages", "awaiting_owner_at")).toBe(false);
+    // And once the cause is fixed the next open applies 8 and 9 only.
+    raw.exec(`DROP VIEW gh_prs; CREATE TABLE gh_prs (
+      repo TEXT NOT NULL, number INTEGER NOT NULL, state TEXT NOT NULL, sha TEXT NOT NULL, branch TEXT NOT NULL, updated TEXT NOT NULL,
+      url TEXT NOT NULL, conflicting INTEGER NOT NULL, checks TEXT NOT NULL, activity TEXT NOT NULL, PRIMARY KEY (repo, number)) WITHOUT ROWID;`);
+  } finally { raw.close(); }
+  const store = new SqliteStore(path);
+  try {
+    expect(store.meta("schema_version")).toBe(String(SCHEMA_VERSION));
+    expect(hasColumn(store.database, "gh_prs", "head_repo")).toBe(true);
+    expect(hasColumn(store.database, "owner_messages", "awaiting_owner_at")).toBe(true);
+  } finally { store.close(); }
 });
