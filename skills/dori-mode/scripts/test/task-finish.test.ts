@@ -16,7 +16,10 @@ import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } 
 type Criterion = { id: number; text: string; kind: string; state: string; evidence: string | null };
 type Task = { id: number; status: string; resolution: string | null; refs: string[]; notes: { kind: string; body: string }[]; criteria: Criterion[] };
 
-/** A fake toodo `/mcp` endpoint with toodo's result shape; complete_task is refused while a criterion is not met. */
+/**
+ * A fake toodo `/mcp` endpoint with toodo's result shape; complete_task is refused on a task already done (as toodo's
+ * transition rules do) and while a criterion is not met.
+ */
 const fakeToodo = (task: Task) => {
   const calls: { name: string; args: Record<string, unknown> }[] = [];
   const ok = (id: unknown, value: unknown) => Response.json({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(value) }] } });
@@ -38,6 +41,7 @@ const fakeToodo = (task: Task) => {
         return ok(rpc.id, task);
       }
       if (name === "complete_task") {
+        if (task.status === "done") return refuse(rpc.id, "invalidTransition");
         if (task.criteria.some((c) => c.state !== "met")) return refuse(rpc.id, "criteriaUnmet");
         task.status = "done"; task.resolution = "completed"; task.refs.push(...(a.refs as string[]));
         return ok(rpc.id, task);
@@ -185,6 +189,16 @@ test("a task toodo refuses to complete wakes the lead with the reason, and the m
   expect(eventClass(lines[2] ?? "")).toBe("lead-digest");
   expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
   expect(fake.sends).toEqual([]);
+});
+
+test("a merged lane whose task the lead already completed with other refs says toodo=done, warns no one, and still appends the merge", async () => {
+  const task: Task = { ...inProgress([manual(1, true)]), status: "done", resolution: "completed", refs: ["https://github.com/acme/app/pull/2"] };
+  const fake = fakeDiscord();
+  const { lines, calls } = await closeMerged(lane, task, fake.discord);
+  expect(lines).toEqual([`LANE_CLOSED demo-lane closed seen-claim toodo=done ${PR}`, `MERGE_FACT demo-lane ${PR} merge=${SHA}; report appended (m1)`]);
+  expect(calls.map((c) => c.name)).toEqual(["get_task"]);
+  expect(task.refs).toEqual(["https://github.com/acme/app/pull/2"]);
+  expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
 });
 
 test("a lane whose PR does not read back merged with a merge SHA wakes the lead and its task is left alone", async () => {
