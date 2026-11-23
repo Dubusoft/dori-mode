@@ -6,6 +6,11 @@ const MASK = "[REDACTED]";
 /** Env names whose values are credentials: a name ending in one of these words, or containing WEBHOOK/CREDENTIAL. */
 const SECRET_NAME = /(?:TOKEN|SECRET|KEY|COOKIE|PASSWORD|PASSWD)$|WEBHOOK|CREDENTIAL/i;
 const MIN_KNOWN_SECRET = 8;
+/**
+ * Shortest line of a multiline secret (a JSON service account key, a PEM body) masked when it shows up on its own: a log
+ * printed line by line leaks the value one line at a time. Shorter lines (`{`, `},`, `"type": "x",`) say nothing secret.
+ */
+const MIN_SECRET_LINE = 16;
 
 let storeSecrets = new Set<string>();
 
@@ -42,14 +47,30 @@ const envFileSecrets = (): readonly string[] => {
   } catch { return []; }
 };
 
-/** Exact-match masking of the secret values the env file and the process environment carry, longest value first. */
+/** `value` as a pattern whose whitespace runs match any whitespace run, so text flattened to one line still matches it. */
+const loosePattern = (value: string): RegExp =>
+  new RegExp(value.trim().split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+"), "g");
+
+/**
+ * Masking of the secret values the env file, the secret store and the process environment carry, longest first. A value
+ * holding whitespace also matches with its whitespace changed (newlines flattened to spaces before redaction), and each
+ * line of a multiline value of MIN_SECRET_LINE+ characters is masked on its own.
+ */
 const maskKnownSecrets = (text: string): string => {
   const known = new Set([...envFileSecrets(), ...storeSecrets]);
   for (const [name, value] of Object.entries(process.env)) {
     if (value && value.length >= MIN_KNOWN_SECRET && SECRET_NAME.test(name)) known.add(value);
   }
+  for (const value of [...known]) {
+    if (!/[\r\n]/.test(value)) continue;
+    for (const line of value.split(/\r?\n/)) if (line.trim().length >= MIN_SECRET_LINE) known.add(line.trim());
+  }
   let out = text;
-  for (const value of [...known].sort((a, b) => b.length - a.length)) if (out.includes(value)) out = out.split(value).join(MASK);
+  for (const value of [...known].sort((a, b) => b.length - a.length)) {
+    // A value that is mostly whitespace keeps exact matching: its loose pattern would match (almost) anything.
+    if (/\s/.test(value) && value.trim().length >= MIN_KNOWN_SECRET) out = out.replace(loosePattern(value), MASK);
+    else if (out.includes(value)) out = out.split(value).join(MASK);
+  }
   return out;
 };
 
