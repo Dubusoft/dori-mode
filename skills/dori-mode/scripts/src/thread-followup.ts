@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { replaceFileAtomic } from "./durable-write.ts";
+import { withStateLockSync } from "./state-lock.ts";
 import { NotThreadError } from "./messenger/discord.ts";
 import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord-split.ts";
 import { guardText, MessengerError } from "./messenger/http.ts";
@@ -21,33 +22,73 @@ export const OWNER_CLOSED_FILE = "owner-closed-threads.json";
 /** Each lane's last `dori reported` post into a thread, lane key -> { channel, message, at }; written by `dori reported`. */
 export const LAST_REPORTS_FILE = "last-reports.json";
 
+/** Held while OWNER_CLOSED_FILE or LAST_REPORTS_FILE is read, changed and written back (the supervisor and the CLI both write them). */
+export const THREAD_FOLLOWUP_LOCK = "thread-followup.lock.sqlite";
+
 export type LastReport = { readonly channel: string; readonly message: string; readonly at: number };
 
-const readObject = (path: string): Record<string, unknown> => {
+/** A state file that exists but is not a JSON object. */
+export class MalformedStateFileError extends Error {}
+
+/** The file's object; a missing file is an empty one, any other read error or a file that is not a JSON object throws. */
+const loadObject = (path: string): Record<string, unknown> => {
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw e;
+  }
   let value: unknown;
-  try { value = JSON.parse(readFileSync(path, "utf8")); } catch { return {}; }
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  try { value = JSON.parse(text); } catch (e) { throw new MalformedStateFileError(`${path} is malformed: ${e instanceof Error ? e.message : String(e)}`); }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new MalformedStateFileError(`${path} is malformed: not a JSON object`);
+  return value as Record<string, unknown>;
 };
 
-const writeObject = (path: string, value: Record<string, unknown>): void => {
-  replaceFileAtomic(path, JSON.stringify(value), 0o600);
+/** Malformed contents already warned about (path + content hash), so a polling reader warns once per corruption. */
+const warned = new Set<string>();
+
+/** For readers: a malformed file warns and reads as empty; it stays on disk for the owner to repair (writers refuse it). */
+const readObject = (path: string): Record<string, unknown> => {
+  try { return loadObject(path); } catch (e) {
+    if (!(e instanceof MalformedStateFileError)) throw e;
+    const key = `${path}\0${Bun.hash(readFileSync(path))}`;
+    if (!warned.has(key)) {
+      warned.add(key);
+      console.error(`THREAD_STATE_WARNING ${e.message}; it reads as empty and is not written until it is repaired or removed`);
+    }
+    return {};
+  }
 };
 
-export const readOwnerClosed = (stateDir: string): Record<string, number> =>
-  Object.fromEntries(Object.entries(readObject(join(stateDir, OWNER_CLOSED_FILE)))
-    .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])));
+/**
+ * Reads `file` under THREAD_FOLLOWUP_LOCK, lets `change` make the next object (undefined: leave the file as it is) and
+ * writes it back (tmp + rename). A malformed file throws instead of being overwritten.
+ */
+const updateObject = (stateDir: string, file: string, change: (current: Record<string, unknown>) => Record<string, unknown> | undefined): void => {
+  withStateLockSync(join(stateDir, THREAD_FOLLOWUP_LOCK), () => {
+    const path = join(stateDir, file);
+    const next = change(loadObject(path));
+    if (next) replaceFileAtomic(path, JSON.stringify(next), 0o600);
+  });
+};
 
-/** Records that the owner closed `thread` at `at` (tmp + rename). */
+const ownerClosedOf = (value: Record<string, unknown>): Record<string, number> =>
+  Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])));
+
+export const readOwnerClosed = (stateDir: string): Record<string, number> => ownerClosedOf(readObject(join(stateDir, OWNER_CLOSED_FILE)));
+
+/** Records that the owner closed `thread` at `at`. */
 export const recordOwnerClosed = (stateDir: string, thread: string, at: number): void => {
-  writeObject(join(stateDir, OWNER_CLOSED_FILE), { ...readOwnerClosed(stateDir), [thread]: at });
+  updateObject(stateDir, OWNER_CLOSED_FILE, (current) => ({ ...ownerClosedOf(current), [thread]: at }));
 };
 
 /** Drops `thread`'s close record: the thread is open again. */
 export const forgetOwnerClosed = (stateDir: string, thread: string): void => {
-  const closed = readOwnerClosed(stateDir);
-  if (!(thread in closed)) return;
-  delete closed[thread];
-  writeObject(join(stateDir, OWNER_CLOSED_FILE), closed);
+  updateObject(stateDir, OWNER_CLOSED_FILE, (current) => {
+    const closed = ownerClosedOf(current);
+    if (!(thread in closed)) return undefined;
+    delete closed[thread];
+    return closed;
+  });
 };
 
 const isLastReport = (value: unknown): value is LastReport => {
@@ -55,12 +96,14 @@ const isLastReport = (value: unknown): value is LastReport => {
   return typeof v === "object" && v !== null && typeof v.channel === "string" && typeof v.message === "string" && typeof v.at === "number";
 };
 
-export const readLastReports = (stateDir: string): Record<string, LastReport> =>
-  Object.fromEntries(Object.entries(readObject(join(stateDir, LAST_REPORTS_FILE))).filter((entry): entry is [string, LastReport] => isLastReport(entry[1])));
+const lastReportsOf = (value: Record<string, unknown>): Record<string, LastReport> =>
+  Object.fromEntries(Object.entries(value).filter((entry): entry is [string, LastReport] => isLastReport(entry[1])));
 
-/** Records `lane`'s last report message (tmp + rename). */
+export const readLastReports = (stateDir: string): Record<string, LastReport> => lastReportsOf(readObject(join(stateDir, LAST_REPORTS_FILE)));
+
+/** Records `lane`'s last report message. */
 export const recordLastReport = (stateDir: string, lane: string, report: LastReport): void => {
-  writeObject(join(stateDir, LAST_REPORTS_FILE), { ...readLastReports(stateDir), [lane]: report });
+  updateObject(stateDir, LAST_REPORTS_FILE, (current) => ({ ...lastReportsOf(current), [lane]: report }));
 };
 
 /** The latest report message posted into `thread` by any lane, or undefined. */
