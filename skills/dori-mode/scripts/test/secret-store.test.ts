@@ -64,6 +64,18 @@ test("legacy cred reads decrypt --user; updating replaces it with plain", async 
   expect(await store.read("API_KEY")).toBe("replacement");
 });
 
+test("an update interrupted before removing the legacy cred still reads the new plain value", async () => {
+  mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(join(dir, "API_KEY.cred"), Buffer.from("old").toString("base64"), { mode: 0o600 });
+  writeFileSync(join(dir, "API_KEY.plain"), "new", { mode: 0o600 });
+  const fake = fakeCreds();
+  const store = new SecretStore({ dir, run: fake.run });
+  expect(await store.read("API_KEY")).toBe("new");
+  expect(store.list()).toEqual([{ name: "API_KEY", backend: "plain" }]);
+  expect([...(await store.readAll(true))]).toEqual([["API_KEY", "new"]]);
+  expect(fake.calls).toEqual([]);
+});
+
 test("a failed legacy decrypt remains SECRET_DECRYPT_FAILED", async () => {
   mkdirSync(dir, { mode: 0o700 });
   writeFileSync(join(dir, "A.cred"), "legacy");

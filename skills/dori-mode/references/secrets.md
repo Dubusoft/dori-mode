@@ -6,7 +6,7 @@ The secret store is a plain sharing channel from the supervisor host to every la
 
 Each secret is one file in `~/.dori/secrets` (mode 0700). Writes always produce `<NAME>.plain`, the raw value with mode 0600.
 
-A legacy `<NAME>.cred` (ciphertext from `systemd-creds --user encrypt`, written by older versions) is still read, decrypted with `systemd-creds --user`, so existing entries keep working without a migration. Updating a `.cred` name writes `<NAME>.plain` and removes the `.cred`.
+A legacy `<NAME>.cred` (ciphertext from `systemd-creds --user encrypt`, written by older versions) is still read, decrypted with `systemd-creds --user`, so existing entries keep working without a migration. Updating a `.cred` name writes `<NAME>.plain` and removes the `.cred`; when both files exist (an update stopped before the removal), the `.plain` value is the one read and listed.
 
 If the directory has any group or other permission bit set, every store command refuses with `SECRET_DIR_UNSAFE` and changes nothing. Fix it with `chmod 700 ~/.dori/secrets`.
 
