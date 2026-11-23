@@ -163,7 +163,7 @@ const USAGE = `dori <command> [options]
                                        lane status, heavy, secret env and secret run (alias host <op>) (anything else: DORI_CLI_LANE_ONLY, exit 2); lane commands of the lead need the
                                        supervisor (RUNNER_UNAVAILABLE, exit 2, while it is down)
   pause  <key> [--note TEXT]           the owner said wait: goal paused (read back), running turn stopped, no nudges; exit 3 if unconfirmed
-  resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status
+  resume <key> [--note TEXT]           undo pause: goal resumed (read back), lane back to its earlier status; an agent that exited is relaunched
   watch                                long-running: emits LANE_* lines every 30 s
   supervise                            own inbound/sweeps and restart a cold idle lead
   runner serve [--label LABEL] [--enroll] [--listen HOST:PORT]

@@ -119,6 +119,31 @@ const liveModel = (raw: unknown): { readonly omo: boolean; readonly model?: stri
   return { omo };
 };
 
+/**
+ * The pane is there but its agent is gone (its shell is all that runs): no omo process, no live herdr status, and past
+ * the runner's startup window (where its lane.recover leaves the pane alone).
+ */
+const agentGoneFrom = (deps: FlowDeps, lane: Lane, pane: Pane, live: { readonly omo: boolean }): boolean =>
+  !live.omo && !ALIVE_STATUSES.has(pane.agent_status ?? "")
+  && deps.clock.now() - (lane.lastRecoveryAt ?? Date.parse(lane.openedAt)) >= RUNNER_STARTUP_GRACE_MS;
+
+/**
+ * Whether the lane's agent is gone as recovery reads it: its registered pane is missing from its runner's pane list, or
+ * left with only its shell. A runner that cannot be read, or a pane whose processes cannot be read, says nothing is gone.
+ */
+export const laneAgentGone = async (deps: FlowDeps, lane: Lane, view: SweepView = passthroughView(deps.ops)): Promise<boolean> => {
+  if (!lane.pane) return false;
+  try {
+    const pane = await view.find(lane);
+    if (!pane) return true;
+    const got = await view.processInfo({ ...lane, pane: pane.pane_id });
+    return got.code === 0 && agentGoneFrom(deps, lane, pane, liveModel(JSON.parse(got.out)));
+  } catch (error) {
+    if (error instanceof LaneOpsError) return false;
+    throw error;
+  }
+};
+
 const providerOf = (model: string): string | undefined => model.includes("/") ? model.slice(0, model.indexOf("/")) : undefined;
 const bareOf = (model: string): string => model.slice(model.indexOf("/") + 1);
 
@@ -246,12 +271,10 @@ const recoverOne = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue |
     const got = await view.processInfo({ ...lane, pane: old.pane_id });
     if (got.code !== 0) throw new LaunchError(`process-info failed: ${got.err || got.out}`);
     const live = liveModel(JSON.parse(got.out));
-    // The pane is there but its agent is gone (its shell is all that runs): the runner relaunches it like a missing pane.
-    // A pane with another live agent, or one still in the runner's startup window (where its lane.recover leaves the
-    // pane alone), is left alone.
+    // An agent gone from its pane is relaunched by the runner like a missing pane. A pane with another live agent, or one
+    // still in the runner's startup window, is left alone.
     if (!live.omo) {
-      const launchedAt = lane.lastRecoveryAt ?? Date.parse(lane.openedAt);
-      if (ALIVE_STATUSES.has(old.agent_status ?? "") || deps.clock.now() - launchedAt < RUNNER_STARTUP_GRACE_MS) return [];
+      if (!agentGoneFrom(deps, lane, old, live)) return [];
       reason = "agent-gone";
     } else {
     const expected = lane.model ?? deps.config.defaultModel;
@@ -395,6 +418,11 @@ export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: Recov
     }
     if (!deps.ops.connected(lane.machine)) {
       if (key && statusOf(lane) === "working") events.push(runnerHeld(lane, runner));
+      continue;
+    }
+    // A paused lane is the owner's to resume; `dori resume` relaunches one whose agent is gone (pause.ts resumeLane).
+    if (key && statusOf(lane) === "paused") {
+      events.push(`LANE_PAUSED_NOT_RECOVERED ${lane.key} is paused; dori resume ${lane.key} resumes it and relaunches its agent if it is gone`);
       continue;
     }
     events.push(...await relaunchLane(deps, lane, enqueue, view, key !== undefined));
