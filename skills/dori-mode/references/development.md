@@ -45,7 +45,8 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/inbox.ts` | the lead's event inbox (`dori inbox take`) |
 | `src/supervise.ts` and `src/supervise-*.ts` | `dori supervise` and its loop, delivery and lead lifecycle |
 | `src/runner/` | the runner protocol, outbox, state, hub, lane socket, CLI relay and transports behind `dori runner serve` (the local runner is a child of `dori supervise`); see [runner-protocol.md](runner-protocol.md) |
-| `src/cli.ts` | the `dori` command itself |
+| `src/cli.ts` | the `dori` command's routing: the lane-mode gate, `--help`, the early commands (setup, doctor, status, runner) and dispatch through `src/commands/index.ts` |
+| `src/commands/` | one module per lead command; each declares the flags it takes (`options`); a flag no command declares is refused before it runs unless it reads its own (`ownFlags`) |
 
 Every module takes its HTTP, clock and timers as arguments. That's how the tests run without the network.
 
