@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { replaceFileAtomic } from "./durable-write.ts";
 import { NotThreadError } from "./messenger/discord.ts";
 import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord-split.ts";
-import { guardText } from "./messenger/http.ts";
+import { guardText, MessengerError } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Lane } from "./registry.ts";
 import type { AppendOutcome } from "./task-finish.ts";
@@ -81,14 +81,16 @@ export type FollowUpDiscord = {
  * Whether the owner closed `thread` and it is still closed: a close is recorded and Discord still reports the thread
  * archived. A recorded thread that is open again (the owner wrote in it) has its record dropped and counts as open.
  * A thread with no record is open without asking Discord. A recorded id Discord reports is not a thread (a plain channel)
- * cannot be closed: its record is dropped and it counts as open. A closed thread comes back with its parent channel, where a
- * line redirected from it goes (undefined when Discord names none: the caller's owner channel then); an open one is undefined.
+ * cannot be closed, and one Discord no longer knows (404: deleted) cannot be posted into or reopened: either way its record
+ * is dropped and it counts as open. Any other failed read (403, 5xx) is thrown, keeping the record. A closed thread comes
+ * back with its parent channel, where a line redirected from it goes (undefined when Discord names none: the caller's owner
+ * channel then); an open one is undefined.
  */
 export const closedByOwner = async (stateDir: string, discord: Pick<FollowUpDiscord, "threadState">, thread: string): Promise<{ readonly parent: string | undefined } | undefined> => {
   if (readOwnerClosed(stateDir)[thread] === undefined) return undefined;
   let state: { readonly archived: boolean; readonly parent: string | undefined };
   try { state = await discord.threadState(thread); } catch (e) {
-    if (!(e instanceof NotThreadError)) throw e;
+    if (!(e instanceof NotThreadError) && !(e instanceof MessengerError && e.status === 404)) throw e;
     forgetOwnerClosed(stateDir, thread);
     return undefined;
   }
