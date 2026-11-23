@@ -154,6 +154,8 @@ export const takeReminders = (stateDir: string): string[] =>
 
 export class OutcomeTracking {
   private published?: string;
+  /** The last tick pass, settled or not: the next one starts after it (tick). */
+  private ticking: Promise<void> = Promise.resolve();
 
   constructor(private readonly core: JournalCore, private readonly enqueue: (id: string, line: string) => void) {}
 
@@ -282,8 +284,17 @@ export class OutcomeTracking {
    * published list is kept current, and the new lead's `dori inbox take` prints every open obligation. Reported rows are
    * dropped after REPORTED_KEEP_MS. A claim-only row is dropped once the registry holds an objection made at or after it
    * opened: `dori object-done` writes only the registry and is never an event.
+   *
+   * Passes run one at a time, in call order: lead delivery and the report check tick from separate supervisor tasks,
+   * and a pass writes back the outcome list it read before its awaits.
    */
-  async tick(registry: Pick<Registry, "read">, leadStatus?: () => Promise<string | undefined>): Promise<void> {
+  tick(registry: Pick<Registry, "read">, leadStatus?: () => Promise<string | undefined>): Promise<void> {
+    const pass = this.ticking.then(() => this.tickOnce(registry, leadStatus));
+    this.ticking = pass.catch(() => {});
+    return pass;
+  }
+
+  private async tickOnce(registry: Pick<Registry, "read">, leadStatus?: () => Promise<string | undefined>): Promise<void> {
     this.consumeReceipts();
     if (this.journal.restart) { this.publish(); return; }
     const watching = (outcome: LaneOutcome) => outcome.reportedAt === undefined && outcome.deliveredAt !== undefined && !(outcome.reminders ?? 0);

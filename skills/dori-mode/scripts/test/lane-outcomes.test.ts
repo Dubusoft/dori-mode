@@ -241,6 +241,32 @@ test("a done claim opens the lane's obligation: listed for inbox take, UNREPORTE
   expect(first?.line).toBe(`UNREPORTED alpha claimed done 5 min ago and the owner has not been told: run dori reported alpha --text TEXT to post the outcome to the owner in its thread. ${CLAIM}`);
 });
 
+test("report checks tick one at a time: a receipt taken by a later tick survives an earlier tick still reading the registry", async () => {
+  // Given a claim past reportTimeoutMin whose first tick hangs in its registry read (lead delivery and the report check
+  // tick from separate supervisor tasks).
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  f.clock.at += 5 * MIN;
+  const read = f.deps.registry.read.bind(f.deps.registry);
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let entered = () => {};
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  let reads = 0;
+  f.deps.registry.read = async (key) => { if (reads++ === 0) { entered(); await held; } return read(key); };
+  const first = supervisor.reportTick();
+  await reading;
+  // When the lead reports while it hangs and the next tick starts.
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  const second = supervisor.reportTick();
+  release();
+  await Promise.all([first, second]);
+  // Then the first tick's reminder stands, and the second tick's receipt is not overwritten by the first tick's stale list.
+  expect(f.unreported()).toHaveLength(1);
+  expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "alpha", reportedAt: f.clock.now(), reminders: 1 });
+});
+
 test("the seen-claim close joins the claim's obligation: a reported claim is not owed again", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
