@@ -119,6 +119,10 @@ export const listenWs = (hostPort: string): WsListener => {
     },
     websocket: {
       maxPayloadLength: MAX_FRAME_BYTES,
+      // A link idle this long is pinged and closed when the ping goes unanswered: a worker's only way to drop a
+      // supervisor link that died without a FIN, which would otherwise refuse the redial as `runner already connected`.
+      idleTimeout: 120,
+      sendPings: true,
       open(ws: ServerWebSocket<ServerData>) {
         const transport = new WsTransport(ws);
         ws.data.transport = transport;

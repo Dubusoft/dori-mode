@@ -6,7 +6,7 @@ import { paneAlive, type Pane } from "../panes.ts";
 import type { Clock } from "../run.ts";
 import { backoffMs, type RunnerClient, yieldTurn } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { HUB_FILE, type CommitFn, type RunnerHub } from "./hub.ts";
+import { HUB_FILE, RUNNER_SILENT_CLOSE_MS, type CommitFn, type RunnerHub } from "./hub.ts";
 import { fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
 import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
@@ -18,7 +18,7 @@ import {
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
-import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
+import { fileCapabilityDetail, isFileOperation, realTimers, RunnerUnavailable, type Timers } from "./call.ts";
 import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
@@ -165,6 +165,8 @@ export type HubHooks = {
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
   readonly auth?: SupervisorAuth;
+  /** The silence watchdog's timers (default real timers). */
+  readonly timers?: Timers;
   readonly log: (line: string) => void;
 };
 
@@ -203,8 +205,11 @@ type Connection = {
  * `hooks.auth`, an `enroll`); a rejected hello is answered and the connection closed. After it, every frame must name
  * the admitted label. The hub's hello rules (fencing.ts `decideHello`) see the gen of the label's live connection; an
  * admitted hello closes that older connection. An invalid frame, or an event whose commit
- * throws (no ack), closes the connection; the runner reconnects and replays from its hello. Returns a function that
- * stops accepting.
+ * throws (no ack), closes the connection; the runner reconnects and replays from its hello. A connection that carries
+ * no frame for `RUNNER_SILENT_CLOSE_MS` (heartbeats come every 15 s) is closed with
+ * `RUNNER_SILENT runner=<label> ...` and, when admitted, `RUNNER_DISCONNECTED`: a link whose TCP died without a FIN
+ * would otherwise look open, so the network listener would not redial and the runner's next hello at the same gen
+ * would be refused as `RUNNER_CONFLICT`. Returns a function that stops accepting (and the watchdogs).
  *
  * With `hooks.auth`:
  * - `enroll` is checked by `SupervisorAuth.enroll`, answered `enroll.ok` (the runner closes) or refused with
@@ -224,6 +229,8 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     if (connection.proto === undefined || connection.proto < 5) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(connection.proto));
   };
   const auth = hooks.auth;
+  const timers = hooks.timers ?? realTimers;
+  const watchdogs = new Set<() => void>();
   const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
   const serve = (transport: Transport): void => {
     let label: string | undefined;
@@ -231,6 +238,24 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     let session: Session | undefined;
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
+    let silence: unknown;
+    const unwatch = (): void => {
+      if (silence !== undefined) timers.clear(silence);
+      silence = undefined;
+    };
+    // Re-armed by every line; firing means nothing arrived for RUNNER_SILENT_CLOSE_MS.
+    const watch = (): void => {
+      unwatch();
+      silence = timers.set(() => {
+        silence = undefined;
+        if (!transport.open) return;
+        hooks.log(`RUNNER_SILENT runner=${label ?? "-"} no frame for ${RUNNER_SILENT_CLOSE_MS / 1000} s: closing the link so the runner reconnects`);
+        phase = "done";
+        transport.close("RUNNER_SILENT");
+      }, RUNNER_SILENT_CLOSE_MS);
+    };
+    watchdogs.add(unwatch);
+    watch();
     const reply = (frame: Frame | undefined): void => {
       if (frame && transport.open) {
         const encoded = encodeFrame(session ? session.seal(frame) : frame);
@@ -267,6 +292,8 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       hooks.onHello?.(label, hello.body);
     };
     transport.onClose(() => {
+      unwatch();
+      watchdogs.delete(unwatch);
       if (label !== undefined && current.get(label)?.transport === transport) {
         current.delete(label);
         hub.disconnected(label);
@@ -275,6 +302,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       }
     });
     transport.onLine((line) => {
+      if (transport.open) watch();
       try {
         const frame = decodeFrame(line, "runner");
         if (phase === "done") return;
@@ -388,7 +416,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     });
   };
   const stops = (Array.isArray(listeners) ? listeners : [listeners as Listener]).map((listener) => listener.onConnection(serve));
-  return Object.assign(() => { for (const stop of stops) stop(); }, {
+  return Object.assign(() => { for (const stop of stops) stop(); for (const unwatch of watchdogs) unwatch(); watchdogs.clear(); }, {
     checkFileCapability,
     connected: (name: string): boolean => current.get(name)?.transport.open === true,
     command<T extends SupervisorCommandType>(name: string, type: T, body: SupervisorCommandBodies[T]): number | undefined {
