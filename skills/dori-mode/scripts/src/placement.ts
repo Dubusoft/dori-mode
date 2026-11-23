@@ -122,7 +122,7 @@ export type MachineCheck = {
   readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number;
   /** Admission inputs from the same observation; absent for an unobservable or offline machine. */
   readonly paneCap?: number; readonly paneCount?: number; readonly paneIds?: readonly string[];
-  /** placement.maxLanes for this machine; absent: no lane cap. */
+  /** placement.maxLanes for this machine, for this host its cores when unset; absent: no lane cap. */
   readonly laneCap?: number;
 };
 
@@ -168,7 +168,8 @@ const unobservable = (machine: string, error: unknown): string => {
  * machine's runner observes it (`q.machine.observe`: its guard sample and pane list); a machine without a connected runner
  * cannot host a lane, so it holds. A remote machine is judged at the thresholds its runner-config.json sets (the
  * observation's `guard`), config.guard for every key it does not set; the local machine always at config.guard, and it
- * also holds while its 1-minute load exceeds its cores x LOAD_PER_CORE_MAX. `laneCap` is placement.maxLanes[machine].
+ * also holds while its 1-minute load exceeds its cores x LOAD_PER_CORE_MAX. `laneCap` is placement.maxLanes[machine];
+ * this host without an entry is capped at its cores, because the load hold lags a burst of launches.
  */
 export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: string): Promise<MachineCheck> => {
   let seen;
@@ -178,7 +179,7 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
   }
   const s = seen.sample;
-  const cap = config.placement.maxLanes?.[machine];
+  const cap = config.placement.maxLanes?.[machine] ?? (machine === LOCAL_MACHINE ? availableParallelism() : undefined);
   const laneCap = cap === undefined ? {} : { laneCap: cap };
   if (machine === LOCAL_MACHINE) {
     const cores = availableParallelism(), limit = cores * LOAD_PER_CORE_MAX;
