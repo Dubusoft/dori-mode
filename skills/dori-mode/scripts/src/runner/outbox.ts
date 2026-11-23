@@ -212,9 +212,12 @@ export class Outbox {
     return this.hydrate(this.db.query("SELECT * FROM events WHERE seq = ?").get(seq) as Row) as OutboxRow<T>;
   }
 
-  /** Every row with `seq > since` that is not acked, ascending by seq: the replay after a hello. */
-  unacked(since: number): OutboxRow[] {
-    const rows = this.db.query("SELECT * FROM events WHERE seq > ? AND acked_at IS NULL ORDER BY seq").all(since) as Row[];
+  /**
+   * The rows with `seq > since` that are not acked, ascending by seq; at most `limit` of them when given. The replay
+   * after a hello reads them a page at a time so a large backlog is never loaded at once.
+   */
+  unacked(since: number, limit?: number): OutboxRow[] {
+    const rows = this.db.query("SELECT * FROM events WHERE seq > ? AND acked_at IS NULL ORDER BY seq LIMIT ?").all(since, limit ?? -1) as Row[];
     return rows.map((row) => this.hydrate(row));
   }
 

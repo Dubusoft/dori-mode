@@ -47,6 +47,11 @@ class SocketTransport extends LineTransport {
     if (!this.pending.length || this.closed) return;
     const written = this.wire.write(this.pending);
     if (written > 0) this.pending = this.pending.subarray(written);
+    this.wake();
+  }
+
+  protected backlogged(): boolean {
+    return this.pending.length > 0;
   }
 
   receive(chunk: Uint8Array): void {

@@ -30,12 +30,18 @@ export { backoffMs };
  * `hello.reject` are read. `runner.rotate` is handled here: the client answers `runner.rotated` with a new key and
  * makes it current on `rotate.ok`, recording the command in the state so `cmdAck` moves past it.
  *
+ * The replay reads the outbox `REPLAY_PAGE_ROWS` rows at a time and, when the transport reports backpressure, waits
+ * for it to drain before the next row; live sends hold until the replay is done. `hello.ok` ends the handshake
+ * deadline, so a long replay to a slow peer is not cut by it.
+ *
  * A frame over `MAX_FRAME_BYTES` is never sent. When the replay cannot send a row, the attempt ends as
  * `RUNNER_CLOSED` with `RUNNER_REPLAY_FAILED seq=<n> ...` logged and the connection closed, so the reconnect loop
  * backs off instead of holding a connection that never becomes ready.
  */
 
 export const HEARTBEAT_MS = 15_000;
+/** How many outbox rows the replay reads at once (rows are at most `OUTBOX_EVENT_MAX` bytes each). */
+export const REPLAY_PAGE_ROWS = 64;
 /**
  * How long either end of a connection waits for the handshake to finish: the runner from sending `hello` to `hello.ok`
  * (or a reject), the supervisor from accepting the connection to admitting it. A peer that stays silent past it is closed,
@@ -132,6 +138,8 @@ export class RunnerClient {
   private ready = false;
   private settle: ((outcome: ConnectOutcome) => void) | undefined;
   private replayed = 0;
+  /** Disarms the current connection's handshake deadline. */
+  private cancelHandshake: () => void = () => {};
   private closedWaiter: Promise<void> = Promise.resolve();
   /** Set once the supervisor's challenge verified; every frame after that is sealed and checked with it. */
   private session: Session | undefined;
@@ -219,6 +227,7 @@ export class RunnerClient {
         this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
         transport.close("RUNNER_HELLO_TIMEOUT");
       });
+      this.cancelHandshake = cancelDeadline;
     }
     return outcome;
   }
@@ -423,23 +432,8 @@ export class RunnerClient {
         this.deps.state.observeEpoch(frame.body.epoch);
         this.cursor = frame.body.eventAck;
         this.deps.outbox.ack(this.cursor);
-        let seq = this.cursor;
-        try {
-          for (const row of this.deps.outbox.unacked(this.cursor)) {
-            seq = row.seq;
-            this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
-            this.replayed += 1;
-          }
-        } catch (error) {
-          const detail = `RUNNER_REPLAY_FAILED seq=${seq} ${error instanceof Error ? error.message : String(error)}`;
-          this.log(detail);
-          this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
-          this.transport?.close("RUNNER_REPLAY_FAILED");
-          return;
-        }
-        this.helloProto = frame.body.proto;
-        this.ready = true;
-        this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });
+        this.cancelHandshake();
+        if (this.transport) void this.replay(this.transport, frame.body.proto);
         return;
       }
       case "hello.reject":
@@ -489,6 +483,41 @@ export class RunnerClient {
         // hello.challenge after the handshake and enroll.ok have no meaning on an open connection.
         return;
     }
+  }
+
+  /**
+   * Sends every unacked row after the cursor, a page at a time, then marks the connection ready. It runs synchronously
+   * until the transport reports backpressure; while it waits, newly published rows stay in the outbox and a later page
+   * picks them up, so the loop ends only on an empty page, with no wait between that read and `ready`.
+   */
+  private async replay(transport: Transport, proto: number): Promise<void> {
+    let seq = this.cursor;
+    try {
+      for (;;) {
+        const page = this.deps.outbox.unacked(seq, REPLAY_PAGE_ROWS);
+        if (!page.length) break;
+        for (const row of page) {
+          seq = row.seq;
+          this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
+          this.replayed += 1;
+          const drained = transport.drained?.();
+          if (drained) {
+            await drained;
+            // A close while waiting has already ended the attempt.
+            if (this.transport !== transport) return;
+          }
+        }
+      }
+    } catch (error) {
+      const detail = `RUNNER_REPLAY_FAILED seq=${seq} ${error instanceof Error ? error.message : String(error)}`;
+      this.log(detail);
+      this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
+      this.transport?.close("RUNNER_REPLAY_FAILED");
+      return;
+    }
+    this.helloProto = proto;
+    this.ready = true;
+    this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });
   }
 
   private invalidCommand(line: string): void {

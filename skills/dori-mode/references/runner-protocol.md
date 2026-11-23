@@ -377,8 +377,11 @@ committed. When the hub receives `seq`:
 
 If the commit throws, `eventAck` doesn't move and no ack is sent. So `eventAck` never runs ahead of the journal,
 and the journal holds events in `seq` order. After a reconnect the runner replays every outbox row above the
-`eventAck` from `hello.ok`, in order, before sending anything new. A lower ack than the runner already holds is
-ignored.
+`eventAck` from `hello.ok`, in order, before sending anything new. It reads the outbox 64 rows at a time and, when
+the socket reports backpressure, waits for it to drain before the next row, so a large backlog is neither loaded
+nor queued at once; `hello.ok` ends the handshake deadline, so a slow replay is not cut by it. A message the socket
+drops closes the link with `RUNNER_SEND_DROPPED`: the peer sees the close at once instead of waiting out a lost
+control frame, and a lost event replays after the reconnect. A lower ack than the runner already holds is ignored.
 
 Runner events land in the hub's own `runner_events` table, never in the lead's journal, and are pruned after 7 days.
 
