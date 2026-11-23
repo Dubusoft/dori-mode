@@ -144,7 +144,10 @@ verifies with the stored key. A failed signature on either side closes the conne
 unenrolled label or another host is refused the same way, a revoked one with `RUNNER_REVOKED`. The session key is
 HKDF over the X25519 shared secret, salted with both nonces, with both identity keys as info, so someone who only
 watched the handshake cannot compute it. From then on every frame both ways carries a `mac`, compared in constant
-time; a frame with a missing or wrong `mac` is dropped and logged `RUNNER_AUTH_FAILED ... bad mac`. Authentication is
+time; a frame with a missing or wrong `mac` is dropped. Each end logs its drops once per connection, as
+`RUNNER_AUTH_FAILED ... bad mac count=<n> ...`: after `BAD_MAC_CLOSE_AFTER` (8) of them it closes the connection with
+`RUNNER_AUTH_FAILED` so the runner handshakes again and gets a fresh session key, and a connection that closes sooner
+logs its count on close. Authentication is
 always on for the unix socket and the WebSocket listener alike.
 
 **Rotation.** `dori runner rotate <label>` sends `runner.rotate` to the connected runner. It writes a new key pair

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { SECRET_COMMAND_MAX_TIMEOUT_SEC } from "../config.ts";
 import type { Clock } from "../run.ts";
-import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
+import { BadMacTally, isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
   CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
@@ -25,8 +25,10 @@ export { backoffMs };
  *
  * With `auth` set (auth.ts), the hello carries a nonce and an ephemeral key; the client checks the supervisor's
  * `hello.challenge` signature against the pinned key and closes with `RUNNER_AUTH_FAILED` when it does not verify,
- * answers `auth.proof`, and from then on seals every frame it sends with the session MAC and drops (logging
- * `RUNNER_AUTH_FAILED`) every received frame whose MAC does not check. Before the handshake only `hello.challenge` and
+ * answers `auth.proof`, and from then on seals every frame it sends with the session MAC and drops every received
+ * frame whose MAC does not check. Those drops are logged once per connection (`RUNNER_AUTH_FAILED frames dropped: bad
+ * mac count=<n> ...`): at `BAD_MAC_CLOSE_AFTER` the client closes the connection with `RUNNER_AUTH_FAILED` and `run`
+ * handshakes again; a connection that closes first logs its count on close. Before the handshake only `hello.challenge` and
  * `hello.reject` are read. `runner.rotate` is handled here: the client answers `runner.rotated` with a new key and
  * makes it current on `rotate.ok`, recording the command in the state so `cmdAck` moves past it.
  *
@@ -144,6 +146,8 @@ export class RunnerClient {
   /** Set once the supervisor's challenge verified; every frame after that is sealed and checked with it. */
   private session: Session | undefined;
   private pendingHello: PendingRunnerHello | undefined;
+  /** The current connection's frames dropped for a bad MAC. */
+  private badMac = new BadMacTally();
   /** The `proto` of the current connection's `hello.ok`; undefined before it and after a close. */
   private helloProto: number | undefined;
   /** Open `secretRequest`s by rid, each bound to the connection it went out on. */
@@ -182,6 +186,8 @@ export class RunnerClient {
     this.session = undefined;
     this.helloProto = undefined;
     this.pendingHello = this.deps.auth?.startHello();
+    const badMac = new BadMacTally();
+    this.badMac = badMac;
     let cancelDeadline: () => void = () => {};
     const outcome = new Promise<ConnectOutcome>((resolve) => {
       this.settle = (settled) => { cancelDeadline(); resolve(settled); };
@@ -191,6 +197,8 @@ export class RunnerClient {
     const offLine = transport.onLine((line) => { if (this.transport === transport) this.handleLine(line); });
     transport.onClose((reason) => {
       offLine();
+      const summary = badMac.summary(false);
+      if (summary) this.log(`RUNNER_AUTH_FAILED ${summary}`);
       if (this.transport === transport) {
         this.transport = undefined;
         this.ready = false;
@@ -418,7 +426,7 @@ export class RunnerClient {
           return;
         }
       } else if (!this.session.check(frame)) {
-        this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac type=${frame.type}`);
+        this.badMacFrame(frame.type);
         return;
       }
     }
@@ -525,11 +533,25 @@ export class RunnerClient {
     let raw: unknown;
     try { raw = JSON.parse(line); } catch { return; }
     if (typeof raw !== "object" || raw === null || !("cmdSeq" in raw)) return;
-    if (this.deps.auth && !(this.session && this.session.check(raw as SupervisorFrame))) {
-      this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac on an invalid command`);
+    if (this.deps.auth && !this.session) {
+      this.log(`RUNNER_AUTH_FAILED frame dropped: invalid command before the handshake`);
+      return;
+    }
+    if (this.session && !this.session.check(raw as SupervisorFrame)) {
+      this.badMacFrame("invalid-command");
       return;
     }
     this.deps.onInvalidCommand(raw);
+  }
+
+  /** Counts a received frame dropped for a bad MAC; at `BAD_MAC_CLOSE_AFTER` logs the summary and closes the connection. */
+  private badMacFrame(type: string): void {
+    const transport = this.transport;
+    if (!this.badMac.drop(type) || !transport) return;
+    const summary = this.badMac.summary(true);
+    if (summary) this.log(`RUNNER_AUTH_FAILED ${summary}`);
+    this.finish({ ok: false, code: "RUNNER_AUTH_FAILED", detail: "too many frames with a bad mac" });
+    transport.close("RUNNER_AUTH_FAILED");
   }
 
   private answerChallenge(challenge: SupervisorControlBodies["hello.challenge"]): void {

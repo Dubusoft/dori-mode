@@ -44,6 +44,36 @@ import type { Connector } from "./transport.ts";
 export const ENROLL_CODE_BYTES = 32;
 export const ENROLL_CODE_TTL_MS = 10 * 60_000;
 export const NONCE_BYTES = 32;
+/**
+ * How many frames with a bad session MAC one connection may carry before either end closes it with
+ * `RUNNER_AUTH_FAILED`: a session whose keys disagree stays broken, and only a fresh handshake derives a new key.
+ */
+export const BAD_MAC_CLOSE_AFTER = 8;
+
+/**
+ * One connection's frames dropped for a bad session MAC. Both ends log one summary line per connection with the count,
+ * when the count reaches `BAD_MAC_CLOSE_AFTER` (and the connection is closed) or when the connection closes first.
+ */
+export class BadMacTally {
+  private count = 0;
+  private last = "";
+  private reported = false;
+
+  /** Records a dropped frame; true once the count has reached `BAD_MAC_CLOSE_AFTER`. */
+  drop(type: string): boolean {
+    this.count += 1;
+    this.last = type;
+    return this.count >= BAD_MAC_CLOSE_AFTER;
+  }
+
+  /** The summary, given once per connection; undefined when no frame was dropped or it was already given. */
+  summary(closing: boolean): string | undefined {
+    if (this.count === 0 || this.reported) return undefined;
+    this.reported = true;
+    const tail = closing ? "closing so the peer handshakes again" : "before the connection closed";
+    return `frames dropped: bad mac count=${this.count} last type=${this.last}, ${tail}`;
+  }
+}
 /** Used codes are kept this long after they expire, so a reuse is refused as used rather than unknown. */
 export const ENROLL_CODE_RETENTION_MS = 24 * 60 * 60_000;
 

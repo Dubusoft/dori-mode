@@ -7,7 +7,7 @@ import type { Clock } from "../run.ts";
 import { backoffMs, HANDSHAKE_TIMEOUT_MS, type RunnerClient, yieldTurn } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { HUB_FILE, RUNNER_SILENT_CLOSE_MS, type CommitFn, type RunnerHub } from "./hub.ts";
-import { fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
+import { BadMacTally, fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
 import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
@@ -220,8 +220,10 @@ type Connection = {
  * - `hello` is answered with the signed `hello.challenge` (or refused: `RUNNER_AUTH_FAILED`, `RUNNER_REVOKED`); the
  *   next frame must be `auth.proof`. A proof that does not verify is refused with `RUNNER_AUTH_FAILED` and closed;
  *   one that verifies opens the session and only then runs the hub's hello rules.
- * - Every later frame must carry the session MAC; one that does not is dropped and logged
- *   `RUNNER_AUTH_FAILED runner=<label> frame dropped: bad mac type=<type>`, and the connection stays open.
+ * - Every later frame must carry the session MAC; one that does not is dropped. The connection's dropped frames are
+ *   logged once, `RUNNER_AUTH_FAILED runner=<label> frames dropped: bad mac count=<n> last type=<type>, ...`: when the
+ *   count reaches `BAD_MAC_CLOSE_AFTER` the connection is closed with `RUNNER_AUTH_FAILED` so the runner handshakes
+ *   again, and a connection that closes before that logs its count on close.
  * - `runner.rotated` answering the pending `runner.rotate` stores the new key and is acked with `rotate.ok`.
  */
 export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Listener[], hooks: HubHooks): RunnerAccept => {
@@ -241,6 +243,11 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
     let silence: unknown;
+    const badMac = new BadMacTally();
+    const reportBadMac = (closing: boolean): void => {
+      const summary = badMac.summary(closing);
+      if (summary) hooks.log(`RUNNER_AUTH_FAILED runner=${label ?? "-"} ${summary}`);
+    };
     const unwatch = (): void => {
       if (silence !== undefined) timers.clear(silence);
       silence = undefined;
@@ -308,6 +315,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       hooks.onHello?.(label, hello.body);
     };
     transport.onClose(() => {
+      reportBadMac(false);
       unwatch();
       watchdogs.delete(unwatch);
       cancelDeadline();
@@ -360,7 +368,11 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           return;
         }
         if (session && !session.check(frame)) {
-          hooks.log(`RUNNER_AUTH_FAILED runner=${label ?? "-"} frame dropped: bad mac type=${frame.type}`);
+          if (badMac.drop(frame.type)) {
+            reportBadMac(true);
+            phase = "done";
+            transport.close("RUNNER_AUTH_FAILED");
+          }
           return;
         }
         if (label === undefined) throw new ProtocolError("sequence", `${frame.type} before hello`);

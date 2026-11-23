@@ -3,7 +3,7 @@ import { sign } from "node:crypto";
 import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
-  ENROLL_CODE_TTL_MS, RUNNER_KEY_FILES, RunnerAuth, SupervisorAuth, enrollOverStdio, enrollRunner, fingerprint, transcript, type HandshakeParams,
+  BAD_MAC_CLOSE_AFTER, ENROLL_CODE_TTL_MS, RUNNER_KEY_FILES, RunnerAuth, SupervisorAuth, enrollOverStdio, enrollRunner, fingerprint, transcript, type HandshakeParams,
 } from "../src/runner/auth.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { RunnerHub } from "../src/runner/hub.ts";
@@ -132,17 +132,12 @@ describe("runner authentication", () => {
     pair.runner.send(encodeFrame({ ...runnerEvent(head, 1, "lane.state", stateBody), mac: Buffer.alloc(32).toString("base64") }));
     pair.runner.send(encodeFrame(runnerEvent(head, 1, "lane.state", stateBody)));
     pair.pump();
-    expect(sup.logs.filter((line) => line.startsWith("RUNNER_AUTH_FAILED"))).toEqual([
-      "RUNNER_AUTH_FAILED runner=r1 frame dropped: bad mac type=lane.state",
-      "RUNNER_AUTH_FAILED runner=r1 frame dropped: bad mac type=lane.state",
-    ]);
     expect(sup.committed).toEqual([]);
     expect(sup.hub.runner(LABEL)?.eventAck).toBe(0);
     expect(pair.supervisor.open).toBe(true);
 
     pair.supervisor.send(encodeFrame({ ...supervisorControl(head, "ack", { eventAck: 99 }), mac: "AAAA" }));
     pair.pump();
-    expect(run.logs).toContain("RUNNER_AUTH_FAILED frame dropped: bad mac type=ack");
     expect(run.client.eventAck).toBe(0);
 
     // A sealed frame from the real client still goes through.
@@ -150,6 +145,65 @@ describe("runner authentication", () => {
     pair.pump();
     expect(sup.committed).toEqual(["runner:r1:1"]);
     expect(run.client.eventAck).toBe(1);
+
+    // Each side logs its drops once, with the count, when the connection closes.
+    expect(sup.logs.filter((line) => line.startsWith("RUNNER_AUTH_FAILED"))).toEqual([]);
+    pair.sever("link down");
+    expect(sup.logs.filter((line) => line.startsWith("RUNNER_AUTH_FAILED"))).toEqual([
+      "RUNNER_AUTH_FAILED runner=r1 frames dropped: bad mac count=2 last type=lane.state, before the connection closed",
+    ]);
+    expect(run.logs.filter((line) => line.startsWith("RUNNER_AUTH_FAILED"))).toEqual([
+      "RUNNER_AUTH_FAILED frames dropped: bad mac count=1 last type=ack, before the connection closed",
+    ]);
+  });
+
+  test("BAD_MAC_CLOSE_AFTER bad MACs close the connection with RUNNER_AUTH_FAILED and one summary line, on both sides, and the runner handshakes again", async () => {
+    const sup = supervisor("sup");
+    const run = runner("runner", sup.net);
+    expect((await enroll(sup, run)).ok).toBe(true);
+    expect((await connect(sup, run)).ok).toBe(true);
+    const first = sup.net.pairs.at(-1);
+    if (!first) throw new Error("no pair");
+    const head = { runner: LABEL, gen: run.state.gen(), epoch: 2 };
+    const authFailed = (logs: readonly string[]) => logs.filter((line) => line.startsWith("RUNNER_AUTH_FAILED"));
+
+    // Supervisor side: frames from the runner whose MAC does not check.
+    for (let i = 0; i < BAD_MAC_CLOSE_AFTER - 1; i += 1) {
+      first.runner.send(encodeFrame({ ...runnerControl(head, "heartbeat", { outbox: { unacked: 0, oldestAgeMs: 0 } }), mac: "AAAA" }));
+    }
+    first.pump();
+    expect(authFailed(sup.logs)).toEqual([]);
+    expect(first.supervisor.open).toBe(true);
+    first.runner.send(encodeFrame({ ...runnerControl(head, "heartbeat", { outbox: { unacked: 0, oldestAgeMs: 0 } }), mac: "AAAA" }));
+    first.pump();
+    expect(authFailed(sup.logs)).toEqual([
+      `RUNNER_AUTH_FAILED runner=r1 frames dropped: bad mac count=${BAD_MAC_CLOSE_AFTER} last type=heartbeat, closing so the peer handshakes again`,
+    ]);
+    expect(sup.logs).toContain("RUNNER_DISCONNECTED runner=r1");
+    expect(first.supervisor.open).toBe(false);
+    expect(run.client.connected).toBe(false);
+
+    // A fresh handshake opens a new session.
+    expect(await connect(sup, run)).toEqual({ ok: true, eventAck: 0, replayed: 0 });
+    const second = sup.net.pairs.at(-1);
+    if (!second || second === first) throw new Error("no new pair");
+
+    // Runner side: frames from the supervisor whose MAC does not check.
+    for (let i = 0; i < BAD_MAC_CLOSE_AFTER; i += 1) {
+      second.supervisor.send(encodeFrame({ ...supervisorControl(head, "ack", { eventAck: 99 }), mac: "AAAA" }));
+    }
+    second.pump();
+    expect(authFailed(run.logs)).toEqual([
+      `RUNNER_AUTH_FAILED frames dropped: bad mac count=${BAD_MAC_CLOSE_AFTER} last type=ack, closing so the peer handshakes again`,
+    ]);
+    expect(second.runner.open).toBe(false);
+    expect(run.client.eventAck).toBe(0);
+    expect(sup.logs.filter((line) => line === "RUNNER_DISCONNECTED runner=r1")).toHaveLength(2);
+
+    expect(await connect(sup, run)).toEqual({ ok: true, eventAck: 0, replayed: 0 });
+    run.client.publish("lane.state", stateBody);
+    pumpAll(sup.net);
+    expect(sup.committed).toEqual(["runner:r1:1"]);
   });
 
   test("reusing a used enrollment code is refused", async () => {
