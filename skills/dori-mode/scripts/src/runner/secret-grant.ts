@@ -45,6 +45,12 @@ export const secretGranter = (deps: SecretGranterDeps) => async (_key: string, n
   } catch (e) { return { ok: false, code: "RUNNER_SECRET_FAILED", detail: e instanceof Error ? e.message : String(e) }; }
 };
 
+/** Registers every readable store value for masking; a store that cannot be read at all is logged as RUNNER_SECRET_MASK_FAILED. */
+export const maskStoreSecrets = async (store: Pick<SecretStore, "readAll">, register: (values: Iterable<string>) => void, log: (line: string) => void): Promise<void> => {
+  try { register((await store.readAll()).values()); }
+  catch (e) { log(`RUNNER_SECRET_MASK_FAILED ${e instanceof Error ? e.message : String(e)}`); }
+};
+
 /** "owner/repo" from a GitHub-style remote URL (https, scp-like ssh or ssh://), else undefined. */
 export const repoFromRemote = (url: string): string | undefined => {
   const u = url.trim();
