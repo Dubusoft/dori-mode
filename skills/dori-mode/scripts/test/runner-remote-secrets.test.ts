@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { RunnerAuth, SupervisorAuth, enrollOverStdio, type PendingHello, type Session } from "../src/runner/auth.ts";
 import { SECRET_COMMAND_MAX_TIMEOUT_SEC } from "../src/config.ts";
-import { RunnerClient, SECRET_RUN_TIMEOUT_MS, SECRET_TIMEOUT_MS } from "../src/runner/client.ts";
+import { HANDSHAKE_TIMEOUT_MS, RunnerClient, SECRET_RUN_TIMEOUT_MS, SECRET_TIMEOUT_MS } from "../src/runner/client.ts";
 import { Outbox } from "../src/runner/outbox.ts";
 import {
   decodeFrame, encodeFrame, supervisorControl,
@@ -88,6 +88,8 @@ const runner = (sup: Sup, opts: { auth?: boolean } = {}) => {
   const logs: string[] = [];
   const timers: { ms: number; fire: () => void; cancelled: boolean }[] = [];
   const timer = (ms: number, fire: () => void) => {
+    // The handshake deadline never fires here; only the secret timers are recorded.
+    if (ms === HANDSHAKE_TIMEOUT_MS) return () => {};
     const t = { ms, fire, cancelled: false };
     timers.push(t);
     return () => { t.cancelled = true; };
