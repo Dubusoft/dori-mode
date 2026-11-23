@@ -57,19 +57,21 @@ export class SecretStore {
     return this.write(name, value);
   }
 
-  /** The stored names with their backend, sorted by name. */
+  /** The stored names with the backend read() uses, sorted by name. */
   list(): readonly SecretEntry[] {
     if (!existsSync(this.dir)) return [];
     this.checkDirMode();
-    const entries: SecretEntry[] = [];
+    const backends = new Map<string, SecretBackend>();
     for (const file of readdirSync(this.dir)) {
       for (const { ext, backend } of EXTENSIONS) {
         if (!file.endsWith(ext)) continue;
         const name = file.slice(0, -ext.length);
-        if (SECRET_NAME.test(name)) entries.push({ name, backend });
+        if (SECRET_NAME.test(name) && backends.get(name) !== "plain") backends.set(name, backend);
       }
     }
-    return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return [...backends]
+      .map(([name, backend]) => ({ name, backend }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
   /** Removes a secret's file(s); SECRET_MISSING when there are none. */
@@ -81,21 +83,24 @@ export class SecretStore {
     for (const file of found) rmSync(file, { force: true });
   }
 
-  /** The secret's value; SECRET_MISSING when absent, SECRET_DECRYPT_FAILED when systemd-creds refuses. */
+  /**
+   * The secret's value; SECRET_MISSING when absent, SECRET_DECRYPT_FAILED when systemd-creds refuses. The .plain file
+   * wins over a legacy .cred: writes only produce .plain, so a .cred beside it is one a write did not get to remove.
+   */
   async read(name: string): Promise<string> {
     this.checkName(name);
     if (existsSync(this.dir)) this.checkDirMode();
-    const cred = join(this.dir, `${name}.cred`);
-    if (existsSync(cred)) {
-      const res = await this.runner(["systemd-creds", "decrypt", "--user", `--name=${name}`, cred, "-"]);
-      if (res.code !== 0) throw new SecretStoreError("SECRET_DECRYPT_FAILED", `SECRET_DECRYPT_FAILED: ${name}: ${res.err}`);
-      return res.out;
-    }
     const plain = join(this.dir, `${name}.plain`);
     if (existsSync(plain)) {
       // A hand-written file (echo VALUE > NAME.plain) ends in a newline the value never had.
       const text = readFileSync(plain, "utf8");
       return text.endsWith("\n") ? text.slice(0, -1) : text;
+    }
+    const cred = join(this.dir, `${name}.cred`);
+    if (existsSync(cred)) {
+      const res = await this.runner(["systemd-creds", "decrypt", "--user", `--name=${name}`, cred, "-"]);
+      if (res.code !== 0) throw new SecretStoreError("SECRET_DECRYPT_FAILED", `SECRET_DECRYPT_FAILED: ${name}: ${res.err}`);
+      return res.out;
     }
     throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING: secret ${name} does not exist`);
   }
