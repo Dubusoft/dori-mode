@@ -18,6 +18,12 @@ import { checkManagedReport } from "./lane-files.ts";
  * (each ending with `TRUNCATION_MARKER`) until its JSON fits `OUTBOX_EVENT_MAX`, and a row stored before that rule
  * existed is cut the same way when it is read back. A replay therefore never stops at a row the wire cannot carry.
  * An event that still does not fit after every string is cut is refused with `OutboxEventTooLarge` and gets no seq.
+ *
+ * A row whose body file is gone or unreadable is read back with `BODY_MISSING_TEXT` in place of the moved text (and,
+ * on `lane.report`, a `bodyRef` marked truncated) and logs `RUNNER_OUTBOX_BODY_MISSING seq=<n> ...`, so it still
+ * replays under its seq and the rows after it are not held. A row whose body JSON does not parse is not skipped: the
+ * supervisor commits only the next seq, so a skipped row would hold every later row just the same, and no event can
+ * be rebuilt from it. Reading it throws, and the replay ends with `RUNNER_REPLAY_FAILED seq=<n>` on every attempt.
  */
 
 const HOUR_MS = 60 * 60_000;
@@ -33,6 +39,8 @@ export const OUTBOX_LARGE_AGE_MS = 24 * HOUR_MS;
 export const FRAME_HEADROOM = 64 * 1024;
 /** The largest JSON size of an event body, as read back. */
 export const OUTBOX_EVENT_MAX = MAX_FRAME_BYTES - FRAME_HEADROOM;
+/** The text a row whose body file is gone or unreadable is read back with. */
+export const BODY_MISSING_TEXT = "[the runner outbox lost this text: its body file is missing or unreadable]";
 
 /** An event whose body cannot be cut to fit `OUTBOX_EVENT_MAX` (it is large without long strings). */
 export class OutboxEventTooLarge extends Error {
@@ -61,6 +69,8 @@ export type OutboxOptions = {
   readonly now: () => number;
   readonly largeRows?: number;
   readonly largeAgeMs?: number;
+  /** Where `RUNNER_OUTBOX_BODY_MISSING` goes. */
+  readonly log?: (line: string) => void;
 };
 
 /** The one text field per event type that may be moved to a body file. */
@@ -140,12 +150,14 @@ export class Outbox {
   private readonly now: () => number;
   private readonly largeRows: number;
   private readonly largeAgeMs: number;
+  private readonly log: (line: string) => void;
 
   /** Opens or creates `<runnerDir>/outbox.sqlite` and `<runnerDir>/bodies/`; the caller has checked the directory. */
   constructor(readonly runnerDir: string, options: OutboxOptions) {
     this.now = options.now;
     this.largeRows = options.largeRows ?? OUTBOX_LARGE_ROWS;
     this.largeAgeMs = options.largeAgeMs ?? OUTBOX_LARGE_AGE_MS;
+    this.log = options.log ?? (() => {});
     this.bodiesDir = join(runnerDir, OUTBOX_BODIES_DIR);
     mkdirSync(this.bodiesDir, { recursive: true, mode: 0o700 });
     const path = join(runnerDir, OUTBOX_FILE);
@@ -257,8 +269,20 @@ export class Outbox {
     let body = JSON.parse(row.body) as Record<string, unknown>;
     if (row.body_path) {
       const field = TEXT_FIELD[row.type as RunnerEventType]!;
-      body = { ...body, [field]: readFileSync(row.body_path, "utf8") };
-      if (row.type === "lane.report") body.bodyRef = { sha256: row.body_sha!, bytes: row.body_bytes!, truncated: row.body_cut === 1 };
+      let text = BODY_MISSING_TEXT;
+      let missing = false;
+      try {
+        text = readFileSync(row.body_path, "utf8");
+      } catch (error) {
+        missing = true;
+        this.log(`RUNNER_OUTBOX_BODY_MISSING seq=${row.seq} type=${row.type} ${error instanceof Error ? error.message : String(error)}`);
+      }
+      body = { ...body, [field]: text };
+      if (row.type === "lane.report") {
+        body.bodyRef = missing
+          ? bodyRefFor(text, true)
+          : { sha256: row.body_sha!, bytes: row.body_bytes!, truncated: row.body_cut === 1 };
+      }
     }
     // A row stored before every event was fitted at append is cut here, so its replay still fits a frame.
     const managed = row.type === "lane.report" && body.files !== undefined;
