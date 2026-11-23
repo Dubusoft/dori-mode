@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { autopilotLaneKey, DEFAULT_AUTOPILOT, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
-import { type ExecutorDeps, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
+import { type ExecutorDeps, type ExecutorResult, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
+import { AutopilotTick } from "../src/autopilot-tick.ts";
 import { type LaunchInput, SandboxRefusal } from "../src/launch.ts";
 import type { PlacedLaunch } from "../src/launch-service.ts";
 import type { ThreadMember } from "../src/messenger/discord.ts";
 import { SqliteOperations, type Observed, type Operation, type OperationStore, plan, settleOperation } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue } from "../src/routing.ts";
-import type { ToodoGuideline, ToodoTaskRecord } from "../src/toodo-client.ts";
+import { type ToodoGuideline, type ToodoTaskRecord, ToodoUnreadable } from "../src/toodo-client.ts";
 import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -337,7 +338,7 @@ test("failed member addition is partial success and never creates another thread
 for (const boundary of ["prepare", "reserve", "start-task", "thread", "brief", "admit", "settle"]) {
   test(`crash after ${boundary}: fresh executor resumes each effect once`, async () => {
     const h = harness(); h.crashAfter(boundary);
-    await runExecutor(h.fresh(), [12]).catch((e: Error) => { expect(e.message).toBe(`crash after ${boundary}`); });
+    await runExecutor(h.fresh(), [12]);
     expect(h.crashed()).toBe(true);
     expect((await reconcileExecutions(h.fresh(freshStore())))[0]?.kind).toBe("launched");
     expect([h.calls.start, h.calls.thread, h.calls.brief, h.calls.admit, h.calls.launch, h.calls.notify]).toEqual([1, 1, 1, 1, 1, 1]);
@@ -345,6 +346,14 @@ for (const boundary of ["prepare", "reserve", "start-task", "thread", "brief", "
     expect(row("execute").state).toBe("verified");
   });
 }
+
+test("a throw inside an open execution is that task's interrupted result, and the next pass resumes it", async () => {
+  const h = harness(); h.crashAfter("thread");
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "interrupted", reasons: ["crash after thread"] }]);
+  expect(row("execute").state).toBe("planned");
+  expect(await runExecutor(h.fresh(freshStore()), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(h.calls.thread).toBe(1);
+});
 
 test("attempted launch with unknown read-back becomes ambiguous and never admits again", async () => {
   const h = harness(); h.held(true);
@@ -480,6 +489,25 @@ test("a CLI reservation is never adopted by the executor", async () => {
   plan(store, T0, { lane: "toodo:12", action: "autopilot-launch", target: "1", data: JSON.stringify({ laneKey: KEY }) });
   expect((await runExecutor(h.fresh(), [12]))[0]?.kind).toBe("refused");
   expect(h.calls.start).toBe(0);
+});
+
+test("one task's unreadable Toodo keeps the pass's earlier launch and the tick wakes the lead only for that task", async () => {
+  const h = harness();
+  const deps = (): ExecutorDeps => {
+    const base = h.fresh();
+    return { ...base, toodo: () => ({ ...base.toodo(), task: async (id) => { if (id === 13) throw new ToodoUnreadable("get_task timed out"); return base.toodo().task(id); } }) };
+  };
+  let results: ExecutorResult[] = [];
+  const lines: string[] = [];
+  const tick = new AutopilotTick({
+    tickMs: () => 60_000, executorOn: () => true, now: () => T0, log: () => {}, enqueue: (_id, line) => { lines.push(line); },
+    judge: async () => ({ paused: false, slots: 1, verdicts: [12, 13].map((taskId) => ({ taskId, verdict: "LAUNCH" as const, reasons: [] })) }),
+    execute: async (ids) => (results = await runExecutor(deps(), ids)),
+  });
+  await tick.tick();
+  expect(results).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }, { taskId: 13, kind: "error", reasons: ["get_task timed out"] }]);
+  expect(h.logs).toContain("AUTOPILOT_EXECUTOR_ERROR #13 get_task timed out");
+  expect(lines).toEqual(["AUTOPILOT_READY #13 slots=1"]);
 });
 
 test("a failed execution never runs again by itself; once the owner re-arms it, the next tick runs attempt 2", async () => {

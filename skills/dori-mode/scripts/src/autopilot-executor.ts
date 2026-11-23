@@ -44,11 +44,14 @@ import { ToodoClient, ToodoWriter } from "./toodo-client.ts";
 
 type Terminal = "launched" | "review" | "failed" | "ambiguous";
 
-/** An execution's current result. Held and paused executions retain their original reservation. */
+/**
+ * An execution's current result. Held and paused executions retain their original reservation. A throw is kept to its
+ * task: `error` before any execution existed (nothing started), `interrupted` inside an open one (the next pass resumes it).
+ */
 export type ExecutorResult = {
   readonly taskId: number;
   readonly laneKey?: string;
-  readonly kind: Terminal | "held" | "paused" | "disabled" | "refused";
+  readonly kind: Terminal | "held" | "paused" | "disabled" | "refused" | "error" | "interrupted";
   readonly reasons?: readonly string[];
 };
 
@@ -337,19 +340,23 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     admitted.op.state === "verified" ? undefined : [admitted.op.detail]);
 };
 
-/** Execute LAUNCH candidates serially under the same lock as the CLI. Existing executions resume their original key. */
+/**
+ * Execute LAUNCH candidates serially under the same lock as the CLI. Existing executions resume their original key.
+ * A task that throws (an unreadable Toodo) gets its own error result; earlier results stand and later tasks still run.
+ */
 export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]): Promise<ExecutorResult[]> => {
   const results: ExecutorResult[] = [];
   for (const taskId of new Set(taskIds)) {
     if (!deps.config.executor) { results.push({ taskId, kind: "disabled" }); continue; }
     const release = await deps.lock();
+    let row: Operation | undefined;
     try {
       // Sequences and attempts the owner covered (a re-arm, or a pause and a wait that ended since) are the owner's to
       // forget; the next one is attempt through + 1. The task is read only when an attempt is left to cover.
       const ledger = ledgerRows(deps.store);
       const executions = deps.store.list({ lane: `toodo:${taskId}` }).filter((op) => op.action === EXECUTE);
       const running = executions.find((op) => ["planned", "attempted"].includes(op.state) && Number(op.target) > rearmedThrough(ledger, taskId));
-      if (running) { results.push(await resume(deps, running)); continue; }
+      if (running) { row = running; results.push(await resume(deps, running)); continue; }
       const rearmed = ledgerState(ledger, taskId, new Set());
       const task = rearmed.attempts > 0 ? await deps.toodo().task(taskId) : undefined;
       const state = task ? ledgerState(ledger, taskId, new Set(), task) : rearmed;
@@ -369,8 +376,12 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
         taskId, laneKey, title: ready.task.title, contract: ready.contract, brief: ready.brief,
         thread: { parent: deps.parentChannel, title: `${laneKey}: ${ready.task.title}`.slice(0, 100) },
       };
-      const row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: EXECUTE, target: String(attempt), data: JSON.stringify(data) });
+      row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: EXECUTE, target: String(attempt), data: JSON.stringify(data) });
       results.push(await resume(deps, row));
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      deps.err(`AUTOPILOT_EXECUTOR_ERROR #${taskId} ${why}`);
+      results.push(row ? { taskId, laneKey: dataOf(row).laneKey, kind: "interrupted", reasons: [why] } : { taskId, kind: "error", reasons: [why] });
     } finally { release(); }
   }
   return results;
