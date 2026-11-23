@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir, loadavg, userInfo } from "node:os";
 import { join, resolve } from "node:path";
-import { parseArgs } from "node:util";
+import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 
 import { configPath, loadConfig } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
@@ -385,26 +385,32 @@ const needSupervisor = async (): Promise<void> => {
 };
 const [command = "", ...rest] = process.argv.slice(2);
 
-const flags = parseArgs({
-  args: rest,
-  allowPositionals: true,
-  strict: false,
-  options: {
-    title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
-    model: { type: "string" }, mode: { type: "string" }, task: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
-    reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
-    to: { type: "string" }, text: { type: "string" }, append: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
-    until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" }, "on-success": { type: "string" },
-    list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, sandbox: { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
-    lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" }, grant: { type: "string", multiple: true },
-    type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
-    port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
-    cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
-    dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" }, result: { type: "string" },
-    "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" }, "no-handled": { type: "boolean" },
-    worktree: { type: "string" }, base: { type: "string" },
-  },
-});
+const options = {
+  title: { type: "string" }, brief: { type: "string" }, done: { type: "string" }, thread: { type: "string" },
+  model: { type: "string" }, mode: { type: "string" }, task: { type: "string" }, thinking: { type: "string" }, cwd: { type: "string" }, pane: { type: "string" }, workspace: { type: "string" }, machine: { type: "string" }, evidence: { type: "string" },
+  reason: { type: "string", multiple: true }, note: { type: "string" }, write: { type: "boolean" }, full: { type: "boolean" }, loop: { type: "string" },
+  to: { type: "string" }, text: { type: "string" }, append: { type: "string" }, edit: { type: "string" }, name: { type: "string" }, message: { type: "string" },
+  until: { type: "string" }, every: { type: "string" }, timeout: { type: "string" }, "on-success": { type: "string" },
+  list: { type: "boolean" }, final: { type: "boolean" }, cancel: { type: "string" }, "share-thread": { type: "boolean" }, "allow-repo-mismatch": { type: "boolean" }, sandbox: { type: "boolean" }, json: { type: "boolean" }, force: { type: "boolean" }, cancelled: { type: "boolean" },
+  lane: { type: "string" }, as: { type: "string" }, all: { type: "boolean" }, grant: { type: "string", multiple: true },
+  type: { type: "string" }, command: { type: "string" }, match: { type: "string" }, kind: { type: "string" }, path: { type: "string" },
+  port: { type: "string" }, secret: { type: "string" }, id: { type: "string" },
+  cron: { type: "string" }, tz: { type: "string" }, "catch-up": { type: "string" }, heavy: { type: "boolean" },
+  dev: { type: "boolean" }, buttons: { type: "string" }, repo: { type: "string" }, result: { type: "string" },
+  "no-redirect": { type: "boolean" }, "drop-notice": { type: "boolean" }, "no-handled": { type: "boolean" },
+  worktree: { type: "string" }, base: { type: "string" },
+} satisfies ParseArgsOptionsConfig;
+// Not strict: the commands below read their own flags from `rest` (their own parseArgs or argv walk) and check them there.
+const OWN_FLAG_COMMANDS = new Set(["launch", "autopilot", "merge", "heavy", "event", "inbox", "decision", "ack", "reported", "handled", "send", "thread", "typing"]);
+const flags = parseArgs({ args: rest, allowPositionals: true, strict: false, options });
+if (!OWN_FLAG_COMMANDS.has(command)) {
+  const unknown = Object.keys(flags.values).filter((name) => !Object.hasOwn(options, name));
+  if (unknown.length) die(`usage: dori ${command} ...: unknown option ${unknown.map((name) => `--${name}`).join(" ")} (see dori ${command} --help)`, 2);
+}
+const loopFlag = flags.values.loop;
+if (loopFlag !== undefined && (typeof loopFlag !== "string" || !/^\d+(\.\d+)?$/.test(loopFlag.trim()))) {
+  die(`usage: dori ${command} [--loop MIN]: --loop takes a number of minutes (0 runs once), got ${typeof loopFlag === "string" ? JSON.stringify(loopFlag) : "no value"}`, 2);
+}
 const opt = (name: string): string | undefined => {
   const v = flags.values[name];
   return typeof v === "string" ? v.trim() : undefined;
