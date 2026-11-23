@@ -249,6 +249,41 @@ test("a lane.start without cwd creates <runnerDir>/lanes/<key>, opens its tab th
   expect(calls.find((a) => a.slice(0, 3).join(" ") === "herdr tab create")).toContain(laneDir);
 });
 
+test.each(["idle", "unknown"])("a live fresh launch never seen working is unconfirmed without typing (%s)", async (status) => {
+  const t = await setup();
+  const runnerDir = join(t.s.dir, "runner");
+  mkdirSync(runnerDir, { mode: 0o700 });
+  const clock = fakeClock(T0);
+  const sleep = async (ms: number) => { clock.at += ms; };
+  const calls: string[][] = [];
+  const brief = join(runnerDir, "briefs", "lane-a.md");
+  const prompt = `ulw. Read and execute the lane brief at ${brief} in full. You are the lane-a lane; report as the brief's footer says.`;
+  const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
+  const lanes = new RunnerLanes({
+    instance: async () => "server-1", runnerDir, clock: { ...clock, sleep }, publish: () => {},
+    policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
+    run: async (argv) => {
+      calls.push([...argv]);
+      const verb = argv.slice(0, 3).join(" ");
+      if (verb === "herdr tab create") return ok(JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7" } } }));
+      if (verb === "herdr pane list") return ok(JSON.stringify({ result: { panes: [{ pane_id: "p7", agent: "omo", agent_status: status }] } }));
+      if (verb === "herdr pane process-info" && clock.at > T0) {
+        return ok(JSON.stringify({ result: { process_info: { shell_pid: 1, foreground_processes: [{ pid: 2, argv: ["omo", prompt] }] } } }));
+      }
+      if (verb === "herdr pane read") return ok("❯ ");
+      return ok();
+    },
+  });
+  const { result } = await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES });
+  expect(calls.find((a) => a[2] === "run")?.[4]).toContain(prompt.replace("'", "'\\''"));
+  expect(result.startup).toEqual({
+    verdict: "unconfirmed",
+    detail: `agent process is alive but was never observed working (${status}); inspect the pane before sending the start prompt manually; last lines: ❯`,
+  });
+  expect(clock.at - T0).toBeWithin(38_000, 45_001);
+  expect(calls.filter((a) => a[2] === "send-text" || a[2] === "send-keys")).toEqual([]);
+});
+
 test.each([false, true])("POSIX launch selects its CLI, inherits secrets in shells, and continues after refusal (remote=%s)", async (remote) => {
   const t = await setup();
   const runnerDir = join(t.s.dir, "runner");

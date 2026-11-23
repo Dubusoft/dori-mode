@@ -362,6 +362,65 @@ test("attempted launch with unknown read-back becomes ambiguous and never admits
   expect(ledgerRows(store)[0]?.state).toBe("ambiguous");
 });
 
+/** start_task commits, then its confirmation and every Toodo read time out until `readable` is set. */
+const halfStart = async () => {
+  const h = harness();
+  let unreadable = false;
+  let reads = 0;
+  const deps = (ops: OperationStore = store): ExecutorDeps => {
+    const base = h.fresh(ops);
+    return {
+      ...base,
+      toodo: () => ({ ...base.toodo(), task: async (id) => { reads++; if (unreadable) throw new Error("get_task timed out"); return base.toodo().task(id); } }),
+      writer: { ...base.writer, startTask: async (id, opts) => { await base.writer.startTask(id, opts); unreadable = true; throw new Error("get_task timed out"); } },
+    };
+  };
+  expect((await runExecutor(deps(), [12]))[0]?.kind).toBe("ambiguous");
+  expect(h.notices.get(`toodo:12/autopilot-notice/1`)).toContain("at start-task, before any lane launched");
+  return { h, deps, readable: () => { unreadable = false; }, reads: () => reads };
+};
+const orphanNotices = (h: ReturnType<typeof harness>) => [...h.notices.values()].filter((line) => line.startsWith("AUTOPILOT_EXECUTOR_ORPHAN "));
+
+test("an ambiguous start with no lane is reported orphaned once it reads back, once across ticks and restarts", async () => {
+  const { h, deps, readable } = await halfStart();
+  await reconcileExecutions(deps());
+  expect(orphanNotices(h)).toEqual([]);
+  readable();
+  await reconcileExecutions(deps());
+  await reconcileExecutions(deps(freshStore()));
+  expect(orphanNotices(h)).toHaveLength(1);
+  expect(orphanNotices(h)[0]).toContain(`#12 lane=${KEY} Toodo shows the task in_progress with lane:${KEY}`);
+  expect(orphanNotices(h)[0]).toContain("dori autopilot rearm 12");
+  expect([h.calls.start, h.calls.admit, h.calls.blocker, h.calls.notify]).toEqual([1, 0, 0, 2]);
+  expect(row("execute").state).toBe("ambiguous");
+});
+
+for (const [name, setup] of [
+  ["a registered lane", (h) => { h.lanes.set(KEY, { key: KEY, title: "t", brief: "b", thread: "discord:c/x", openedAt: new Date(T0).toISOString() } as Lane); }],
+  ["a queued launch", () => { enqueueLaunch(dir, { key: KEY, title: "t", brief: "b", done: "pr owner/repo autopilot/12", queuedAt: new Date(T0).toISOString(), reasons: ["no room"] }); }],
+  ["an admit row", () => { store.put({ ...plan(store, T0, { lane: "toodo:12", action: "autopilot-admit", target: "1" }), state: "attempted" }); }],
+  ["a task back in planned", (h) => { h.task({ status: "planned" }); }],
+  ["a task without the lane ref", (h) => { h.task({ refs: task().refs }); }],
+] as const satisfies readonly (readonly [string, (h: ReturnType<typeof harness>) => void])[]) {
+  test(`an ambiguous start with ${name} is not reported orphaned`, async () => {
+    const { h, deps, readable } = await halfStart();
+    readable(); setup(h);
+    await reconcileExecutions(deps());
+    expect(orphanNotices(h)).toEqual([]);
+  });
+}
+
+test("an ambiguous start that read back as not orphaned is not read again on later ticks", async () => {
+  const { h, deps, readable, reads } = await halfStart();
+  readable(); h.task({ status: "planned" });
+  await reconcileExecutions(deps());
+  const after = reads();
+  await reconcileExecutions(deps());
+  await reconcileExecutions(deps(freshStore()));
+  expect(reads()).toBe(after);
+  expect(orphanNotices(h)).toEqual([]);
+});
+
 test("attempted launch with confirmed startup reconciles without another admission", async () => {
   const h = harness(); h.held(true);
   await runExecutor(h.fresh(), [12]);

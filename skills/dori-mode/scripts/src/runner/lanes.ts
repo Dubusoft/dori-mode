@@ -421,7 +421,10 @@ export class RunnerLanes {
     // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
     if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
     this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
-    const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
+    const startup = await (this.deps.startup?.(pane) ?? startupPoll(
+      { run: this.deps.run, clock: this.deps.clock }, pane,
+      !resumed && argv.includes(prompt) ? (run) => laneProcessAlive(run, pane, key) : undefined,
+    ));
     const model = argvModel(argv);
     return { pane, tab, resumed, startup, cwd, ...(model ? { model } : {}) };
   }
