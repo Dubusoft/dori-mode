@@ -254,7 +254,7 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
       return task?.refs.includes(`lane:${data.laneKey}`) && task.status !== "planned" ? "done" : "not-done";
     });
   if (started.op.state !== "verified") {
-    if (started.op.state === "ambiguous") return stop(deps, row, "ambiguous", [started.op.detail]);
+    if (started.op.state === "ambiguous") return stop(deps, row, "ambiguous", [`at start-task, before any lane launched: ${started.op.detail}`]);
     return resultOf(data, "held");
   }
   const beforeThread = await guard(deps, row);
@@ -376,9 +376,46 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
   return results;
 };
 
-/** At startup and each tick, resume open sequences (including HOLD); settled or ambiguous launches never relaunch. */
-export const reconcileExecutions = (deps: ExecutorDeps): Promise<ExecutorResult[]> =>
-  runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE).map((op) => dataOf(op).taskId));
+/**
+ * Report, once per attempt, an ambiguous start-task that never reached hold or admit while Toodo shows the task
+ * in_progress with its lane ref and no lane or queued launch exists for the key. Each attempt is checked until one read
+ * answers, then recorded either way; an unreadable task or lane is unknown and waits for a later tick. Never pauses, edits or relaunches the task.
+ */
+const reportOrphans = async (deps: ExecutorDeps): Promise<void> => {
+  const ledger = ledgerRows(deps.store);
+  const candidates = deps.store.list({ states: ["ambiguous"] }).filter((op) => op.action === EXECUTE
+    && deps.store.get(stepId(op, "start-task"))?.state === "ambiguous"
+    && !deps.store.get(stepId(op, "admit")) && !deps.store.get(stepId(op, "hold"))
+    && deps.store.get(stepId(op, "orphan"))?.state !== "verified"
+    && Number(op.target) > rearmedThrough(ledger, dataOf(op).taskId));
+  for (const row of candidates) {
+    const { taskId, laneKey } = dataOf(row);
+    let orphaned: boolean;
+    try {
+      const task = await deps.toodo().task(taskId);
+      orphaned = task?.status === "in_progress" && task.refs.includes(`lane:${laneKey}`)
+        && !(await deps.readLane(laneKey)) && !deps.queue().some((q) => q.key === laneKey);
+    } catch { continue; }
+    let journaled = false;
+    await perform(deps.store, deps.now, step(row, "orphan", { taskId, laneKey }), async () => {
+      journaled = true;
+      if (!orphaned) return { ok: true, detail: "not orphaned" };
+      deps.notify(stepId(row, "orphan"), `AUTOPILOT_EXECUTOR_ORPHAN #${taskId} lane=${laneKey} Toodo shows the task in_progress with lane:${laneKey} `
+        + `but no lane was ever launched (start-task was ambiguous, nothing held or admitted); check nobody works it, then pause it in Toodo `
+        + `and leave the next attempt to the owner: a wait set after the pause runs attempt ${Number(row.target) + 1} when it ends, \`dori autopilot rearm ${taskId}\` runs it now`);
+      return { ok: true, detail: "journaled" };
+    }, async () => journaled ? "done" : "not-done");
+  }
+};
+
+/** At startup and each tick, resume open sequences (including HOLD) and report orphaned starts; settled or ambiguous launches never relaunch. */
+export const reconcileExecutions = async (deps: ExecutorDeps): Promise<ExecutorResult[]> => {
+  const results = await runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE).map((op) => dataOf(op).taskId));
+  if (!deps.config.executor) return results;
+  const release = await deps.lock();
+  try { await reportOrphans(deps); } finally { release(); }
+  return results;
+};
 
 /**
  * Live dependencies over FlowDeps and a caller-owned operation store. notify enqueues a stable supervisor event id;
