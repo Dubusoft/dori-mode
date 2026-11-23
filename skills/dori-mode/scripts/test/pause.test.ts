@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import { freshnessTick } from "../src/freshness.ts";
 import { CONFIRM_BACKOFF_MS, sendGuarded, sendVerified } from "../src/panes.ts";
 import { passthroughView } from "../src/sweep-view.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import type { LaneRef } from "../src/lane-ops.ts";
-import { type Lane, statusOf } from "../src/registry.ts";
+import { type Lane, Registry, statusOf, withStatus } from "../src/registry.ts";
 import type { Runner } from "../src/run.ts";
 import { depsFor, fakeClock, fakeRunner, newWorld, sent, withState, type World } from "./fakes.ts";
 
@@ -240,6 +241,24 @@ test("pause and resume refuse lanes in other states with exit 2, and a lane with
   const paneless: Lane = { ...working, pane: undefined };
   expect((await pauseLane(deps(T0), paneless, "wait")).code).toBe(3);
   expect(sent(world)).toEqual([]);
+});
+
+test("a lane closed while its goal is being paused is reported closed, and its archived record is left as it was", async () => {
+  await deps(T0).registry.write(working);
+  const closedAt = new Date(T0).toISOString();
+  // The close lands between the pause's goal command and its registry update.
+  const registry = new (class extends Registry {
+    override async update(...args: Parameters<Registry["update"]>) {
+      if (!(await this.read(working.key))?.closedAt) await this.write(withStatus(working, "closed", "Done", closedAt, { closedAt }));
+      return super.update(...args);
+    }
+  })(state.dir);
+  const r = await pauseLane({ ...deps(T0 + MIN), registry }, working, "owner said wait");
+  const archived = readFileSync(registry.archivePath(working.key), "utf8");
+  expect(r).toMatchObject({ code: 2, lines: ["NOT_PAUSED waiting-lane is closed, not working"] });
+  expect(JSON.parse(archived)).toMatchObject({ status: "closed", version: 2 });
+  expect((await stored())?.history?.map((h) => h.status)).toEqual(["closed"]);
+  expect(world.ops.filter((e) => e.op === "notify")).toEqual([]);
 });
 
 test("every wake of a paused lane is reported, across a resume and a second pause", async () => {
