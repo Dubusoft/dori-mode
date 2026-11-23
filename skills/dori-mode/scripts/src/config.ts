@@ -145,7 +145,7 @@ export type PlacementConfig = {
   readonly defaultMachine: string;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
-  /** Open lanes (plus pending launches) a machine ("local" or a label) may hold; a machine absent here has no lane cap. */
+  /** Open lanes (plus pending launches) a machine ("local" or a label) may hold; absent here, "local" is capped at this host's cores and any other machine has no lane cap. */
   readonly maxLanes?: Readonly<Record<string, number>>;
 };
 

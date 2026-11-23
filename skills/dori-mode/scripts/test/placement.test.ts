@@ -74,7 +74,7 @@ test("checkMachine local asks the local runner and applies canLaunch to its samp
   expect(asked).toEqual([undefined]);
   expect(c).toEqual({
     machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}`, freeSlots: 0,
-    paneCap: T.panesMax, paneCount: T.panesMax, paneIds: listed(T.panesMax).map((p) => p.pane_id),
+    paneCap: T.panesMax, paneCount: T.panesMax, paneIds: listed(T.panesMax).map((p) => p.pane_id), laneCap: availableParallelism(),
   });
 });
 

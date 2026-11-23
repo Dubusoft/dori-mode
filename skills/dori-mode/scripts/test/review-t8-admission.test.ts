@@ -43,6 +43,8 @@ const world = (cap: number) => {
   const deps = depsFor(w, clock, state.dir, {
     review: { repos: ["acme/app", "Dubusoft/dori-mode"] },
     guard: { ...defaultConfig("/home/test").guard, panesMax: cap }, autopilot: { ...DEFAULT_AUTOPILOT, executor: true },
+    // The pane cap alone admits here, not the default local lane cap (this host's cores).
+    placement: { defaultMachine: "local", fallback: [], maxLanes: { local: cap } },
   });
   const brief = (key: string): string => {
     const path = join(state.dir, "briefs", `${key}.md`);
