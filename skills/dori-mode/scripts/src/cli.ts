@@ -11,7 +11,7 @@ import { withThreadParent } from "./messenger/target.ts";
 import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { displayTime } from "./display-time.ts";
 import { claimDone, closeLane, type FlowDeps, objectDone, watchTick } from "./done-flow.ts";
-import { freshnessTick } from "./freshness.ts";
+import { freshnessTick, sweepActLine } from "./freshness.ts";
 import { acquireSlot, pidAlive } from "./heavy-slot.ts";
 import { watchSimulators } from "./heavy-simulators.ts";
 import { guardTick } from "./host-guard.ts";
@@ -980,7 +980,7 @@ try {
       await every(loopMin, async () => {
         const reports = openLaneReports(deps.config);
         try {
-          for (const a of await freshnessTick(deps, undefined, reports)) console.log(`${a.kind.toUpperCase()} ${a.lane} ${a.detail}`);
+          for (const a of await freshnessTick(deps, undefined, reports)) console.log(sweepActLine(a));
         } finally { reports.close(); }
       });
       break;

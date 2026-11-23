@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { DECISIONS_FILE, type OwnerDecision } from "../src/decision-store.ts";
-import { freshnessTick } from "../src/freshness.ts";
+import { freshnessTick, sweepActLine } from "../src/freshness.ts";
 import type { Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World } from "./fakes.ts";
 
@@ -57,6 +57,23 @@ test("an idle silent lane is still nudged, and nothing is posted from its pane",
   expect((await freshnessTick(deps(T0 + 16 * MIN))).map((a) => a.kind)).toEqual(["nudged"]);
   expect(sent(world)).toHaveLength(1);
   expect(posts()).toEqual([]);
+});
+
+test("a lane whose status read throws is one warning, and the lanes after it are still nudged", async () => {
+  const broken: Lane = { ...lane, key: "broken-lane", pane: "w:p6" };
+  await deps(T0).registry.write(broken);
+  await deps(T0).registry.write(lane);
+  world.panes = ["w:p6", "w:p7"].map((pane_id) => ({ pane_id, workspace_id: "w", agent: "omo", agent_status: "idle" }));
+  const base = deps(T0 + 16 * MIN);
+  // The lane the tick reads first throws, so the other one comes after it.
+  const [first, after] = await base.registry.open();
+  const ops: typeof base.ops = { ...base.ops, status: async (ref) => {
+    if (ref.pane === first?.pane) throw new Error("runner read failed");
+    return base.ops.status(ref);
+  } };
+  const acts = await freshnessTick({ ...base, ops });
+  expect(acts.map(sweepActLine)).toEqual([`SWEEP_WARN freshness ${first?.key} runner read failed`, expect.stringMatching(new RegExp(`^NUDGED ${after?.key} 16 min silent`))]);
+  expect(sent(world)).toHaveLength(1);
 });
 
 test("a registry row with the removed progress fields still loads and does not change the outcome", async () => {
