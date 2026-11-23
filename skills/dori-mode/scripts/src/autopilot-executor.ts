@@ -218,7 +218,12 @@ const launchReadback = async (deps: ExecutorDeps, row: Operation): Promise<Obser
   return deps.observeLaunch(data.input!);
 };
 
-const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResult> => {
+/**
+ * Runs or resumes one execution. The contract is read again (guard) before each effect others can see: the reservation,
+ * start-task, the thread and the launch. `prepared` means the caller read it under this same lock with only local writes
+ * since, so the first check is that read. The brief is lead-local, so the check before the launch covers it too.
+ */
+const resume = async (deps: ExecutorDeps, row: Operation, prepared = false): Promise<ExecutorResult> => {
   let data = dataOf(deps.store.get(row.id)!);
   if (data.outcome) return finish(deps, row);
   // Read back an attempted launch before pause or scope checks: its effect may already exist.
@@ -236,7 +241,7 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     }
   }
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
-  const changed = await guard(deps, row);
+  const changed = prepared ? undefined : await guard(deps, row);
   if (changed) return changed;
   await perform(deps.store, deps.now, step(row, "prepare", { taskId: data.taskId, laneKey: data.laneKey, version: data.contract.version, base: data.contract.base }),
     async () => ({ ok: true, detail: "contract prepared" }), async () => "done");
@@ -279,8 +284,6 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     });
   if (threaded.op.state !== "verified") return stop(deps, row, "ambiguous", [threaded.op.detail]);
   data = dataOf(deps.store.get(row.id)!);
-  const beforeBrief = await guard(deps, row);
-  if (beforeBrief) return beforeBrief;
   const input: LaunchInput = data.input ?? {
     key: data.laneKey, title: data.title, brief: join(deps.stateDir, "autopilot", data.laneKey, "brief.md"),
     done: data.contract.done, mode: data.contract.mode, ...(data.contract.model ? { model: data.contract.model } : {}),
@@ -377,7 +380,7 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
         thread: { parent: deps.parentChannel, title: `${laneKey}: ${ready.task.title}`.slice(0, 100) },
       };
       row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: EXECUTE, target: String(attempt), data: JSON.stringify(data) });
-      results.push(await resume(deps, row));
+      results.push(await resume(deps, row, true));
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
       deps.err(`AUTOPILOT_EXECUTOR_ERROR #${taskId} ${why}`);

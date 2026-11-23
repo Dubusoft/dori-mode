@@ -121,10 +121,39 @@ test("401, a network error and a missing token file are all ToodoUnreadable", as
   const e401 = await refused.tasksByIds([1]).catch((e: unknown) => e);
   expect(e401).toBeInstanceOf(ToodoUnreadable);
   expect((e401 as ToodoUnreadable).status).toBe(401);
-  const down = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => { throw new TypeError("connect ECONNREFUSED"); } });
+  const down = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => { throw new TypeError("connect ECONNREFUSED"); }, sleep: async () => {} });
   expect(await down.tasksByIds([1]).catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
   const noToken = new ToodoClient({ url: "http://toodo.test", tokenFile: join(dir, "absent") }, { fetch: async () => json(200, []) });
   expect(await noToken.tasksByIds([1]).catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
+});
+
+test("one 5xx, 429 or timeout is read again after a pause; a second one or any 4xx is ToodoUnreadable", async () => {
+  const timeout = async (): Promise<Response> => { throw new DOMException("The operation timed out.", "TimeoutError"); };
+  const client = (replies: (() => Promise<Response>)[]) => {
+    const sent: number[] = [];
+    const sleeps: number[] = [];
+    const fetch: ToodoFetch = async () => { sent.push(sent.length + 1); return replies[sent.length - 1]!(); };
+    return { sent, sleeps, client: new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch, sleep: async (ms) => { sleeps.push(ms); } }) };
+  };
+  const ok = async () => json(200, [wire(task(12))]);
+  for (const first of [async () => json(503, {}), async () => json(429, {}), timeout]) {
+    const c = client([first, ok]);
+    expect(await c.client.tasksByIds([12])).toEqual([task(12)]);
+    expect([c.sent.length, c.sleeps]).toEqual([2, [500]]);
+  }
+  const twice = client([async () => json(502, {}), timeout]);
+  const e = await twice.client.tasksByIds([12]).catch((err: unknown) => err);
+  expect(e).toBeInstanceOf(ToodoUnreadable);
+  expect((e as Error).message).toContain("tried 2 times");
+  expect(twice.sent.length).toBe(2);
+  for (const status of [400, 401, 403]) {
+    const c = client([async () => json(status, {}), ok]);
+    expect(((await c.client.tasksByIds([12]).catch((err: unknown) => err)) as ToodoUnreadable).status).toBe(status);
+    expect(c.sent.length).toBe(1);
+  }
+  const missing = client([async () => json(404, {}), ok]);
+  expect(await missing.client.task(12)).toBeUndefined();
+  expect(missing.sent.length).toBe(1);
 });
 
 // candidates end to end

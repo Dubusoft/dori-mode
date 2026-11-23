@@ -12,7 +12,7 @@ import type { ThreadMember } from "../src/messenger/discord.ts";
 import { SqliteOperations, type Observed, type Operation, type OperationStore, plan, settleOperation } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue } from "../src/routing.ts";
-import { type ToodoGuideline, type ToodoTaskRecord, ToodoUnreadable } from "../src/toodo-client.ts";
+import { ToodoClient, type ToodoFetch, type ToodoGuideline, type ToodoTaskRecord, ToodoUnreadable } from "../src/toodo-client.ts";
 import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -129,7 +129,8 @@ const harness = (initial = task(), attempt = 1) => {
     writeBrief: async (path, brief) => { checkpoint(); calls.brief++; files.set(path, brief); },
     worktreeRoot: (label) => { expect(label).toBe("local"); return worktreeRoot; },
     makeLaneDir: async (path) => { checkpoint(); dirs.push(path); },
-    readBrief: async (path) => { checkpoint(); return files.get(path); },
+    // No crash point: the read-back would swallow it (a crash after thread lands in the brief write instead).
+    readBrief: async (path) => files.get(path),
     notify: (id, line) => { checkpoint(); calls.notify++; notices.set(id, line); },
   });
   return {
@@ -320,6 +321,56 @@ test("a dependency re-read refuses an open prerequisite", async () => {
   expect(h.calls.start).toBe(0);
 });
 
+/**
+ * The harness's Toodo served over the real client's RPC: every request is counted, and `fail(n, status)` answers the
+ * n-th one (1-based) with that status once.
+ */
+const overRpc = (h: ReturnType<typeof harness>) => {
+  const sent: string[] = [];
+  const failures = new Map<number, number>();
+  const tokenFile = join(dir, "toodo-token");
+  writeFileSync(tokenFile, "tok\n");
+  const deps = (): ExecutorDeps => {
+    const base = h.fresh();
+    const fetch: ToodoFetch = async (url, init) => {
+      sent.push(url.split("/").pop()!);
+      const status = failures.get(sent.length);
+      if (status) return new Response("{}", { status });
+      const args = JSON.parse(init.body as string) as { id?: number; workspaceId?: number; filter?: { ids?: number[] } };
+      const reader = base.toodo();
+      const reply = url.endsWith("/get_task") ? await reader.task(args.id!)
+        : url.endsWith("/list_guidelines") ? await reader.guidelines(args.workspaceId!)
+        : url.endsWith("/get_workspace") ? { repository: await reader.workspaceRepository(args.id!) }
+        : args.filter?.ids ? await reader.tasksByIds(args.filter.ids) : await reader.flaggedTasks();
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    return { ...base, toodo: () => new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch, sleep: async () => {} }) };
+  };
+  return { deps, sent, fail: (n: number, status: number) => { failures.set(n, status); } };
+};
+
+// One launch reads the contract (get_task, list_tasks for prerequisites, list_guidelines, get_workspace) four times:
+// once to plan it and again before start-task, the thread and the launch. The reservation reads list_tasks twice and
+// start-task reads get_task back before and after its write. All of it runs under the launch lock.
+const LAUNCH_READS_MAX = 4 * 4 + 2 + 2;
+
+test("one launch reads Toodo at most LAUNCH_READS_MAX times", async () => {
+  const h = harness(task({ dependsOn: [3] }));
+  h.dependencies([task({ id: 3, status: "done", resolution: "merged" })]);
+  const rpc = overRpc(h);
+  expect(await runExecutor(rpc.deps(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(rpc.sent.length).toBeLessThanOrEqual(LAUNCH_READS_MAX);
+  expect(rpc.sent.filter((c) => c === "list_guidelines")).toHaveLength(4);
+});
+
+test("one 5xx from Toodo under the launch lock is read again and the launch goes on", async () => {
+  const h = harness();
+  const rpc = overRpc(h);
+  rpc.fail(1, 503);
+  expect(await runExecutor(rpc.deps(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(h.calls.launch).toBe(1);
+});
+
 test("a lead file the description names but cannot ship stops the task before it starts", async () => {
   const file = join(dir, "briefs", "evidence.md");
   const h = harness(task({ description: `Work from \`${file}\`.` }));
@@ -348,8 +399,8 @@ for (const boundary of ["prepare", "reserve", "start-task", "thread", "brief", "
 }
 
 test("a throw inside an open execution is that task's interrupted result, and the next pass resumes it", async () => {
-  const h = harness(); h.crashAfter("thread");
-  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "interrupted", reasons: ["crash after thread"] }]);
+  const h = harness(); h.crashAfter("brief");
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "interrupted", reasons: ["crash after brief"] }]);
   expect(row("execute").state).toBe("planned");
   expect(await runExecutor(h.fresh(freshStore()), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
   expect(h.calls.thread).toBe(1);
