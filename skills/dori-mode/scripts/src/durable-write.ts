@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { withStateLockSync } from "./state-lock.ts";
@@ -31,21 +31,36 @@ export const readJsonState = <T>(path: string, tag: string, valid: (v: unknown) 
   return undefined;
 };
 
-/** Replaces `path` atomically through a unique tmp file and rename; nothing is fsynced, so a crash may lose the update but never tears it. */
+/** Runs `write` against `tmp` and removes `tmp` when it throws, so a failed replace leaves no partial copy behind. */
+const throughTmp = (tmp: string, write: () => void): void => {
+  try { write(); } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+};
+
+/**
+ * Replaces `path` atomically through a unique tmp file and rename; nothing is fsynced, so a crash may lose the update but never tears it.
+ * Concurrent writers of one path never share a tmp file: the last rename wins whole.
+ */
 export const replaceFileAtomic = (path: string, data: string, mode: number): void => {
   const tmp = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, data, { mode });
-  renameSync(tmp, path);
+  throughTmp(tmp, () => {
+    writeFileSync(tmp, data, { mode });
+    renameSync(tmp, path);
+  });
 };
 
 /** Replaces `path` durably: tmp file (unique unless the caller names one), fsync, rename, then fsync of the directory so the rename survives a crash. */
 export const replaceFileDurable = (path: string, data: string, mode: number, tmp = `${path}.${randomUUID()}.tmp`): void => {
-  const fd = openSync(tmp, "w", mode);
-  try {
-    writeFileSync(fd, data);
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
-  renameSync(tmp, path);
+  throughTmp(tmp, () => {
+    const fd = openSync(tmp, "w", mode);
+    try {
+      writeFileSync(fd, data);
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+  });
   const dir = openSync(dirname(path), "r");
   try { fsyncSync(dir); } finally { closeSync(dir); }
 };

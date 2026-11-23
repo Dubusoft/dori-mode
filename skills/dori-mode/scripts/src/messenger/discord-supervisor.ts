@@ -1,7 +1,8 @@
-import { readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { type DirectRouting, routeDecisionClick, routeOwnerDelete, routeOwnerEdit, routeOwnerMessage } from "../decision-inbound.ts";
 import type { FlowDeps } from "../done-flow.ts";
+import { replaceFileAtomic } from "../durable-write.ts";
 import type { LaneMessageStore } from "../lane-messages.ts";
 import { statusOf } from "../registry.ts";
 import { answeredEventId, answeredLine, recordChannelAnswer, recordOwnerAnswer } from "../owner-decisions.ts";
@@ -58,8 +59,7 @@ export const takeGatewaySession = (stateDir: string, now: number): GatewaySessio
 /** Leaves `session` for the next supervisor (tmp + rename, owner-only). */
 export const saveGatewaySession = (stateDir: string, session: GatewaySession, now: number): void => {
   const path = join(stateDir, GATEWAY_SESSION_FILE);
-  writeFileSync(`${path}.tmp`, JSON.stringify({ ...session, at: now }), { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
+  replaceFileAtomic(path, JSON.stringify({ ...session, at: now }), 0o600);
 };
 
 /**

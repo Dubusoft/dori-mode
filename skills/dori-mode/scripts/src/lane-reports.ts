@@ -1,7 +1,8 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { fillHook } from "./config.ts";
+import { replaceFileAtomic } from "./durable-write.ts";
 import { claimDone, type Emit, type FlowDeps, laneMeta } from "./done-flow.ts";
 import { relayedText, scrubForThread } from "./freshness.ts";
 import { type Lane, statusOf } from "./registry.ts";
@@ -36,7 +37,7 @@ export const saveReportBody = (stateDir: string, report: LaneReport): string | u
   const dir = join(stateDir, REPORT_BODIES_DIR);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, `${report.id.replace(/[^\w.-]/g, "_")}.txt`);
-  writeFileSync(path, `lane: ${report.lane}\nkind: ${report.kind}\nreport: ${report.id}\nat: ${new Date(report.at).toISOString()}\n\n${report.text}\n${report.evidence ? `\nevidence:\n${report.evidence}\n` : ""}`);
+  replaceFileAtomic(path, `lane: ${report.lane}\nkind: ${report.kind}\nreport: ${report.id}\nat: ${new Date(report.at).toISOString()}\n\n${report.text}\n${report.evidence ? `\nevidence:\n${report.evidence}\n` : ""}`, 0o600);
   return path;
 };
 

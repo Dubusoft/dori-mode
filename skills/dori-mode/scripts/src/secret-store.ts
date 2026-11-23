@@ -1,7 +1,8 @@
 /** One 0600 plain file per secret under the 0700 supervisor store; legacy credentials remain readable. */
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { replaceFileDurable } from "./durable-write.ts";
 import { run, type Runner } from "./run.ts";
 import { SECRET_NAME } from "./secret-name.ts";
 
@@ -138,14 +139,7 @@ export class SecretStore {
   }
 
   private async write(name: string, value: string): Promise<SecretEntry> {
-    const tmp = join(this.dir, `.${name}.tmp`);
-    try {
-      writeFileSync(tmp, value, { mode: 0o600 });
-      chmodSync(tmp, 0o600);
-      renameSync(tmp, join(this.dir, `${name}.plain`));
-    } finally {
-      rmSync(tmp, { force: true });
-    }
+    replaceFileDurable(join(this.dir, `${name}.plain`), value, 0o600);
     rmSync(join(this.dir, `${name}.cred`), { force: true });
     return { name, backend: "plain" };
   }

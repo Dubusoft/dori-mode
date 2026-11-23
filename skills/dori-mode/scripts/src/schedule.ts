@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
+import { replaceFileAtomic } from "./durable-write.ts";
 import { SourceError, type SourceEnqueue, type SourceStatus, sourceText } from "./event-sources.ts";
 import { type Operation, type OperationStore, OPEN_STATES, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import type { Runner } from "./run.ts";
@@ -219,8 +220,7 @@ export const queueRunNow = (stateDir: string, name: string, now: number): void =
   const dir = join(stateDir, RUN_NOW_DIR);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${now}-${randomUUID()}.json`);
-  writeFileSync(`${path}.tmp`, JSON.stringify({ name, at: now }), { mode: 0o600 });
-  renameSync(`${path}.tmp`, path);
+  replaceFileAtomic(path, JSON.stringify({ name, at: now }), 0o600);
 };
 
 /** One job as `dori schedule list` and `dori status` show it. */
