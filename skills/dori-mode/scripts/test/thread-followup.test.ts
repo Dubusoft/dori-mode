@@ -1,10 +1,15 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { pendingReported } from "../src/lane-outcomes.ts";
 import { Discord } from "../src/messenger/discord.ts";
 import type { Lane } from "../src/registry.ts";
 import { postLaneReport } from "../src/report-post.ts";
-import { closedByOwner, readLastReports, readOwnerClosed, recordOwnerClosed } from "../src/thread-followup.ts";
+import {
+  closedByOwner, forgetOwnerClosed, LAST_REPORTS_FILE, MalformedStateFileError, OWNER_CLOSED_FILE, readLastReports, readOwnerClosed, recordLastReport,
+  recordOwnerClosed,
+} from "../src/thread-followup.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -38,6 +43,24 @@ test("a recorded thread Discord no longer knows (deleted) counts as open and los
   recordOwnerClosed(state.dir, "901", T0 - 1);
   expect(await closedByOwner(state.dir, discordWith({}), "903")).toBeUndefined();
   expect(readOwnerClosed(state.dir)).toEqual({ "901": T0 - 1 });
+});
+
+test("a malformed owner-closed or last-reports file warns on read and is never overwritten", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const warn = spyOn(console, "error").mockImplementation(() => {});
+  cleanups.push(() => warn.mockRestore());
+  // A missing file is empty without a warning.
+  expect(readOwnerClosed(state.dir)).toEqual({});
+  expect(warn).not.toHaveBeenCalled();
+  for (const file of [OWNER_CLOSED_FILE, LAST_REPORTS_FILE]) writeFileSync(join(state.dir, file), '{"900": 1');
+  expect(readOwnerClosed(state.dir)).toEqual({});
+  expect(readLastReports(state.dir)).toEqual({});
+  expect(warn.mock.calls.map((c) => String(c[0]).split(" ")[0])).toEqual(["THREAD_STATE_WARNING", "THREAD_STATE_WARNING"]);
+  expect(() => recordOwnerClosed(state.dir, "901", T0)).toThrow(MalformedStateFileError);
+  expect(() => forgetOwnerClosed(state.dir, "900")).toThrow(MalformedStateFileError);
+  expect(() => recordLastReport(state.dir, "ap-1-1", { channel: "901", message: "m-1", at: T0 })).toThrow(MalformedStateFileError);
+  for (const file of [OWNER_CLOSED_FILE, LAST_REPORTS_FILE]) expect(readFileSync(join(state.dir, file), "utf8")).toBe('{"900": 1');
 });
 
 test("a failed thread read of a recorded thread still fails and keeps the record", async () => {

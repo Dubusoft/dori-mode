@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { Registry } from "../src/registry.ts";
 import { clearLaunchHold, launchHeld, launchQueue, recordLaunchVerdict } from "../src/routing.ts";
+import { OWNER_CLOSED_FILE, readOwnerClosed } from "../src/thread-followup.ts";
 import { withState } from "./fakes.ts";
 
 const worker = (mode: string, dir: string) => {
@@ -117,6 +118,41 @@ test("subprocess HOLD enqueues preserve both entries across a paused read-modify
     // Then both held launches are durable and the host remains blocked.
     expect(launchQueue(state.dir).map((q) => q.key).sort()).toEqual(["first-lane", "second-lane"]);
     expect(launchHeld(state.dir)).toBe(true);
+  } finally {
+    first.child.kill();
+    second?.child.kill();
+    await Promise.all([first.child.exited, second?.child.exited]);
+    state.done();
+  }
+});
+
+test("subprocess owner-close records keep both threads across a paused read-modify-write", async () => {
+  // Given a first record paused right after reading owner-closed-threads.json.
+  const state = withState();
+  await Bun.write(join(state.dir, OWNER_CLOSED_FILE), "{}");
+  const first = worker("owner-closed-first", state.dir);
+  let second: ReturnType<typeof worker> | undefined;
+  try {
+    expect(await first.next()).toBe("read");
+    second = worker("owner-closed-second", state.dir);
+    // When the second record reaches the lock (or, without one, reads the stale file).
+    const event = await second.next();
+    if (event === "locking") {
+      first.release();
+      await first.finish();
+      second.release();
+      expect(await second.next()).toBe("read");
+      second.release();
+      await second.finish();
+    } else {
+      expect(event).toBe("read");
+      second.release();
+      await second.finish();
+      first.release();
+      await first.finish();
+    }
+    // Then both closes are on disk.
+    expect(readOwnerClosed(state.dir)).toEqual({ "901": 1, "902": 1 });
   } finally {
     first.child.kill();
     second?.child.kill();
