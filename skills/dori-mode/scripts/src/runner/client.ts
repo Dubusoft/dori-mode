@@ -18,8 +18,10 @@ export { backoffMs };
  * The runner side of the connection. One `connectOnce` is: connect, send `hello {proto, gen, label, hostId, cmdAck}`,
  * wait for `hello.ok`, raise `maxEpoch` to its epoch, then send every outbox row with `seq > eventAck` in seq order.
  * Each `ack {eventAck}` frame marks rows up to it acked in the outbox; an ack never moves the cursor backwards.
- * `run` repeats `connectOnce` with the reconnect backoff until aborted. `gen` is the state's current gen: the
- * process bumps it with `RunnerState.boot()` once before the client starts.
+ * Without `hello.ok` or a reject within `HANDSHAKE_TIMEOUT_MS` of the hello, the attempt ends as `RUNNER_CLOSED` with
+ * `RUNNER_HELLO_TIMEOUT ...` logged and the connection closed. `run` repeats `connectOnce` with the reconnect backoff
+ * until aborted. `gen` is the state's current gen: the process bumps it with `RunnerState.boot()` once before the
+ * client starts.
  *
  * With `auth` set (auth.ts), the hello carries a nonce and an ephemeral key; the client checks the supervisor's
  * `hello.challenge` signature against the pinned key and closes with `RUNNER_AUTH_FAILED` when it does not verify,
@@ -34,6 +36,12 @@ export { backoffMs };
  */
 
 export const HEARTBEAT_MS = 15_000;
+/**
+ * How long either end of a connection waits for the handshake to finish: the runner from sending `hello` to `hello.ok`
+ * (or a reject), the supervisor from accepting the connection to admitting it. A peer that stays silent past it is closed,
+ * so a stray connection cannot hold the runner's single network slot, or a supervisor connection, for good.
+ */
+export const HANDSHAKE_TIMEOUT_MS = 10_000;
 /** How long `secretRequest("secret.get")` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
 export const SECRET_TIMEOUT_MS = 30_000;
 /**
@@ -101,7 +109,10 @@ export type ClientDeps = {
   readonly auth?: RunnerAuth;
   /** Receives `RUNNER_AUTH_FAILED ...` and `RUNNER_KEY_ROTATED ...` lines. */
   readonly log?: (line: string) => void;
-  /** Arms the `secretRequest` timeout: calls `fire` after `ms` unless the returned cancel runs first. Default setTimeout. */
+  /**
+   * Arms the handshake, `secretRequest` and `closedLanes` timeouts: calls `fire` after `ms` unless the returned cancel
+   * runs first. Default setTimeout.
+   */
   readonly timer?: (ms: number, fire: () => void) => () => void;
 };
 
@@ -163,7 +174,10 @@ export class RunnerClient {
     this.session = undefined;
     this.helloProto = undefined;
     this.pendingHello = this.deps.auth?.startHello();
-    const outcome = new Promise<ConnectOutcome>((resolve) => { this.settle = resolve; });
+    let cancelDeadline: () => void = () => {};
+    const outcome = new Promise<ConnectOutcome>((resolve) => {
+      this.settle = (settled) => { cancelDeadline(); resolve(settled); };
+    });
     let markClosed: () => void = () => {};
     this.closedWaiter = new Promise<void>((resolve) => { markClosed = resolve; });
     const offLine = transport.onLine((line) => { if (this.transport === transport) this.handleLine(line); });
@@ -197,6 +211,15 @@ export class RunnerClient {
       ...(this.pendingHello ? { nonce: this.pendingHello.nonce, dh: this.pendingHello.dh } : {}),
     };
     transport.send(encodeFrame(runnerControl(this.head(), "hello", hello)));
+    if (this.transport === transport && this.settle) {
+      cancelDeadline = (this.deps.timer ?? defaultTimer)(HANDSHAKE_TIMEOUT_MS, () => {
+        if (this.transport !== transport) return;
+        const detail = `RUNNER_HELLO_TIMEOUT no hello.ok within ${HANDSHAKE_TIMEOUT_MS / 1000}s`;
+        this.log(detail);
+        this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
+        transport.close("RUNNER_HELLO_TIMEOUT");
+      });
+    }
     return outcome;
   }
 

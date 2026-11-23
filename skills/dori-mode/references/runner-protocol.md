@@ -165,7 +165,10 @@ the `runners` task drains every 5 seconds; a request not answered within 2 minut
 
 A worker's runner listens and the supervisor dials it. The runner runs
 `dori runner serve --label <label> --listen <host>:<port>` and accepts one WebSocket connection at a time; a second
-connection while one is open is refused. The supervisor reads `<stateDir>/runner-endpoints.json`, an object mapping
+connection while one is open is refused. Both ends bound the handshake to 10 s: the runner closes a connection that
+has not answered its `hello` with `hello.ok` or `hello.reject` by then (`RUNNER_HELLO_TIMEOUT`) and reconnects after
+the backoff, and the supervisor closes a connection it has not admitted, refused or answered `enroll.ok` within 10 s
+of accepting it. A peer that takes the runner's slot and stays silent therefore holds it for at most 10 s. The supervisor reads `<stateDir>/runner-endpoints.json`, an object mapping
 labels to `host:port` (`{"worker-a":"100.101.1.2:7411","worker-b":"[fd12::1]:7411"}`), dials each endpoint next to
 its local unix socket, and redials after a failure or close with backoff: 1 s doubling to 60 s, scaled by a random
 0.8 to 1.2. It rereads the file every second, so an added, changed or removed endpoint takes effect without a
