@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { envFilePath } from "./credentials.ts";
+import { envFilePath, parseEnvFile } from "./credentials.ts";
 
 const MASK = "[REDACTED]";
 
@@ -36,13 +36,9 @@ const envFileSecrets = (): readonly string[] => {
     const st = statSync(path);
     const key = `${path}:${st.mtimeMs}:${st.size}`;
     if (envCache?.key === key) return envCache.values;
-    const values: string[] = [];
-    for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-      const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
-      if (!m || !SECRET_NAME.test(m[1] ?? "")) continue;
-      const value = (m[2] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
-      if (value.length >= MIN_KNOWN_SECRET) values.push(value);
-    }
+    const values = parseEnvFile(readFileSync(path, "utf8"))
+      .filter(([name, value]) => SECRET_NAME.test(name) && value.length >= MIN_KNOWN_SECRET)
+      .map(([, value]) => value);
     envCache = { key, values };
     return values;
   } catch { return []; }

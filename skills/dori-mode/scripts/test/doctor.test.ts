@@ -4,7 +4,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync }
 import { join } from "node:path";
 
 import { defaultConfig, loadConfig } from "../src/config.ts";
-import { type Check, configSources, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks, tokenFrom } from "../src/doctor.ts";
+import { type Check, configSources, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks } from "../src/doctor.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
 import { defaultRunnerDir, RUNNER_PATHS } from "../src/runner/fs-safety.ts";
 import { gatewayView, writeGatewayStatus } from "../src/gateway-status.ts";
@@ -486,11 +486,7 @@ test("an unreachable Discord API is a bounded FAIL, not a crash", async () => {
   expect(find(await runDoctor(deps), "discord token")).toMatchObject({ level: "FAIL", detail: "Discord API unreachable" });
 });
 
-test("tokenFrom reads the env file forms and gatewayView ages with the injected clock", () => {
-  expect(tokenFrom("A=1\nDORI_DISCORD_TOKEN=abc\n")).toBe("abc");
-  expect(tokenFrom('export DORI_DISCORD_TOKEN="q q"')).toBe("q q");
-  expect(tokenFrom("DORI_DISCORD_TOKEN=")).toBeUndefined();
-  expect(tokenFrom(undefined)).toBeUndefined();
+test("gatewayView ages with the injected clock", () => {
   const s = { pid: 1, at: 1000, connected: true, messageContent: true };
   expect(gatewayView(s, 1000 + 59_000).state).toBe("live");
   expect(gatewayView(s, 1000 + 61_000).state).toBe("stale");
