@@ -243,6 +243,25 @@ test("a repo timeout still lets a healthy repo emit its decision event", async (
   expect(f.events.some((e) => e.line.startsWith("HOST_GITHUB slow/repo poll_failed "))).toBe(true);
 });
 
+test("CI follow-up sees a finished green PR even when the repo's issue poll keeps timing out", async () => {
+  const f = await fixture();
+  const head = { ...pull().head, sha: "def" };
+  const next = pull({ head, updated_at: "2026-10-20T00:00:00Z" });
+  f.responses.set("repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100", ok([next]));
+  f.responses.set("repos/acme/app/pulls/7", ok(next));
+  f.responses.set("repos/acme/app/commits/def/check-runs?per_page=100", ok({ check_runs: [{ status: "completed", conclusion: "success" }] }));
+  f.responses.set("repos/acme/app/commits/def/status?per_page=100", ok({ state: "pending", statuses: [] }));
+  f.responses.set(ISSUES, { code: 124, out: "", err: "timeout" });
+
+  for (let tick = 0; tick < 2; tick++) {
+    await f.github.tick(f.deps, f.emit);
+    expect(f.github.openPulls()).toMatchObject([{ number: 7, sha: "def", checks: "green" }]);
+    expect(readGithub(f.state.dir).repos["acme/app"].pulls["7"]).toMatchObject({ sha: "abc", checks: "none" });
+  }
+  expect(f.events.filter((e) => e.line.includes("poll_failed")).map((e) => e.line))
+    .toEqual(["HOST_GITHUB acme/app poll_failed gh api HTTP unavailable exit=124"]);
+});
+
 test("a repo poll cut short keeps what it read: the next tick resumes after the finished PRs instead of starting over", async () => {
   const f = await fixture();
   const LIST = "repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100";

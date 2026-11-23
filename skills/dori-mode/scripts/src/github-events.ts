@@ -255,9 +255,10 @@ export class GitHubEvents {
 
   close(): void { this.store.close(); }
 
-  /** The open PRs as of the last poll, per repo (ci-follow.ts reads it after each tick; no GitHub call). */
+  /** Include finished PR observations from a cut-short poll without advancing the durable repo cursor. */
   openPulls(): readonly OpenPull[] {
-    return Object.entries(this.state.repos).flatMap(([repo, state]) => Object.values(state.pulls)
+    const repos = new Set([...Object.keys(this.state.repos), ...this.partial.keys()]);
+    return [...repos].flatMap((repo) => Object.values(this.partial.get(repo)?.pulls ?? this.state.repos[repo]?.pulls ?? {})
       .filter((p) => p.state === "open")
       .map((p) => ({ repo, number: p.number, sha: p.sha, branch: p.branch, ...headOf(p), url: p.url, conflicting: p.conflicting, checks: p.checks })));
   }
