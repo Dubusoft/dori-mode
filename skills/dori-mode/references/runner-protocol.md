@@ -85,14 +85,13 @@ Samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
-verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action. A protocol 3
-runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action.
 
 Protocol 7 adds the command `lane.attach {key, tree}` (`dori attach`): the runner validates `tree` like a `lane.start`
 input tree, writes it into the running lane's existing `briefs/<key>.files` directory under the next free `a<NNNN>`
 group (in place, so a sandbox that bound that directory at start sees it; the combined directory keeps the launch caps),
 and answers `{dir}`, that group's path. A lane without a file run (adopted, or started before lane files) refuses it
-with `LANE_ATTACH_UNMANAGED`. A protocol 6 runner is never sent it (`RUNNER_UNAVAILABLE ... outdated`).
+with `LANE_ATTACH_UNMANAGED`.
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
@@ -100,8 +99,7 @@ A verified `cmd.result` carries `result` per command type: `lane.start` and `lan
 `lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.attach` `{dir}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
 `lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
 managed, paused}`. A runner effect that only returns a
-detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
-with protocol 2: such a call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+detail sends no `result`.
 
 ## Queries
 
@@ -635,8 +633,6 @@ pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a 
   `RUNNER_HERDR_LANES machine=<label> ...` with the machine's open lanes (and the lead pane for `local`), and sends the
   command only with `--yes`; without it, it exits 2 with `RUNNER_HERDR_CONFIRM`. After a restart the recovery sweep
   relaunches those lanes in new tabs on their sessions; after a stop their recovery is held until `start`.
-- A runner whose hub row shows protocol 3 is refused before anything is sent: `RUNNER_HERDR_UNSUPPORTED` names
-  `dori runner install --machine <label>` to upgrade it.
 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
 with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
@@ -652,8 +648,7 @@ for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the
   check or runner call.
 - `dori status` shows `herdr <정상|다운|멈춤|미확인>` on each machine line.
 - `dori doctor`'s `runner <label>` check is FAIL while that machine's herdr is down (fix `dori runner herdr start
-  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`); a protocol 3 runner's fix
-  starts with `dori runner install --machine <label>`. Its local `herdr` check points a worker machine (a runner
+  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`). Its local `herdr` check points a worker machine (a runner
   labelled other than `local` in `~/.dori/runner/runner.json`) at the lead host's `dori runner herdr start` or, without
   a herdr unit, `dori runner install`; the lead host keeps `systemctl --user start herdr-server.service`.
 - On the lead host the local runner reports as `machine=local`. While that herdr is down or hung the supervisor does
@@ -843,15 +838,24 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 added `secret.put` (since removed; the protocol number stays); protocol 9 adds
-`lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
-that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
-(see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
-Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
-warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).
-**Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
-runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
-nullable `commands.result_json` column in protocol 3.
+The current protocol is 9, so a supervisor accepts runners at 9 and 8 (`checkProto`). Any other runner is refused at
+hello with `RUNNER_PROTO_MISMATCH`: one at 7 or below as too old (`dori runner update` upgrades it), one at 10 or
+above as newer than the supervisor. Protocol 9 adds `lanes.closed` / `lanes.closed.result`; a proto 8 runner still
+runs lanes and secrets while `dori doctor` warns that its cleanup sweep skips the closed lanes' `node_modules`.
+Protocol 8 added `secret.put` (since removed; the protocol number stays).
+
+**Upgrade the supervisor before its runners**: a proto 8 runner still connects to a proto 9 supervisor, but a proto 9
+runner is refused by a proto 8 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). Bring every runner
+to the supervisor's version before the next bump: a supervisor at protocol 10 would accept 10 and 9 and refuse a
+runner still at 8.
+
+Historical note (runners below protocol 8 can no longer connect): protocol 3 added the queries, the `cmd.result`
+`result` and the other protocol 3 fields above, and the runner's `state.sqlite` gained the nullable
+`commands.result_json` column; protocol 4 added herdr state and `host.herdr`; protocol 5 added the runner file
+operations, `wait.check` and `job.run`; protocol 6 added the four secret control frames (see
+[Secrets over the link](#secrets-over-the-link)); protocol 7 added `lane.attach`. The per-feature proto checks left in
+the code (`NEEDS_PROTO`, `secretsSupported`, the `host.herdr` proto check) date from those versions and never refuse a
+runner the current window accepts.
 
 ## Liveness and restarts
 
@@ -1015,8 +1019,7 @@ reaches herdr. Windows has no lane herdr socket.
 sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked
 first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "...", ...}}`;
 a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_FAILED`). The
-local runner answers from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
-a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
+local runner answers from its own store. A remote runner asks the supervisor over the link (below). The lane reply is never journaled,
 logged or put in the outbox. See [secrets.md](secrets.md).
 
 ### Secrets over the link
