@@ -41,7 +41,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
-import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
+import { appendFollowUp, pruneThreadFollowups, redirectIfClosed } from "./thread-followup.ts";
 import { autoReportPoster } from "./auto-report.ts";
 import { taskBlocker, taskFinisher } from "./task-finish.ts";
 import { ToodoWriter } from "./toodo-client.ts";
@@ -816,6 +816,8 @@ const ownerNotices = (p: NoticeParts): (() => Promise<void>) => {
     });
     // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
     await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisions, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
+    // Owner-closed records and closed lanes' last reports past THREAD_FOLLOWUP_KEEP_MS are dropped.
+    await isolate("THREAD_FOLLOWUP_PRUNE_ERROR", async () => { pruneThreadFollowups(deps.config.stateDir, deps.clock.now(), await deps.registry.open()); });
     // A thread whose work is all finished and reported gets the owner's close button on its last report, and is closed
     // (archived) once threadCloseAfterHours pass with no click.
     await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick({

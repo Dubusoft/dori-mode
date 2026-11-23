@@ -7,8 +7,8 @@ import { Discord } from "../src/messenger/discord.ts";
 import type { Lane } from "../src/registry.ts";
 import { postLaneReport } from "../src/report-post.ts";
 import {
-  closedByOwner, forgetOwnerClosed, LAST_REPORTS_FILE, MalformedStateFileError, OWNER_CLOSED_FILE, readLastReports, readOwnerClosed, recordLastReport,
-  recordOwnerClosed,
+  closedByOwner, forgetOwnerClosed, LAST_REPORTS_FILE, MalformedStateFileError, OWNER_CLOSED_FILE, pruneThreadFollowups, readLastReports, readOwnerClosed,
+  recordLastReport, recordOwnerClosed, THREAD_FOLLOWUP_KEEP_MS,
 } from "../src/thread-followup.ts";
 import { fakeClock, withState } from "./fakes.ts";
 
@@ -61,6 +61,22 @@ test("a malformed owner-closed or last-reports file warns on read and is never o
   expect(() => forgetOwnerClosed(state.dir, "900")).toThrow(MalformedStateFileError);
   expect(() => recordLastReport(state.dir, "ap-1-1", { channel: "901", message: "m-1", at: T0 })).toThrow(MalformedStateFileError);
   for (const file of [OWNER_CLOSED_FILE, LAST_REPORTS_FILE]) expect(readFileSync(join(state.dir, file), "utf8")).toBe('{"900": 1');
+});
+
+test("the prune drops owner-closed records and closed lanes' last reports once they are THREAD_FOLLOWUP_KEEP_MS old", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const old = T0 - THREAD_FOLLOWUP_KEEP_MS;
+  recordOwnerClosed(state.dir, "900", old);
+  recordOwnerClosed(state.dir, "901", old + 1);
+  recordOwnerClosed(state.dir, "902", old);
+  recordLastReport(state.dir, "ap-1-1", { channel: "900", message: "m-1", at: old });
+  recordLastReport(state.dir, "ap-2-1", { channel: "901", message: "m-2", at: old + 1 });
+  recordLastReport(state.dir, "ap-3-1", { channel: "902", message: "m-3", at: old });
+  // ap-3-1 is still open in thread 902: neither its last report nor its thread's close record goes.
+  pruneThreadFollowups(state.dir, T0, [{ key: "ap-3-1", thread: "discord:800/902" }]);
+  expect(readOwnerClosed(state.dir)).toEqual({ "901": old + 1, "902": old });
+  expect(Object.keys(readLastReports(state.dir))).toEqual(["ap-2-1", "ap-3-1"]);
 });
 
 test("a failed thread read of a recorded thread still fails and keeps the record", async () => {

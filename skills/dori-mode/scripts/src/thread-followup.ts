@@ -17,10 +17,19 @@ import type { AppendOutcome } from "./task-finish.ts";
  * the owner channel) as one line that links the thread instead.
  */
 
-/** Threads the owner closed with the close-thread button, thread id -> when (epoch ms); written by `dori supervise`. */
+/**
+ * Threads the owner closed with the close-thread button, thread id -> when (epoch ms); written by `dori supervise`.
+ * Old records are dropped by pruneThreadFollowups.
+ */
 export const OWNER_CLOSED_FILE = "owner-closed-threads.json";
-/** Each lane's last `dori reported` post into a thread, lane key -> { channel, message, at }; written by `dori reported`. */
+/**
+ * Each lane's last `dori reported` post into a thread, lane key -> { channel, message, at }; written by `dori reported`.
+ * Closed lanes' old records are dropped by pruneThreadFollowups.
+ */
 export const LAST_REPORTS_FILE = "last-reports.json";
+
+/** How long an owner-closed record or a closed lane's last report is kept, like a closed decision (DECISION_KEEP_CLOSED_MS). */
+export const THREAD_FOLLOWUP_KEEP_MS = 30 * 24 * 60 * 60_000;
 
 /** Held while OWNER_CLOSED_FILE or LAST_REPORTS_FILE is read, changed and written back (the supervisor and the CLI both write them). */
 export const THREAD_FOLLOWUP_LOCK = "thread-followup.lock.sqlite";
@@ -104,6 +113,25 @@ export const readLastReports = (stateDir: string): Record<string, LastReport> =>
 /** Records `lane`'s last report message. */
 export const recordLastReport = (stateDir: string, lane: string, report: LastReport): void => {
   updateObject(stateDir, LAST_REPORTS_FILE, (current) => ({ ...lastReportsOf(current), [lane]: report }));
+};
+
+/**
+ * The supervisor's pass over both files: an owner-closed record THREAD_FOLLOWUP_KEEP_MS old whose thread no open lane
+ * is bound to, and a last report THREAD_FOLLOWUP_KEEP_MS old of a lane that is not open, are dropped. A closed lane
+ * keeps its last report until then, so the close button and the merge line still find it. A file with nothing to drop
+ * is not locked or written, and a malformed one is only warned about (readObject).
+ */
+export const pruneThreadFollowups = (stateDir: string, now: number, open: readonly Pick<Lane, "key" | "thread">[]): void => {
+  const openKeys = new Set(open.map((lane) => lane.key));
+  const openThreads = new Set(open.flatMap((lane) => threadOfRef(lane.thread) ?? []));
+  const closedExpired = (thread: string, at: number): boolean => now - at >= THREAD_FOLLOWUP_KEEP_MS && !openThreads.has(thread);
+  const reportExpired = (lane: string, report: LastReport): boolean => now - report.at >= THREAD_FOLLOWUP_KEEP_MS && !openKeys.has(lane);
+  if (Object.entries(readOwnerClosed(stateDir)).some(([thread, at]) => closedExpired(thread, at))) {
+    updateObject(stateDir, OWNER_CLOSED_FILE, (current) => Object.fromEntries(Object.entries(ownerClosedOf(current)).filter(([thread, at]) => !closedExpired(thread, at))));
+  }
+  if (Object.entries(readLastReports(stateDir)).some(([lane, report]) => reportExpired(lane, report))) {
+    updateObject(stateDir, LAST_REPORTS_FILE, (current) => Object.fromEntries(Object.entries(lastReportsOf(current)).filter(([lane, report]) => !reportExpired(lane, report))));
+  }
 };
 
 /** The latest report message posted into `thread` by any lane, or undefined. */
