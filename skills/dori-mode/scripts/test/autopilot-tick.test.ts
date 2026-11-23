@@ -186,13 +186,16 @@ test("switch off: the lead is woken as before and execute is never called", asyn
 
 test("switch on: execute gets the LAUNCH ids, and only ids it left to the lead are announced", async () => {
   const calls: (readonly number[])[] = [];
-  const h = harness(report([launch(15), launch(12), launch(16), launch(17), hold(13)]), AUTOPILOT_TICK_MS, undefined, {
+  const h = harness(report([launch(15), launch(12), launch(16), launch(17), launch(18), launch(19), hold(13)]), AUTOPILOT_TICK_MS, undefined, {
     on: true,
-    execute: async (ids) => { calls.push(ids); return [{ taskId: 12, kind: "launched" }, { taskId: 15, kind: "review" }, { taskId: 16, kind: "failed" }]; },
+    execute: async (ids) => {
+      calls.push(ids);
+      return [{ taskId: 12, kind: "launched" }, { taskId: 15, kind: "review" }, { taskId: 16, kind: "failed" }, { taskId: 18, kind: "error" }, { taskId: 19, kind: "interrupted" }];
+    },
   });
   await h.at(0);
-  expect(calls).toEqual([[12, 15, 16, 17]]);
-  expect(h.lines).toEqual(["AUTOPILOT_READY #15,#17 slots=1"]);
+  expect(calls).toEqual([[12, 15, 16, 17, 18, 19]]);
+  expect(h.lines).toEqual(["AUTOPILOT_READY #15,#17,#18 slots=1"]);
   h.set(report([launch(12)]));
   await h.at(AUTOPILOT_TICK_MS);
   expect(h.lines).toHaveLength(1);
