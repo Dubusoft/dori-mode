@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { enrollRunner, RunnerAuth } from "../src/runner/auth.ts";
-import { CALL_TIMEOUT_MS, COMMAND_TIMEOUTS, NEEDS_PROTO, newCmdId, QUERY_TIMEOUT_MS, RunnerUnavailable } from "../src/runner/call.ts";
+import { CALL_TIMEOUT_MS, COMMAND_TIMEOUTS, newCmdId, QUERY_TIMEOUT_MS, RunnerUnavailable } from "../src/runner/call.ts";
 import { RunnerClient } from "../src/runner/client.ts";
 import { readRunnerRows, resetRunnerGen } from "../src/runner/hub.ts";
 import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
@@ -225,7 +225,7 @@ test("the dispatcher answers a schema failure and a stale epoch, runs nothing tw
   expect(logs).toContain("RUNNER_CMD_DROPPED type=lane.observe no cmdId or cmdSeq to answer");
 });
 
-test("call.ts: cmdId shapes lanes-hub parses, the fail-closed error, and the proto each new type needs", () => {
+test("call.ts: cmdId shapes lanes-hub parses and the fail-closed error", () => {
   expect(newCmdId("lane.start", "lane-a", 1_700, 0)).toBe("lane-start:lane-a:1700");
   expect(newCmdId("lane.recover", "lane-a", 1_700, 4)).toBe("recover:lane-a:1700");
   expect(newCmdId("lane.close", "lane-a", 1_700, 2)).toBe("lane.close:lane-a:1700:2");
@@ -235,8 +235,4 @@ test("call.ts: cmdId shapes lanes-hub parses, the fail-closed error, and the pro
   expect(error).toMatchObject({ code: "RUNNER_UNAVAILABLE", label: "lab", why: "outdated" });
   expect(error.message).toBe("RUNNER_UNAVAILABLE runner=lab outdated: proto 2 has no lane.pause");
   expect([CALL_TIMEOUT_MS, QUERY_TIMEOUT_MS, COMMAND_TIMEOUTS["lane.start"], COMMAND_TIMEOUTS["lane.send"]]).toEqual([30_000, 15_000, 90_000, undefined]);
-  expect(NEEDS_PROTO["q.panes"]).toBe(3);
-  expect(NEEDS_PROTO["lane.pause"]).toBe(3);
-  expect(NEEDS_PROTO["lane.close"]).toBeUndefined();
-  expect([NEEDS_PROTO["lane.start"], NEEDS_PROTO["lane.recover"], NEEDS_PROTO["q.lane.files"]]).toEqual([5, 5, 5]);
 });

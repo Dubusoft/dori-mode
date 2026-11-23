@@ -27,6 +27,8 @@ import type { Check } from "../signals.ts";
  * the supervisor must be upgraded before its runners.
  */
 export const PROTO = 9;
+/** The lowest protocol version a supervisor admits (`checkProto`): every admitted connection speaks at least this. */
+export const MIN_PROTO = PROTO - 1;
 /** The first protocol version with `lanes.closed` / `lanes.closed.result` (the cleanup sweep's closed lanes). */
 export const CLOSED_LANES_PROTO = 9;
 /** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */

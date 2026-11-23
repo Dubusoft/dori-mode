@@ -18,7 +18,7 @@ import {
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
-import { fileCapabilityDetail, isFileOperation, realTimers, RunnerUnavailable, type Timers } from "./call.ts";
+import { isFileOperation, realTimers, RunnerUnavailable, type Timers } from "./call.ts";
 import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
@@ -172,6 +172,7 @@ export type HubHooks = {
 
 /** `acceptRunners`' stop function, with the operations on live connections. */
 export type RunnerAccept = (() => void) & {
+  /** Throws `disconnected` unless `label` has an open connection; every admitted proto (at least MIN_PROTO) carries the lane file operations. */
   checkFileCapability(label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void;
   /** Deletes the label's key, sends `hello.reject RUNNER_REVOKED` and closes its connection; false when it held no key. */
   revoke(label: string): boolean;
@@ -228,7 +229,6 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
   const checkFileCapability = (label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void => {
     const connection = current.get(label);
     if (!connection?.transport.open) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
-    if (connection.proto === undefined || connection.proto < 5) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(connection.proto));
   };
   const auth = hooks.auth;
   const timers = hooks.timers ?? realTimers;

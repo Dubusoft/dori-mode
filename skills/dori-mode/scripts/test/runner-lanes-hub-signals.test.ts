@@ -61,7 +61,7 @@ test.each(["preparation", "capability"])("one hello %s refusal leaves fields unt
   const notified: string[] = [], prepared: string[] = [], dispatched: string[] = [];
   let id = 0;
   const refusal = failure === "capability"
-    ? new RunnerUnavailable("worker-a", "outdated", "lane files require proto 5 (runner proto 4); run dori runner update")
+    ? new RunnerUnavailable("worker-a", "disconnected", "no admitted connection for lane.recover")
     : new Error("LANE_FILE_READ_FAILED lane-a: cannot read attachment");
   await reconcileInventory({ ...t.hub, newFileRunId: () => `run-${++id}`,
     registry: { read: t.deps.registry.read.bind(t.deps.registry), update: t.deps.registry.update.bind(t.deps.registry),
