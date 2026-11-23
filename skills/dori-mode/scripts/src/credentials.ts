@@ -5,17 +5,43 @@ import { join } from "node:path";
 /** The file the supervisor unit loads with EnvironmentFile (written by `dori setup`). */
 export const envFilePath = (home = homedir()): string => join(home, ".dori", "env");
 
-/** Reads one `KEY=value` (optionally `export`ed, optionally quoted) from env-file text; blank counts as unset. */
-export const envFileValue = (text: string, name: string): string | undefined => {
-  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=(.*)$`);
-  for (const line of text.split(/\r?\n/)) {
-    const m = pattern.exec(line);
-    if (!m) continue;
-    const value = (m[1] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
-    if (value) return value;
+const ASSIGNMENT = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*/gm;
+
+/**
+ * Every `KEY=value` entry of env-file text, in file order. Like systemd's EnvironmentFile, a value opened with a quote runs
+ * to its closing quote across lines (inside double quotes `\"` and `\\` are escapes); a quote that never closes, like an
+ * unquoted value, takes the rest of its line, trimmed.
+ */
+export const parseEnvFile = (text: string): (readonly [name: string, value: string])[] => {
+  const entries: (readonly [string, string])[] = [];
+  const re = new RegExp(ASSIGNMENT);
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const start = re.lastIndex;
+    const quote = text[start];
+    if (quote === '"' || quote === "'") {
+      let value = "";
+      let i = start + 1;
+      for (; i < text.length && text[i] !== quote; i++) {
+        if (quote === '"' && text[i] === "\\" && (text[i + 1] === '"' || text[i + 1] === "\\")) i++;
+        value += text[i];
+      }
+      if (i < text.length) {
+        entries.push([m[1] ?? "", value]);
+        const eol = text.indexOf("\n", i);
+        re.lastIndex = eol < 0 ? text.length : eol;
+        continue;
+      }
+    }
+    const eol = text.indexOf("\n", start);
+    entries.push([m[1] ?? "", text.slice(start, eol < 0 ? text.length : eol).trim()]);
+    re.lastIndex = eol < 0 ? text.length : eol;
   }
-  return undefined;
+  return entries;
 };
+
+/** The first non-blank value of `name` in env-file text; blank counts as unset. */
+export const envFileValue = (text: string, name: string): string | undefined =>
+  parseEnvFile(text).find(([key, value]) => key === name && value)?.[1];
 
 /**
  * Resolves a messenger credential the way the supervisor sees it: the process environment first, then the

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
+import { envFilePath, envFileValue } from "./credentials.ts";
 import { alertsChannelOf, autopilotThreadChannelOf, CONFIG_FILE_KEYS, configPath, defaultConfig, loadConfig, type DoriConfig } from "./config.ts";
 import { gatewayView, readGatewayStatus } from "./gateway-status.ts";
 import { githubSummary } from "./github-events.ts";
@@ -66,12 +67,6 @@ const MESSAGE_CONTENT = 1 << 18;
 const MESSAGE_CONTENT_LIMITED = 1 << 19;
 const RESTART = "systemctl --user restart dori-supervisor.service";
 const LEAD_WAKE_WARNING_THRESHOLD = 20;
-
-export const tokenFrom = (envText: string | undefined): string | undefined => {
-  const m = /^\s*(?:export\s+)?DORI_DISCORD_TOKEN=(.*)$/m.exec(envText ?? "");
-  const v = m?.[1]?.trim().replace(/^(["'])(.*)\1$/, "$2");
-  return v || undefined;
-};
 
 const units = async (d: DoctorDeps): Promise<Check[]> => {
   const checks: Check[] = [];
@@ -649,8 +644,8 @@ export const realDoctorDeps = async (): Promise<DoctorDeps> => {
   let cfg = defaultConfig();
   let configError: string | undefined;
   try { cfg = await loadConfig(path); } catch (e) { configError = e instanceof Error ? e.message : String(e); }
-  const envPath = join(homedir(), ".dori", "env");
-  const fromFile = tokenFrom(existsSync(envPath) ? readFileSync(envPath, "utf8") : undefined);
+  const envPath = envFilePath();
+  const fromFile = existsSync(envPath) ? envFileValue(readFileSync(envPath, "utf8"), "DORI_DISCORD_TOKEN") : undefined;
   const token = fromFile ?? process.env.DORI_DISCORD_TOKEN;
   return {
     run, http: fetchHttp, clock: realClock, config: cfg, configPath: path, ...(configError ? { configError } : {}), envPath,

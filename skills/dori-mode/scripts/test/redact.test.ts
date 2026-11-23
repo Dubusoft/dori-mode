@@ -72,6 +72,13 @@ describe("known secret values from the dori env file", () => {
     expect(redactSecrets(`oops ${value} leaked`)).toBe("oops [REDACTED] leaked");
     expect(redactSecrets("harmless-note-text")).toBe("harmless-note-text");
   });
+  test("a quoted multiline value is known in full, and each long line of it on its own", () => {
+    const first = `first-${body(5)}`;
+    const second = `second-${body(5)}`;
+    writeFileSync(join(home, ".dori", "env"), `DORI_SA_KEY="${first}\n${second}"\nDORI_NOTE=x\n`);
+    expect(redactSecrets(`dump ${first} ${second} end`)).toBe("dump [REDACTED] end");
+    expect(redactSecrets(`log: ${second}`)).toBe("log: [REDACTED]");
+  });
 });
 
 describe("multiline secret-store values", () => {
