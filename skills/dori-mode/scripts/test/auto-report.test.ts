@@ -8,7 +8,7 @@ import { DISCORD_UPLOAD_MAX } from "../src/messenger/discord.ts";
 import type { ReportPostDeps } from "../src/report-post.ts";
 import type { Lane } from "../src/registry.ts";
 import { appendFollowUp, type FollowUpDiscord, readLastReports, recordOwnerClosed } from "../src/thread-followup.ts";
-import { withState } from "./fakes.ts";
+import { visible, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -61,7 +61,7 @@ test("the auto report goes into the lane's thread as its last report with a repo
   expect(readLastReports(state.dir)["ap-12-1"]).toEqual({ channel: "901", message: "m-1", at: T0 });
   expect(pendingReported(state.dir)).toMatchObject([{ lane: "ap-12-1", message: "m-1", thread: "901", note: "auto-reported by the supervisor" }]);
   expect(await appendFollowUp(state.dir, discord, lane, "머지 acme/app#1 (abc1234)")).toEqual({ appended: true, message: "m-1" });
-  expect(contents.get("901/m-1")).toEndWith("\n머지 acme/app#1 (abc1234)");
+  expect(visible(contents.get("901/m-1") ?? "")).toEndWith("\n머지 acme/app#1 (abc1234)");
 });
 
 test("the auto report carries the lane's review files as attachments and names the ones past Discord's upload limit", async () => {
