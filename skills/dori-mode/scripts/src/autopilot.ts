@@ -73,7 +73,7 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   mergeBase: "dev", tickSec: 300, quotaCacheSec: 90, threadChannel: "",
 };
 
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+export const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Keys read as nothing so an older config still loads: the bundle design's, `mode` (autopilot is always on; `dori

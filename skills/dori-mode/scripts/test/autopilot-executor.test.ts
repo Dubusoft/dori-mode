@@ -406,6 +406,15 @@ test("a throw inside an open execution is that task's interrupted result, and th
   expect(h.calls.thread).toBe(1);
 });
 
+test("an execution row without its required fields is that task's interrupted result naming them, and nothing launches", async () => {
+  const h = harness();
+  plan(store, T0, { lane: "toodo:12", action: "autopilot-execute", target: "1", data: JSON.stringify({ taskId: 12, title: "older shape" }) });
+  expect(await reconcileExecutions(h.fresh())).toEqual([
+    { taskId: 12, kind: "interrupted", reasons: ["AUTOPILOT_EXECUTION_MALFORMED toodo:12/autopilot-execute/1 data has no valid laneKey, contract"] },
+  ]);
+  expect([h.calls.start, h.calls.thread, h.calls.launch]).toEqual([0, 0, 0]);
+});
+
 test("attempted launch with unknown read-back becomes ambiguous and never admits again", async () => {
   const h = harness(); h.held(true);
   await runExecutor(h.fresh(), [12]);

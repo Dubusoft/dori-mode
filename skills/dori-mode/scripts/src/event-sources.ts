@@ -227,10 +227,13 @@ export type SourceStatus = {
 };
 export type SourceStatusFile = { readonly at: number; readonly sources: Readonly<Record<string, SourceStatus>> };
 
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
 export const readSourceStatus = (stateDir: string): SourceStatusFile | undefined => {
   try {
-    const raw = JSON.parse(readFileSync(join(stateDir, SOURCE_STATUS_FILE), "utf8")) as SourceStatusFile;
-    return typeof raw === "object" && raw !== null && typeof raw.sources === "object" && raw.sources !== null ? raw : undefined;
+    const raw: unknown = JSON.parse(readFileSync(join(stateDir, SOURCE_STATUS_FILE), "utf8"));
+    if (!isRecord(raw) || !isRecord(raw.sources) || !Object.values(raw.sources).every(isRecord)) return undefined;
+    return raw as SourceStatusFile;
   } catch { return undefined; }
 };
 

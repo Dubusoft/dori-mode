@@ -62,6 +62,7 @@ type State = {
 };
 type Targets = { numbers: Set<number>; branches: Set<string> };
 const EMPTY: State = { repos: {}, failures: {} };
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** The response fields the poll reads. The cache keeps only these: a cached PR is a few hundred bytes, not tens of KB. */
 const READ_FIELDS = new Set([
@@ -531,11 +532,26 @@ const saveGithub = (db: Database, prev: State, next: State): void => {
  */
 export const importGithub = (db: Database, stateDir: string, now: number): { readonly repos: number; readonly prs: number; readonly cache: number } => {
   const path = join(stateDir, GITHUB_FILE);
-  const source = JSON.parse(readFileSync(path, "utf8")) as Partial<State>;
-  if (typeof source !== "object" || source === null || typeof source.repos !== "object" || source.repos === null) {
-    throw new StoreError(`STORE_IMPORT_MALFORMED ${path} has no repos object`);
+  const malformed = (what: string): StoreError => new StoreError(`STORE_IMPORT_MALFORMED ${path} ${what}`);
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(path, "utf8")); } catch (e) {
+    if (e instanceof SyntaxError) throw malformed("is not valid JSON");
+    throw e;
   }
-  const repos = Object.fromEntries(Object.entries(source.repos).map(([repo, state]): [string, RepoState] => [repo, {
+  if (!isRecord(raw) || !isRecord(raw.repos)) throw malformed("has no repos object");
+  if (raw.failures !== undefined && !isRecord(raw.failures)) throw malformed("has a failures value that is not an object");
+  for (const [repo, state] of Object.entries(raw.repos)) {
+    if (!isRecord(state)) throw malformed(`repo ${repo} is not an object`);
+    for (const field of ["pulls", "cache", "issues"] as const) {
+      const value = state[field];
+      if (value === undefined) continue;
+      if (!isRecord(value)) throw malformed(`repo ${repo} ${field} is not an object`);
+      for (const [key, entry] of Object.entries(value)) if (!isRecord(entry)) throw malformed(`repo ${repo} ${field} ${key} is not an object`);
+    }
+  }
+  // Shallow: entry fields are not checked; the read-back below refuses any state the tables cannot hold.
+  const source = raw as Partial<State>;
+  const repos = Object.fromEntries(Object.entries(source.repos!).map(([repo, state]): [string, RepoState] => [repo, {
     ...state,
     cache: Object.fromEntries(Object.entries(state.cache ?? {}).map(([key, entry]) => [key, {
       ...(entry.etag !== undefined ? { etag: entry.etag } : {}), body: slimBody(entry.body), ...(entry.next !== undefined ? { next: entry.next } : {}),

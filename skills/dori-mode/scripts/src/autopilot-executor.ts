@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 
-import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
+import { autopilotLaneKey, depSatisfied, isRecord, laneKeyOf, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
 import { autopilotThreadChannelOf } from "./config.ts";
@@ -103,7 +103,16 @@ type Execution = {
   readonly reasons?: readonly string[];
 };
 
-const dataOf = (row: Operation): Execution => JSON.parse(row.data!) as Execution;
+/** A sequence row's execution, checked shallowly: corrupt or older data fails here by name, not as an undefined read later. */
+const dataOf = (row: Operation): Execution => {
+  let data: unknown;
+  try { data = JSON.parse(row.data ?? ""); } catch { data = undefined; }
+  const missing = isRecord(data)
+    ? [typeof data.taskId !== "number" && "taskId", typeof data.laneKey !== "string" && "laneKey", !isRecord(data.contract) && "contract"].filter((f) => f !== false)
+    : ["JSON object"];
+  if (missing.length > 0) throw new Error(`AUTOPILOT_EXECUTION_MALFORMED ${row.id} data has no valid ${missing.join(", ")}`);
+  return data as Execution;
+};
 const step = (row: Operation, name: string, data: unknown): OperationSpec =>
   ({ lane: row.lane, action: `autopilot-${name}`, target: row.target, data: JSON.stringify(data) });
 const stepId = (row: Operation, name: string): string => `${row.lane}/autopilot-${name}/${row.target}`;
@@ -384,7 +393,9 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
       deps.err(`AUTOPILOT_EXECUTOR_ERROR #${taskId} ${why}`);
-      results.push(row ? { taskId, laneKey: dataOf(row).laneKey, kind: "interrupted", reasons: [why] } : { taskId, kind: "error", reasons: [why] });
+      // laneKeyOf, not dataOf: the throw may be the row's own malformed data.
+      const laneKey = row ? laneKeyOf(row) : undefined;
+      results.push(row ? { taskId, ...(laneKey ? { laneKey } : {}), kind: "interrupted", reasons: [why] } : { taskId, kind: "error", reasons: [why] });
     } finally { release(); }
   }
   return results;
@@ -424,7 +435,9 @@ const reportOrphans = async (deps: ExecutorDeps): Promise<void> => {
 
 /** At startup and each tick, resume open sequences (including HOLD) and report orphaned starts; settled or ambiguous launches never relaunch. */
 export const reconcileExecutions = async (deps: ExecutorDeps): Promise<ExecutorResult[]> => {
-  const results = await runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE).map((op) => dataOf(op).taskId));
+  const results = await runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE)
+    // The task id from the row's lane, so one malformed row is that task's interrupted result, not the whole pass's throw.
+    .map((op) => Number(op.lane.slice("toodo:".length))));
   if (!deps.config.executor) return results;
   const release = await deps.lock();
   try { await reportOrphans(deps); } finally { release(); }
