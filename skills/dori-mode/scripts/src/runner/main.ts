@@ -158,7 +158,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
     const state = new RunnerState(runnerDir, { now: realClock.now });
     const gen = state.boot();
-    const outbox = new Outbox(runnerDir, { now: realClock.now });
+    const outbox = new Outbox(runnerDir, { now: realClock.now, log: (line) => { console.log(line); } });
     // Every runner owns the lanes it starts and observes its host's lanes from herdr and /proc.
     type InventoryLane = { key: string; pane: string; tab: string; session?: string };
     // The lanes only observed (not owned), as of the last observe pass; the owned part is read fresh in each hello.
@@ -454,7 +454,8 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
       // For `dori runner evacuate` over ssh: every event this runner has not had acked, as the frames it would send.
       const runnerDir = defaultRunnerDir();
       const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
-      const outbox = new Outbox(runnerDir, { now: realClock.now });
+      // stdout carries the frames, so a missing body file is reported on stderr.
+      const outbox = new Outbox(runnerDir, { now: realClock.now, log: (line) => { console.error(line); } });
       try {
         const frames = outbox.unacked(0).map((row) => ({ v: 1, runner: identity.label, gen: 0, epoch: 0, seq: row.seq, type: row.type, body: row.body }));
         console.log(JSON.stringify(frames));

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -8,7 +9,7 @@ import { memoryPair } from "./support/memory-transport.ts";
 import { encodeFrame, supervisorControl } from "../src/runner/protocol.ts";
 import { join } from "node:path";
 import {
-  Outbox, OUTBOX_ACKED_RETENTION_MS, OUTBOX_BODY_CAP, OUTBOX_EVENT_MAX, OUTBOX_FILE, OUTBOX_INLINE_MAX, OutboxEventTooLarge, TRUNCATION_MARKER,
+  BODY_MISSING_TEXT, Outbox, OUTBOX_ACKED_RETENTION_MS, OUTBOX_BODY_CAP, OUTBOX_EVENT_MAX, OUTBOX_FILE, OUTBOX_INLINE_MAX, OutboxEventTooLarge, TRUNCATION_MARKER,
   bodyRefFor, outboxLargeLine, outboxMaintenance,
 } from "../src/runner/outbox.ts";
 import { fakeClock, withState } from "./fakes.ts";
@@ -101,6 +102,61 @@ describe("runner outbox", () => {
       expect(logs.at(-1)).toBe("RUNNER_SEND_FAILED seq=1 send failed");
       expect(box.unacked(0)[0]?.body).toEqual(managed());
     } finally { pair.sever(); state.close(); }
+  });
+
+  /** Connects a client over a memory pair and replays the outbox; returns the attempt and the events the supervisor got. */
+  const replayOnce = async () => {
+    const state = new RunnerState(dir, { now: () => at });
+    state.boot();
+    const pair = memoryPair(), events: { seq: number; body: Record<string, unknown> }[] = [];
+    pair.supervisor.onLine((line) => {
+      const frame = JSON.parse(line);
+      if (frame.type === "hello") pair.supervisor.send(encodeFrame(supervisorControl({ runner: "local", gen: 1, epoch: 1 }, "hello.ok", { proto: 5, epoch: 1, eventAck: 0 })));
+      else if ("seq" in frame) events.push(frame);
+    });
+    const client = new RunnerClient({ label: "local", hostId: "host" }, { state, outbox: box, clock: fakeClock(at), connect: async () => pair.runner });
+    try {
+      const connected = client.connectOnce();
+      await Promise.resolve();
+      pair.pump();
+      const attempt = await connected;
+      pair.pump();
+      return { attempt, events };
+    } finally { pair.sever(); state.close(); }
+  };
+
+  test("a row whose body file is gone replays with the marker under its seq and the rows after it follow", async () => {
+    box.append("lane.report", report("m".repeat(OUTBOX_INLINE_MAX + 1)));
+    box.append("job.result", { opKey: "o", state: "verified", exitCode: 0, output: "o".repeat(OUTBOX_INLINE_MAX + 1) });
+    box.append("lane.state", { key: "a", status: "idle" });
+    rmSync(join(dir, "bodies", "1.body"));
+    rmSync(join(dir, "bodies", "2.body"));
+    mkdirSync(join(dir, "bodies", "2.body"));
+    const logs: string[] = [];
+    box.close();
+    box = new Outbox(dir, { now: () => at, log: (line) => logs.push(line) });
+    const { attempt, events } = await replayOnce();
+    expect(attempt).toMatchObject({ ok: true, replayed: 3 });
+    expect(events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    expect(events[0]!.body).toEqual({ ...report(BODY_MISSING_TEXT), bodyRef: bodyRefFor(BODY_MISSING_TEXT, true) });
+    expect(events[1]!.body.output).toBe(BODY_MISSING_TEXT);
+    expect(events[2]!.body).toEqual({ key: "a", status: "idle" });
+    expect(logs.map((line) => line.split(" ").slice(0, 3).join(" "))).toEqual([
+      "RUNNER_OUTBOX_BODY_MISSING seq=1 type=lane.report", "RUNNER_OUTBOX_BODY_MISSING seq=2 type=job.result",
+    ]);
+  });
+
+  test("a row whose body JSON does not parse holds the replay on purpose: skipping it would leave a seq gap", async () => {
+    box.append("lane.state", { key: "a", status: "idle" });
+    box.append("lane.state", { key: "a", status: "working" });
+    const db = new Database(join(dir, OUTBOX_FILE));
+    db.query("UPDATE events SET body = '{' WHERE seq = 1").run();
+    db.close();
+    const { attempt, events } = await replayOnce();
+    expect(attempt).toMatchObject({ ok: false, code: "RUNNER_CLOSED" });
+    expect((attempt as { detail: string }).detail).toStartWith("RUNNER_REPLAY_FAILED seq=0 ");
+    expect(events).toEqual([]);
+    expect(box.stats().unacked).toBe(2);
   });
 
   test("seq is durable, increasing and never reused after prune", () => {
