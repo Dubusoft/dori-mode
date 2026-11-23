@@ -39,6 +39,15 @@ test("add, list, update and delete never print the value", async () => {
   for (const r of [added, again, listed, updated, deleted]) expect(r.out + r.err).not.toContain(VALUE);
 });
 
+test("a value too short to mask is stored with a warning", async () => {
+  const h = home();
+  const added = await dori(h, ["add", "TEST_PIN"], "1234\n");
+  expect(added.code).toBe(0);
+  expect(added.err).toMatch(/^SECRET_NOT_MASKED TEST_PIN: /m);
+  const updated = await dori(h, ["update", "TEST_PIN"], VALUE);
+  expect(updated.err).not.toContain("SECRET_NOT_MASKED");
+});
+
 test("an empty value and a bad name are refused", async () => {
   const h = home();
   expect((await dori(h, ["add", "TEST_TOKEN"], "\n")).err).toContain("SECRET_VALUE_EMPTY");

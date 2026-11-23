@@ -5,7 +5,8 @@ const MASK = "[REDACTED]";
 
 /** Env names whose values are credentials: a name ending in one of these words, or containing WEBHOOK/CREDENTIAL. */
 const SECRET_NAME = /(?:TOKEN|SECRET|KEY|COOKIE|PASSWORD|PASSWD)$|WEBHOOK|CREDENTIAL/i;
-const MIN_KNOWN_SECRET = 8;
+// Decision: store values keep this floor too (a PIN would mask every match in ordinary text); `dori secret add/update` warn SECRET_NOT_MASKED instead.
+export const MIN_KNOWN_SECRET = 8;
 /**
  * Shortest line of a multiline secret (a JSON service account key, a PEM body) masked when it shows up on its own: a log
  * printed line by line leaks the value one line at a time. Shorter lines (`{`, `},`, `"type": "x",`) say nothing secret.
