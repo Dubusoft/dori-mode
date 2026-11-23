@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { ghJson } from "./gh-json.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
 import { launchLane, SandboxRefusal } from "./launch.ts";
@@ -285,14 +286,9 @@ type PrView = {
 const PR_FIELDS = "state,baseRefName,headRefOid,isCrossRepository,isDraft,mergeable,mergeStateStatus,statusCheckRollup,mergeCommit";
 
 const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">, fields = PR_FIELDS): Promise<PrView> => {
-  const r = await deps.run(["gh", "pr", "view", String(pull.number), "-R", pull.repo, "--json", fields], { timeoutMs: 20_000 });
-  if (r.code !== 0) throw new Error(`gh pr view ${pull.repo}#${pull.number} exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
-  try {
-    return JSON.parse(r.out) as PrView;
-  } catch (e) {
-    if (!(e instanceof SyntaxError)) throw e;
-    throw new Error(`gh pr view ${pull.repo}#${pull.number} answered non-JSON: ${r.out.trim().slice(0, 160)}`);
-  }
+  const r = await ghJson<PrView>(deps.run, ["gh", "pr", "view", String(pull.number), "-R", pull.repo, "--json", fields], "object", { timeoutMs: 20_000 });
+  if (!r.ok) throw new Error(`gh pr view ${pull.repo}#${pull.number}${r.code ? ` exit ${r.code}` : ""}: ${r.error}`);
+  return r.value;
 };
 
 const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
@@ -482,9 +478,9 @@ export class CiFollowUp {
       if (!issue || !pull || this.settled.has(row.id)) continue;
       try {
         const readBack: ReadBack = async () => {
-          const r = await deps.run(["gh", "issue", "view", String(issue.number), "-R", issue.repo, "--json", "state"], { timeoutMs: 20_000 });
-          if (r.code !== 0) return "unknown";
-          const state = (JSON.parse(r.out) as { state?: string }).state;
+          const r = await ghJson<{ state?: string }>(deps.run, ["gh", "issue", "view", String(issue.number), "-R", issue.repo, "--json", "state"], "object", { timeoutMs: 20_000 });
+          if (!r.ok) return "unknown";
+          const state = r.value.state;
           return state === "CLOSED" ? "done" : state === "OPEN" ? "not-done" : "unknown";
         };
         const spec: OperationSpec = { lane: row.lane, action: row.action, target: row.target };

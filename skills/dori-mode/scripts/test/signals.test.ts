@@ -178,6 +178,23 @@ test("a pr signal reports an error, not an unmet condition, when gh fails, answe
   expect(fork).toMatchObject({ ok: false, error: `${URL7} comes from a fork; pr signals support same-repo branches only` });
 });
 
+test("a gh signal whose answer is a warning, nothing, or JSON of the wrong shape is a failed check with an error, never a throw", async () => {
+  const cases: [string, string, string][] = [
+    ["merged acme/app#7", "warning: cache stale", "gh answered no JSON"],
+    ["merged acme/app#7", "", "gh answered no JSON"],
+    ["merged acme/app#7", "[]", "gh answered JSON that is not an object"],
+    ["closed acme/app#2", "<html>proxy</html>", "gh answered no JSON"],
+    ["pr acme/app feat/x", "{}", "gh answered JSON that is not an array"],
+  ];
+  for (const [signal, out, error] of cases) {
+    const c = await checkSignal(signal, ghPrs(out).fake, io);
+    expect(c).toMatchObject({ signal, ok: false });
+    expect(c.error).toStartWith(error);
+  }
+  const all = await checkDone("merged acme/app#7; closed acme/app#2", ghPrs("warning: cache stale").fake, io);
+  expect(all.map((c) => c.ok)).toEqual([false, false]);
+});
+
 test("a pr Done line is accepted at launch, and a pr signal without a repo is refused", async () => {
   // Its own state: the earlier qa-lane already holds the fake checkout in the shared one.
   const own = withState();
