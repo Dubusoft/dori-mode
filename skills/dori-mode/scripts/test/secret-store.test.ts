@@ -110,8 +110,12 @@ describe("store rules", () => {
     const failing: Runner = async (argv, o) => (argv[0] === "systemd-creds" && argv[1] === "decrypt" && String(argv[argv.length - 2]).endsWith("BAD.cred")
       ? { code: 1, out: "", err: "bad" }
       : fakeCreds().run(argv, o));
-    expect([...(await new SecretStore({ dir, run: failing }).readAll())]).toEqual([["GOOD", VALUE]]);
-    expect(await codeOf(new SecretStore({ dir, run: failing }).readAll(true))).toBe("SECRET_DECRYPT_FAILED");
+    const lines: string[] = [];
+    expect([...(await new SecretStore({ dir, run: failing, log: (line) => { lines.push(line); } }).readAll())]).toEqual([["GOOD", VALUE]]);
+    // Name and code only: the systemd-creds error text ("bad") stays out of the log.
+    expect(lines).toEqual(["SECRET_STORE_READ_SKIPPED BAD SECRET_DECRYPT_FAILED"]);
+    expect(await codeOf(new SecretStore({ dir, run: failing, log: (line) => { lines.push(line); } }).readAll(true))).toBe("SECRET_DECRYPT_FAILED");
+    expect(lines).toHaveLength(1);
   });
 
   test("an existing dir with group/other bits is refused and left alone", async () => {

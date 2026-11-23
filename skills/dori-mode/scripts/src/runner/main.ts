@@ -7,7 +7,7 @@ import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
-import { laneRepoOf, secretGranter } from "./secret-grant.ts";
+import { laneRepoOf, maskStoreSecrets, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
@@ -361,7 +361,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
       };
     } else {
-      const secretStore = new SecretStore();
+      const secretStore = new SecretStore({ log });
       const runOp = secretCommandRunner({
         store: secretStore,
         commands: async () => (await loadConfig()).secretCommands,
@@ -377,7 +377,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         secrets: secretGranter({ store: secretStore, onGranted: addKnownSecrets }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
-      void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});
+      void maskStoreSecrets(secretStore, replaceKnownSecrets, log);
     }
     const stopLaneServes = laneListeners.map((listener) => serveLaneSocket(listener, laneSocketLanes, publish, log));
     const stopLaneSocket = (): void => {

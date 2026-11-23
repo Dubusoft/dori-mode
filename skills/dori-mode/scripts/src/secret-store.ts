@@ -22,7 +22,7 @@ export class SecretStoreError extends Error {
   }
 }
 
-export type SecretStoreDeps = { readonly dir?: string; readonly run?: Runner };
+export type SecretStoreDeps = { readonly dir?: string; readonly run?: Runner; readonly log?: (line: string) => void };
 
 const EXTENSIONS: readonly { readonly ext: string; readonly backend: SecretBackend }[] = [
   { ext: ".cred", backend: "cred" },
@@ -32,10 +32,12 @@ const EXTENSIONS: readonly { readonly ext: string; readonly backend: SecretBacke
 export class SecretStore {
   readonly dir: string;
   private readonly runner: Runner;
+  private readonly log: (line: string) => void;
 
   constructor(deps: SecretStoreDeps = {}) {
     this.dir = deps.dir ?? secretsDir();
     this.runner = deps.run ?? run;
+    this.log = deps.log ?? ((line) => { console.error(line); });
   }
 
   /** Stores a new secret; SECRET_EXISTS when the name is taken. */
@@ -97,11 +99,17 @@ export class SecretStore {
     throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING: secret ${name} does not exist`);
   }
 
-  /** Every readable secret by name; strict pulls reject instead of skipping unreadable entries. */
+  /**
+   * Every readable secret by name; strict pulls reject instead of skipping unreadable entries. A skipped entry is logged
+   * as SECRET_STORE_READ_SKIPPED with its name and error code only: the error text may quote what systemd-creds printed.
+   */
   async readAll(strict = false): Promise<ReadonlyMap<string, string>> {
     const values = new Map<string, string>();
     for (const { name } of this.list()) {
-      try { values.set(name, await this.read(name)); } catch (error) { if (strict) throw error; }
+      try { values.set(name, await this.read(name)); } catch (error) {
+        if (strict) throw error;
+        this.log(`SECRET_STORE_READ_SKIPPED ${name}${error instanceof SecretStoreError ? ` ${error.code}` : ""}`);
+      }
     }
     return values;
   }
