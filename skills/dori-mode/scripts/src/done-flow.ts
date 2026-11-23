@@ -1006,14 +1006,15 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
 /**
  * Why a done-claimed lane's PR counts as merged, or undefined: the supervisor merged it (a verified
  * `merge` operation of the lane, its CI_MERGED), a `merged` Done signal's PR reads MERGED, or GitHub reports a PR merged
- * into `ciMergeBase` from a lane worktree's branch at exactly that worktree's HEAD.
+ * into `ciMergeBase` from a lane worktree's branch at exactly that worktree's HEAD. A remote lane has only the first
+ * two: its worktrees are not read from here (D10), while the operation ledger and `gh` are the lead host's own.
  */
 export const mergeConfirmed = async (deps: FlowDeps, lane: Lane): Promise<string | undefined> => {
-  if (lane.machine) return undefined;
   const op = await withOperations(deps, async (store) => store.list({ lane: lane.key }).find((o) => o.action === "merge" && o.state === "verified"));
   if (op) return `CI_MERGED ${op.target}`;
   const signalled = (await readBindings(lane.done, deps.run)).find((b) => !("error" in b));
   if (signalled) return `${signalled.repo}#${signalled.n} merged`;
+  if (lane.machine) return undefined;
   const read = await readLane(deps, lane);
   const cwd = await cwdWorktree(deps, lane, read, false);
   const { atHead } = await readBranchBindings(deps.run, [...(cwd ? [cwd] : []), ...read.worktrees], deps.config.ciMergeBase);
