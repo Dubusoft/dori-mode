@@ -39,7 +39,7 @@ A lane's pane command exports its `DORI_LANE_*` variables, then runs `eval "$(<d
 export NPM_TOKEN='...'
 ```
 
-Single quotes in a value are written as `'\''`, so multi-line values survive. On a refusal or failure it prints `<code> <detail>` to stderr, nothing on stdout, and exits 1. The lane still starts, just without values, and the error shows in the pane.
+Single quotes in a value are written as `'\''`, so multi-line values survive. On a refusal or failure it prints `<code> <detail>` to stderr, nothing on stdout, and exits 1. The lane still starts, just without values, and the error shows in the pane. It is only for `eval "$(...)"`: with stdout on a terminal it asks the runner nothing, prints `SECRET_ENV_TTY_REFUSED <detail>` to stderr and exits 2, so a hand-typed `dori secret env` never puts values in pane scrollback or logs.
 
 - **Local runner:** reads its own store.
 - **Remote runner** (`dori runner serve --listen`): holds no store. It sends a sealed `secret.get` control frame with an empty names list, and the supervisor answers with every store value in a sealed `secret.value`. The supervisor refuses a link that isn't authenticated, a lane that isn't open or isn't owned by that runner (logged as `RUNNER_FORGED_SECRET runner=<label> key=<key>`, a sign the runner host is compromised), and every lane of a runner with `runners.<label>.allowUnsandboxed`. An older runner that still sends names gets just those names.

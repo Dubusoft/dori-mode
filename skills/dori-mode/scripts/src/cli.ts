@@ -90,7 +90,7 @@ const laneContext = async (env: Readonly<Record<string, string | undefined>>, ru
   const laneKey = await laneContext(process.env, laneRunnerDir, connectLane);
   if (laneKey !== undefined) {
     process.exit(await laneCliMain(process.argv.slice(2), {
-      env: process.env, laneKey, connect: connectLane,
+      env: process.env, laneKey, connect: connectLane, stdoutIsTTY: process.stdout.isTTY === true,
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     }));
   }
@@ -214,7 +214,7 @@ const USAGE = `dori <command> [options]
   secret add NAME | secret update NAME   store a secret shared with every lane at launch; the value is read from stdin only (hidden prompt on a terminal), never argv
   secret list [--json]                 stored secret names and backend (cred or plain); values are never printed
   secret delete NAME                   remove a stored secret
-  secret env                          inside a lane: export every stored secret as POSIX shell lines (loaded at launch)
+  secret env                          inside a lane: export every stored secret as POSIX shell lines for eval "$(dori secret env)" (loaded at launch; refuses a terminal stdout)
   secret run <op> | host <op>          inside a lane: the supervisor host runs config secretCommands.<op> and prints its redacted output
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes

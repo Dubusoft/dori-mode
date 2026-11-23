@@ -432,7 +432,7 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
   // Inside a lane this bundle is the lane-mode `dori`: report, claim-done and heavy for the lane's own key, nothing else.
   if (process.env.DORI_LANE_KEY) {
     return laneCliMain(args, {
-      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectLane(path)),
+      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectLane(path)), stdoutIsTTY: process.stdout.isTTY === true,
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     });
   }
