@@ -106,6 +106,14 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     reportTicks++;
     changed();
   });
+  // Each reports pass reads the pending lane reports once.
+  let reportPasses = 0;
+  const pending = SqliteLaneReports.prototype.pending;
+  spyOn(SqliteLaneReports.prototype, "pending").mockImplementation(function (this: SqliteLaneReports) {
+    reportPasses++;
+    changed();
+    return pending.call(this);
+  });
   const done = { machines: 0, gh: 0 };
   const deps = {
     ...base,
@@ -166,6 +174,7 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     notices: () => reportTicks > 0,
     sweeps: () => done.machines > 0,
     polling: () => done.gh > 0,
+    reports: () => reportPasses > 0,
   };
   const subscribe = (signal: () => void) => {
     listeners.add(signal);
@@ -173,12 +182,12 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     return () => { listeners.delete(signal); watcher.close(); };
   };
   const stop = async () => { controller.abort(); release(); await running; };
-  // Once the four working tasks, the runners and autopilot tasks (the hub always opens) and the stall check are parked, each takes its next pass.
+  // Once the five working tasks, the runners and autopilot tasks (the hub always opens) and the stall check are parked, each takes its next pass.
   const next = async () => {
-    await until(subscribe, () => pauses.parked() === 7, 10_000, "the four working tasks, the runners and autopilot tasks and the stall check parked");
+    await until(subscribe, () => pauses.parked() === 8, 10_000, "the five working tasks, the runners and autopilot tasks and the stall check parked");
     pauses.tick();
   };
-  return { clock, errors, posts, hung, working, subscribe, stop, next };
+  return { clock, errors, posts, hung, working, subscribe, stop, next, reportPasses: () => reportPasses };
 };
 
 const others = (stalled: SupervisorTask): SupervisorTask[] => SUPERVISOR_TASKS.filter((task) => task !== stalled);
@@ -260,3 +269,18 @@ stallTest("delivery", (s) => until(s.subscribe, () => s.posts.some((body) => bod
 stallTest("notices");
 stallTest("sweeps");
 stallTest("polling");
+
+test("lane reports are routed again in the next pass while a GitHub poll hangs", async () => {
+  // Given the real supervise() whose GitHub poll never answers.
+  const s = setup("polling");
+  try {
+    await until(s.subscribe, () => s.hung.length > 0, 10_000, "the hung GitHub poll");
+    await until(s.subscribe, s.working.reports, 10_000, "the first reports pass");
+    const first = s.reportPasses();
+    // When the next 5 s pass is due, the hung poll still holds its polling pass.
+    await s.next();
+    // Then the reports task routes again without waiting for it.
+    await until(s.subscribe, () => s.reportPasses() > first, 10_000, "a second reports pass beside the hung poll");
+    expect(s.hung.length).toBeGreaterThan(0);
+  } finally { await s.stop(); }
+}, 30_000);
