@@ -330,7 +330,8 @@ export class Scheduler {
       let request: { name?: unknown; at?: unknown };
       try { request = JSON.parse(readFileSync(path, "utf8")); } catch { request = {}; }
       const spec = typeof request.name === "string" ? byName.get(request.name) : undefined;
-      if (!spec || typeof request.at !== "number") {
+      // A hand-edited or damaged `at` (Infinity, or past what a Date holds) would make iso() throw out of tick.
+      if (!spec || typeof request.at !== "number" || Number.isNaN(new Date(request.at).getTime())) {
         renameSync(path, `${path}.bad`);
         this.host.log?.(`SCHEDULE_RUN_NOW_BAD ${file}: no such schedule or not a run-now request`);
         continue;
