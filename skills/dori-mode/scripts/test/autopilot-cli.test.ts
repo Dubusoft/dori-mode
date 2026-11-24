@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,7 @@ import type { LaneOps } from "../src/lane-ops.ts";
 import type { MachineObservation } from "../src/runner/protocol.ts";
 import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
 import { SqliteOperations, plan } from "../src/operations.ts";
-import { acquireStateLock } from "../src/state-lock.ts";
+import { acquireStateLock, StateLockError } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
 import { storePath } from "./fakes.ts";
 
@@ -165,6 +165,7 @@ const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
   quota: QuotaSummary = { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
   machines?: (ids: readonly number[]) => TaskHosts, config: AutopilotConfig = DEFAULT_AUTOPILOT,
+  lock: () => Promise<() => void> = () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
@@ -184,7 +185,7 @@ const harness = (
     openLanes: async () => openLanes,
     quota: async () => { probes.quota++; return quota; },
     hosts: async (ids) => { probes.host++; return machines ? machines(ids) : { defaultMachine: "local", machines: new Map([["local", host]]), targets: new Map() }; },
-    lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
+    lock,
     now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
   });
   const run = async (...args: string[]): Promise<Run> => {
@@ -446,6 +447,46 @@ test("pause stops reserves and shows in candidates until resume; pausing twice k
   expect(await h.run("resume")).toEqual({ code: 0, out: ["AUTOPILOT_NOT_PAUSED"], err: [] });
   expect((await h.run("candidates")).out[0]).toBe("AUTOPILOT slots=unlimited candidates=1");
   expect((await h.run("launch", "12")).out).toEqual(["AUTOPILOT_RESERVED #12 lane=ap-12-1 attempt=1"]);
+});
+
+test("a pause that lands while a reserve reads toodo and the host refuses that reserve and writes no row", async () => {
+  const local = { defaultMachine: "local", machines: new Map([["local", { ok: true }]]), targets: new Map() };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, () => {
+    writeFileSync(join(dir, "autopilot-pause.json"), JSON.stringify({ since: "2026-01-01T12:00:30.000Z", reason: "freeze" }));
+    return local;
+  });
+  expect(await h.run("launch", "12")).toEqual({
+    code: 1, out: [], err: ["AUTOPILOT_LAUNCH_REFUSED #12 paused since 2026-01-01T12:00:30.000Z: freeze (dori autopilot resume lifts it)"],
+  });
+  expect(rows()).toEqual([]);
+});
+
+test("pause is in force at once and returns only once the reserve or launch holding the launch lock let go", async () => {
+  const order: string[] = [];
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const lock = async () => { order.push("lock asked"); await held; order.push("lock taken"); return () => { order.push("lock released"); }; };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, DEFAULT_AUTOPILOT, lock);
+  const paused = h.run("pause").then((r) => { order.push("pause returned"); return r; });
+  expect(existsSync(join(dir, "autopilot-pause.json"))).toBe(true);
+  order.push("in-flight launch done");
+  release();
+  expect(await paused).toEqual({ code: 0, out: ["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z"], err: [] });
+  expect(order).toEqual(["lock asked", "in-flight launch done", "lock taken", "lock released", "pause returned"]);
+  // Pausing again also waits for the launch in flight before it answers.
+  order.length = 0;
+  expect((await h.run("pause")).out).toEqual(["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z (already paused)"]);
+  expect(order).toEqual(["lock asked", "lock taken", "lock released"]);
+});
+
+test("a pause whose launch lock stays busy is in force but exits 1, since a launch under way may still start", async () => {
+  const lock = async (): Promise<() => void> => { throw new StateLockError("state lock timed out: autopilot-launch.lock.sqlite"); };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, DEFAULT_AUTOPILOT, lock);
+  expect(await h.run("pause")).toEqual({
+    code: 1, out: ["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z"],
+    err: ["AUTOPILOT_PAUSE_UNSETTLED a launch under way still holds the launch lock and may start its lane; run pause again to confirm it finished"],
+  });
+  expect((await harness([task(12)]).run("launch", "12")).code).toBe(1);
 });
 
 test("an unparsable pause file still pauses", async () => {

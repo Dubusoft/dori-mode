@@ -329,6 +329,8 @@ const resume = async (deps: ExecutorDeps, row: Operation, prepared = false): Pro
   try { await deps.validate(launch); } catch (e) {
     return stop(deps, row, "failed", [e instanceof Error ? e.message : String(e)]);
   }
+  // Placement and validation wait on the runner: a pause that landed meanwhile still stops the launch.
+  if (readPause(deps.pauseFile)) return resultOf(data, "paused");
   if (!placed.plan.check.verdict.ok) {
     const held = await perform(deps.store, deps.now, step(row, "hold", { input: launch, placed, base: data.contract.base }),
       async () => ({ ok: (await deps.admit(launch, placed)).kind === "held", detail: "queued" }),
