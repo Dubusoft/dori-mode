@@ -289,6 +289,18 @@ test("pause stops new executions and prevents a held launch from draining", asyn
   expect(launchQueue(dir)[0]?.key).toBe(KEY);
 });
 
+test("a pause that lands while the launch is placed stops before admission, and the same key launches after resume", async () => {
+  const h = harness();
+  const deps = h.fresh();
+  const pausing: ExecutorDeps = { ...deps, place: async (input) => { writeFileSync(join(dir, "pause.json"), "{}"); return deps.place(input); } };
+  expect((await runExecutor(pausing, [12]))[0]).toEqual({ taskId: 12, laneKey: KEY, kind: "paused" });
+  expect(h.calls.admit).toBe(0);
+  expect(store.get("toodo:12/autopilot-admit/1")).toBeUndefined();
+  rmSync(join(dir, "pause.json"));
+  expect((await runExecutor(h.fresh(), [12]))[0]).toEqual({ taskId: 12, laneKey: KEY, kind: "launched" });
+  expect([h.calls.admit, h.calls.launch]).toEqual([1, 1]);
+});
+
 test("scope or guideline changes while held require review and remove the queued launch", async () => {
   const h = harness(); h.held(true);
   await runExecutor(h.fresh(), [12]);

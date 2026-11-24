@@ -16,6 +16,7 @@ import { hostSummary, machineHosts } from "./launch-service.ts";
 import { checkMachine } from "./placement.ts";
 import { ToodoClient, ToodoUnreadable } from "./toodo-client.ts";
 import { replaceFileAtomic } from "./durable-write.ts";
+import { StateLockError } from "./state-lock.ts";
 
 /**
  * `dori autopilot` (lead-only): judges the planned toodo tasks marked for autopilot and reserves a launch. Nothing here
@@ -265,15 +266,16 @@ const candidates = async (deps: AutopilotDeps, json: boolean, extraIds: readonly
 /**
  * Reserves the next launch attempt of `taskId`; the caller must hold the launch lock. Re-reads toodo, the ledger, open lanes, quota and
  * the host, judges the task among every marked one (other tasks' reservations not running yet take a host slot each),
- * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and before
- * reading anything when a pause is in force.
+ * and only on LAUNCH writes the planned row with its lane key. Exit 1 with the verdict when it is not LAUNCH, and when a
+ * pause is in force: before reading anything, and again right before the row (a pause may land during the reads).
  */
 export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Promise<number> => {
-  const pause = readPause(deps.pauseFile);
-  if (pause) {
-    deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
-    return 1;
-  }
+  const refusePaused = (): boolean => {
+    const pause = readPause(deps.pauseFile);
+    if (pause) deps.err(`AUTOPILOT_LAUNCH_REFUSED #${taskId} paused ${pauseText(pause)} (dori autopilot resume lifts it)`);
+    return pause !== undefined;
+  };
+  if (refusePaused()) return 1;
   const read = await readTasks(deps, [taskId]);
   if (!read) return 1;
   const ledger = ledgerRows(deps.store);
@@ -289,6 +291,7 @@ export const reserveAutopilot = async (deps: AutopilotDeps, taskId: number): Pro
   const laneKey = autopilotLaneKey(taskId, attempt);
   // A reservation on the default machine names none, as rows written before machines were recorded.
   const machine = verdict.machine !== undefined && verdict.machine !== found.defaultMachine ? verdict.machine : undefined;
+  if (refusePaused()) return 1;
   plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: LAUNCH_ACTION, target: String(attempt), data: JSON.stringify({ laneKey, ...(machine ? { machine } : {}) }) });
   deps.out(`AUTOPILOT_RESERVED #${taskId} lane=${laneKey} attempt=${attempt}${machine ? ` machine=${machine}` : ""}`);
   return 0;
@@ -376,13 +379,22 @@ const rearm = async (deps: AutopilotDeps, positionals: readonly string[], note: 
   }
 };
 
-/** `dori autopilot pause`: new reservations refuse until `resume`; running lanes go on. Pausing twice keeps the first. */
-const pause = (deps: AutopilotDeps, reason: string | undefined): number => {
+/**
+ * `dori autopilot pause`: new reservations refuse until `resume`; running lanes go on. Pausing twice keeps the first.
+ * The file is written first, so every later check refuses; then the launch lock is taken once, so the reserve or
+ * executor launch already holding it (past its last pause check) has finished before this answers. Exit 1 when that
+ * lock stays busy: the pause is in force, but the launch under way may still start its lane.
+ */
+const pause = async (deps: AutopilotDeps, reason: string | undefined): Promise<number> => {
   const current = readPause(deps.pauseFile);
-  if (current) { deps.out(`AUTOPILOT_PAUSED ${pauseText(current)} (already paused)`); return 0; }
-  const next: Pause = { since: new Date(deps.now()).toISOString(), reason: reason?.trim() || null };
-  writePause(deps.pauseFile, next);
-  deps.out(`AUTOPILOT_PAUSED ${pauseText(next)}`);
+  const next: Pause = current ?? { since: new Date(deps.now()).toISOString(), reason: reason?.trim() || null };
+  if (!current) writePause(deps.pauseFile, next);
+  deps.out(`AUTOPILOT_PAUSED ${pauseText(next)}${current ? " (already paused)" : ""}`);
+  try { (await deps.lock())(); } catch (e) {
+    if (!(e instanceof StateLockError)) throw e;
+    deps.err("AUTOPILOT_PAUSE_UNSETTLED a launch under way still holds the launch lock and may start its lane; run pause again to confirm it finished");
+    return 1;
+  }
   return 0;
 };
 
@@ -409,7 +421,7 @@ export const autopilotMain = async (args: readonly string[], deps: AutopilotDeps
     if (sub === "launch") return await launch(deps, extra, v);
     if (sub === "rearm") return await rearm(deps, extra, v.note as string | undefined);
     if (extra.length) throw new UsageError(`autopilot ${sub} takes no arguments`);
-    if (sub === "pause") return pause(deps, v.reason as string | undefined);
+    if (sub === "pause") return await pause(deps, v.reason as string | undefined);
     if (sub === "resume") return resume(deps);
     const extraIds = v.tasks === undefined ? [] : taskIds(v.tasks as string);
     return await candidates(deps, v.json === true, extraIds);
