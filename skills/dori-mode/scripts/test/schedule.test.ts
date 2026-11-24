@@ -157,6 +157,21 @@ test("catchUp skip records the missed slots without running them; the next slot 
   expect(w.lines("HOURLY")).toEqual(["HOURLY hourly"]);
 });
 
+test("catchUp skip: a missed slot a stop left planned is recorded skipped on the next start, never run", async () => {
+  const w = world();
+  w.specs.add({ name: "tick", type: "schedule", kind: "HOURLY", everySec: 3_600, text: "hourly", catchUp: "skip", since: SINCE });
+  w.clock.at = SINCE + 5 * 3_600_000 + 20 * 60_000;
+  // The supervisor stopped right after planning the missed slot, before recording it skipped.
+  plan(w.ops(), w.clock.at, { lane: "schedule:tick", action: SCHEDULE_ACTION, target: new Date(SINCE + 5 * 3_600_000).toISOString(), data: JSON.stringify({ missed: 5 }) });
+  w.restart();
+  await w.tick();
+  expect(w.lines("HOURLY")).toEqual([]);
+  const [skipped] = w.ops().list({ lane: "schedule:tick" });
+  expect(skipped?.state).toBe("verified");
+  expect(skipped?.detail).toContain("skipped: 5 slot(s) missed");
+  expect(readSourceStatus(w.dir)?.sources.tick).toMatchObject({ lastResult: "skipped 5 missed" });
+});
+
 test("a heavy command job waits for a free slot, releases it, and a failing command is one SCHEDULE_FAILED event", async () => {
   const calls: { argv: readonly string[]; timeoutMs?: number; cwd?: string }[] = [];
   const w = world(async (argv, opts) => {

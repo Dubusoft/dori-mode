@@ -274,6 +274,11 @@ const iso = (ms: number): string => new Date(ms).toISOString();
 const isManual = (op: Operation): boolean => op.target.startsWith(MANUAL);
 /** A scheduled row's slot; NaN for a manual one. */
 const slotOf = (op: Operation): number => (isManual(op) ? Number.NaN : Date.parse(op.target));
+/** How many slots a row stands for when planned after the supervisor missed them; 0 for an on-time or manual row. */
+const missedOf = (op: Operation): number => {
+  const missed = (JSON.parse(op.data ?? "{}") as { missed?: unknown }).missed;
+  return typeof missed === "number" ? missed : 0;
+};
 
 export class Scheduler {
   private readonly running = new Set<string>();
@@ -294,7 +299,7 @@ export class Scheduler {
       try {
         const rows = this.rows(spec.name);
         const planned = this.planDue(spec, rows, now);
-        const all = planned ? [...rows, planned] : rows;
+        const all = (planned ? [...rows, planned] : rows).map((op) => this.skipMissed(spec, op, now));
         const lastSlot = Math.max(spec.since, ...all.map(slotOf).filter(Number.isFinite));
         const settled = all.filter((op) => !OPEN_STATES.includes(op.state)).sort((a, b) => a.updatedAt - b.updatedAt).at(-1);
         this.host.update(spec.name, { lastSlot, ...(settled ? { lastRunAt: settled.updatedAt } : {}) });
@@ -306,20 +311,26 @@ export class Scheduler {
     }
   }
 
-  /** Plans the due slot (durable) unless a row for a slot at least as new exists; a missed one follows catchUp. */
+  /** Plans the due slot (durable) unless a row for a slot at least as new exists; a missed one carries its count for catchUp. */
   private planDue(spec: ScheduleSpec, rows: readonly Operation[], now: number): Operation | undefined {
     const after = Math.max(spec.since, ...rows.map(slotOf).filter(Number.isFinite));
     const due = dueSlot(spec, after, now);
     if (!due) return undefined;
     const missed = due.count > 1 || now - due.slot > SCHEDULE_GRACE_MS;
     const spec_ = { lane: laneOf(spec.name), action: SCHEDULE_ACTION, target: iso(due.slot), ...(missed ? { data: JSON.stringify({ missed: due.count }) } : {}) };
-    const op = plan(this.deps.operations, now, spec_);
-    if (!missed || spec.catchUp === "once") {
-      if (missed) this.host.log?.(`SCHEDULE_CATCH_UP ${spec.name} ${due.count} missed slot(s), running ${spec_.target} once`);
-      return op;
-    }
-    this.host.update(spec.name, { lastResult: `skipped ${due.count} missed` });
-    return settleOperation(this.deps.operations, now, op.id, "verified", `skipped: ${due.count} slot(s) missed while the supervisor was down (catchUp skip)`);
+    if (missed && spec.catchUp === "once") this.host.log?.(`SCHEDULE_CATCH_UP ${spec.name} ${due.count} missed slot(s), running ${spec_.target} once`);
+    return plan(this.deps.operations, now, spec_);
+  }
+
+  /**
+   * Records a planned missed-slot row as skipped under catchUp skip. Decided from the stored row on every pass, not when
+   * planning it, so a row a stop left planned before this write is skipped on the next start instead of run.
+   */
+  private skipMissed(spec: ScheduleSpec, op: Operation, now: number): Operation {
+    const missed = missedOf(op);
+    if (op.state !== "planned" || !missed || spec.catchUp === "once") return op;
+    this.host.update(spec.name, { lastResult: `skipped ${missed} missed` });
+    return settleOperation(this.deps.operations, now, op.id, "verified", `skipped: ${missed} slot(s) missed while the supervisor was down (catchUp skip)`)!;
   }
 
   private drainRunNow(byName: ReadonlyMap<string, ScheduleSpec>): void {
