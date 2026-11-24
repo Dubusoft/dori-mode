@@ -4,7 +4,8 @@ import { relayedText, scrubForThread } from "./freshness.ts";
 import { Discord, DISCORD_MESSAGES_PAGE, DISCORD_SUPPRESS_NOTIFICATIONS } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
-import { type LaneReport, type LaneReportStore, oneLine } from "./lane-report-store.ts";
+import { type LaneReport, type LaneReportStore } from "./lane-report-store.ts";
+import { errLine, oneLine } from "./line-text.ts";
 import type { Clock } from "./run.ts";
 import type { Lane } from "./registry.ts";
 import type { ReportKind } from "./runner/report-kinds.ts";
@@ -57,7 +58,6 @@ const elapsed = (ms: number): string => {
   const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
   return d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
 };
-export const errorText = (e: unknown): string => oneLine(e instanceof Error ? e.message : String(e)).slice(0, 160);
 
 /**
  * The text of a lane's status message as of `report` (absent: every row): its key, time since it opened, and its last
@@ -143,19 +143,19 @@ export const writeLaneStatus = async (
   if (previous) {
     let latest = true;
     try { latest = await statusIsLatest(transport, channel, previous); }
-    catch (e) { console.error(`LANE_STATUS_CHECK_FAILED ${lane.key} ${previous} ${errorText(e)}; editing it in place`); }
+    catch (e) { console.error(`LANE_STATUS_CHECK_FAILED ${lane.key} ${previous} ${errLine(e, 160)}; editing it in place`); }
     if (!latest) {
       const id = await transport.post(channel, text, stableId, true);
       await deps.registry.patch(lane.key, { statusMessageId: id });
       try { await transport.remove(channel, previous); }
-      catch (e) { console.error(`LANE_STATUS_DELETE_FAILED ${lane.key} ${previous} ${errorText(e)}`); }
+      catch (e) { console.error(`LANE_STATUS_DELETE_FAILED ${lane.key} ${previous} ${errLine(e, 160)}`); }
       return;
     }
     try {
       await transport.edit(channel, previous, text);
       return;
     } catch (e) {
-      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${previous} ${errorText(e)}; posting a new status message`);
+      console.error(`LANE_STATUS_EDIT_FAILED ${lane.key} ${previous} ${errLine(e, 160)}; posting a new status message`);
     }
   }
   const id = await transport.post(channel, text, stableId, silent);
@@ -188,7 +188,7 @@ export const firstStatusTick = async (
       await writeLaneStatus(deps, transport, channel, lane, text, `lane-status:first:${lane.key}`);
       out.push(`LANE_STATUS_FIRST ${lane.key}`);
     } catch (e) {
-      console.error(`LANE_STATUS_FIRST_FAILED ${lane.key} ${errorText(e)}`);
+      console.error(`LANE_STATUS_FIRST_FAILED ${lane.key} ${errLine(e, 160)}`);
     }
   }
   return out;

@@ -4,8 +4,9 @@ import { DECISION_RELAY_ATTEMPTS, DECISION_RELAY_RETRY_MS, type DecisionRelay, t
 import type { FlowDeps } from "./done-flow.ts";
 import { type LaneMessageStore, openLaneMessages, updateLaneMessage } from "./lane-messages.ts";
 import { openOperations } from "./operations.ts";
-import { errorText, relayFailedLine, relaysToLane, short } from "./owner-decisions.ts";
+import { relayFailedLine, relaysToLane, short } from "./owner-decisions.ts";
 import { statusOf } from "./registry.ts";
+import { errLine } from "./line-text.ts";
 
 /*
  * `dori decision close` on a decision that relays to its lane (a lane's own question or request, or a lead decision
@@ -92,7 +93,7 @@ const attemptRelay = async (deps: FlowDeps, d: OwnerDecision, attempts: number):
     if (sent.state === "queued") updateLaneMessage(messages, sent, { state: "superseded", blocked: `close relay failed: ${reason}` }, deps.clock.now());
     return record({ state: "failed", message: id, reason });
   } catch (e) {
-    return record({ state: "failed", reason: errorText(e) });
+    return record({ state: "failed", reason: errLine(e) });
   } finally {
     messages?.close();
   }

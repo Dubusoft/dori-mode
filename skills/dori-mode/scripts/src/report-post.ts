@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import type { DoriConfig } from "./config.ts";
 import { laneOutputDir } from "./lane-files.ts";
 import { recordReported } from "./lane-outcomes.ts";
-import { oneLine } from "./lane-report-store.ts";
+import { oneLine } from "./line-text.ts";
 import { DISCORD_FILES_MAX, DISCORD_UPLOAD_MAX, type DiscordFile } from "./messenger/discord.ts";
 import { discordThreadOf, resolveTarget } from "./messenger/target.ts";
 import type { Lane } from "./registry.ts";

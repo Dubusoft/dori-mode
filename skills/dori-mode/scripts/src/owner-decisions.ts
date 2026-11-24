@@ -12,6 +12,7 @@ import { appendToMessage, closedByOwner } from "./thread-followup.ts";
 
 import { recordReviewDecision, REVIEW_DECISION_OUTCOMES, type ReviewDecisionOutcome, ReviewJobs } from "./review-jobs.ts";
 import type { ReviewCapDecision } from "./decision-store.ts";
+import { errLine } from "./line-text.ts";
 /** What opening, closing and the tick need from Discord; the Discord client fits it. */
 export type DecisionTransport = {
   /** `components` (action rows) ride under the message, as Discord.send puts them. */
@@ -210,7 +211,6 @@ export type DecisionSpec = DecisionChoices & {
   readonly reviewCap?: ReviewCapDecision;
 };
 
-export const errorText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
 const isGone = (e: unknown): boolean => e instanceof MessengerError && e.status === 404;
 
 /**
@@ -234,7 +234,7 @@ export const postDecisionLink = async (ctx: DecisionContext, d: OwnerDecision): 
     patchOne(ctx.config.stateDir, d.id, (x) => ({ ...x, linkMessage: message }));
     return { kind: "linked", origin, message };
   } catch (e) {
-    return { kind: "failed", reason: errorText(e) };
+    return { kind: "failed", reason: errLine(e) };
   }
 };
 
@@ -254,7 +254,7 @@ export const removeThreadNotice = async (transport: Pick<DecisionTransport, "mes
     await transport.deleteMessage(channel, notice.id);
     return undefined;
   } catch (e) {
-    return errorText(e);
+    return errLine(e);
   }
 };
 
@@ -342,7 +342,7 @@ export const openOwnerDecision = async (ctx: DecisionContext, spec: DecisionSpec
     // An attached decision archives the shared thread only when the decisions it joined all closed meanwhile.
     const orphaned = thread !== undefined && !d.inLaneThread && (!d.attachedTo || !readDecisions(stateDir).decisions.some((x) => x.thread === thread && x.state !== "closed"));
     if (thread && orphaned) { try { await ctx.transport.setThread(thread, { archived: true }); } catch { /* the reservation still goes */ } }
-    throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errorText(e)}`);
+    throw new OwnerDecisionError("DECISION_NOT_POSTED", `DECISION_NOT_POSTED ${errLine(e)}`);
   }
   const link = await postDecisionLink(ctx, d);
   return { decision: readDecisions(stateDir).decisions.find((x) => x.id === d.id) ?? d, channel: chosen, link, ...(noticeKept ? { noticeKept } : {}) };
@@ -445,7 +445,7 @@ const recordAnswersHandled = async (
       patchOne(stateDir, d.id, (x) => ({ ...x, handledAnswers: [...new Set([...(x.handledAnswers ?? []), key])] }));
       handled.push(ref);
     } catch (e) {
-      handledFailed.push({ ...ref, error: errorText(e) });
+      handledFailed.push({ ...ref, error: errLine(e) });
     }
   }
   return { handled, handledFailed };
@@ -495,7 +495,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
       const ref = refOf(key);
       if (receipts.acked(ref.channel, ref.message)) continue;
       try { await receipts.ack(ref.channel, ref.message); acked.push(ref); }
-      catch (e) { ackFailed.push({ ...ref, error: errorText(e) }); }
+      catch (e) { ackFailed.push({ ...ref, error: errLine(e) }); }
     }
   }
   // A review limit decision's outcome is recorded on its job first too: the review gate reads it from there.
@@ -505,7 +505,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     try {
       recordReviewDecision(new ReviewJobs(stateDir), ctx.now(), d.reviewCap.jobId, d.id, outcome);
       review = { jobId: d.reviewCap.jobId, outcome };
-    } catch (e) { throw new OwnerDecisionError("DECISION_REVIEW_FAILED", `DECISION_REVIEW_FAILED ${id}: ${errorText(e)}; nothing closed`); }
+    } catch (e) { throw new OwnerDecisionError("DECISION_REVIEW_FAILED", `DECISION_REVIEW_FAILED ${id}: ${errLine(e)}; nothing closed`); }
   }
   let archivePending: string | undefined;
   if (d.thread) {
@@ -513,7 +513,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     const shared = readDecisions(stateDir).decisions.some((x) => x.id !== d.id && x.thread === d.thread && x.state !== "closed");
     const keepsThread = d.inLaneThread === true || shared;
     try { await ctx.transport.send(d.thread, decisionCloseText(d, options, ctx.home, keepsThread), `decision-close:${d.id}`); }
-    catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errorText(e)}`); }
+    catch (e) { throw new OwnerDecisionError("DECISION_NOT_CLOSED", `DECISION_NOT_CLOSED ${id} ${errLine(e)}`); }
   }
   const at = ctx.now();
   // Under DECISIONS_LOCK with the close: the close that leaves no other decision waiting in its thread (attachedTo, either
@@ -535,12 +535,12 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
   // Before the archive: a message in an archived thread cannot be edited.
   let buttonsNote: string | undefined;
   try { closed = await syncDecisionButtons(ctx, closed); }
-  catch (e) { buttonsNote = `answer buttons not disabled: ${errorText(e)}`; }
+  catch (e) { buttonsNote = `answer buttons not disabled: ${errLine(e)}`; }
   if (recorded?.owns && closed.thread) {
     try {
       await archiveThread(ctx.transport, closed.thread);
       closed = patchOne(stateDir, id, (x) => { const { archivePending: _, ...rest } = x; return rest; }) ?? closed;
-    } catch (e) { archivePending = errorText(e); }
+    } catch (e) { archivePending = errLine(e); }
   }
   let resolved: string | undefined;
   if (closed.answerEvent) {
@@ -553,7 +553,7 @@ export const closeOwnerDecision = async (ctx: DecisionContext, id: string, optio
     try {
       if (await closedByOwner(stateDir, ctx.transport, origin)) linkNote = "origin thread closed by the owner; link line left as it is";
       else if (!await appendToMessage(ctx.transport, origin, closed.linkMessage, decisionLinkClosedText(closed), await ctx.transport.threadArchived(origin), `decision-link:${id}`)) linkNote = "link line too long to append";
-    } catch (e) { linkNote = `link line not updated: ${errorText(e)}`; }
+    } catch (e) { linkNote = `link line not updated: ${errLine(e)}`; }
   }
   let answers: AnswerOutcome | undefined;
   if (receipts) {
@@ -759,7 +759,7 @@ export const ownerDecisionTick = async (deps: TickDeps): Promise<void> => {
         if (isGone(e)) {
           await deps.enqueue(`owner-decision-gone:${d.id}`, `OWNER_DECISION_THREAD_GONE ${d.id} thread ${d.thread} no longer exists (archive retry): nothing to do unless the decision should be asked again`);
           patchOne(stateDir, d.id, (x) => ({ ...x, goneAt: now }));
-        } else log(`OWNER_DECISION_ARCHIVE_FAILED ${d.id} ${errorText(e)}`);
+        } else log(`OWNER_DECISION_ARCHIVE_FAILED ${d.id} ${errLine(e)}`);
       }
     }
   }

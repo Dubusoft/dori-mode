@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { replaceFileAtomic } from "./durable-write.ts";
 import type { Runner } from "./run.ts";
+import { errText } from "./line-text.ts";
 
 export const SUPERVISOR_UNIT = "dori-supervisor.service";
 const ACTIVE_POLLS = 10;
@@ -41,7 +42,6 @@ export type UpdateOptions = {
 
 class UpdateStop extends Error {}
 
-const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const KEY_CHANGE = /^SETUP_KEY_(REMOVED|SET|UNSET) (\S+)/;
 const KEY_PROBLEM = /^SETUP_KEY_(MISSING|INVALID) (\S+)/;
 
@@ -69,15 +69,15 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   };
   const refreshSandbox = (): void => {
     if (!d.refreshLaneSandbox) return;
-    try { const line = d.refreshLaneSandbox(); if (line) { d.log(line); changed.push("lane sandbox"); } } catch (e) { d.log(`WARN lane sandbox: ${message(e)}`); failed.push("lane sandbox"); }
+    try { const line = d.refreshLaneSandbox(); if (line) { d.log(line); changed.push("lane sandbox"); } } catch (e) { d.log(`WARN lane sandbox: ${errText(e)}`); failed.push("lane sandbox"); }
   };
   const refreshBootPrep = (): void => {
     if (!d.refreshBootPrep) return;
-    try { const line = d.refreshBootPrep(); if (line) { d.log(line); changed.push("boot prep"); } } catch (e) { d.log(`WARN boot prep: ${message(e)}`); failed.push("boot prep"); }
+    try { const line = d.refreshBootPrep(); if (line) { d.log(line); changed.push("boot prep"); } } catch (e) { d.log(`WARN boot prep: ${errText(e)}`); failed.push("boot prep"); }
   };
   const upgradeRunners = async (): Promise<void> => {
     if (!d.upgradeRunners) return;
-    try { const code = await d.upgradeRunners(); if (code !== 0) failed.push(`runners exit ${code}`); } catch (e) { d.log(`WARN runners: ${message(e)}`); failed.push("runners"); }
+    try { const code = await d.upgradeRunners(); if (code !== 0) failed.push(`runners exit ${code}`); } catch (e) { d.log(`WARN runners: ${errText(e)}`); failed.push("runners"); }
   };
   const migrateConfig = async (): Promise<void> => {
     if (!d.migrateConfig) return;
@@ -91,7 +91,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
         if (p) problems.push(`${p[2]} ${p[1]!.toLowerCase()}`);
       }
       if (r.code !== 0) failed.push(`config migrate exit ${r.code}${problems.length ? ` (${problems.join(", ")})` : ""}`);
-    } catch (e) { d.log(`WARN config migrate: ${message(e)}`); failed.push("config migrate"); }
+    } catch (e) { d.log(`WARN config migrate: ${errText(e)}`); failed.push("config migrate"); }
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);

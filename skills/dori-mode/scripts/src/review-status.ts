@@ -18,6 +18,7 @@ import { MAX_REVIEW_ROUNDS } from "./review-response.ts";
 import { withStateLockSync } from "./state-lock.ts";
 import { saveJsonFile } from "./store.ts";
 import { ownerClosedRecorded } from "./thread-followup.ts";
+import { errLine, oneLine } from "./line-text.ts";
 
 /**
  * The owner's view of review progress (design 5.8): one line per PR in the author lane's own `[System]` status message
@@ -85,7 +86,6 @@ export type ReviewStatusInput = {
 
 const short = (sha: string): string => sha.slice(0, 7);
 const sameRepo = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
-const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
 const cut = (s: string, max: number): string => (s.length <= max ? s : `${s.slice(0, max - 3)}...`);
 const minutes = (ms: number): string => `${Math.max(0, Math.floor(ms / 60_000))}분`;
 
@@ -117,7 +117,7 @@ const findingsText = (r: ReviewJobRecord, budget: number): string => {
     const rest = k < findings.length ? `; 외 ${findings.length - k}건` : "";
     const each = Math.floor((budget - rest.length - 2 * (k - 1)) / k);
     if (each < FINDING_ITEM_MIN) continue;
-    return findings.slice(0, k).map((f) => cut(`${f.id} ${basename(f.path)}:${f.lineStart} ${flat(f.observation)}`, each)).join("; ") + rest;
+    return findings.slice(0, k).map((f) => cut(`${f.id} ${basename(f.path)}:${f.lineStart} ${oneLine(f.observation)}`, each)).join("; ") + rest;
   }
   return "";
 };
@@ -150,7 +150,7 @@ const prLine = (pull: { readonly repo: string; readonly number: number; readonly
   const left = Math.max(0, MAX_REVIEW_ROUNDS - sinceOwner(pr).filter((r) => r.receipt?.result.verdict === "findings").length);
   switch (e.state) {
     case "queued":
-      return `${name}: ${again ? "재리뷰 대기" : "리뷰 대기"} -${at}, 라운드 ${job.round}, 사유 ${cut(flat(e.reason), 80)}, 대기 ${minutes(input.now - job.createdAt)} (job ${job.jobId})`;
+      return `${name}: ${again ? "재리뷰 대기" : "리뷰 대기"} -${at}, 라운드 ${job.round}, 사유 ${cut(oneLine(e.reason), 80)}, 대기 ${minutes(input.now - job.createdAt)} (job ${job.jobId})`;
     case "running": {
       const reviewer = input.reviewers.get(e.reviewerLaneKey);
       return `${name}: ${again ? "재리뷰 중" : "리뷰 중"} -${at}, 라운드 ${job.round}, 리뷰 레인 ${e.reviewerLaneKey} (모델 ${reviewer?.model || input.defaultModel}, 머신 ${reviewer?.machine ?? "local"}), 시작 ${stamp(e.startedAt)} (job ${job.jobId})`;
@@ -171,9 +171,9 @@ const prLine = (pull: { readonly repo: string; readonly number: number; readonly
       return summary ? `${state}; 요약 ${summary}` : state;
     }
     case "error":
-      return `${name}: 리뷰 재시도 대기 -${at}, 실행 실패 ${e.code}: ${cut(flat(e.detail), 80)} (job ${job.jobId})`;
+      return `${name}: 리뷰 재시도 대기 -${at}, 실행 실패 ${e.code}: ${cut(oneLine(e.detail), 80)} (job ${job.jobId})`;
     case "escalated":
-      return `${name}: 결정 필요 -${at}, 리뷰 실행 장애: ${cut(flat(e.reason), 100)}; 리드가 확인 중 (job ${job.jobId})`;
+      return `${name}: 결정 필요 -${at}, 리뷰 실행 장애: ${cut(oneLine(e.reason), 100)}; 리드가 확인 중 (job ${job.jobId})`;
     case "stale":
       return undefined;
   }
@@ -182,10 +182,10 @@ const prLine = (pull: { readonly repo: string; readonly number: number; readonly
 /** The line of a PR stopped by its review limit: undecided (결정 필요) or held by the owner (보류). */
 const capLine = (name: string, cap: ReviewCap, pr: readonly ReviewJobRecord[], r: ReviewJobRecord): string => {
   const at = ` head ${short(r.job.snapshot.headSha)}`;
-  if (cap.ownerDecision?.outcome === "hold") return `${name}: 보류 -${at}, 오너 결정 ${cap.ownerDecision.decisionId}로 자동 리뷰를 멈춤 (${cut(flat(cap.reason), 100)})`;
+  if (cap.ownerDecision?.outcome === "hold") return `${name}: 보류 -${at}, 오너 결정 ${cap.ownerDecision.decisionId}로 자동 리뷰를 멈춤 (${cut(oneLine(cap.reason), 100)})`;
   const tries = `리뷰 ${pr.length}회, 지적 ${pr.filter((x) => x.receipt?.result.verdict === "findings").length}회`;
   const ask = cap.decisionId ? `오너 결정 ${cap.decisionId} 대기 (수정 계속 / 기각 후 재검토 / 보류)` : "오너 결정 요청 준비 중";
-  return `${name}: 결정 필요 -${at}, 자동 한도 도달: ${cut(flat(cap.reason), 100)}; ${tries}; ${ask}`;
+  return `${name}: 결정 필요 -${at}, 자동 한도 도달: ${cut(oneLine(cap.reason), 100)}; ${tries}; ${ask}`;
 };
 
 /** The review lines of `lane`'s status message, one per PR (design 5.8), each at most REVIEW_LINE_MAX characters. */
@@ -233,7 +233,7 @@ export const reviewCapSpec = (r: ReviewJobRecord, cap: ReviewCap, pr: readonly R
   const task = taskOfLane(r.job.authorLaneKey);
   const origin = author && author.thread !== "none" && refIds(author.thread) ? author.thread : undefined;
   return {
-    question: `${s.repo}#${s.prNumber} 자동 리뷰 한도 도달 (${flat(cap.reason)}). 어떻게 할까요?`,
+    question: `${s.repo}#${s.prNumber} 자동 리뷰 한도 도달 (${oneLine(cap.reason)}). 어떻게 할까요?`,
     options: [...REVIEW_CAP_OPTIONS],
     recommend: findings >= MAX_REVIEW_ROUNDS ? 1 : 2,
     reason: `리뷰 ${pr.length}회, 지적으로 끝난 라운드 ${findings}회${last ? `, 마지막 receipt ${last.receiptId} (${last.result.verdict})` : ""}, head ${short(s.headSha)}. 리뷰 없이 머지하는 선택지는 없습니다.`,
@@ -272,7 +272,6 @@ export type ReviewStatusTickDeps = {
 export const reviewStatusTick = async (d: ReviewStatusTickDeps): Promise<string[]> => {
   const out: string[] = [];
   const { flow, stores } = d;
-  const err = (e: unknown): string => flat(e instanceof Error ? e.message : String(e)).slice(0, 200);
   for (const r of stores.jobs.list()) {
     const cap = r.capReached;
     const s = r.job.snapshot;
@@ -285,9 +284,9 @@ export const reviewStatusTick = async (d: ReviewStatusTickDeps): Promise<string[
       d.emit(`owner-decision-opened:${opened.decision.id}`, openedLine(opened.decision, opened.duplicateOf));
       out.push(`REVIEW_DECISION_OPENED ${s.repo}#${s.prNumber} job=${r.job.jobId} decision=${opened.decision.id}`);
     } catch (e) {
-      console.error(`REVIEW_DECISION_ERROR ${r.job.jobId} ${err(e)}; retried next pass`);
+      console.error(`REVIEW_DECISION_ERROR ${r.job.jobId} ${errLine(e)}; retried next pass`);
       d.emit(`review-decision-failed:${r.job.jobId}`,
-        `REVIEW_DECISION_FAILED ${s.repo}#${s.prNumber} lane=${r.job.authorLaneKey} job=${r.job.jobId} the owner decision for the reached review limit could not be opened: ${err(e)}; retried every pass, the PR stays held`);
+        `REVIEW_DECISION_FAILED ${s.repo}#${s.prNumber} lane=${r.job.authorLaneKey} job=${r.job.jobId} the owner decision for the reached review limit could not be opened: ${errLine(e)}; retried every pass, the PR stays held`);
     }
   }
   let input: ReviewStatusInput | undefined;
@@ -308,7 +307,7 @@ export const reviewStatusTick = async (d: ReviewStatusTickDeps): Promise<string[
       stores.merges.setShown(lane.key, now);
       out.push(`REVIEW_STATUS_UPDATED ${lane.key} lines=${lines.length}`);
     } catch (e) {
-      console.error(`REVIEW_STATUS_FAILED ${lane.key} ${err(e)}; retried next pass`);
+      console.error(`REVIEW_STATUS_FAILED ${lane.key} ${errLine(e)}; retried next pass`);
     }
   }
   return out;

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { writeFileAtomic } from "../setup.ts";
 import { MAX_FRAME_BYTES, type BodyRef, type RunnerEventBodies, type RunnerEventType } from "./protocol.ts";
 import { checkManagedReport } from "./lane-files.ts";
+import { HOUR_MS } from "../time-ms.ts";
 
 /**
  * The runner outbox (`<runnerDir>/outbox.sqlite`, WAL): every runner event is appended here before it is sent, with
@@ -26,7 +27,6 @@ import { checkManagedReport } from "./lane-files.ts";
  * be rebuilt from it. Reading it throws, and the replay ends with `RUNNER_REPLAY_FAILED seq=<n>` on every attempt.
  */
 
-const HOUR_MS = 60 * 60_000;
 export const OUTBOX_FILE = "outbox.sqlite";
 export const OUTBOX_BODIES_DIR = "bodies";
 export const OUTBOX_INLINE_MAX = 8 * 1024;

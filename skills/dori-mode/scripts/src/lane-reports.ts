@@ -12,8 +12,9 @@ import { LaneFileError } from "./lane-file-contract.ts";
 import { ownerClosedRecorded } from "./thread-followup.ts";
 import { type OpenResult, openedLine } from "./owner-decisions.ts";
 import { parseRequestText } from "./runner/decision-text.ts";
-import { type LaneReport, type LaneReportStore, laneGeneration, oneLine, type ReportRoute, UNFENCED_GENERATION } from "./lane-report-store.ts";
-import { discordStatusTransport, errorText, type LaneStatusTransport, statusChannel, upsertStatus } from "./lane-status.ts";
+import { type LaneReport, type LaneReportStore, laneGeneration, type ReportRoute, UNFENCED_GENERATION } from "./lane-report-store.ts";
+import { discordStatusTransport, type LaneStatusTransport, statusChannel, upsertStatus } from "./lane-status.ts";
+import { errLine, oneLine } from "./line-text.ts";
 export { REPORT_KINDS, isReportKind, type ReportKind } from "./runner/report-kinds.ts";
 
 /**
@@ -97,7 +98,7 @@ export const routeReports = async (
   // A review status that cannot be read never stops a report: the status message goes out without it.
   const review = async (lane: Lane): Promise<readonly string[]> => {
     try { return (await reviewSection?.(lane)) ?? []; } catch (e) {
-      console.error(`LANE_STATUS_REVIEW_ERROR ${lane.key} ${errorText(e)}`);
+      console.error(`LANE_STATUS_REVIEW_ERROR ${lane.key} ${errLine(e, 160)}`);
       return [];
     }
   };
@@ -141,7 +142,7 @@ export const routeReports = async (
           route = "thread";
         } catch (e) {
           eventId = `lane-report:${report.id}`;
-          await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report))} (status message failed: ${errorText(e)})`, laneMeta(lane));
+          await enqueue(eventId, `${reportLine(report, saveReportBody(deps.config.stateDir, report))} (status message failed: ${errLine(e, 160)})`, laneMeta(lane));
           route = "journal";
         }
       } else if (report.kind === "progress" && deps.config.hooks.threadReply && lane.thread !== "none" && !ownerClosedRecorded(deps.config.stateDir, lane.thread)) {
@@ -160,7 +161,7 @@ export const routeReports = async (
         const channel = statusChannel(lane);
         if (report.kind === "milestone" && transport && channel) {
           try { await upsertStatus(deps, transport, channel, lane, store, report, home, await review(lane)); }
-          catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errorText(e)}`); }
+          catch (e) { console.error(`LANE_STATUS_ERROR ${lane.key} ${report.id} ${errLine(e, 160)}`); }
         }
       }
       // A routed report is the lane being heard, like a thread reply: freshness neither nudges it nor raises NO-PROGRESS.
@@ -197,7 +198,7 @@ export const routeReports = async (
       if (n !== POISON_ALERT_AFTER) continue;
       try {
         // LANE_REPORT ... blocked is urgent in the default event policy; the journal dedupes the id across restarts.
-        await enqueue(`lane-report-stuck:${report.id}`, `LANE_REPORT ${report.lane} blocked REPORT_STUCK ${report.id} (${report.kind}) failed to route ${n} times: ${oneLine(message).slice(0, 160)}; it stays pending and is retried every pass`, { lane: report.lane });
+        await enqueue(`lane-report-stuck:${report.id}`, `LANE_REPORT ${report.lane} blocked REPORT_STUCK ${report.id} (${report.kind}) failed to route ${n} times: ${oneLine(message, 160)}; it stays pending and is retried every pass`, { lane: report.lane });
       } catch (alert) {
         console.error(`LANE_REPORT_STUCK_ERROR ${report.id} ${alert instanceof Error ? alert.message : String(alert)}`);
       }

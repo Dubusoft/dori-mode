@@ -1,4 +1,5 @@
 import type { Clock, Runner } from "../run.ts";
+import { oneLine } from "../line-text.ts";
 
 /**
  * Keeps a BrowserSkill browser connected on a macOS runner host. The extension connects bsk only while at least one
@@ -24,7 +25,6 @@ export type BrowserWindowDeps = {
 
 type BrowserCount = "connected" | "none" | { readonly unavailable: string };
 
-const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 const browsers = async (run: Runner): Promise<BrowserCount> => {
   const ran = await run(["bsk", "browsers"], { timeoutMs: 15_000 });

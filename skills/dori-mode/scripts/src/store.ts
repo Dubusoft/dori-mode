@@ -5,6 +5,7 @@ import { Database } from "bun:sqlite";
 import { replaceFileDurable } from "./durable-write.ts";
 import type { Wake } from "./lead-wakes.ts";
 import type { AwaitingAck, Journal, JournalEvent, Notice, OutboxItem, Restart } from "./supervise.ts";
+import { DAY_MS } from "./time-ms.ts";
 
 /**
  * Where the supervisor journal lives (config `store`): `supervisor.sqlite` (WAL), the only store. Each save writes only
@@ -33,7 +34,6 @@ export const DEFAULT_LEAD = "dori";
 
 export class StoreError extends Error {}
 
-const DAY_MS = 24 * 60 * 60_000;
 /**
  * Retention per class (sqlite store, Appendix D). Unresolved work is never pruned: undelivered events, the events of
  * tracked owner messages, a pending restart and open PRs. Delivered event bodies leave after `eventBodyMs` for a dedupe
