@@ -13,7 +13,7 @@ const fakeTimers = () => {
   return { api, timers, fire: (i = 0) => { const t = timers.filter((x) => x.live)[i]!; t.live = false; t.fn(); } };
 };
 
-const setup = (over: { connected?: boolean; proto?: number; lowRefusal?: Error } = {}) => {
+const setup = (over: { connected?: boolean; proto?: number; lowRefusal?: Error; attemptFailure?: Error } = {}) => {
   const sent: { label: string; type: string; body: Record<string, unknown> }[] = [];
   const controls: { label: string; type: string; body: Record<string, unknown> }[] = [];
   const logs: string[] = [];
@@ -30,7 +30,7 @@ const setup = (over: { connected?: boolean; proto?: number; lowRefusal?: Error }
     now: () => 1000,
     timers: t.api,
     log: (l) => logs.push(l),
-    attempts: { record: (_label, _type, id) => { attempts.push(id); }, settle: (_label, id) => { settledAttempts.push(id); } },
+    attempts: { record: (_label, _type, id) => { if (over.attemptFailure) throw over.attemptFailure; attempts.push(id); }, settle: (_label, id) => { settledAttempts.push(id); } },
   };
   return { calls: new RunnerCalls(deps), sent, controls, logs, attempts, settledAttempts, t, setConnected: (v: boolean) => { connected = v; } };
 };
@@ -176,6 +176,15 @@ test("a low-level gate change settles the never-sent attempt and removes its wai
   expect(s.sent).toEqual([]);
   expect(s.calls.pending()).toBe(0);
   expect(s.t.timers.every((t) => !t.live)).toBe(true);
+});
+
+test("a failed attempt write rejects the call with no send, waiter or timer left to time out unhandled", async () => {
+  const failure = new Error("disk write failed");
+  const s = setup({ attemptFailure: failure });
+  await expect(s.calls.call("box", "lane.start", { key: "a" } as never)).rejects.toBe(failure);
+  expect(s.sent).toEqual([]);
+  expect(s.calls.pending()).toBe(0);
+  expect(s.t.timers).toEqual([]);
 });
 
 test("complete body preflight includes the exact cmdId and allocates nothing on overflow", async () => {

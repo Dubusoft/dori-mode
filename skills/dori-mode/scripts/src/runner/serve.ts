@@ -793,7 +793,11 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
       else finish(output.detail, "verified", output.result as JsonValue | undefined);
     },
     (error: unknown) => { finish(`RUNNER_CMD_FAILED ${error instanceof Error ? error.message : String(error)}`); },
-  );
+  ).catch((error: unknown) => {
+    // Recording or publishing the result failed: an unrecorded intent is settled at the next boot, a recorded result is
+    // answered again when the supervisor resends the cmdId.
+    deps.log(`RUNNER_CMD_FINISH_FAILED cmdId=${cmdId} type=${type} ${error instanceof Error ? error.message : String(error)}`);
+  });
 };
 
 /** Wraps `connect` so `serveRunner` sees each connection; pass the result to both the client and `serveRunner`. */

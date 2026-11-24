@@ -180,11 +180,15 @@ export class SupervisorRunners {
       const readBackStarts = async (label: string, inventory: readonly InventoryLane[]): Promise<void> => {
         if (this.hub) await readBackRunnerStarts(this.hub, deps.registry, label, inventory, emit, (line) => { console.log(line); });
       };
+      // A failed liveness update (operations store, emit, outage write) is this runner's error, logged like a failed tick.
+      const livenessFailed = (what: string) => (e: unknown): void => {
+        console.error(`RUNNER_LIVENESS_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`);
+      };
       const inOrder = (what: string, work: () => Promise<void>): void => {
         laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
       };
       const hub = this.hub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
-        onHeartbeat: (label) => { void monitor?.heartbeat(label); },
+        onHeartbeat: (label) => { void monitor?.heartbeat(label).catch(livenessFailed(`heartbeat runner=${label}`)); },
         onHerdr: (id, line) => { emit(id, line); },
         // A runner's cleanup sweep asks for its closed lanes (lanes.closed): local lanes carry no machine, a remote runner's carry its label.
         onClosedLanes: async (label) => closedLanesOf(await deps.registry.archived(), label === LOCAL_RUNNER ? undefined : label),
@@ -215,7 +219,7 @@ export class SupervisorRunners {
           catch (e) { console.error(`WAIT_ERROR runner=${label} wait=${frame.body.waitId} ${e instanceof Error ? e.message : String(e)}`); }
         },
         onHello: (label, body) => {
-          void monitor?.hello(label, body.gen);
+          void monitor?.hello(label, body.gen).catch(livenessFailed(`hello runner=${label}`));
           inOrder(`hello ${label}`, async () => {
             await reconcileInventory(laneDeps, label, body.inventory ?? []);
             // Off the lane-event queue: the read-back awaits the runner's answers, which arrive as lane events too.
