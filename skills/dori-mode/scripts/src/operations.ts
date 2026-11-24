@@ -60,6 +60,10 @@ export const FINAL_STATES: ReadonlySet<OperationState> = new Set(["verified", "f
 /** States a sequence still has to finish: planned (intent recorded) and attempted (an effect may be in flight). */
 export const OPEN_STATES: readonly OperationState[] = ["planned", "attempted"];
 
+/** Autopilot ledger actions (autopilot.ts): a launch attempt bars a relaunch and a re-arm covers attempts, so their rows never expire. */
+export const LAUNCH_ACTION = "autopilot-launch";
+export const REARM_ACTION = "autopilot-rearm";
+
 export const operationId = (spec: Pick<OperationSpec, "lane" | "action" | "target">): string => `${spec.lane}/${spec.action}/${spec.target}`;
 
 /** Where operation rows live: the sqlite store's `operations` table, or `operations.json` beside supervisor.json. */
@@ -69,7 +73,10 @@ export interface OperationStore {
   put(op: Operation): void;
   /** Rows of one lane and/or in the given states, oldest first. */
   list(filter?: { readonly lane?: string; readonly states?: readonly OperationState[] }): Operation[];
-  /** Removes verified history older than statusHistoryMs; unresolved effects stay available for reconciliation. */
+  /**
+   * Removes verified history older than statusHistoryMs; unresolved effects stay available for reconciliation, and the
+   * autopilot ledger (LAUNCH_ACTION, REARM_ACTION) is never removed.
+   */
   prune(now: number): void;
   close(): void;
 }
@@ -139,7 +146,9 @@ export class SqliteOperations implements OperationStore {
     return readRows(this.db).filter((op) => matches(op, filter));
   }
   prune(now: number): void {
-    this.db.query("DELETE FROM operations WHERE state = 'verified' AND updated_at < ?").run(now - RETENTION.statusHistoryMs);
+    this.db
+      .query("DELETE FROM operations WHERE state = 'verified' AND updated_at < ? AND action NOT IN (?, ?)")
+      .run(now - RETENTION.statusHistoryMs, LAUNCH_ACTION, REARM_ACTION);
   }
   close(): void { this.db.close(); }
 }
