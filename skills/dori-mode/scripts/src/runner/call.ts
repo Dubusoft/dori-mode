@@ -151,11 +151,12 @@ export class RunnerCalls implements RunnerCall {
     const cmdId = opts.cmdId ?? newCmdId(type, (body as { key?: string }).key, this.deps.now(), this.n);
     if (type === "lane.start" || type === "lane.recover") checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
     const timeoutMs = opts.timeoutMs ?? COMMAND_TIMEOUTS[type] ?? CALL_TIMEOUT_MS;
-    const answer = this.wait(this.cmdWaiters, cmdId, label, timeoutMs,
-      () => new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
     const key = (body as { key?: string }).key;
     const recorded = ATTEMPT_TYPES.has(type) && this.deps.attempts !== undefined;
+    // Recorded before the waiter exists: a failed write throws with no waiter or timer left behind.
     if (recorded) this.deps.attempts?.record(label, type, cmdId, key, body);
+    const answer = this.wait(this.cmdWaiters, cmdId, label, timeoutMs,
+      () => new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
     let sent;
     try { sent = this.deps.accept.command(label, type, { ...body, cmdId } as SupervisorCommandBodies[T]); }
     catch (e) {

@@ -128,6 +128,29 @@ test("a resent cmdId still at intent is left alone, and a string effect still an
   state.close();
 });
 
+test("a result that cannot be published is logged, recorded final and answered again on resend", async () => {
+  const dir = runnerDir();
+  const state = new RunnerState(dir, { now: () => 1_000 });
+  state.boot();
+  const published: RunnerEventBodies["cmd.result"][] = [];
+  let outboxDown = true;
+  let logged: (line: string) => void = () => {};
+  const failedLine = new Promise<string>((resolve) => { logged = (line) => { if (line.startsWith("RUNNER_CMD_FINISH_FAILED")) resolve(line); }; });
+  const dispatch = commandDispatcher({
+    state, policy: DEFAULT_POLICY, realpath: (p) => p, log: (line) => { logged(line); },
+    publish: (body) => { if (outboxDown) throw new Error("outbox write failed"); published.push(body); },
+    effects: { "lane.observe": async () => "present" },
+  });
+  const observe = (cmdSeq: number) => ({ v: 1, runner: "local", gen: 1, epoch: 1, cmdSeq, type: "lane.observe", body: { cmdId: "obs-1", key: "lane-a" } });
+  dispatch(observe(1));
+  expect(await failedLine).toBe("RUNNER_CMD_FINISH_FAILED cmdId=obs-1 type=lane.observe outbox write failed");
+  expect(state.command("obs-1")?.state).toBe("verified");
+  outboxDown = false;
+  dispatch(observe(2));
+  expect(published).toEqual([{ cmdId: "obs-1", cmdSeq: 1, state: "verified", detail: "present" }]);
+  state.close();
+});
+
 test("final command records past the 30-day retention are pruned; intent rows and the command cursor stay", () => {
   const dir = runnerDir();
   const clock = fakeClock(1_000);
