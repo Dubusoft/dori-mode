@@ -192,12 +192,14 @@ export class RunnerState {
     return ack;
   }
 
-  /** Deletes final rows last updated before `cutoff`; returns how many went. */
+  /** Deletes final rows at or below the ack cursor last updated before `cutoff`; returns how many went. */
   pruneCommands(cutoff: number): number {
     return this.db.transaction(() => {
-      // Remember the cursor first so deleting old rows can never lower it.
-      this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('ackFloor', ?)").run(this.cmdAck());
-      return this.db.query("DELETE FROM commands WHERE state != 'intent' AND updated_at < ?").run(cutoff).changes;
+      // Remember the cursor first so deleting old rows can never lower it. A final row above it (past a gap left by an
+      // intent) stays: cmdAck must still find it once the gap closes.
+      const ack = this.cmdAck();
+      this.db.query("INSERT OR REPLACE INTO meta (key, value) VALUES ('ackFloor', ?)").run(ack);
+      return this.db.query("DELETE FROM commands WHERE state != 'intent' AND cmdSeq <= ? AND updated_at < ?").run(ack, cutoff).changes;
     }).immediate();
   }
 

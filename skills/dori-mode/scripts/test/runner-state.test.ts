@@ -187,6 +187,20 @@ describe("retention", () => {
     a.close();
     expect(make().cmdAck()).toBe(3);
   });
+
+  test("a final row above an unfinished intent is kept, so cmdAck passes it once the intent finishes", () => {
+    const a = make();
+    a.recordIntent(intent(1));
+    a.recordIntent(intent(2));
+    a.recordResult("op-2", "verified", "");
+    clock.t += COMMAND_RETENTION_MS + 1;
+    expect(a.pruneCommands(clock.t - COMMAND_RETENTION_MS)).toBe(0);
+    a.recordResult("op-1", "verified", "");
+    expect(a.cmdAck()).toBe(2);
+    a.recordIntent(intent(3));
+    a.recordResult("op-3", "verified", "");
+    expect(a.cmdAck()).toBe(3);
+  });
 });
 
 describe("structured results", () => {
