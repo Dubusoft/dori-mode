@@ -690,6 +690,13 @@ test("send refuses while a question shows when asked to, guarded mode answers se
   expect(t.calls.some((a) => a.join(" ") === "herdr pane send-text p1 hello")).toBe(true);
   const closedWhileListed = await t.lanes.close("lane-a");
   expect(closedWhileListed.result).toEqual({ closed: "tab", gone: false });
+  // A pane still listed keeps the lane's record and token file, so a later close can still reach it.
+  expect(t.lanes.records()["lane-a"]).toBeDefined();
+  expect(existsSync(t.lanes.tokenPath("lane-a"))).toBe(true);
+  t.world.panes = [];
+  expect((await t.lanes.close("lane-a")).result).toEqual({ closed: "none", gone: true });
+  expect(t.lanes.records()["lane-a"]).toBeUndefined();
+  expect(existsSync(t.lanes.tokenPath("lane-a"))).toBe(false);
   await t.lanes.start({ ...START, key: "lane-b" });
   t.world.panes = [];
   expect((await t.lanes.close("lane-b")).result).toEqual({ closed: "none", gone: true });

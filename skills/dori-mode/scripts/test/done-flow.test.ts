@@ -273,6 +273,28 @@ test("a close runs through the lane's runner: inspect, then lane.close, with its
   expect(world.ops.find((e) => e.op === "close")?.args).toEqual({ opts: { cmdId: "op:demo-lane/pane-close/w:p1:1" } });
 });
 
+test("a pane still listed after its close leaves the lane open, and the next close retries it", async () => {
+  livePane();
+  const stuck = at(T0);
+  const r = await closeLane({ ...stuck, ops: { ...stuck.ops, close: async () => ({ closed: "pane", gone: false }) } }, lane, "manual");
+  expect(r.closed).toBe(false);
+  expect(r.lines.at(-1)).toStartWith("REFUSED demo-lane: pane w:p1 is still listed after its close");
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).not.toBe("closed");
+  const again = await closeLane(at(T0 + MIN), lane, "manual");
+  expect(again.closed).toBe(true);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("closed");
+});
+
+test("a runner lane with no recorded pane whose runner still lists its pane after lane.close is left open", async () => {
+  const reserved: Lane = { ...lane, key: "reserved-lane", pane: undefined, runner: "local", status: "paused", launchReservation: "tok" };
+  await at(T0).registry.write(reserved);
+  const d = at(T0);
+  const r = await closeLane({ ...d, ops: { ...d.ops, close: async () => ({ closed: "tab", gone: false }) } }, reserved, "cancelled", { cancelled: { reason: "launch timed out" } });
+  expect(r.closed).toBe(false);
+  expect(r.lines.at(-1)).toStartWith("REFUSED reserved-lane: runner lane reserved-lane is still listed after its close");
+  expect(statusOf((await at(T0).registry.read("reserved-lane"))!)).not.toBe("closed");
+});
+
 test("cancelling a runner lane whose start never reported a pane still sends lane.close for its key", async () => {
   const reserved: Lane = { ...lane, key: "reserved-lane", pane: undefined, runner: "local", status: "paused", launchReservation: "tok" };
   await at(T0).registry.write(reserved);

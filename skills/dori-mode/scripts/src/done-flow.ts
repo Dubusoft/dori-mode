@@ -322,11 +322,14 @@ export const closeRunning = (deps: FlowDeps, key: string): boolean => {
 const paneGone = (deps: FlowDeps, lane: Lane, match: (pane: { readonly pane_id: string; readonly tab_id?: string }) => boolean): ReadBack => async () =>
   (await deps.ops.panes(lane.machine)).some(match) ? "not-done" : "done";
 
+/** The error of a `lane.close` its runner answered with the lane's pane still listed (`gone: false`). */
+const STILL_LISTED = "still listed after closing";
+
 /** The lane's runner closes its tab (else its pane), `lane.close`; a refusal or an ambiguous answer is data for the read-back. */
 const closeEffect = (deps: FlowDeps, lane: Lane) => async (cmdId: string): Promise<Ran> => {
   try {
     const r = await deps.ops.close(lane, { cmdId });
-    return r.gone ? { code: 0, out: `closed ${r.closed}`, err: "" } : { code: 1, out: "", err: `still listed after closing ${r.closed}` };
+    return r.gone ? { code: 0, out: `closed ${r.closed}`, err: "" } : { code: 1, out: "", err: `${STILL_LISTED} ${r.closed}` };
   } catch (e) {
     if (e instanceof LaneOpsError) return { code: 1, out: "", err: e.message };
     throw e;
@@ -546,21 +549,28 @@ const closeSequence = async (
     queue.branches.push(target);
     cleanup.push(`branch ${target.branch} queued: deleted by the closed-lane cleanup after its worktrees go, only while it is at ${target.repo}#${target.n} merged head ${target.sha.slice(0, 10)}`);
   }
+  // A lane whose agent may still run is never recorded closed: it would be left with no record to report through or
+  // to close again. The failed close operation stays retryable, so the next close tries it again.
+  const stillListed = (what: string, detail: string) => ({ closed: false, lines: [...lines, ...cleanup,
+    `REFUSED ${lane.key}: ${what} is still listed after its close (${detail.slice(0, 120)}); the lane is left open, close it again`] });
   // The lane's thread stays open: only the owner closes it, with the button on the lead's report.
   if (lane.tab) {
     const tab = lane.tab;
     const step = await act("tab-close", tab, closeEffect(deps, lane), paneGone(deps, lane, (p) => p.tab_id === tab));
     if (step.state === "ambiguous") return ambiguous(step);
-    cleanup.push(step.state === "verified" ? `tab ${tab} closed` : `tab ${tab} not closed`);
+    if (step.state !== "verified") return stillListed(`tab ${tab}`, step.err);
+    cleanup.push(`tab ${tab} closed`);
   } else if (lane.pane) {
     const pane = lane.pane;
     const step = await act("pane-close", pane, closeEffect(deps, lane), paneGone(deps, lane, (p) => p.pane_id === pane));
     if (step.state === "ambiguous") return ambiguous(step);
-    cleanup.push(step.state === "verified" ? `pane ${pane} closed` : `pane ${pane} not closed`);
+    if (step.state !== "verified") return stillListed(`pane ${pane}`, step.err);
+    cleanup.push(`pane ${pane} closed`);
   } else if (lane.runner) {
     // No pane yet: a start may still be out (a cancelled reservation). lane.close by key stops a lane the runner
     // already recorded; a start that lands after the close is stopped by the supervisor (LANE_STARTED_AFTER_CLOSE).
     const r = await closeEffect(deps, lane)(`close-by-key:${lane.key}:${deps.clock.now()}`);
+    if (r.err.startsWith(STILL_LISTED)) return stillListed(`runner lane ${lane.key}`, r.err);
     cleanup.push(r.code === 0 ? `runner lane ${lane.key} ${r.out}` : `runner lane ${lane.key} not closed: ${r.err.slice(0, 120)}`);
   }
   const at = iso(deps.clock);
