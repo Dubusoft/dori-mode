@@ -68,11 +68,12 @@ import { openOperations, type OperationStore } from "./operations.ts";
 import { routeReports } from "./lane-reports.ts";
 import { type LaneReportStore, openLaneReports } from "./lane-report-store.ts";
 import { firstStatusTick, type LaneStatusTransport, statusTransportOf } from "./lane-status.ts";
-import { criticalTick, errText, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_STATE_FILE, type PressureIo, pressureIo, warnMachineLanes } from "./supervise-guard.ts";
+import { criticalTick, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_STATE_FILE, type PressureIo, pressureIo, warnMachineLanes } from "./supervise-guard.ts";
 import { runnerCallsOf, SupervisorRunners } from "./supervise-runners.ts";
 import { decisionDeliveryTick, reconcileDecisionsAtStart } from "./decision-delivery.ts";
 import { type DecisionContext, openLaneDecision, ownerDecisionTick } from "./owner-decisions.ts";
 import { relayLine, retryDecisionRelays } from "./decision-relay.ts";
+import { errLine } from "./line-text.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
@@ -387,7 +388,7 @@ export const supervisorSweeps = (
       const warned = new Map<string, string>();
       await Promise.all(results.map(async ({ machine, sample }) => {
         if (machineGuard.get(machine.label)?.alerting) return;
-        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errLine(e, 160)}`);
         if (note) warned.set(machine.label, note);
       }));
       const lanesOn = (m: GuardMachine): string | undefined => {
@@ -435,7 +436,7 @@ export const runSweeps = async (sweeps: readonly Sweep[], emit: Emit, now: () =>
     try {
       for (const line of await step(put)) await put(line);
     } catch (e) {
-      const message = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+      const message = errLine(e);
       log(`SWEEP_ERROR ${name} ${message}`);
       try { await put(name === "watch" ? `LANE_WATCH_WARN ${message}` : `SWEEP_WARN ${name} ${message}`); }
       catch (w) { log(`SWEEP_WARN_LOST ${name} ${w instanceof Error ? w.message : String(w)}`); }

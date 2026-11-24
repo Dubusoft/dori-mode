@@ -1,6 +1,6 @@
 import { publishedDecisions } from "./decision-obligations.ts";
 import { scrubForThread } from "./freshness.ts";
-import { oneLine } from "./lane-report-store.ts";
+import { oneLine } from "./line-text.ts";
 import { openOwnerDecisions } from "./owner-decisions.ts";
 import type { Claim, Lane } from "./registry.ts";
 import { postLaneReport, type ReportPostDeps } from "./report-post.ts";

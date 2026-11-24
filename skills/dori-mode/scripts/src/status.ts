@@ -26,6 +26,7 @@ import { unsandboxedReason } from "./runner-sandbox.ts";
 import { openOperations } from "./operations.ts";
 import { openOwnerDecisions } from "./owner-decisions.ts";
 import type { Tunables } from "./tunables.ts";
+import { oneLine } from "./line-text.ts";
 
 export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
@@ -441,10 +442,9 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
 };
 
 /** Whitespace (newlines included) collapsed, so every item stays on one line. */
-const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
 /** One line of at most n characters, cut at a word when one is near and marked "...", never inside a surrogate pair. */
 const clip = (s: string, n: number): string => {
-  const t = flat(s);
+  const t = oneLine(s);
   if (t.length <= n) return t;
   const room = Math.max(1, n - 3);
   const cut = t.slice(0, room).replace(/[\uD800-\uDBFF]$/, "");

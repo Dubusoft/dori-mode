@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { releaseSlot } from "./heavy-slot.ts";
 import type { Runner } from "./run.ts";
+import { errText } from "./line-text.ts";
 
 /**
  * iOS simulators a heavy command boots outlive it: CoreSimulator, not the command, owns a booted device, so
@@ -29,7 +30,6 @@ export type SimulatorDeps = {
   readonly err: (line: string) => void;
 };
 
-const message = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 /** The UDIDs `xcrun simctl` lists as Booted; throws when simctl fails or prints something else. */
 export const bootedSimulators = async (run: Runner): Promise<Set<string>> => {
@@ -71,7 +71,7 @@ export const shutDownHeavySimulators = async (deps: SimulatorDeps): Promise<void
     booted = await bootedSimulators(deps.run);
   } catch (error) {
     record(deps, listed);
-    deps.err(`dori heavy: simulators left booted: ${message(error)}`);
+    deps.err(`dori heavy: simulators left booted: ${errText(error)}`);
     return;
   }
   // A heavy that started meanwhile may be using one of them: it takes the list over.
@@ -95,20 +95,20 @@ export const watchSimulators = async (deps: SimulatorDeps, slot: string): Promis
   try {
     before = await bootedSimulators(deps.run);
   } catch (error) {
-    deps.err(`dori heavy: simulators this command boots are not tracked: ${message(error)}`);
+    deps.err(`dori heavy: simulators this command boots are not tracked: ${errText(error)}`);
   }
   return async () => {
     try {
       if (before) record(deps, [...await bootedSimulators(deps.run)].filter((u) => !before.has(u)));
     } catch (error) {
-      deps.err(`dori heavy: simulators this command booted are not tracked: ${message(error)}`);
+      deps.err(`dori heavy: simulators this command booted are not tracked: ${errText(error)}`);
     } finally {
       releaseSlot(slot);
     }
     try {
       await shutDownHeavySimulators(deps);
     } catch (error) {
-      deps.err(`dori heavy: simulators not shut down: ${message(error)}`);
+      deps.err(`dori heavy: simulators not shut down: ${errText(error)}`);
     }
   };
 };

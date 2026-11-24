@@ -1,3 +1,5 @@
+import { oneLine } from "../line-text.ts";
+
 /**
  * The fixed text form of a lane question that asks the owner to choose (owner decision channel). The lane CLI checks
  * the choices and writes them into the report's `text` in this form, so the runner protocol (`lane.report`) is unchanged
@@ -34,7 +36,6 @@ export type DecisionChoices = {
   readonly blocking: boolean;
 };
 
-const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 /**
  * Why `choices` cannot become a decision (one line), or undefined when it can: 2-9 options, a recommendation in range, and
@@ -44,7 +45,7 @@ export const decisionChoicesProblem = (choices: {
   readonly question?: string; readonly options?: readonly string[]; readonly recommend?: number | string;
   readonly reason?: string; readonly waiting?: string;
 }): string | undefined => {
-  const options = (choices.options ?? []).map(flat);
+  const options = (choices.options ?? []).map((text) => oneLine(text));
   if (options.length < DECISION_OPTIONS_MIN || options.length > DECISION_OPTIONS_MAX) return `needs ${DECISION_OPTIONS_MIN}-${DECISION_OPTIONS_MAX} --option values, got ${options.length}`;
   const empty = options.findIndex((o) => !o);
   if (empty >= 0) return `option ${empty + 1} is empty`;
@@ -54,7 +55,7 @@ export const decisionChoicesProblem = (choices: {
   if (recommend === undefined) return "needs --recommend N";
   if (!Number.isInteger(recommend) || recommend < 1 || recommend > options.length) return `--recommend must be 1-${options.length}`;
   const text = (name: string, value: string | undefined, max: number): string | undefined => {
-    const v = flat(value ?? "");
+    const v = oneLine(value ?? "");
     if (!v) return `needs ${name}`;
     return v.length > max ? `${name} is longer than ${max} characters` : undefined;
   };
@@ -65,10 +66,10 @@ export const decisionChoicesProblem = (choices: {
 /** `choices` (already checked with decisionChoicesProblem) in the fixed text form. */
 export const serializeDecisionText = (choices: DecisionChoices): string => [
   DECISION_TEXT_HEAD,
-  `Q: ${flat(choices.question)}`,
-  ...choices.options.map((option, i) => `${i + 1}) ${flat(option)}`),
-  `REC ${choices.recommend}: ${flat(choices.reason)}`,
-  `WAIT: ${flat(choices.waiting)}`,
+  `Q: ${oneLine(choices.question)}`,
+  ...choices.options.map((option, i) => `${i + 1}) ${oneLine(option)}`),
+  `REC ${choices.recommend}: ${oneLine(choices.reason)}`,
+  `WAIT: ${oneLine(choices.waiting)}`,
   `MODE: ${choices.blocking ? "blocking" : "nonblocking"}`,
 ].join("\n");
 
@@ -138,14 +139,14 @@ export const inputRequestProblem = (request: {
   readonly need?: string; readonly reason?: string; readonly file?: string; readonly waiting?: string;
 }): string | undefined => {
   const text = (name: string, value: string | undefined, max: number): string | undefined => {
-    const v = flat(value ?? "");
+    const v = oneLine(value ?? "");
     if (!v) return `needs ${name}`;
     return v.length > max ? `${name} is longer than ${max} characters` : undefined;
   };
   const problem = text("what is needed (--text)", request.need, DECISION_QUESTION_MAX) ?? text("--reason", request.reason, DECISION_REASON_MAX)
     ?? text("--waiting", request.waiting, DECISION_WAITING_MAX);
   if (problem) return problem;
-  const file = request.file === undefined ? undefined : flat(request.file);
+  const file = request.file === undefined ? undefined : oneLine(request.file);
   if (file !== undefined) {
     if (!isOwnerPath(file)) return `--file must be an absolute or ~/ path, got "${file}"`;
     if (file.length > REQUEST_FILE_MAX) return `--file is longer than ${REQUEST_FILE_MAX} characters`;
@@ -159,10 +160,10 @@ export const inputRequestProblem = (request: {
 /** `request` (already checked with inputRequestProblem) in the fixed text form. */
 export const serializeRequestText = (request: InputRequest): string => [
   REQUEST_TEXT_HEAD,
-  `NEED: ${flat(request.need)}`,
-  `WHY: ${flat(request.reason)}`,
-  `SEND: ${request.file === undefined ? "thread" : `file ${flat(request.file)}`}`,
-  `WAIT: ${flat(request.waiting)}`,
+  `NEED: ${oneLine(request.need)}`,
+  `WHY: ${oneLine(request.reason)}`,
+  `SEND: ${request.file === undefined ? "thread" : `file ${oneLine(request.file)}`}`,
+  `WAIT: ${oneLine(request.waiting)}`,
   `MODE: ${request.blocking ? "blocking" : "nonblocking"}`,
 ].join("\n");
 

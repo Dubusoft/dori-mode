@@ -1,5 +1,5 @@
 import { realClock } from "../run.ts";
-import { oneLine } from "../lane-report-store.ts";
+import { oneLine } from "../line-text.ts";
 import { type CliCommand, die } from "./context.ts";
 
 /** `dori resolved <eventId> ... [--note TEXT]`: the lead decided these decision events. */

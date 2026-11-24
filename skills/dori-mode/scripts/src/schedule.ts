@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync } 
 import { isAbsolute, join } from "node:path";
 
 import { replaceFileAtomic } from "./durable-write.ts";
-import { SourceError, type SourceEnqueue, type SourceStatus, sourceText } from "./event-sources.ts";
+import { SourceError, type SourceEnqueue, type SourceStatus, sourceText } from "./source-types.ts";
 import { type Operation, type OperationStore, OPEN_STATES, perform, plan, type ReadBack, settleOperation } from "./operations.ts";
 import type { Runner } from "./run.ts";
 import { machineLabel, remoteRunner } from "./remote-jobs.ts";

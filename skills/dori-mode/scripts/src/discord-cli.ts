@@ -6,7 +6,7 @@ import { alertsChannelOf } from "./config.ts";
 import { envFilePath, resolveCredential } from "./credentials.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { staleOwnerEvents, unreadAfterAck } from "./inbox.ts";
-import { oneLine } from "./lane-report-store.ts";
+import { oneLine } from "./line-text.ts";
 import { buttonRow } from "./messenger/discord-buttons.ts";
 import { discordOwnerConfigured } from "./messenger/discord-inbound.ts";
 import { Discord } from "./messenger/discord.ts";

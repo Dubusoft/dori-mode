@@ -21,6 +21,7 @@ import { discordStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
 import { passthroughView, SWEEP_SCREEN_LINES, type SweepView } from "./sweep-view.ts";
 import { LANE_KEY, type Lane, statusOf } from "./registry.ts";
+import { errText } from "./line-text.ts";
 
 export const RECOVERY_LIMIT = 3;
 
@@ -80,7 +81,6 @@ const turnInterrupted = async (deps: FlowDeps, lane: RecoveryLane, pane: Pane, e
   return event && !enqueue ? [event] : [];
 };
 
-const message = (error: unknown): string => error instanceof Error ? error.message : String(error);
 
 /** SQLite releases this exclusion even when the recovering process dies. */
 export const withRecoveryLock = async (deps: FlowDeps, key: string, action: () => Promise<string[]>): Promise<string[]> => {
@@ -394,7 +394,7 @@ const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue
         const event = `LANE_RECOVERY_ERROR ${lane.key} ${error.code.toLowerCase().replace("_", "-")}: ${error.message}`;
         return [event, ...await postSandboxNotice(deps, current, error.message)];
       }
-      return [`LANE_RECOVERY_ERROR ${lane.key} ${message(error)}`];
+      return [`LANE_RECOVERY_ERROR ${lane.key} ${errText(error)}`];
     }
   });
 

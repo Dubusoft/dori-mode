@@ -37,6 +37,7 @@ import {
   classifyExemption, EXEMPT_POLICY_VERSION, type ExemptDecision, exemptKey, exemptReceipt, type ExemptReceipt, isExemptFor, ReviewExemptions,
 } from "./review-exempt.ts";
 import { runnerWorktreeRoot } from "./runner/hub.ts";
+import { errLine, oneLine } from "./line-text.ts";
 
 /**
  * The supervisor's review gate (T4 design D2-D11): observes a PR's review snapshot, starts at most one review job per
@@ -86,7 +87,6 @@ export const reviewEnabledFor = (config: Pick<DoriConfig, "review">, repo: strin
 
 /** The urgent REVIEW_STALLED event id of a PR head: stable, so the event store keeps exactly one per head. */
 const stalledId = (s: ReviewSnapshot): string => `review-stalled:${s.repo.toLowerCase()}#${s.prNumber}@${s.headSha}`;
-const oneLine = (s: string, max = 200): string => s.replace(/\s+/g, " ").trim().slice(0, max);
 
 /** The canonical criteria text: the common criteria, then the author lane's brief when it is readable. */
 export const criteriaText = (brief: string | undefined): string =>
@@ -353,7 +353,7 @@ export class ReviewGate {
         ? { kind: "exempt", key, receipt: exemptReceipt(s, c, sha256(diff), at) }
         : { kind: "review", key, reason: c.reason, classifiedAt: new Date(at).toISOString() };
     } catch (e) {
-      decision = { kind: "review", key, reason: `diff unreadable: ${oneLine(e instanceof Error ? e.message : String(e))}`, classifiedAt: new Date(at).toISOString() };
+      decision = { kind: "review", key, reason: `diff unreadable: ${errLine(e)}`, classifiedAt: new Date(at).toISOString() };
     }
     return this.exemptions.record(decision);
   }
@@ -525,7 +525,7 @@ export class ReviewGate {
     if (!last || last.execution.state !== "error") return undefined;
     const atOnce = last.execution.code === "model_unavailable";
     if (!atOnce && errors.length < 2) return undefined;
-    const reason = atOnce ? `model unavailable: ${oneLine(last.execution.detail)}` : `${errors.length} review runs failed (last ${last.execution.code}: ${oneLine(last.execution.detail)})`;
+    const reason = atOnce ? `model unavailable: ${oneLine(last.execution.detail, 200)}` : `${errors.length} review runs failed (last ${last.execution.code}: ${oneLine(last.execution.detail, 200)})`;
     const next = escalate(this.jobs, this.now(), last.job.jobId, reason);
     emit(`review-escalated:${next.job.jobId}`, line("REVIEW_ESCALATED", next, `head=${short(next.job.snapshot.headSha)} ${reason}; the lead decides ${prUrl(next.job.snapshot.repo, next.job.snapshot.prNumber)}`));
     return { kind: "escalated", jobId: next.job.jobId, reason };
@@ -558,7 +558,7 @@ export class ReviewGate {
     const repoDir = io.repoDir(lane);
     let diff: string;
     try { diff = await io.diff(s.repo, s.mergeBaseSha, s.headSha); } catch (e) {
-      return { kind: "waiting", why: `diff unreadable: ${oneLine(e instanceof Error ? e.message : String(e))}` };
+      return { kind: "waiting", why: `diff unreadable: ${errLine(e)}` };
     }
     const { record, created } = enqueue(this.jobs, now, { ...job, diffSha256: sha256(diff) }, attempt > 1 ? `attempt ${attempt}` : "queued");
     if (!created) return this.continueLive(record, lane, emit);
@@ -570,7 +570,7 @@ export class ReviewGate {
     if (!repoDir) return broken(`author lane ${lane.key} has no local checkout to snapshot (remote lanes are not reviewed on this host yet)`);
     // A failed fetch is not fatal (the head may already be local); it is named when the snapshot then fails.
     let fetchError = "";
-    try { await io.fetchHead(repoDir, s.headSha); } catch (e) { fetchError = oneLine(e instanceof Error ? e.message : String(e)); }
+    try { await io.fetchHead(repoDir, s.headSha); } catch (e) { fetchError = errLine(e); }
     const snap = await io.prepareSnapshot({ repoDir, path: reviewSnapshotPath(root, repoName(s.repo), id), headSha: s.headSha, jobId: id });
     if (!snap.ok) return broken(`snapshot: ${snap.detail}${fetchError ? `; fetching ${short(s.headSha)} failed first: ${fetchError}` : ""}`);
     annotate(this.jobs, this.now(), id, { snapshotPath: snap.path, snapshotStartedAt: snap.startedAt, repoDir });
@@ -618,7 +618,7 @@ export class ReviewGate {
         cwd: r.snapshotPath, ...(author.thread ? { thread: author.thread } : {}),
       });
     } catch (e) {
-      const reason = `launch error: ${oneLine(e instanceof Error ? e.message : String(e))}`;
+      const reason = `launch error: ${errLine(e)}`;
       requeue(this.jobs, this.now(), id, reason);
       return { kind: "queued", jobId: id, reason };
     }
@@ -626,7 +626,7 @@ export class ReviewGate {
     if (result.kind === "held") {
       const before = r.execution.state === "queued" ? r.execution.reason : "";
       const next = requeue(this.jobs, this.now(), id, result.reason);
-      if (before !== result.reason) emit(`review-queued:${id}`, line("REVIEW_QUEUED", next, `head=${short(s.headSha)} held: ${oneLine(result.reason)}`));
+      if (before !== result.reason) emit(`review-queued:${id}`, line("REVIEW_QUEUED", next, `head=${short(s.headSha)} held: ${oneLine(result.reason, 200)}`));
       return { kind: "queued", jobId: id, reason: result.reason };
     }
     const failed = fail(this.jobs, this.now(), id, "input_unavailable", `launch refused: ${result.detail}`);
@@ -715,7 +715,7 @@ export class ReviewGate {
    */
   private failed(r: ReviewJobRecord, emit: ReviewEmit): EnsureResult | undefined {
     if (r.execution.state !== "error") return undefined;
-    const s = r.job.snapshot, code = r.execution.code, detail = oneLine(r.execution.detail);
+    const s = r.job.snapshot, code = r.execution.code, detail = oneLine(r.execution.detail, 200);
     const attempt = this.jobs.byKey(r.key).filter((j) => j.job.createdAt <= r.job.createdAt).length;
     emit(stalledId(s), line("REVIEW_STALLED", r, `head=${short(s.headSha)} code=${code}: ${detail}; the merge waits, the review is retried automatically and escalates if it fails again ${prUrl(s.repo, s.prNumber)}`));
     emit(`review-failed:${r.job.jobId}`, line("REVIEW_FAILED", r, `code=${code} attempt=${attempt}: ${detail}`));
@@ -800,7 +800,7 @@ export class ReviewGate {
   /** Closes a reviewer lane (once per job) and releases the job's snapshot. A failed close is retried by the next tick. */
   private async closeReviewer(lane: Lane, r: ReviewJobRecord | undefined, note: string, ok: boolean): Promise<void> {
     const res = await this.io.closeLane(lane, note, ok);
-    if (!res.closed) console.error(`REVIEW_GATE_CLOSE_REFUSED ${lane.key}: ${oneLine(res.lines.at(-1) ?? "refused")}`);
+    if (!res.closed) console.error(`REVIEW_GATE_CLOSE_REFUSED ${lane.key}: ${oneLine(res.lines.at(-1) ?? "refused", 200)}`);
     if (!r) return;
     if (res.closed) annotate(this.jobs, this.now(), r.job.jobId, { reviewerClosed: true });
     await this.release(this.jobs.get(r.job.jobId) ?? r);
@@ -810,7 +810,7 @@ export class ReviewGate {
     if (!r.snapshotPath || !r.repoDir || r.snapshotReleased) return;
     const res = await this.io.releaseSnapshot({ repoDir: r.repoDir, path: r.snapshotPath });
     if (res.ok) annotate(this.jobs, this.now(), r.job.jobId, { snapshotReleased: true });
-    else console.error(`REVIEW_SNAPSHOT_RELEASE_FAILED ${r.job.jobId}: ${oneLine(res.detail)}`);
+    else console.error(`REVIEW_SNAPSHOT_RELEASE_FAILED ${r.job.jobId}: ${oneLine(res.detail, 200)}`);
   }
 
   private recordsOf(repo: string, n: number): ReviewJobRecord[] {

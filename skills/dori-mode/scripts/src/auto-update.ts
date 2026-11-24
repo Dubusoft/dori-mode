@@ -5,6 +5,7 @@ import { isRecord, readJsonState, replaceFileAtomic } from "./durable-write.ts";
 import { githubRepoFromRemote } from "./git-remote.ts";
 import type { Runner } from "./run.ts";
 import type { EventMeta } from "./supervise-journal.ts";
+import { oneLine } from "./line-text.ts";
 
 /**
  * Automatic `dori update --dev` after the supervisor merges a PR of dori's own repo into dev. The merge only records
@@ -93,7 +94,6 @@ export type AutoUpdateDeps = {
 };
 
 const STOP_LINE = /^(UPDATE_FAILED|UPDATE_STASH_CONFLICT|UPDATE_NOT_FAST_FORWARD)\b/;
-const oneLine = (s: string): string => s.replace(/\s+/g, " ").trim().slice(0, 300);
 
 /** The line the lead gets for a finished run. */
 export const autoUpdateLine = (result: UpdateResult, merges: readonly string[]): string => {
@@ -101,10 +101,10 @@ export const autoUpdateLine = (result: UpdateResult, merges: readonly string[]):
   const summary = result.lines.find((l) => l.startsWith("UPDATE_SUMMARY "));
   if (result.code === 0) {
     const head = result.lines.find((l) => l.startsWith("UPDATED ") || l.startsWith("UP_TO_DATE "));
-    return oneLine(`AUTO_UPDATE_DONE after ${after}: ${[head, summary].filter(Boolean).join("; ") || "exit 0"}`);
+    return oneLine(`AUTO_UPDATE_DONE after ${after}: ${[head, summary].filter(Boolean).join("; ") || "exit 0"}`, 300);
   }
   const why = result.lines.find((l) => STOP_LINE.test(l)) ?? summary ?? result.lines.at(-1) ?? "no output";
-  return oneLine(`AUTO_UPDATE_FAILED exit ${result.code} after ${after}: ${why}; log: journalctl --user -u ${AUTO_UPDATE_UNIT}; run dori update --dev by hand once fixed`);
+  return oneLine(`AUTO_UPDATE_FAILED exit ${result.code} after ${after}: ${why}; log: journalctl --user -u ${AUTO_UPDATE_UNIT}; run dori update --dev by hand once fixed`, 300);
 };
 
 /** The merges still pending once `covered` are taken by a run. */
@@ -196,7 +196,7 @@ export class AutoUpdate {
       "systemd-run", "--user", "--unit", AUTO_UPDATE_UNIT, "--collect", "--quiet", ...env, "--", ...d.command, "--result", this.resultPath,
     ], { timeoutMs: 30_000 });
     if (started.code !== 0) {
-      await emit(oneLine(`AUTO_UPDATE_FAILED after ${merges.join(", ")}: systemd-run exit ${started.code}: ${started.err || started.out}; run dori update --dev by hand`), `auto-update-start:${at}`);
+      await emit(oneLine(`AUTO_UPDATE_FAILED after ${merges.join(", ")}: systemd-run exit ${started.code}: ${started.err || started.out}; run dori update --dev by hand`, 300), `auto-update-start:${at}`);
       this.save((s) => ({ pending: rest(s, merges) }));
       return;
     }

@@ -11,6 +11,7 @@ import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { isLaneOutputFiles } from "./lane-files.ts";
 import { checkLaneFilesBody } from "./lane-file-contract.ts";
 import type { LaneBriefFiles, LaneFileTree, LaneOutputFiles } from "./runner/protocol.ts";
+import { errText } from "./line-text.ts";
 
 /**
  * The lane facade (design 3.3): every lane and host-pane operation the supervisor and the CLI need, each one a single
@@ -195,7 +196,6 @@ const toOpsError = (e: unknown, label: string): LaneOpsError => {
   return new LaneOpsError("LANE_OP_FAILED", label, e instanceof Error ? e.message : String(e));
 };
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; readonly log?: (line: string) => void }): LaneOps => {
   const log = deps.log ?? (() => {});

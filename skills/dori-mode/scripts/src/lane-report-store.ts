@@ -195,5 +195,3 @@ export const appendDeadPaneReport = (config: { readonly stateDir: string }, lane
   } finally { store.close(); }
 };
 
-/** A report's text as one line (it lands in an event line and a thread message). */
-export const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
