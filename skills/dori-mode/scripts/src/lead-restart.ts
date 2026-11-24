@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import { leadModels, qualifiedModel, type DoriConfig, type LeadModel } from "./config.ts";
+import { isRecord, readJsonState } from "./durable-write.ts";
 
 export type LeadRestartRequest = {
   readonly id: string;
@@ -12,8 +13,12 @@ export type LeadRestartRequest = {
 
 const path = (stateDir: string): string => join(stateDir, "lead-restart.json");
 
+const isRequest = (v: unknown): v is LeadRestartRequest =>
+  isRecord(v) && typeof v.id === "string" && typeof v.at === "number" && Array.isArray(v.models) && v.models.every((m) => isRecord(m) && typeof m.model === "string");
+
+/** A corrupt request is moved aside and read as none: the restart it asked for does not happen. */
 export const pendingLeadRestart = (stateDir: string): LeadRestartRequest | undefined =>
-  existsSync(path(stateDir)) ? JSON.parse(readFileSync(path(stateDir), "utf8")) : undefined;
+  readJsonState(path(stateDir), "LEAD_RESTART", isRequest, "no pending lead restart; request it again");
 
 export const requestLeadRestart = (config: DoriConfig, at: number, model?: string, thinking?: string): LeadRestartRequest => {
   const models = leadModels(config);

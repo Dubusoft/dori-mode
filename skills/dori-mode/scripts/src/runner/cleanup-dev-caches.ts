@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import type { Runner } from "../run.ts";
 import type { CleanupPaths, InUse, SkipReason, TargetCount } from "./cleanup.ts";
+import { DAY_MS } from "../time-ms.ts";
+import { errText } from "../line-text.ts";
 
 /**
  * The cleanup sweep's developer-cache targets (all `report` by default):
@@ -18,7 +20,6 @@ import type { CleanupPaths, InUse, SkipReason, TargetCount } from "./cleanup.ts"
  * removes a simulator), a folder a process holds a file open in or runs in, symlinks and other users' folders.
  */
 
-const DAY_MS = 24 * 60 * 60_000;
 export const DEV_CACHE_AGES = {
   /** Nothing in a DerivedData folder changed for this long. */
   xcodeDerivedData: 14 * DAY_MS,
@@ -124,7 +125,6 @@ export type DevCacheDeps = {
   readonly errors: string[];
 };
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 const notInstalled = (code: number): boolean => code === 127;
 
 /** Whether `dir` or anything under it changed (mtime or ctime; atime is no change) at or after `cutoff`. */

@@ -115,7 +115,7 @@ const fakeHost = () => {
 };
 
 const PLIST = readFileSync(join(import.meta.dir, "..", "templates", "dori-runner-launchd.plist"), "utf8");
-const SYSTEM_TOOLS = ["mkdir", "chmod", "cat", "mv", "rm", "sed", "mktemp", "unzip", "dirname", "cp", "sleep", "tail", "grep"];
+const SYSTEM_TOOLS = ["mkdir", "chmod", "cat", "mv", "rm", "sed", "mktemp", "unzip", "dirname", "cp", "sleep", "tail", "grep", "awk"];
 /** A Darwin host whose PATH is only the fake bin, with the system tools the script needs linked into it. */
 const darwinHost = (launchctl = "exit 0") => {
   const host = fakeHost();
@@ -303,6 +303,39 @@ test("on Darwin with bun on PATH, the script writes the launchd agent, boots it 
   expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
   expect(existsSync(join(host.home, ".config"))).toBe(false);
   expect(existsSync(join(host.home, ".dori/runner/com.dori.runner.plist.tmp"))).toBe(false);
+});
+
+test("on Darwin a reinstall keeps the variables an operator added to the agent's EnvironmentVariables and renews the template's", async () => {
+  const host = darwinHost();
+  mkdirSync(join(host.home, "Library/LaunchAgents"), { recursive: true });
+  // As `plutil -insert` leaves it: tab indents, an old PATH, the operator's own entries after the template's.
+  writeFileSync(plistPath(host.home), [
+    '<?xml version="1.0" encoding="UTF-8"?>', "<plist version=\"1.0\">", "<dict>",
+    "\t<key>EnvironmentVariables</key>", "\t<dict>",
+    "\t\t<key>PATH</key>", "\t\t<string>/old/bin</string>",
+    "\t\t<key>LANG</key>", "\t\t<string>C</string>",
+    "\t\t<key>DORI_CLEANUP_TARGETS</key>", "\t\t<string>closedNodeModules=on</string>",
+    "\t\t<key>DORI_EXTRA</key>", "\t\t<string>a&amp;b c</string>",
+    "\t</dict>", "\t<key>KeepAlive</key>", "\t<true/>", "</dict>", "</plist>", "",
+  ].join("\n"));
+  const result = await runDarwin(host, darwinScript());
+  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\n" });
+  const plist = readFileSync(plistPath(host.home), "utf8");
+  const env = plist.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)?.[1] ?? "";
+  const pairs = [...env.matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g)].map((m) => [m[1], m[2]]);
+  expect(pairs).toEqual([
+    ["PATH", `${host.bin}:/opt/login&amp;tools|x/bin:${host.bin}`],
+    ["LANG", "en_US.UTF-8"],
+    ["DORI_CLEANUP_TARGETS", "closedNodeModules=on"],
+    ["DORI_EXTRA", "a&amp;b c"],
+  ]);
+  expect(programArguments(plist)).toEqual([join(host.bin, "bun"), join(host.home, ".dori/runner/bin/dori.js"), ...ARGS]);
+  expect(statSync(plistPath(host.home)).mode & 0o777).toBe(0o644);
+  const left = new Bun.Glob("com.dori.runner.plist.*").scanSync({ cwd: join(host.home, ".dori/runner") });
+  expect([...left]).toEqual([]);
+  // A second run keeps them once, not twice.
+  expect((await runDarwin(host, darwinScript())).code).toBe(0);
+  expect(readFileSync(plistPath(host.home), "utf8")).toBe(plist);
 });
 
 const CANDIDATES = ["/opt/homebrew/bin/bun", "/usr/local/bin/bun"];

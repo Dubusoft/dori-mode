@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { defaultConfig, type GuardThresholds, type PlacementConfig } from "../src/config.ts";
@@ -8,7 +8,7 @@ import type { HostSample } from "../src/host-guard.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
 import {
-  checkMachine, LOCAL_MACHINE, machineVerdict, placementLine, placementTable, planLaunch, resolvePlacement, type RunnerPlacement,
+  checkMachine, LOAD_PER_CORE_MAX, LOCAL_MACHINE, machineVerdict, placementLine, placementTable, planLaunch, resolvePlacement, type RunnerPlacement,
   runnerPlacements, verdictLine,
 } from "../src/placement.ts";
 import type { MachineSample, SampleResult } from "../src/remote-guard.ts";
@@ -70,11 +70,11 @@ const cfg = { ...defaultConfig("/home/test"), stateDir: "/state" };
 
 test("checkMachine local asks the local runner and applies canLaunch to its sample", async () => {
   const asked: (string | undefined)[] = [];
-  const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ memFreePct: 50, diskFreeGb: 100, panes: T.panesMax }), panes: listed(T.panesMax) }), asked), cfg, "local");
+  const c = await checkMachine(observing(() => ({ os: "linux", sampledAt: 0, sample: host({ load1: 1, memFreePct: 50, diskFreeGb: 100, panes: T.panesMax }), panes: listed(T.panesMax) }), asked), cfg, "local");
   expect(asked).toEqual([undefined]);
   expect(c).toEqual({
     machine: "local", verdict: { ok: false, reasons: [`panes ${T.panesMax} >= ${T.panesMax}`] }, summary: `memory free 50%, disk free 100 GB, panes ${T.panesMax}`, freeSlots: 0,
-    paneCap: T.panesMax, paneCount: T.panesMax, paneIds: listed(T.panesMax).map((p) => p.pane_id),
+    paneCap: T.panesMax, paneCount: T.panesMax, paneIds: listed(T.panesMax).map((p) => p.pane_id), laneCap: availableParallelism(),
   });
 });
 
@@ -106,7 +106,17 @@ test("checkMachine remote holds at the panesMax its runner reports, over the sup
   expect((await checkMachine(observing(() => seen()), { ...cfg, guard: { ...cfg.guard, panesMax: 6 } }, "mini")).verdict.reasons).toEqual(["panes 6 >= 6"]);
   // Only the reported keys win; the local machine ignores a reported guard.
   expect((await checkMachine(observing(() => seen({ diskFreeMinGb: 500 })), wide, "mini")).verdict.reasons).toEqual(["disk free 200 GB < 500 GB"]);
-  expect((await checkMachine(observing(() => seen({ panesMax: 6 })), wide, "local")).verdict).toEqual({ ok: true, reasons: [] });
+  expect((await checkMachine(observing(() => ({ ...seen({ panesMax: 6 }), sample: host({ load1: 1, panes: 6 }) })), wide, "local")).verdict).toEqual({ ok: true, reasons: [] });
+});
+
+test("checkMachine local holds above its cores x LOAD_PER_CORE_MAX load, a remote never does; laneCap is placement.maxLanes of the machine", async () => {
+  const cores = availableParallelism(), limit = cores * LOAD_PER_CORE_MAX;
+  const at = (load1: number): LaneOps => observing(() => ({ os: "linux", sampledAt: 0, sample: host({ load1 }), panes: listed(2) }));
+  expect((await checkMachine(at(limit), cfg, "local")).verdict).toEqual({ ok: true, reasons: [] });
+  expect((await checkMachine(at(limit + 0.5), cfg, "local")).verdict).toEqual({ ok: false, reasons: [`load ${(limit + 0.5).toFixed(1)} > ${limit} (${cores} cores x ${LOAD_PER_CORE_MAX})`] });
+  expect((await checkMachine(at(limit * 10), cfg, "big")).verdict).toEqual({ ok: true, reasons: [] });
+  const capped = { ...cfg, placement: { ...cfg.placement, maxLanes: { local: 4, big: 2 } } };
+  expect([(await checkMachine(at(1), capped, "local")).laneCap, (await checkMachine(at(1), capped, "big")).laneCap, (await checkMachine(at(1), capped, "mini")).laneCap]).toEqual([4, 2, undefined]);
 });
 
 test("checkMachine holds with no runner when the machine's runner is unavailable", async () => {

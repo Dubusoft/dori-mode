@@ -7,6 +7,8 @@ import type { Runner } from "../run.ts";
 import { sweepArtifacts } from "./cleanup-artifacts.ts";
 import { type DevCacheTarget, type Proc, sweepDevCaches } from "./cleanup-dev-caches.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
+import { DAY_MS, HOUR_MS } from "../time-ms.ts";
+import { errText } from "../line-text.ts";
 
 /**
  * The runner's daily cleanup sweep: every runner host (Linux, macOS, Windows) cleans its own caches and temp the same
@@ -35,8 +37,6 @@ import { writeRunnerFile } from "./fs-safety.ts";
  * `DORI_CLEANUP_TARGETS=temp=off,memoryAgents=report` sets single targets (cleanupSettings).
  */
 
-const HOUR_MS = 60 * 60_000;
-const DAY_MS = 24 * HOUR_MS;
 export const CLEANUP_AGES = {
   sandbox: 3 * DAY_MS,
   omoTmp: 3 * DAY_MS,
@@ -293,14 +293,16 @@ export type ClosedLane = { readonly key: string; readonly closedAt: number; read
 
 /**
  * The closed lanes of one host from registry records: `machine` undefined for the supervisor's own host (local lanes
- * carry no machine), else that machine's label. Each lane's worktrees are its cwd and its recorded worktrees; a record
- * without a readable `closedAt` is not closed and never listed.
+ * carry no machine), else that machine's label. Each lane's worktrees are its directory (`cwd` for a local lane,
+ * `remoteCwd` for a remote one, which never records `cwd`) and its recorded worktrees; a record without a readable
+ * `closedAt` is not closed and never listed.
  */
 export const closedLanesOf = (lanes: readonly Lane[], machine: string | undefined): ClosedLane[] =>
   lanes.flatMap((lane) => {
     const closedAt = Date.parse(lane.closedAt ?? "");
     if (!Number.isFinite(closedAt) || lane.machine !== machine) return [];
-    const worktrees = [...new Set([...(lane.cwd ? [lane.cwd] : []), ...(lane.worktrees ?? [])])];
+    const dir = machine === undefined ? lane.cwd : lane.remoteCwd;
+    const worktrees = [...new Set([...(dir ? [dir] : []), ...(lane.worktrees ?? [])])];
     return worktrees.length ? [{ key: lane.key, closedAt, worktrees }] : [];
   });
 export type CleanupReport = {
@@ -357,7 +359,6 @@ export type Ctx = {
 const ageOf = (st: { mtimeMs: number; ctimeMs: number; atimeMs: number }): number => Math.max(st.mtimeMs, st.ctimeMs, st.atimeMs);
 const newCount = (mode: CleanupMode): TargetCount => ({ mode, removed: 0, bytes: 0, candidates: 0, candidateBytes: 0, kept: 0, errors: 0, skipped: {} });
 export const skipped = (count: TargetCount, reason: SkipReason): void => { count.skipped[reason] = (count.skipped[reason] ?? 0) + 1; };
-export const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 export const noteError = (ctx: Ctx, count: TargetCount, path: string, e: unknown): void => {
   count.errors++;
   if (ctx.errors.length < 20) ctx.errors.push(`${path}: ${errText(e)}`);

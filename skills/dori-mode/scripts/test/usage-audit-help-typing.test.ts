@@ -60,7 +60,7 @@ test("dori setup --help prints setup-specific help and exits successfully", () =
 }));
 
 test("send, thread, typing and presence usage make Discord optional", async () => {
-  const cliSource = await Bun.file(join(import.meta.dir, "../src/cli.ts")).text();
+  const cliSource = await Bun.file(join(import.meta.dir, "../src/commands/usage.ts")).text();
   expect(cliSource).toMatch(/send \[discord\]/);
   expect(cliSource).toMatch(/thread \[discord\]/);
   expect(cliSource).toMatch(/typing \[discord\]/);

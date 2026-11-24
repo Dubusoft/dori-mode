@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { availableParallelism } from "node:os";
 import { join } from "node:path";
 import { Worker } from "node:worker_threads";
 
@@ -27,13 +28,17 @@ const check = (cap = 20, panes = 1, machine = "local"): MachineCheck => ({
   machine, verdict: { ok: true, reasons: [] }, summary: "", paneCap: cap, paneCount: panes,
   paneIds: Array.from({ length: panes }, (_, i) => `p${i}`),
 });
-const world = (cap = 20) => {
+/** `maxLanes` null: the default placement, whose local lane cap is this host's cores. */
+const world = (cap = 20, maxLanes: Record<string, number> | null = { local: cap }) => {
   const state = withState();
   cleanups.push(state.done);
   const w = newWorld(), clock = fakeClock(T0);
   w.panes = [{ pane_id: "p0", workspace_id: "w" }];
   w.inspection = { git: undefined };
-  const deps = depsFor(w, clock, state.dir, { guard: { ...defaultConfig("/home/test").guard, panesMax: cap } });
+  const deps = depsFor(w, clock, state.dir, {
+    guard: { ...defaultConfig("/home/test").guard, panesMax: cap },
+    ...(maxLanes ? { placement: { defaultMachine: "local", fallback: [], maxLanes } } : {}),
+  });
   const input = (key: string): LaunchInput => {
     const brief = join(state.dir, `${key}.md`);
     writeFileSync(brief, "Do the task.\n");
@@ -44,6 +49,14 @@ const world = (cap = 20) => {
 };
 const lane = (key: string, patch: Partial<Lane> = {}): Lane => ({
   key, title: key, thread: "none", brief: "/b.md", done: "closed acme/app#1", openedAt: new Date(T0).toISOString(), ...patch,
+});
+const flagged = (n: number): ToodoTask[] => Array.from({ length: n }, (_, i) => ({
+  id: i + 1, workspaceId: 1, title: `task ${i + 1}`, description: "Do it", status: "planned", resolution: null, dependsOn: [],
+  refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
+}));
+const judgeDeps = (h: ReturnType<typeof world>, store: SqliteOperations, tasks: ToodoTask[]) => ({
+  ...liveJudgeDeps(h.deps, store), toodo: () => ({ flaggedTasks: async () => tasks, tasksByIds: async () => [] }),
+  quota: async () => ({ readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] }),
 });
 
 test("admission formula counts observed panes and pending launches against the cap, and is unlimited while the cap is off", () => {
@@ -163,7 +176,8 @@ test("an unobservable runner holds with no slot", async () => {
 });
 
 test("disabled pane cap keeps launches unlimited", async () => {
-  const h = world(0);
+  // No lane cap either (the default local one is the cores): this test is about the pane cap alone.
+  const h = world(0, { local: Infinity });
   for (let n = 0; n < 25; n++) expect(claimSlot(h.state.dir, check(0), `uncapped-${n}`, T0).ok).toBe(true);
   const first = h.input("uncapped-first"), second = h.input("uncapped-second");
   const [a, b] = await Promise.all([placeLaunch(h.deps, first), placeLaunch(h.deps, second)]);
@@ -207,18 +221,33 @@ test("a default machine filled by pending launches tries fallback and uses the r
   expect(placed.lines.join("\n")).toContain("PLACEMENT_FALLBACK local -> box (launch slots 0");
 });
 
+test("a lane cap counts the machine's open lanes and pending launches once by key, never the candidate's own key", async () => {
+  const h = world(), capped = { ...check(), laneCap: 3 };
+  await h.deps.registry.write(lane("open-1"));
+  await h.deps.registry.write(lane("open-2", { machine: "local" }));
+  await h.deps.registry.write(lane("closed-1", { status: "closed", closedAt: new Date(T0).toISOString() }));
+  await h.deps.registry.write(lane("remote-1", { machine: "box" }));
+  expect(claimSlot(h.state.dir, check(), "open-1", T0).ok).toBe(true);
+  expect(precheckSlots(h.state.dir, capped, T0, "next-1")).toMatchObject({ verdict: { ok: true }, free: 1 });
+  expect(claimSlot(h.state.dir, capped, "next-1", T0).ok).toBe(true);
+  expect(claimSlot(h.state.dir, capped, "next-1", T0 + 1).ok).toBe(true);
+  expect(claimSlot(h.state.dir, capped, "next-2", T0)).toEqual({ ok: false, reasons: ["lanes 3 >= maxLanes 3 on machine local"] });
+  expect(precheckSlots(h.state.dir, { ...check(), laneCap: 1, machine: "box" }, T0).verdict.reasons).toEqual(["lanes 1 >= maxLanes 1 on machine box"]);
+});
+
+test("a default machine at its placement.maxLanes falls back to the next machine", async () => {
+  const h = world();
+  await h.deps.registry.write(lane("open-1"));
+  const deps = { ...h.deps, config: { ...h.deps.config, placement: { defaultMachine: "local", fallback: ["box"], maxLanes: { local: 1 } } } };
+  const input = { ...h.input("capped-1"), done: "" }, placed = await placeLaunch(deps, input);
+  expect(placed.target).toBe("box");
+  expect(placed.lines.join("\n")).toContain("PLACEMENT_FALLBACK local -> box (lanes 1 >= maxLanes 1 on machine local)");
+});
+
 test("autopilot plans 19 lanes and de-duplicates shared ledger claims against pending reservations by key", async () => {
   const h = world(), store = new SqliteOperations(storePath(h.state.dir));
   cleanups.push(() => store.close());
-  const tasks: ToodoTask[] = Array.from({ length: 20 }, (_, i) => ({
-    id: i + 1, workspaceId: 1, title: `task ${i + 1}`, description: "Do it", status: "planned", resolution: null, dependsOn: [],
-    refs: ["owner:discord:c/m"], criteria: [{ text: "tests pass", kind: "manual" }], wait: null, autopilot: true, dueDate: null, pausedAt: null, waitSetAt: null,
-  }));
-  const live = liveJudgeDeps(h.deps, store);
-  const deps = {
-    ...live, toodo: () => ({ flaggedTasks: async () => tasks, tasksByIds: async () => [] }),
-    quota: async () => ({ readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] }),
-  };
+  const deps = judgeDeps(h, store, flagged(20));
   const report = await judgeCandidates(deps);
   expect(report.slots).toBe(19);
   expect(report.verdicts.filter((v) => v.verdict === "LAUNCH")).toHaveLength(19);
@@ -228,4 +257,17 @@ test("autopilot plans 19 lanes and de-duplicates shared ledger claims against pe
   const deduped = await judgeCandidates(deps);
   expect(deduped.slots).toBe(18);
   expect(deduped.verdicts.filter((v) => v.verdict === "LAUNCH")).toHaveLength(18);
+});
+
+test("without placement.maxLanes this host holds open lanes at its cores: slots stay within them and a burst after resume holds the rest", async () => {
+  const h = world(20, null), store = new SqliteOperations(storePath(h.state.dir));
+  cleanups.push(() => store.close());
+  await h.deps.registry.write(lane("running-1"));
+  const cores = availableParallelism(), room = Math.min(cores - 1, 19);
+  expect((await judgeCandidates(judgeDeps(h, store, flagged(20)))).slots).toBe(room);
+  // The executor places and admits each LAUNCH task in turn, as one tick does right after a resume.
+  const kinds: string[] = [];
+  for (let n = 1; n <= room + 3; n++) kinds.push((await h.launch(h.input(`ap-${n}-1`))).kind);
+  expect(kinds).toEqual([...Array(room).fill("launched"), ...Array(3).fill("held")]);
+  expect(launchQueue(h.state.dir).map((q) => q.reasons)).toEqual(Array(3).fill([`lanes ${cores} >= maxLanes ${cores} on machine local`]));
 });

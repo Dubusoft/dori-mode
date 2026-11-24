@@ -4,12 +4,15 @@ import { isAbsolute, join } from "node:path";
 
 import { DEFAULT_EVENT_POLICY, type EventPolicy, eventKind } from "./event-policy.ts";
 import { redactSecrets } from "./redact.ts";
-import type { EventMeta } from "./supervise-journal.ts";
 import type { Runner } from "./run.ts";
 import { replaceFileDurable } from "./durable-write.ts";
 import { machineLabel, remoteRunner } from "./remote-jobs.ts";
 import type { RunnerCall } from "./runner/call.ts";
 import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, validateSchedule } from "./schedule.ts";
+import { SOURCE_TYPES, type SourceEnqueue, SourceError, type SourceStatus, type SourceType, sourceText } from "./source-types.ts";
+import { errText, oneLine } from "./line-text.ts";
+
+export { SOURCE_TYPES, type SourceEnqueue, SourceError, type SourceStatus, type SourceType, sourceText, TEXT_MAX } from "./source-types.ts";
 
 /*
  * The event source registry (design 1.8). Every event the supervisor journals comes from a named
@@ -28,8 +31,6 @@ import { type ScheduleDeps, Scheduler, type ScheduleSpec, SCHEDULE_FAILED, valid
 
 export const BUILTIN_SOURCES = ["discord", "github", "sweeps", "waits", "emit", "toodo"] as const;
 export type BuiltinSource = (typeof BUILTIN_SOURCES)[number];
-export const SOURCE_TYPES = ["poll", "webhook", "file", "schedule"] as const;
-export type SourceType = (typeof SOURCE_TYPES)[number];
 
 export type PollSpec = {
   readonly name: string; readonly type: "poll"; readonly kind: string;
@@ -41,8 +42,6 @@ export type WebhookSpec = { readonly name: string; readonly type: "webhook"; rea
 export type FileSpec = { readonly name: string; readonly type: "file"; readonly kind: string; readonly path: string; readonly match: string };
 export type SourceSpec = PollSpec | WebhookSpec | FileSpec | ScheduleSpec;
 
-export class SourceError extends Error {}
-
 export const SOURCES_FILE = "sources.json";
 export const SOURCE_STATUS_FILE = "sources-status.json";
 export const EMIT_DIR = "emit";
@@ -53,7 +52,6 @@ export const WEBHOOK_MAX_BYTES = 64 * 1024;
 export const WEBHOOK_SECRET_MIN = 16;
 /** At most this much of a tailed file is read per pass; the rest follows on the next one. */
 export const FILE_MAX_READ = 1 << 20;
-export const TEXT_MAX = 500;
 
 const NAME = /^[a-z0-9][a-z0-9._-]{0,40}$/;
 const KIND = /^[A-Z][A-Z0-9_]{1,40}$/;
@@ -72,12 +70,6 @@ export const validKind = (kind: string): string => {
   if (!KIND.test(kind)) throw new SourceError(`kind "${kind}" must be 2-41 uppercase letters, digits or underscores, starting with a letter`);
   if (RESERVED_KINDS.has(kind)) throw new SourceError(`kind ${kind} is a built-in event kind; a source may not use it`);
   return kind;
-};
-
-/** One line: whitespace collapsed, clipped to TEXT_MAX. */
-export const sourceText = (text: string): string => {
-  const flat = text.replace(/\s+/g, " ").trim();
-  return flat.length > TEXT_MAX ? `${flat.slice(0, TEXT_MAX - 1)}~` : flat;
 };
 
 const regex = (match: unknown, name: string): string => {
@@ -204,33 +196,15 @@ export const queueEmit = (stateDir: string, kind: string, text: string, now: num
   return eventId;
 };
 
-export type SourceStatus = {
-  readonly type: "builtin" | SourceType;
-  /** New events journaled, and events dropped as duplicates of an id the store already had. */
-  readonly events: number;
-  readonly duplicates: number;
-  readonly lastEventAt?: number;
-  /** The policy kind of the last new event (never its text: dori status is posted to Discord). */
-  readonly lastKind?: string;
-  readonly failing?: true;
-  readonly lastError?: string;
-  readonly lastErrorAt?: number;
-  /** Webhook requests refused for a missing or wrong secret. */
-  readonly rejected?: number;
-  /** A file source's read position. */
-  readonly cursor?: { readonly path: string; readonly offset: number };
-  /** A schedule's newest planned slot, when its last run settled, how it ended, and what a due run waits for. */
-  readonly lastSlot?: number;
-  readonly lastRunAt?: number;
-  readonly lastResult?: string;
-  readonly waiting?: string;
-};
 export type SourceStatusFile = { readonly at: number; readonly sources: Readonly<Record<string, SourceStatus>> };
+
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 export const readSourceStatus = (stateDir: string): SourceStatusFile | undefined => {
   try {
-    const raw = JSON.parse(readFileSync(join(stateDir, SOURCE_STATUS_FILE), "utf8")) as SourceStatusFile;
-    return typeof raw === "object" && raw !== null && typeof raw.sources === "object" && raw.sources !== null ? raw : undefined;
+    const raw: unknown = JSON.parse(readFileSync(join(stateDir, SOURCE_STATUS_FILE), "utf8"));
+    if (!isRecord(raw) || !isRecord(raw.sources) || !Object.values(raw.sources).every(isRecord)) return undefined;
+    return raw as SourceStatusFile;
   } catch { return undefined; }
 };
 
@@ -255,7 +229,6 @@ export const sourceViews = (stateDir: string): { readonly sources: readonly Sour
   };
 };
 
-export type SourceEnqueue = (id: string, line: string, meta?: EventMeta) => boolean;
 export type EventSourcesDeps = {
   readonly stateDir: string;
   /** Supervisor.enqueue: durable, deduped by id, classified by the policy table. */
@@ -271,7 +244,7 @@ export type EventSourcesDeps = {
 };
 
 const sha = (text: string | Uint8Array): string => createHash("sha256").update(text).digest("hex");
-const message = (e: unknown): string => redactSecrets(e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+const message = (e: unknown): string => oneLine(redactSecrets(errText(e)), 200);
 const sameSecret = (a: string, b: string): boolean => timingSafeEqual(Buffer.from(sha(a), "hex"), Buffer.from(sha(b), "hex"));
 
 /** The webhook secret as `X-Dori-Secret: <secret>`, or as GitHub's `X-Hub-Signature-256: sha256=<hmac of the body>`. */

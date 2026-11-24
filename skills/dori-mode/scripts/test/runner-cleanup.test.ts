@@ -394,16 +394,17 @@ test("Metro's temp caches are metroCache's alone: kept by the temp sweep, remove
   expect(on.targets.metroCache).toMatchObject({ mode: "on", removed: 2, bytes: 9 });
 });
 
-test("closedLanesOf lists one host's closed lanes with their cwd and recorded worktrees", () => {
+test("closedLanesOf lists one host's closed lanes with their directory and recorded worktrees", () => {
   const at = "2026-11-01T00:00:00.000Z";
   const lanes = [
     { key: "a", cwd: "/w/r-a", worktrees: ["/w/r-a", "/w/r-a-2"], openedAt: at, closedAt: at },
     { key: "open", cwd: "/w/r-open", openedAt: at },
-    { key: "mac", cwd: "/w/r-mac", machine: "mini", openedAt: at, closedAt: at },
+    // A remote lane records its directory as remoteCwd only (launch.ts laneDirs).
+    { key: "mac", remoteCwd: "/u/w/r-mac", machine: "mini", openedAt: at, closedAt: at },
     { key: "bad", cwd: "/w/r-bad", openedAt: at, closedAt: "never" },
   ] as unknown as Parameters<typeof closedLanesOf>[0];
   expect(closedLanesOf(lanes, undefined)).toEqual([{ key: "a", closedAt: Date.parse(at), worktrees: ["/w/r-a", "/w/r-a-2"] }]);
-  expect(closedLanesOf(lanes, "mini").map((l) => l.key)).toEqual(["mac"]);
+  expect(closedLanesOf(lanes, "mini")).toEqual([{ key: "mac", closedAt: Date.parse(at), worktrees: ["/u/w/r-mac"] }]);
 });
 
 test("git worktree prune drops records of deleted worktrees and keeps existing dirty ones", async () => {

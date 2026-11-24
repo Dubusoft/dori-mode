@@ -12,8 +12,8 @@ export const normalizeThreadRef = (value: string): string => (/^\d+$/.test(value
  */
 export const discordThreadOf = (ref: string, channels: readonly string[]): string | undefined => {
   const [, id = "", thread] = /^(?:discord:)?(\d+)(?:\/(\d+))?$/.exec(ref) ?? [];
-  if (thread) return thread;
-  return id && !channels.includes(id) ? id : undefined;
+  const named = thread ?? id;
+  return named && !channels.includes(named) ? named : undefined;
 };
 
 /**

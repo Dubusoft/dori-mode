@@ -48,7 +48,17 @@ export const isPrivateListen = (hostPort: string): boolean => {
   return parsed !== undefined && parsed.host !== "" && isPrivateHost(parsed.host);
 };
 
-type Wire = { send(data: string): unknown; close(code?: number, reason?: string): void };
+/**
+ * `send` returns Bun's `ServerWebSocketSendStatus` on the accepting side: the byte count when written, -1 when queued
+ * under backpressure (a `drain` follows), 0 when dropped. The dialing side's WebSocket queues every message without a
+ * status and returns undefined.
+ */
+type Wire = { send(data: string): number | undefined; close(code?: number, reason?: string): void };
+
+/** Bun's send status for a message the socket dropped. */
+const SEND_DROPPED = 0;
+/** Bun's send status for a message queued under backpressure. */
+const SEND_BACKPRESSURE = -1;
 
 const stripNewline = (line: string): string => (line.endsWith("\r\n") ? line.slice(0, -2) : line.endsWith("\n") ? line.slice(0, -1) : line);
 
@@ -58,8 +68,14 @@ const shortReason = (reason: string): string => Buffer.from(reason, "utf8").suba
 /**
  * One WebSocket as a `Transport`. Lines that arrive before the first `onLine` subscriber are held for it. A message
  * over the protocol size limit, or a binary message, closes the link.
+ *
+ * Every send status is checked. A message queued under backpressure makes `drained` wait for the socket's `drain`. A
+ * dropped message closes the link with `RUNNER_SEND_DROPPED`: the peer then sees the close at once instead of waiting
+ * out a timeout for a lost control frame, and a lost event is replayed from the outbox after the reconnect.
  */
 class WsTransport extends LineTransport {
+  private pressured = false;
+
   constructor(private readonly wire: Wire) {
     super();
   }
@@ -67,8 +83,21 @@ class WsTransport extends LineTransport {
   send(line: string): void {
     if (this.closed) throw new Error("transport closed");
     const text = stripNewline(line);
-    if (Buffer.byteLength(text, "utf8") > MAX_FRAME_BYTES) throw new Error(`frame over ${MAX_FRAME_BYTES} bytes`);
-    this.wire.send(text);
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_FRAME_BYTES) throw new Error(`frame over ${MAX_FRAME_BYTES} bytes`);
+    const status = this.wire.send(text);
+    if (status === SEND_DROPPED) this.close(`RUNNER_SEND_DROPPED ${bytes}-byte message dropped by the socket`);
+    else if (status === SEND_BACKPRESSURE) this.pressured = true;
+  }
+
+  /** The socket took its queued output (the server's `drain` handler). */
+  drain(): void {
+    this.pressured = false;
+    this.wake();
+  }
+
+  protected backlogged(): boolean {
+    return this.pressured;
   }
 
   receive(message: string | Uint8Array | ArrayBuffer): void {
@@ -119,6 +148,10 @@ export const listenWs = (hostPort: string): WsListener => {
     },
     websocket: {
       maxPayloadLength: MAX_FRAME_BYTES,
+      // A link idle this long is pinged and closed when the ping goes unanswered: a worker's only way to drop a
+      // supervisor link that died without a FIN, which would otherwise refuse the redial as `runner already connected`.
+      idleTimeout: 120,
+      sendPings: true,
       open(ws: ServerWebSocket<ServerData>) {
         const transport = new WsTransport(ws);
         ws.data.transport = transport;
@@ -127,6 +160,7 @@ export const listenWs = (hostPort: string): WsListener => {
         for (const handler of [...subscribers]) handler(transport);
       },
       message(ws, message) { ws.data.transport?.receive(message); },
+      drain(ws) { ws.data.transport?.drain(); },
       close(ws, code, reason) { ws.data.transport?.ended(reason || `peer closed (${code})`); },
     },
   });
@@ -150,7 +184,7 @@ export const connectWs = (url: string): Connector => () =>
   new Promise<Transport>((resolve, reject) => {
     const socket = new WebSocket(url);
     const transport = new WsTransport({
-      send: (data) => socket.send(data),
+      send: (data) => { socket.send(data); return undefined; },
       close: (code, reason) => socket.close(code, reason),
     });
     let opened = false;

@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { askingLine } from "../src/ask-user.ts";
+import { settleLaneOutcome } from "../src/autopilot.ts";
 import { fillHook } from "../src/config.ts";
 import { buildTrace, traceText } from "../src/event-trace.ts";
 import { SqliteLaneReports } from "../src/lane-report-store.ts";
-import { redactMeta, redactSecrets } from "../src/redact.ts";
+import { SqliteOperations } from "../src/operations.ts";
+import { redactMeta, redactSecrets, replaceKnownSecrets } from "../src/redact.ts";
 import { storePath } from "./fakes.ts";
 
 // Fake values, assembled at run time so no secret scanner sees a literal.
@@ -68,6 +71,48 @@ describe("known secret values from the dori env file", () => {
     writeFileSync(join(home, ".dori", "env"), `DORI_THING_TOKEN=${value}\nDORI_NOTE=harmless-note-text\n`);
     expect(redactSecrets(`oops ${value} leaked`)).toBe("oops [REDACTED] leaked");
     expect(redactSecrets("harmless-note-text")).toBe("harmless-note-text");
+  });
+  test("a quoted multiline value is known in full, and each long line of it on its own", () => {
+    const first = `first-${body(5)}`;
+    const second = `second-${body(5)}`;
+    writeFileSync(join(home, ".dori", "env"), `DORI_SA_KEY="${first}\n${second}"\nDORI_NOTE=x\n`);
+    expect(redactSecrets(`dump ${first} ${second} end`)).toBe("dump [REDACTED] end");
+    expect(redactSecrets(`log: ${second}`)).toBe("log: [REDACTED]");
+  });
+});
+
+describe("multiline secret-store values", () => {
+  // A service-account-style JSON key: its id line is long enough to mask alone, `{` and `}` are not.
+  const idLine = `"private_key_id": "${body(8)}",`;
+  const value = `{\n  "type": "service_account",\n  ${idLine}\n  "client_email": "bot@proj.iam.gserviceaccount.com"\n}`;
+  beforeEach(() => replaceKnownSecrets([value]));
+  afterEach(() => replaceKnownSecrets([]));
+
+  test("the value is masked after its newlines were flattened to spaces", () => {
+    expect(redactSecrets(`failed: ${value.replace(/\s+/g, " ")} end`)).toBe("failed: [REDACTED] end");
+    expect(redactSecrets(`failed: ${value.replace(/\n/g, "\r\n")} end`)).toBe("failed: [REDACTED] end");
+  });
+  test("a line of 16+ characters printed alone is masked; a shorter line stays", () => {
+    expect(redactSecrets(`log:   ${idLine}`)).toBe("log:   [REDACTED]");
+    expect(redactSecrets("{")).toBe("{");
+  });
+  test("a whitespace-only value masks only its exact self", () => {
+    replaceKnownSecrets([" ".repeat(9)]);
+    expect(redactSecrets("plain text, two  spaces")).toBe("plain text, two  spaces");
+  });
+  test("autopilot lane-failed line and on-screen question line", () => {
+    const dir = mkdtempSync(join(tmpdir(), "redact-ops-"));
+    const store = new SqliteOperations(storePath(dir));
+    try {
+      store.put({ id: "toodo:9/autopilot-launch/1", lane: "toodo:9", action: "autopilot-launch", target: "1", state: "verified", detail: "verified", data: JSON.stringify({ laneKey: "k" }), attempts: 1, at: 1, updatedAt: 1 });
+      const line = settleLaneOutcome(store, 2, "k", `gave up:\n${value}`);
+      expect(line).toContain("gave up: [REDACTED]");
+      expect(line).not.toContain(body(8));
+      expect(JSON.stringify(store.list())).not.toContain(body(8));
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+    const asked = askingLine("k", { question: `use this key?\n${value}`, options: [], pending: 1 });
+    expect(asked).toContain("use this key? [REDACTED]");
+    expect(asked).not.toContain(body(8));
   });
 });
 

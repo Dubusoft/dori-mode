@@ -309,7 +309,7 @@ test("without --pane the runner opens a new tab and the lane records the pane it
 
 test("the runner's startup verdict becomes the STARTUP line; the poll constants stay exported", async () => {
   expect(STARTUP_POLL_MS).toBe(2_000);
-  expect(STARTUP_POLLS).toBe(10);
+  expect(STARTUP_POLLS).toBe(22);
   expect(startupLine("k", "w:p9", { verdict: "ok", detail: "ready" })).toBe("STARTUP_OK k w:p9");
   expect(startupLine("k", "w:p9", { verdict: "error", detail: "No API key" })).toBe("STARTUP_ERROR k w:p9: No API key");
   expect(startupLine("k", "w:p9", { verdict: "unconfirmed", detail: "no ready agent status (idle); last lines: ❯" })).toBe("STARTUP_UNCONFIRMED k w:p9: no ready agent status (idle); last lines: ❯");

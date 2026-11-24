@@ -38,9 +38,9 @@ export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } 
  *
  * `lane.adopt` takes an existing pane as a lane and issues it a token file; `lane.notify` stores the status the
  * supervisor holds for the lane (`notice`), which the lane reads with `dori lane status` over the lane socket
- * (lane-socket.ts). `lane.close` and `lane.stop` close the tab (else the pane), delete the brief and the token file and
- * forget the token. `askTick` reads each owned lane's pane for an on-screen question (the same `screenQuestion` the
- * supervisor's ask-user sweep uses) and publishes one `lane.asking` per distinct question.
+ * (lane-socket.ts). `lane.close` and `lane.stop` close the tab (else the pane) and, once the pane list no longer shows it,
+ * delete the brief and the token file and forget the token. `askTick` reads each owned lane's pane for an on-screen
+ * question (the same `screenQuestion` the supervisor's ask-user sweep uses) and publishes one `lane.asking` per distinct question.
  *
  * Turn evidence (read-only): each pass and each `lane.observe` notes whether an owned lane's turn runs. A live lane
  * seen stopped after a running turn (or stopped for the first time after its startup window) gets one new
@@ -421,7 +421,10 @@ export class RunnerLanes {
     // The replaced generation's token is forgotten (its hash went with the old record) and its file deleted.
     if (previous) rmSync(this.tokenFileOf(key, previous.gen), { force: true });
     this.deps.publish("lane.started", { key, pane, tab, session: "", ...(input.fileRun ? { fileRun: input.fileRun } : {}) });
-    const startup = await (this.deps.startup ?? ((p: string) => startupPoll({ run: this.deps.run, clock: this.deps.clock }, p)))(pane);
+    const startup = await (this.deps.startup?.(pane) ?? startupPoll(
+      { run: this.deps.run, clock: this.deps.clock }, pane,
+      !resumed && argv.includes(prompt) ? (run) => laneProcessAlive(run, pane, key) : undefined,
+    ));
     const model = argvModel(argv);
     return { pane, tab, resumed, startup, cwd, ...(model ? { model } : {}) };
   }
@@ -588,7 +591,6 @@ export class RunnerLanes {
     return { detail: `noted ${body.status}`, result: {} };
   }
 
-  /** Closes the lane's tab (else its pane), deletes its brief and token file and forgets its token; `gone` is read back from the pane list. */
   /** Adds lead files to a running lane's briefs/<key>.files (`dori attach`); only a lane started with lane files has one. */
   async attach(body: SupervisorCommandBodies["lane.attach"]): Promise<Effect<"lane.attach">> {
     const record = this.record(body.key);
@@ -598,19 +600,26 @@ export class RunnerLanes {
     return { detail: `attached files=${body.tree.files.length} dir=${dir}`, result: { dir } };
   }
 
+  /**
+   * Closes the lane's tab (else its pane) and reads the pane list back (`gone`); only once the pane is gone are its brief
+   * and token file deleted and its token forgotten. A pane still listed keeps the lane's record.
+   */
   async close(key: string): Promise<Effect<"lane.close">> {
     const record = this.record(key);
     const current = await this.currentPane(record);
     const closed: "tab" | "pane" | "none" = !current ? "none" : record.tab ? "tab" : record.pane ? "pane" : "none";
     if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
     else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
+    let gone = !current;
+    try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
+    catch { gone = false; }
+    // A pane still listed (or a list that cannot be read) may still run the agent: its record and token stay, so it can
+    // still report and a later close can reach it.
+    if (!gone) return { detail: `close left ${closed === "tab" ? `tab=${record.tab}` : `pane=${record.pane}`} listed; lane kept`, result: { closed, gone } };
     this.forgetLaneFiles(key, record.gen, record.fileRun !== undefined);
     const { [key]: _gone, ...rest } = this.records();
     this.save(rest);
     this.deps.herdrReports?.close(key);
-    let gone = !current;
-    try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
-    catch { gone = false; }
     return { detail: closed === "tab" ? `closed tab=${record.tab}` : closed === "pane" ? `closed pane=${record.pane}` : "closed none", result: { closed, gone } };
   }
 

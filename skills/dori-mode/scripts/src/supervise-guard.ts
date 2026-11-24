@@ -8,6 +8,7 @@ import { pauseLane, type PauseResult } from "./pause.ts";
 import type { Lane } from "./registry.ts";
 import type { GuardMachine, KillResult, MachineSample } from "./remote-guard.ts";
 import { systemText } from "./supervise-loop.ts";
+import { errLine } from "./line-text.ts";
 
 /** The machine guard's state file in the supervisor stateDir, so a restart does not re-report unchanged machines. */
 export const MACHINE_GUARD_STATE_FILE = "machine-guard.json";
@@ -86,7 +87,6 @@ export const pressureIo = (deps: FlowDeps): PressureIo => ({
   pause: (lane, note) => pauseLane(deps, lane, note),
 });
 
-export const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 160);
 
 const OWNER = " - tell the owner";
 
@@ -97,7 +97,7 @@ const pauseForCritical = async (io: PressureIo, lane: Lane | undefined, reasons:
     const res = await io.pause(lane, `memory critical: ${reasons.join(" | ")}`);
     return `paused ${lane.key} (${res.lines.join(" ")})`;
   } catch (e) {
-    return `pause of ${lane.key} failed: ${errText(e)}`;
+    return `pause of ${lane.key} failed: ${errLine(e, 160)}`;
   }
 };
 

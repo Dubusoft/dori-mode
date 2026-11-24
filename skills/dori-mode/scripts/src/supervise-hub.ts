@@ -24,27 +24,34 @@ import { readRunnerEndpoints } from "./runner/endpoints.ts";
 /** Supervisor-owned progress through the private runner journal, committed only after successful lane processing. */
 export const RUNNER_LANE_CURSOR_FILE = "runner-lane-cursor.json";
 
+/**
+ * The committed cursor in `stateDir`: 0 when the file does not exist yet, or undefined when it cannot be read as a
+ * non-negative integer; that case logs RUNNER_CURSOR_INVALID with `fallback`, what the caller does instead.
+ */
+export const readLaneCursor = (stateDir: string, fallback: string): number | undefined => {
+  const path = join(stateDir, RUNNER_LANE_CURSOR_FILE);
+  if (!existsSync(path)) return 0;
+  let invalid: string;
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+    invalid = "not a non-negative integer";
+  } catch (e) {
+    invalid = e instanceof Error ? e.message : String(e);
+  }
+  console.error(`RUNNER_CURSOR_INVALID ${path} ${invalid}; ${fallback}`);
+  return undefined;
+};
+
 /** Called in the lane work queue; a failed event stops the pass and is retried on the next call. */
 export const laneEventReader = (stateDir: string, deps: LaneHubDeps): (() => Promise<void>) => {
   // The hello that marks a recovery must number the journal as this reader does; deps without a head get this journal's.
   if (!deps.journalHead) (deps as { journalHead?: () => number }).journalHead = () => runnerJournalHead(stateDir);
   const path = join(stateDir, RUNNER_LANE_CURSOR_FILE);
-  let position = 0;
-  let invalid: string | undefined;
-  if (existsSync(path)) {
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
-      if (typeof parsed === "number" && Number.isSafeInteger(parsed) && parsed >= 0) position = parsed;
-      else invalid = "not a non-negative integer";
-    } catch (e) {
-      invalid = e instanceof Error ? e.message : String(e);
-    }
-  }
-  if (invalid !== undefined) {
-    // Stale lane.started events are ignored by the hub, so replaying the journal from the start is safe.
-    console.error(`RUNNER_CURSOR_INVALID ${path} ${invalid}; reading the runner journal from the start`);
-    writeRunnerFile(path, "0\n");
-  }
+  // Stale lane.started events are ignored by the hub, so replaying the journal from the start is safe.
+  const committed = readLaneCursor(stateDir, "reading the runner journal from the start");
+  if (committed === undefined) writeRunnerFile(path, "0\n");
+  let position = committed ?? 0;
   const db = new Database(join(stateDir, HUB_FILE), { readonly: true });
   try {
     const row = db.query("SELECT MAX(rowid) AS position FROM runner_events").get() as { position: number | null };
@@ -87,7 +94,7 @@ export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEve
   readonly network?: Partial<DialingOptions>;
   /** hostId of a local runner identity created here (default `os.hostname()`). */
   readonly hostId?: string;
-  /** The call/query timeout timers (default real timers). */
+  /** The call/query timeout and link silence timers (default real timers). */
   readonly timers?: Timers;
   /** A runner machine's herdr went down or came back (`HERDR_DOWN` / `HERDR_UP`), already saved on its hub row. */
   readonly onHerdr?: (id: string, line: string) => void;
@@ -166,6 +173,7 @@ export const openRunnerHub = (
     onStatus: (label, frame) => { calls?.onStatus(label, frame); },
     onDisconnected: (label) => { protos.delete(label); calls?.disconnected(label); },
     auth,
+    timers: options.timers ?? realTimers,
     log,
   });
   calls = new RunnerCalls({

@@ -9,7 +9,7 @@ import { eventLine, HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { laneEventsAfter, type LaneHubDeps, reconcileInventory } from "../src/runner/lanes-hub.ts";
 import { PROTO, runnerControl, runnerEvent } from "../src/runner/protocol.ts";
 import { openRunnerJournal, RUNNER_JOURNAL_RETENTION_MS } from "../src/runner/serve.ts";
-import { laneEventReader, RUNNER_LANE_CURSOR_FILE } from "../src/supervise-hub.ts";
+import { laneEventReader, readLaneCursor, RUNNER_LANE_CURSOR_FILE } from "../src/supervise-hub.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
@@ -169,6 +169,19 @@ test("a corrupt cursor file is reported and the journal is read from the start i
   expect(lines[0]).toEndWith("; reading the runner journal from the start");
   expect((await f.flow.registry.read("lane-a"))!.pane).toBe("pane-1");
   expect(JSON.parse(readFileSync(f.cursor, "utf8"))).toBe(1);
+});
+
+test("the cursor reader returns 0 for a missing file, the committed position, and undefined with a report for a corrupt one", async () => {
+  const f = await fixture();
+  expect(readLaneCursor(f.state.dir, "unused")).toBe(0);
+  writeFileSync(f.cursor, "7\n");
+  expect(readLaneCursor(f.state.dir, "unused")).toBe(7);
+  writeFileSync(f.cursor, "-1\n");
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.join(" ")); };
+  try { expect(readLaneCursor(f.state.dir, "pruning no runner journal rows")).toBeUndefined(); } finally { console.error = original; }
+  expect(lines).toEqual([`RUNNER_CURSOR_INVALID ${f.cursor} not a non-negative integer; pruning no runner journal rows`]);
 });
 
 test("B1 a journaled start from before the recovery hello does not complete the recovery; the recovered start does", async () => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,7 +11,7 @@ import type { LaneOps } from "../src/lane-ops.ts";
 import type { MachineObservation } from "../src/runner/protocol.ts";
 import { quotaProvidersFor, type QuotaResult, readUsage } from "../src/claude-quota.ts";
 import { SqliteOperations, plan } from "../src/operations.ts";
-import { acquireStateLock } from "../src/state-lock.ts";
+import { acquireStateLock, StateLockError } from "../src/state-lock.ts";
 import { ToodoClient, type ToodoFetch, ToodoUnreadable } from "../src/toodo-client.ts";
 import { storePath } from "./fakes.ts";
 
@@ -91,6 +91,26 @@ test("a non-boolean autopilot or a non-string dueDate is ToodoUnreadable", async
   }
 });
 
+test("a task list skips and logs an unmarked task it cannot read; a marked or unmarkable one still fails closed", async () => {
+  const broken = [
+    { ...wire(task(13, { autopilot: false, workspaceId: 9 })), status: "archived" },
+    { ...wire(task(14)), id: "x", autopilot: undefined, criteria: "none" },
+  ];
+  const lines: string[] = [];
+  const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [wire(task(12)), ...broken, wire(task(15))]), log: (l) => lines.push(l) });
+  expect((await client.flaggedTasks()).map((t) => t.id)).toEqual([12, 15]);
+  expect((await client.tasksByIds([12, 13, 15])).map((t) => t.id)).toEqual([12, 15]);
+  expect(lines.slice(0, 2)).toEqual([
+    'TOODO_TASK_SKIPPED #13 not marked for autopilot: toodo-server returned a task with status "archived" (#13)',
+    "TOODO_TASK_SKIPPED (no id) not marked for autopilot: toodo-server returned a task with no id",
+  ]);
+  for (const bad of [{ ...wire(task(16)), status: "archived" }, "not a task"]) {
+    const strict = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(200, [wire(task(12)), bad]), log: (l) => lines.push(l) });
+    expect(await strict.flaggedTasks().catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
+  }
+  expect(lines).toHaveLength(4);
+});
+
 test("get_task returns undefined on 404", async () => {
   const client = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => json(404, { error: "not found" }) });
   expect(await client.task(99)).toBeUndefined();
@@ -101,10 +121,39 @@ test("401, a network error and a missing token file are all ToodoUnreadable", as
   const e401 = await refused.tasksByIds([1]).catch((e: unknown) => e);
   expect(e401).toBeInstanceOf(ToodoUnreadable);
   expect((e401 as ToodoUnreadable).status).toBe(401);
-  const down = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => { throw new TypeError("connect ECONNREFUSED"); } });
+  const down = new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch: async () => { throw new TypeError("connect ECONNREFUSED"); }, sleep: async () => {} });
   expect(await down.tasksByIds([1]).catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
   const noToken = new ToodoClient({ url: "http://toodo.test", tokenFile: join(dir, "absent") }, { fetch: async () => json(200, []) });
   expect(await noToken.tasksByIds([1]).catch((e: unknown) => e)).toBeInstanceOf(ToodoUnreadable);
+});
+
+test("one 5xx, 429 or timeout is read again after a pause; a second one or any 4xx is ToodoUnreadable", async () => {
+  const timeout = async (): Promise<Response> => { throw new DOMException("The operation timed out.", "TimeoutError"); };
+  const client = (replies: (() => Promise<Response>)[]) => {
+    const sent: number[] = [];
+    const sleeps: number[] = [];
+    const fetch: ToodoFetch = async () => { sent.push(sent.length + 1); return replies[sent.length - 1]!(); };
+    return { sent, sleeps, client: new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch, sleep: async (ms) => { sleeps.push(ms); } }) };
+  };
+  const ok = async () => json(200, [wire(task(12))]);
+  for (const first of [async () => json(503, {}), async () => json(429, {}), timeout]) {
+    const c = client([first, ok]);
+    expect(await c.client.tasksByIds([12])).toEqual([task(12)]);
+    expect([c.sent.length, c.sleeps]).toEqual([2, [500]]);
+  }
+  const twice = client([async () => json(502, {}), timeout]);
+  const e = await twice.client.tasksByIds([12]).catch((err: unknown) => err);
+  expect(e).toBeInstanceOf(ToodoUnreadable);
+  expect((e as Error).message).toContain("tried 2 times");
+  expect(twice.sent.length).toBe(2);
+  for (const status of [400, 401, 403]) {
+    const c = client([async () => json(status, {}), ok]);
+    expect(((await c.client.tasksByIds([12]).catch((err: unknown) => err)) as ToodoUnreadable).status).toBe(status);
+    expect(c.sent.length).toBe(1);
+  }
+  const missing = client([async () => json(404, {}), ok]);
+  expect(await missing.client.task(12)).toBeUndefined();
+  expect(missing.sent.length).toBe(1);
 });
 
 // candidates end to end
@@ -116,6 +165,7 @@ const harness = (
   tasks: readonly ToodoTask[] | "unreadable", host: HostSummary = { ok: true }, now = T0 + 60_000, openLanes: ReadonlySet<string> = new Set(),
   quota: QuotaSummary = { readable: true, accounts: [{ name: "default", maxUsedPct: 10 }] },
   machines?: (ids: readonly number[]) => TaskHosts, config: AutopilotConfig = DEFAULT_AUTOPILOT,
+  lock: () => Promise<() => void> = () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
 ) => {
   const reads: (number[] | "flagged")[] = [];
   const probes = { quota: 0, host: 0 };
@@ -135,7 +185,7 @@ const harness = (
     openLanes: async () => openLanes,
     quota: async () => { probes.quota++; return quota; },
     hosts: async (ids) => { probes.host++; return machines ? machines(ids) : { defaultMachine: "local", machines: new Map([["local", host]]), targets: new Map() }; },
-    lock: () => acquireStateLock(join(dir, "autopilot-launch.lock.sqlite")),
+    lock,
     now: () => now, out: (l) => { out.push(l); }, err: (l) => { err.push(l); },
   });
   const run = async (...args: string[]): Promise<Run> => {
@@ -397,6 +447,46 @@ test("pause stops reserves and shows in candidates until resume; pausing twice k
   expect(await h.run("resume")).toEqual({ code: 0, out: ["AUTOPILOT_NOT_PAUSED"], err: [] });
   expect((await h.run("candidates")).out[0]).toBe("AUTOPILOT slots=unlimited candidates=1");
   expect((await h.run("launch", "12")).out).toEqual(["AUTOPILOT_RESERVED #12 lane=ap-12-1 attempt=1"]);
+});
+
+test("a pause that lands while a reserve reads toodo and the host refuses that reserve and writes no row", async () => {
+  const local = { defaultMachine: "local", machines: new Map([["local", { ok: true }]]), targets: new Map() };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, () => {
+    writeFileSync(join(dir, "autopilot-pause.json"), JSON.stringify({ since: "2026-01-01T12:00:30.000Z", reason: "freeze" }));
+    return local;
+  });
+  expect(await h.run("launch", "12")).toEqual({
+    code: 1, out: [], err: ["AUTOPILOT_LAUNCH_REFUSED #12 paused since 2026-01-01T12:00:30.000Z: freeze (dori autopilot resume lifts it)"],
+  });
+  expect(rows()).toEqual([]);
+});
+
+test("pause is in force at once and returns only once the reserve or launch holding the launch lock let go", async () => {
+  const order: string[] = [];
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const lock = async () => { order.push("lock asked"); await held; order.push("lock taken"); return () => { order.push("lock released"); }; };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, DEFAULT_AUTOPILOT, lock);
+  const paused = h.run("pause").then((r) => { order.push("pause returned"); return r; });
+  expect(existsSync(join(dir, "autopilot-pause.json"))).toBe(true);
+  order.push("in-flight launch done");
+  release();
+  expect(await paused).toEqual({ code: 0, out: ["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z"], err: [] });
+  expect(order).toEqual(["lock asked", "in-flight launch done", "lock taken", "lock released", "pause returned"]);
+  // Pausing again also waits for the launch in flight before it answers.
+  order.length = 0;
+  expect((await h.run("pause")).out).toEqual(["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z (already paused)"]);
+  expect(order).toEqual(["lock asked", "lock taken", "lock released"]);
+});
+
+test("a pause whose launch lock stays busy is in force but exits 1, since a launch under way may still start", async () => {
+  const lock = async (): Promise<() => void> => { throw new StateLockError("state lock timed out: autopilot-launch.lock.sqlite"); };
+  const h = harness([task(12)], { ok: true }, T0 + 60_000, new Set(), undefined, undefined, DEFAULT_AUTOPILOT, lock);
+  expect(await h.run("pause")).toEqual({
+    code: 1, out: ["AUTOPILOT_PAUSED since 2026-01-01T12:01:00.000Z"],
+    err: ["AUTOPILOT_PAUSE_UNSETTLED a launch under way still holds the launch lock and may start its lane; run pause again to confirm it finished"],
+  });
+  expect((await harness([task(12)]).run("launch", "12")).code).toBe(1);
 });
 
 test("an unparsable pause file still pauses", async () => {

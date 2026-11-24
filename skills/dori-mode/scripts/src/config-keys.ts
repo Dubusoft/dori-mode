@@ -45,6 +45,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("review", "json", "PR review gate: { repos: [\"owner/repo\", ...] } (case-insensitive); unlisted or empty: lane PRs merge without review"),
   spec("memoryLimits", "json", "Lead memory limits: humanMaxKb (15), systemMaxTokens (omo's advisory, 30000), triggerPct (80: past it the lead is woken at once)"),
   spec("autoReport", "enum", "Whose clean done claims the supervisor reports to the owner itself instead of waking the lead (off restores the lead's report)", { values: [...AUTO_REPORT_SCOPES] }),
+  spec("reportQuietLanes", "list", "Lane key patterns (* wildcard) whose lanes post their own results: their done claims are recorded reported with no post and no lead report"),
   spec("threadCloseAfterHours", "json", "Hours a finished work thread waits, with the owner's close button on its last report, before the supervisor closes it (a number; default 24)"),
 ];
 

@@ -64,8 +64,9 @@ const URGENT_KINDS = [
   "TASK_STALLED", "OPERATION_AMBIGUOUS", "OPERATION_FAILED",
   // CI follow-up: a lane that did not confirm its message in time, and a conflict no merge lane could take.
   "LANE_MESSAGE_UNCONFIRMED", "CI_CONFLICT",
-  // A merged lane PR whose merge the supervisor could not read back, and an open one it has been unable to merge.
-  "MERGE_UNVERIFIED", "MERGE_STALLED",
+  // A merged lane PR whose merge the supervisor could not read back, an open one it has been unable to merge, and an open
+  // one whose follow-up keeps throwing (gh login, GitHub, the state store).
+  "MERGE_UNVERIFIED", "MERGE_STALLED", "CI_FOLLOW_STUCK",
   // A lane's done claim wakes the lead when the lane finishes; its window then starts at that delivery (done-flow.ts).
   // A clean claim the supervisor reports to the owner itself is digest LANE_DONE_AUTO_REPORTED (below); a failed auto
   // report wakes the lead, with the claim, so it reports the lane itself.
@@ -73,7 +74,7 @@ const URGENT_KINDS = [
   // A lane that ended is news the lead acts on: report to the owner, free the slot, finish its Toodo task. That holds for
   // a close after a claim the lead already received (`LANE_CLOSED <key> closed seen-claim`) too: the lead's task cleanup
   // waits on the close itself, so it must not sit in the digest. Only a seen-claim close with no task left to finish
-  // (`toodo=done` or `toodo=no-task`, below) is digest; a task it could not finish is TOODO_TASK_NOT_COMPLETED.
+  // (`toodo=done`, `toodo=not-adopted` or `toodo=no-task`, below) is digest; a task it could not finish is TOODO_TASK_NOT_COMPLETED.
   "LANE_CLOSED", "LANE_AUTO_CLOSED", "CI_MERGED", "TOODO_TASK_NOT_COMPLETED",
   // The automatic `dori update --dev` after a merge of dori's own repo failed (update.ts AutoUpdate); its success is digest.
   "AUTO_UPDATE_FAILED",
@@ -139,11 +140,13 @@ const DIGEST_KINDS = [
   // the merge to (task-finish.ts), or whose lane has no Toodo task: nothing is left for the lead. The report the claim
   // opened is still owed and comes back as urgent UNREPORTED (lane-outcomes.ts).
   "LANE_CLOSED * closed seen-claim toodo=done", "LANE_CLOSED * closed seen-claim toodo=no-task", "TOODO_TASK_COMPLETED",
+  // The same for an autopilot lane that found nothing to change: its task concluded not adopted and read back.
+  "LANE_CLOSED * closed seen-claim toodo=not-adopted", "TOODO_TASK_NOT_ADOPTED",
   // A clean done claim the supervisor posted to the owner as the lane's report (config autoReport, auto-report.ts): the
   // lead checks it at its next wake and corrects it with dori reported --append or dori object-done if it must.
   "LANE_DONE_AUTO_REPORTED",
   // An autopilot lane's done outcome whose task the supervisor completed and read back (task-finish.ts finishedOutcome).
-  "AUTOPILOT_LANE_DONE * * * toodo=done:",
+  "AUTOPILOT_LANE_DONE * * * toodo=done:", "AUTOPILOT_LANE_DONE * * * toodo=not-adopted:",
   // Review gate progress the supervisor settles itself (review-gate.ts): a review started, held, passed or went stale,
   // findings went back to the author lane, one failed run is retried, and a reached limit is asked of the owner (its
   // decision is opened by review-status.ts; the answer wakes the lead as OWNER_DECISION_ANSWERED).

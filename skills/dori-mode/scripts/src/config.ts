@@ -145,6 +145,8 @@ export type PlacementConfig = {
   readonly defaultMachine: string;
   /** Machines tried in order when the target machine is HOLD; only for workspace-less launches without an explicit --machine. Empty (default): wait in the HOLD queue. */
   readonly fallback: readonly string[];
+  /** Open lanes (plus pending launches) a machine ("local" or a label) may hold; absent here, "local" is capped at this host's cores and any other machine has no lane cap. */
+  readonly maxLanes?: Readonly<Record<string, number>>;
 };
 
 export type DiscordConfig = {
@@ -254,6 +256,13 @@ export type DoriConfig = {
    */
   readonly autoReport: AutoReportScope;
   /**
+   * Lane key patterns (`*` matches any run of characters) whose lanes post their own results to the owner, e.g. lanes a
+   * script launches that send their own previews and notices: a done claim of such a lane is recorded reported by the
+   * supervisor without any post (done-flow.ts), so the lead owes no report and the thread gets no second copy. Absent
+   * or empty: none.
+   */
+  readonly reportQuietLanes: readonly string[];
+  /**
    * Hours a finished work thread stays open after the owner's close button lands on its last report before the
    * supervisor archives it (lane-outcomes.ts autoCloseTick); a newer report or the owner writing in the thread restarts
    * the wait. Positive; absent is 24.
@@ -317,6 +326,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   drift: DEFAULT_DRIFT,
   autopilot: DEFAULT_AUTOPILOT,
   autoReport: "autopilot",
+  reportQuietLanes: [],
   threadCloseAfterHours: 24,
 });
 
@@ -350,6 +360,20 @@ const autoReport = (raw: unknown): AutoReportScope => {
   if (!AUTO_REPORT_SCOPES.some((scope) => scope === value)) throw new TypeError(`autoReport must be one of ${AUTO_REPORT_SCOPES.join("|")}, not ${JSON.stringify(raw)}`);
   return value as AutoReportScope;
 };
+
+const QUIET_PATTERN = /^[\w.*-]+$/;
+
+/** The config's `reportQuietLanes`, trimmed, blanks dropped; throws TypeError unless absent or an array of lane key patterns. */
+const reportQuietLanes = (raw: unknown): readonly string[] => {
+  if (raw == null) return [];
+  const patterns = Array.isArray(raw) && raw.every((p) => typeof p === "string") ? (raw as string[]).map((p) => p.trim()).filter(Boolean) : undefined;
+  if (!patterns || patterns.some((p) => !QUIET_PATTERN.test(p))) throw new TypeError(`reportQuietLanes must be an array of lane key patterns such as "blog-draft-*", not ${JSON.stringify(raw)}`);
+  return patterns;
+};
+
+/** Whether config `reportQuietLanes` names lane `key`: the lane posts its own results, so its claim is reported quietly. */
+export const reportQuietLane = (config: Pick<DoriConfig, "reportQuietLanes">, key: string): boolean =>
+  config.reportQuietLanes.some((pattern) => new RegExp(`^${pattern.replace(/\./g, "\\.").replace(/\*/g, ".*")}$`).test(key));
 
 /** The config's `laneRules`, whitespace collapsed, blanks dropped; throws TypeError unless absent or an array of strings. */
 const laneRules = (raw: unknown): readonly string[] => {
@@ -479,16 +503,21 @@ const buttonHooks = (raw: unknown, path: string): Readonly<Record<string, ArgvTe
   return Object.fromEntries(valid) as Record<string, string[]>;
 };
 
-/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback`. */
+/** The config's `placement` (absent: the default); throws TypeError on a non-object or a malformed `fallback` or `maxLanes`. */
 const placement = (raw: unknown): PlacementConfig => {
   if (raw === undefined) return { defaultMachine: "local", fallback: [] };
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new TypeError("placement must be an object");
   const o = raw as Record<string, unknown>;
   const fallback = o.fallback ?? [];
   if (!Array.isArray(fallback) || fallback.some((m) => typeof m !== "string" || !m.trim())) throw new TypeError("placement.fallback must be an array of machine names");
+  const maxLanes = o.maxLanes;
+  if (maxLanes !== undefined && (!isRecord(maxLanes) || Object.entries(maxLanes).some(([m, n]) => !m.trim() || typeof n !== "number" || !Number.isSafeInteger(n) || n <= 0))) {
+    throw new TypeError("placement.maxLanes must map machine names to positive integers");
+  }
   return {
     defaultMachine: typeof o.defaultMachine === "string" && o.defaultMachine.trim() ? o.defaultMachine.trim() : "local",
     fallback: (fallback as string[]).map((m) => m.trim()),
+    ...(maxLanes === undefined ? {} : { maxLanes: Object.fromEntries(Object.entries(maxLanes).map(([m, n]) => [m.trim(), n as number])) }),
   };
 };
 
@@ -500,7 +529,7 @@ export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
-  "memoryLimits", "autoReport", "threadCloseAfterHours",
+  "memoryLimits", "autoReport", "reportQuietLanes", "threadCloseAfterHours",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -588,6 +617,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     laneRules: laneRules(raw.laneRules),
     review: reviewConfig(raw.review),
     autoReport: autoReport(raw.autoReport),
+    reportQuietLanes: reportQuietLanes(raw.reportQuietLanes),
     threadCloseAfterHours: threadCloseAfterHours(raw.threadCloseAfterHours),
     memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),

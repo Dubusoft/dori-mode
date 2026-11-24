@@ -1,8 +1,9 @@
 import { readdir, readFile, lstat, realpath, rm } from "node:fs/promises";
 import { join, posix, win32 } from "node:path";
 import type { Runner } from "../run.ts";
+import { errText } from "../line-text.ts";
 import {
-  CLEANUP_AGES, changedAt, errText, gitDirOf, isCheckout, keyNames, noteError, safeRoot, skipped, stripSlash, treeBytes,
+  CLEANUP_AGES, changedAt, gitDirOf, isCheckout, keyNames, noteError, safeRoot, skipped, stripSlash, treeBytes,
   type CleanupDeps, type CleanupTarget, type ClosedLane, type Ctx, type InUse, type TargetCount,
 } from "./cleanup.ts";
 

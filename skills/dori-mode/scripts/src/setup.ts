@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { configureKeys, DORI_CONFIG_KEYS, doriConfigDefault, formatValue, KEY_INPUT_HINT, keyLabel, pruneDoriConfig, readSeenKeys, writeSeenKeys } from "./config-keys.ts";
 import { CONFIG_SCHEMA_KEY, CONFIG_SCHEMA_VERSION, ConfigSchemaError, migrateConfigSchema, removalReason } from "./config-schema.ts";
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
+import { envFileValue } from "./credentials.ts";
 import type { Http } from "./messenger/http.ts";
 import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
 import { listPanes } from "./panes.ts";
@@ -214,14 +215,6 @@ export const saveConfig = (path: string, existing: Json, next: Json, log?: (line
 };
 
 const envLine = (key: string) => new RegExp(`^\\s*(?:export\\s+)?${key}=(.*)$`);
-
-export const envGet = (text: string, key: string): string | undefined => {
-  for (const line of text.split(/\r?\n/)) {
-    const m = envLine(key).exec(line);
-    if (m) return (m[1] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
-  }
-  return undefined;
-};
 
 export const envSet = (text: string, key: string, value: string): string => {
   const lines = text ? text.split(/\r?\n/) : [];
@@ -481,7 +474,7 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
   };
   if (d.interactive) d.log(`SETUP ${KEY_INPUT_HINT}`);
 
-  const storedToken = envGet(envText, TOKEN_KEY) || undefined;
+  const storedToken = envFileValue(envText, TOKEN_KEY);
   const token = await askToken(d, storedToken, input.token);
   const givenChannels = input.channels ?? givenList("discordChannels");
   if (!givenChannels && !unset.includes("discordChannels")) asked.push("discordChannels");

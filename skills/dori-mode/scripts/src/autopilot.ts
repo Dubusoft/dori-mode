@@ -1,4 +1,4 @@
-import { OPEN_STATES, type Operation, type OperationStore, settleOperation } from "./operations.ts";
+import { LAUNCH_ACTION, OPEN_STATES, type Operation, type OperationStore, REARM_ACTION, settleOperation } from "./operations.ts";
 import { redactSecrets } from "./redact.ts";
 
 /**
@@ -20,8 +20,7 @@ import { redactSecrets } from "./redact.ts";
  * attempt holds, and once a wait set after that pause ends, the attempt counts as covered without a re-arm row.
  */
 
-export const LAUNCH_ACTION = "autopilot-launch";
-export const REARM_ACTION = "autopilot-rearm";
+export { LAUNCH_ACTION, REARM_ACTION };
 /** A task ref naming the owner's word that marked it, e.g. `owner:discord:<channel>/<message>`. */
 export const OWNER_REF = /^owner:\S+$/;
 
@@ -73,7 +72,7 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   mergeBase: "dev", tickSec: 300, quotaCacheSec: 90, threadChannel: "",
 };
 
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+export const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
  * Keys read as nothing so an older config still loads: the bundle design's, `mode` (autopilot is always on; `dori

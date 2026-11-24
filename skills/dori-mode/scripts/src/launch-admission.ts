@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { MachineCheck } from "./placement.ts";
@@ -26,7 +26,20 @@ const readLane = (path: string): Lane | undefined => {
   }
 };
 
-/** The locked snapshot includes registry reads, pruning, the decision and (for claims) the write. */
+/** Keys of the registry's open lanes on `machine` ("local": lanes without a machine). */
+const openLaneKeys = (stateDir: string, machine: string): string[] => {
+  const dir = join(stateDir, "lanes");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => f.endsWith(".json")).flatMap((f) => {
+    const lane = readLane(join(dir, f));
+    return lane && statusOf(lane) !== "closed" && (lane.machine ?? "local") === machine ? [lane.key] : [];
+  });
+};
+
+/**
+ * The locked snapshot includes registry reads, pruning, the decision and (for claims) the write. With a lane cap, the
+ * machine's open lanes and pending launches (by key, never `key` itself) must stay below it.
+ */
 const inspect = (stateDir: string, check: MachineCheck, now: number, key?: string, claim = false) =>
   withStateLockSync(join(stateDir, "launch-slots.lock.sqlite"), () => {
     const path = join(stateDir, "launch-slots.json");
@@ -38,10 +51,14 @@ const inspect = (stateDir: string, check: MachineCheck, now: number, key?: strin
       return now - slot.at <= LAUNCH_SLOT_TTL_MS;
     });
     const pending = slots.filter((s) => s.machine === check.machine && s.key !== key);
-    const free = admissionSlots(check.paneCap!, check.paneCount!, pending.length);
-    const verdict: LaunchVerdict = !check.verdict.ok ? check.verdict : free > 0 ? { ok: true, reasons: [] } : {
-      ok: false, reasons: [`launch slots 0 on machine ${check.machine}: ${pending.length} pending launch(es) fill the pane cap ${check.paneCap}`],
-    };
+    const paneFree = admissionSlots(check.paneCap!, check.paneCount!, pending.length);
+    const lanes = check.laneCap === undefined ? 0
+      : new Set([...openLaneKeys(stateDir, check.machine), ...pending.map((s) => s.key)].filter((k) => k !== key)).size;
+    const free = check.laneCap === undefined ? paneFree : Math.min(paneFree, Math.max(0, check.laneCap - lanes));
+    const verdict: LaunchVerdict = !check.verdict.ok ? check.verdict
+      : paneFree <= 0 ? { ok: false, reasons: [`launch slots 0 on machine ${check.machine}: ${pending.length} pending launch(es) fill the pane cap ${check.paneCap}`] }
+      : free <= 0 ? { ok: false, reasons: [`lanes ${lanes} >= maxLanes ${check.laneCap} on machine ${check.machine}`] }
+      : { ok: true, reasons: [] };
     if (claim && key !== undefined && verdict.ok) {
       const previous = slots.findIndex((s) => s.key === key);
       if (previous >= 0) slots.splice(previous, 1);

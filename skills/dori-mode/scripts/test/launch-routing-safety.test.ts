@@ -96,18 +96,16 @@ test("attachment preparation refuses before reservation, workspace creation, sta
   expect(world.calls.filter((c) => c.slice(0, 3).join(" ") === "herdr workspace create")).toEqual([]);
 });
 
-test.each([undefined, 4])("real RunnerCalls proto %s refusal releases the launch reservation with no attempt or send", async (proto) => {
+test("real RunnerCalls unknown-proto refusal releases the launch reservation with no attempt or send", async () => {
   const base = deps(), entry = input("old-runner", { cwd: "/scratch" });
   let sends = 0, attempts = 0, timers = 0;
-  const calls = new RunnerCalls({ proto: () => proto, now: () => T0, log: () => {},
+  const calls = new RunnerCalls({ proto: () => undefined, now: () => T0, log: () => {},
     timers: { set: () => { timers++; }, clear: () => {} }, attempts: { record: () => { attempts++; }, settle: () => {} },
     accept: { connected: () => true, command: () => { sends++; return 1; }, control: () => { sends++; return true; } },
   });
   const facade = laneOps(calls, { now: () => T0 });
   const d = { ...base, ops: { ...base.ops, start: facade.start } };
-  const detail = proto === undefined
-    ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
-    : "lane files require proto 5 (runner proto 4); run dori runner update";
+  const detail = "lane files need the runner's proto (unknown); wait for its hello and retry";
   await expect(launchLane(d, entry)).rejects.toThrow(`old-runner: RUNNER_OUTDATED runner=local outdated: ${detail}`);
   expect([sends, attempts, timers, calls.pending()]).toEqual([0, 0, 0, 0]);
   expect(await base.registry.read(entry.key)).toBeNull();

@@ -7,7 +7,8 @@ import type { Http, HttpRequest } from "../src/messenger/http.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { Repos, ReposError } from "../src/repos.ts";
 import { DORI_CONFIG_KEYS } from "../src/config-keys.ts";
-import { CONFIG_REMOVALS_FILE, envGet, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY } from "../src/setup.ts";
+import { envFileValue } from "../src/credentials.ts";
+import { CONFIG_REMOVALS_FILE, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY } from "../src/setup.ts";
 import { CONFIG_SCHEMA_VERSION } from "../src/config-schema.ts";
 import { withState } from "./fakes.ts";
 
@@ -115,7 +116,7 @@ test("envSet replaces the token line in place and keeps every other line", () =>
   const text = "A=1\nexport DORI_DISCORD_TOKEN='old'\nB=2\n";
   const next = envSet(text, "DORI_DISCORD_TOKEN", "new");
   expect(next).toBe("A=1\nDORI_DISCORD_TOKEN=new\nB=2\n");
-  expect(envGet(text, "DORI_DISCORD_TOKEN")).toBe("old");
+  expect(envFileValue(text, "DORI_DISCORD_TOKEN")).toBe("old");
   expect(envSet("", "K", "v")).toBe("K=v\n");
 });
 
@@ -163,7 +164,7 @@ test("non-interactive setup writes env 600, config with herdr ids and units, nev
   expect(code).toBe(0);
 
   expect(mode(d.envPath)).toBe(0o600);
-  expect(envGet(readFileSync(d.envPath, "utf8"), "DORI_DISCORD_TOKEN")).toBe(TOKEN);
+  expect(envFileValue(readFileSync(d.envPath, "utf8"), "DORI_DISCORD_TOKEN")).toBe(TOKEN);
   const cfg = readJson(d.configPath);
   expect(cfg).not.toHaveProperty("custom");
   expect(cfg).toMatchObject({ hooks: { threadReply: ["notify", "{text}"] }, discordChannels: [CHANNEL], leadCwd: "~/code", stateDir: "~/.dori/state", ignorePanes: ["w2:p1"] });

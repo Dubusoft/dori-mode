@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 
-import { autopilotLaneKey, depSatisfied, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
+import { autopilotLaneKey, depSatisfied, isRecord, laneKeyOf, LAUNCH_ACTION, ledgerRows, ledgerState, OWNER_REF, rearmedThrough } from "./autopilot.ts";
 import { type AutopilotDeps, EXECUTE_ACTION as EXECUTE, liveJudgeDeps, readPause, reserveAutopilot } from "./autopilot-cli.ts";
 import { type AutopilotContract, planTask } from "./autopilot-plan.ts";
 import { autopilotThreadChannelOf } from "./config.ts";
@@ -44,11 +44,14 @@ import { ToodoClient, ToodoWriter } from "./toodo-client.ts";
 
 type Terminal = "launched" | "review" | "failed" | "ambiguous";
 
-/** An execution's current result. Held and paused executions retain their original reservation. */
+/**
+ * An execution's current result. Held and paused executions retain their original reservation. A throw is kept to its
+ * task: `error` before any execution existed (nothing started), `interrupted` inside an open one (the next pass resumes it).
+ */
 export type ExecutorResult = {
   readonly taskId: number;
   readonly laneKey?: string;
-  readonly kind: Terminal | "held" | "paused" | "disabled" | "refused";
+  readonly kind: Terminal | "held" | "paused" | "disabled" | "refused" | "error" | "interrupted";
   readonly reasons?: readonly string[];
 };
 
@@ -100,7 +103,16 @@ type Execution = {
   readonly reasons?: readonly string[];
 };
 
-const dataOf = (row: Operation): Execution => JSON.parse(row.data!) as Execution;
+/** A sequence row's execution, checked shallowly: corrupt or older data fails here by name, not as an undefined read later. */
+const dataOf = (row: Operation): Execution => {
+  let data: unknown;
+  try { data = JSON.parse(row.data ?? ""); } catch { data = undefined; }
+  const missing = isRecord(data)
+    ? [typeof data.taskId !== "number" && "taskId", typeof data.laneKey !== "string" && "laneKey", !isRecord(data.contract) && "contract"].filter((f) => f !== false)
+    : ["JSON object"];
+  if (missing.length > 0) throw new Error(`AUTOPILOT_EXECUTION_MALFORMED ${row.id} data has no valid ${missing.join(", ")}`);
+  return data as Execution;
+};
 const step = (row: Operation, name: string, data: unknown): OperationSpec =>
   ({ lane: row.lane, action: `autopilot-${name}`, target: row.target, data: JSON.stringify(data) });
 const stepId = (row: Operation, name: string): string => `${row.lane}/autopilot-${name}/${row.target}`;
@@ -215,7 +227,12 @@ const launchReadback = async (deps: ExecutorDeps, row: Operation): Promise<Obser
   return deps.observeLaunch(data.input!);
 };
 
-const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResult> => {
+/**
+ * Runs or resumes one execution. The contract is read again (guard) before each effect others can see: the reservation,
+ * start-task, the thread and the launch. `prepared` means the caller read it under this same lock with only local writes
+ * since, so the first check is that read. The brief is lead-local, so the check before the launch covers it too.
+ */
+const resume = async (deps: ExecutorDeps, row: Operation, prepared = false): Promise<ExecutorResult> => {
   let data = dataOf(deps.store.get(row.id)!);
   if (data.outcome) return finish(deps, row);
   // Read back an attempted launch before pause or scope checks: its effect may already exist.
@@ -233,7 +250,7 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     }
   }
   if (readPause(deps.pauseFile)) return resultOf(data, "paused");
-  const changed = await guard(deps, row);
+  const changed = prepared ? undefined : await guard(deps, row);
   if (changed) return changed;
   await perform(deps.store, deps.now, step(row, "prepare", { taskId: data.taskId, laneKey: data.laneKey, version: data.contract.version, base: data.contract.base }),
     async () => ({ ok: true, detail: "contract prepared" }), async () => "done");
@@ -254,7 +271,7 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
       return task?.refs.includes(`lane:${data.laneKey}`) && task.status !== "planned" ? "done" : "not-done";
     });
   if (started.op.state !== "verified") {
-    if (started.op.state === "ambiguous") return stop(deps, row, "ambiguous", [started.op.detail]);
+    if (started.op.state === "ambiguous") return stop(deps, row, "ambiguous", [`at start-task, before any lane launched: ${started.op.detail}`]);
     return resultOf(data, "held");
   }
   const beforeThread = await guard(deps, row);
@@ -276,8 +293,6 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     });
   if (threaded.op.state !== "verified") return stop(deps, row, "ambiguous", [threaded.op.detail]);
   data = dataOf(deps.store.get(row.id)!);
-  const beforeBrief = await guard(deps, row);
-  if (beforeBrief) return beforeBrief;
   const input: LaunchInput = data.input ?? {
     key: data.laneKey, title: data.title, brief: join(deps.stateDir, "autopilot", data.laneKey, "brief.md"),
     done: data.contract.done, mode: data.contract.mode, ...(data.contract.model ? { model: data.contract.model } : {}),
@@ -314,6 +329,8 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
   try { await deps.validate(launch); } catch (e) {
     return stop(deps, row, "failed", [e instanceof Error ? e.message : String(e)]);
   }
+  // Placement and validation wait on the runner: a pause that landed meanwhile still stops the launch.
+  if (readPause(deps.pauseFile)) return resultOf(data, "paused");
   if (!placed.plan.check.verdict.ok) {
     const held = await perform(deps.store, deps.now, step(row, "hold", { input: launch, placed, base: data.contract.base }),
       async () => ({ ok: (await deps.admit(launch, placed)).kind === "held", detail: "queued" }),
@@ -337,19 +354,23 @@ const resume = async (deps: ExecutorDeps, row: Operation): Promise<ExecutorResul
     admitted.op.state === "verified" ? undefined : [admitted.op.detail]);
 };
 
-/** Execute LAUNCH candidates serially under the same lock as the CLI. Existing executions resume their original key. */
+/**
+ * Execute LAUNCH candidates serially under the same lock as the CLI. Existing executions resume their original key.
+ * A task that throws (an unreadable Toodo) gets its own error result; earlier results stand and later tasks still run.
+ */
 export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]): Promise<ExecutorResult[]> => {
   const results: ExecutorResult[] = [];
   for (const taskId of new Set(taskIds)) {
     if (!deps.config.executor) { results.push({ taskId, kind: "disabled" }); continue; }
     const release = await deps.lock();
+    let row: Operation | undefined;
     try {
       // Sequences and attempts the owner covered (a re-arm, or a pause and a wait that ended since) are the owner's to
       // forget; the next one is attempt through + 1. The task is read only when an attempt is left to cover.
       const ledger = ledgerRows(deps.store);
       const executions = deps.store.list({ lane: `toodo:${taskId}` }).filter((op) => op.action === EXECUTE);
       const running = executions.find((op) => ["planned", "attempted"].includes(op.state) && Number(op.target) > rearmedThrough(ledger, taskId));
-      if (running) { results.push(await resume(deps, running)); continue; }
+      if (running) { row = running; results.push(await resume(deps, running)); continue; }
       const rearmed = ledgerState(ledger, taskId, new Set());
       const task = rearmed.attempts > 0 ? await deps.toodo().task(taskId) : undefined;
       const state = task ? ledgerState(ledger, taskId, new Set(), task) : rearmed;
@@ -369,16 +390,61 @@ export const runExecutor = async (deps: ExecutorDeps, taskIds: readonly number[]
         taskId, laneKey, title: ready.task.title, contract: ready.contract, brief: ready.brief,
         thread: { parent: deps.parentChannel, title: `${laneKey}: ${ready.task.title}`.slice(0, 100) },
       };
-      const row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: EXECUTE, target: String(attempt), data: JSON.stringify(data) });
-      results.push(await resume(deps, row));
+      row = plan(deps.store, deps.now(), { lane: `toodo:${taskId}`, action: EXECUTE, target: String(attempt), data: JSON.stringify(data) });
+      results.push(await resume(deps, row, true));
+    } catch (e) {
+      const why = e instanceof Error ? e.message : String(e);
+      deps.err(`AUTOPILOT_EXECUTOR_ERROR #${taskId} ${why}`);
+      // laneKeyOf, not dataOf: the throw may be the row's own malformed data.
+      const laneKey = row ? laneKeyOf(row) : undefined;
+      results.push(row ? { taskId, ...(laneKey ? { laneKey } : {}), kind: "interrupted", reasons: [why] } : { taskId, kind: "error", reasons: [why] });
     } finally { release(); }
   }
   return results;
 };
 
-/** At startup and each tick, resume open sequences (including HOLD); settled or ambiguous launches never relaunch. */
-export const reconcileExecutions = (deps: ExecutorDeps): Promise<ExecutorResult[]> =>
-  runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE).map((op) => dataOf(op).taskId));
+/**
+ * Report, once per attempt, an ambiguous start-task that never reached hold or admit while Toodo shows the task
+ * in_progress with its lane ref and no lane or queued launch exists for the key. Each attempt is checked until one read
+ * answers, then recorded either way; an unreadable task or lane is unknown and waits for a later tick. Never pauses, edits or relaunches the task.
+ */
+const reportOrphans = async (deps: ExecutorDeps): Promise<void> => {
+  const ledger = ledgerRows(deps.store);
+  const candidates = deps.store.list({ states: ["ambiguous"] }).filter((op) => op.action === EXECUTE
+    && deps.store.get(stepId(op, "start-task"))?.state === "ambiguous"
+    && !deps.store.get(stepId(op, "admit")) && !deps.store.get(stepId(op, "hold"))
+    && deps.store.get(stepId(op, "orphan"))?.state !== "verified"
+    && Number(op.target) > rearmedThrough(ledger, dataOf(op).taskId));
+  for (const row of candidates) {
+    const { taskId, laneKey } = dataOf(row);
+    let orphaned: boolean;
+    try {
+      const task = await deps.toodo().task(taskId);
+      orphaned = task?.status === "in_progress" && task.refs.includes(`lane:${laneKey}`)
+        && !(await deps.readLane(laneKey)) && !deps.queue().some((q) => q.key === laneKey);
+    } catch { continue; }
+    let journaled = false;
+    await perform(deps.store, deps.now, step(row, "orphan", { taskId, laneKey }), async () => {
+      journaled = true;
+      if (!orphaned) return { ok: true, detail: "not orphaned" };
+      deps.notify(stepId(row, "orphan"), `AUTOPILOT_EXECUTOR_ORPHAN #${taskId} lane=${laneKey} Toodo shows the task in_progress with lane:${laneKey} `
+        + `but no lane was ever launched (start-task was ambiguous, nothing held or admitted); check nobody works it, then pause it in Toodo `
+        + `and leave the next attempt to the owner: a wait set after the pause runs attempt ${Number(row.target) + 1} when it ends, \`dori autopilot rearm ${taskId}\` runs it now`);
+      return { ok: true, detail: "journaled" };
+    }, async () => journaled ? "done" : "not-done");
+  }
+};
+
+/** At startup and each tick, resume open sequences (including HOLD) and report orphaned starts; settled or ambiguous launches never relaunch. */
+export const reconcileExecutions = async (deps: ExecutorDeps): Promise<ExecutorResult[]> => {
+  const results = await runExecutor(deps, deps.store.list({ states: ["planned", "attempted"] }).filter((op) => op.action === EXECUTE)
+    // The task id from the row's lane, so one malformed row is that task's interrupted result, not the whole pass's throw.
+    .map((op) => Number(op.lane.slice("toodo:".length))));
+  if (!deps.config.executor) return results;
+  const release = await deps.lock();
+  try { await reportOrphans(deps); } finally { release(); }
+  return results;
+};
 
 /**
  * Live dependencies over FlowDeps and a caller-owned operation store. notify enqueues a stable supervisor event id;

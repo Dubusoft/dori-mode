@@ -2,12 +2,12 @@ import { fillHook } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { discordStatusTransport, type LaneStatusTransport } from "./lane-status.ts";
 import { redirectHookPost } from "./thread-followup.ts";
+import { errLine, oneLine } from "./line-text.ts";
 
 /** Marks every sandbox notice so the owner reads it as a warning about the lane's isolation, not as lane output. */
 export const SANDBOX_NOTICE_PREFIX = "[sandbox] ";
 
-const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim().slice(0, 160);
-const failure = (prefix: string, error: unknown): string => `${prefix}: ${oneLine(error instanceof Error ? error.message : String(error))}`;
+const failure = (prefix: string, error: unknown): string => `${prefix}: ${errLine(error, 160)}`;
 
 /**
  * Posts a sandbox refusal or an allowed unsandboxed run to the owner on Discord and returns the event lines to log.
@@ -40,7 +40,7 @@ export const postSandboxNotice = async (
     try {
       const posted = await deps.run(fillHook(hook, { thread: lane.thread, key: lane.key, text: body }));
       if (posted.code === 0) return [];
-      failures.push(`thread post failed: ${oneLine(posted.err || posted.out || `exit ${posted.code}`)}`);
+      failures.push(`thread post failed: ${oneLine(posted.err || posted.out || `exit ${posted.code}`, 160)}`);
     } catch (error) { failures.push(failure("thread post failed", error)); }
   }
   const main = deps.config.discordChannels[0];

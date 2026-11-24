@@ -225,8 +225,8 @@ export type DiscordInboundOptions = {
   readonly discordFirstSeenLimit?: number;
   /** Called for each non-bot message with neither content nor attachments: the Message Content intent is missing. */
   readonly onMissingContent?: () => void;
-  /** Called after an owner message is emitted, e.g. to track it for edit and delete notices. */
-  readonly onOwner?: (channel: string, id: string) => void;
+  /** Called after an owner message is emitted, e.g. to track it for edit and delete notices or record it as a decision answer. */
+  readonly onOwner?: (channel: string, id: string, m: InboundMessage) => void;
   /**
    * Decides an owner message's side before anything is emitted (decision-inbound.ts): "direct" means it went to a lane
    * as a decision answer, so neither INBOUND nor onOwner follows; absent or "lead" emits as before.
@@ -296,7 +296,7 @@ export const emitDiscordInbound = async (
     pendingHydration.set(pendingKey, true);
     if (pendingHydration.size > PENDING_HYDRATION_LIMIT) pendingHydration.delete(pendingHydration.keys().next().value as string);
   }
-  if (owner) options.onOwner?.(channel, m.id);
+  if (owner) options.onOwner?.(channel, m.id, m);
 };
 
 /** Marks an owner's edited instruction: the new text supersedes the message with the same id. */

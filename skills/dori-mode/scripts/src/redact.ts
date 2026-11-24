@@ -1,11 +1,17 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { envFilePath } from "./credentials.ts";
+import { envFilePath, parseEnvFile } from "./credentials.ts";
 
 const MASK = "[REDACTED]";
 
 /** Env names whose values are credentials: a name ending in one of these words, or containing WEBHOOK/CREDENTIAL. */
 const SECRET_NAME = /(?:TOKEN|SECRET|KEY|COOKIE|PASSWORD|PASSWD)$|WEBHOOK|CREDENTIAL/i;
-const MIN_KNOWN_SECRET = 8;
+// Decision: store values keep this floor too (a PIN would mask every match in ordinary text); `dori secret add/update` warn SECRET_NOT_MASKED instead.
+export const MIN_KNOWN_SECRET = 8;
+/**
+ * Shortest line of a multiline secret (a JSON service account key, a PEM body) masked when it shows up on its own: a log
+ * printed line by line leaks the value one line at a time. Shorter lines (`{`, `},`, `"type": "x",`) say nothing secret.
+ */
+const MIN_SECRET_LINE = 16;
 
 let storeSecrets = new Set<string>();
 
@@ -30,26 +36,38 @@ const envFileSecrets = (): readonly string[] => {
     const st = statSync(path);
     const key = `${path}:${st.mtimeMs}:${st.size}`;
     if (envCache?.key === key) return envCache.values;
-    const values: string[] = [];
-    for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-      const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
-      if (!m || !SECRET_NAME.test(m[1] ?? "")) continue;
-      const value = (m[2] ?? "").trim().replace(/^(["'])(.*)\1$/, "$2");
-      if (value.length >= MIN_KNOWN_SECRET) values.push(value);
-    }
+    const values = parseEnvFile(readFileSync(path, "utf8"))
+      .filter(([name, value]) => SECRET_NAME.test(name) && value.length >= MIN_KNOWN_SECRET)
+      .map(([, value]) => value);
     envCache = { key, values };
     return values;
   } catch { return []; }
 };
 
-/** Exact-match masking of the secret values the env file and the process environment carry, longest value first. */
+/** `value` as a pattern whose whitespace runs match any whitespace run, so text flattened to one line still matches it. */
+const loosePattern = (value: string): RegExp =>
+  new RegExp(value.trim().split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+"), "g");
+
+/**
+ * Masking of the secret values the env file, the secret store and the process environment carry, longest first. A value
+ * holding whitespace also matches with its whitespace changed (newlines flattened to spaces before redaction), and each
+ * line of a multiline value of MIN_SECRET_LINE+ characters is masked on its own.
+ */
 const maskKnownSecrets = (text: string): string => {
   const known = new Set([...envFileSecrets(), ...storeSecrets]);
   for (const [name, value] of Object.entries(process.env)) {
     if (value && value.length >= MIN_KNOWN_SECRET && SECRET_NAME.test(name)) known.add(value);
   }
+  for (const value of [...known]) {
+    if (!/[\r\n]/.test(value)) continue;
+    for (const line of value.split(/\r?\n/)) if (line.trim().length >= MIN_SECRET_LINE) known.add(line.trim());
+  }
   let out = text;
-  for (const value of [...known].sort((a, b) => b.length - a.length)) if (out.includes(value)) out = out.split(value).join(MASK);
+  for (const value of [...known].sort((a, b) => b.length - a.length)) {
+    // A value that is mostly whitespace keeps exact matching: its loose pattern would match (almost) anything.
+    if (/\s/.test(value) && value.trim().length >= MIN_KNOWN_SECRET) out = out.replace(loosePattern(value), MASK);
+    else if (out.includes(value)) out = out.split(value).join(MASK);
+  }
   return out;
 };
 

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type { GuardThresholds } from "../src/config.ts";
 import {
@@ -123,7 +123,7 @@ test("machine guard state survives a save and load; an old file loads, a missing
     const state: MachineGuardState = new Map();
     machineGuardTick([{ machine: mac, sample: { ...healthy, memFreePct: 5 } }], T, state);
     saveMachineGuardState(path, state);
-    expect(existsSync(`${path}.tmp.${process.pid}`)).toBe(false);
+    expect(readdirSync(dirname(path))).toEqual(["machine-guard.json"]);
     const loaded = loadMachineGuardState(path);
     expect(loaded).toEqual(state);
     // Reloaded state does not report the ALERT again.

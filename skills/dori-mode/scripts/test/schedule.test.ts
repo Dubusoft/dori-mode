@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { readFileSync, watch } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
@@ -7,7 +7,7 @@ import { resolveEventPolicy } from "../src/event-policy.ts";
 import { EventSources, readSourceStatus, SourceError, SourceSpecs } from "../src/event-sources.ts";
 import { openOperations, type OperationStore, plan, settleOperation } from "../src/operations.ts";
 import type { Ran, Runner } from "../src/run.ts";
-import { nextCron, nextSlot, parseCron, queueRunNow, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "../src/schedule.ts";
+import { nextCron, nextSlot, parseCron, queueRunNow, RUN_NOW_DIR, SCHEDULE_ACTION, scheduleRow, type ScheduleSpec } from "../src/schedule.ts";
 import { collectStatus, renderStatus } from "../src/status.ts";
 import { supervise } from "../src/supervise-loop.ts";
 import { Supervisor } from "../src/supervise.ts";
@@ -45,12 +45,14 @@ const world = (run: Runner = async () => ok()) => {
   const clock = fakeClock(SINCE);
   const deps = depsFor(newWorld(), clock, state.dir, { eventPolicy: resolveEventPolicy({ kinds: {} }) });
   const heavy: Heavy = { free: "slot.1", taken: [], released: [] };
+  const logged: string[] = [];
   let open: { supervisor: Supervisor; ops: OperationStore; sources: EventSources } | undefined;
   const start = () => {
     const supervisor = new Supervisor(deps);
     const ops = openOperations(deps.config);
     const sources = new EventSources({
       stateDir: state.dir, enqueue: (id, line) => supervisor.enqueue(id, line), now: clock.now, run, policy: deps.tunables.eventPolicy,
+      log: (line) => { logged.push(line); },
       schedules: {
         operations: ops, journaled: (id) => supervisor.journaled(id),
         heavy: {
@@ -72,7 +74,7 @@ const world = (run: Runner = async () => ok()) => {
   start();
   const live = () => open ?? (() => { throw new Error("stopped"); })();
   return {
-    dir: state.dir, clock, deps, heavy,
+    dir: state.dir, clock, deps, heavy, logged,
     /** One registry pass, then wait for the jobs it started. */
     tick: async () => { await live().sources.tick(); await live().sources.settled(); },
     restart: () => { stop(); start(); },
@@ -155,6 +157,21 @@ test("catchUp skip records the missed slots without running them; the next slot 
   expect(w.lines("HOURLY")).toEqual(["HOURLY hourly"]);
 });
 
+test("catchUp skip: a missed slot a stop left planned is recorded skipped on the next start, never run", async () => {
+  const w = world();
+  w.specs.add({ name: "tick", type: "schedule", kind: "HOURLY", everySec: 3_600, text: "hourly", catchUp: "skip", since: SINCE });
+  w.clock.at = SINCE + 5 * 3_600_000 + 20 * 60_000;
+  // The supervisor stopped right after planning the missed slot, before recording it skipped.
+  plan(w.ops(), w.clock.at, { lane: "schedule:tick", action: SCHEDULE_ACTION, target: new Date(SINCE + 5 * 3_600_000).toISOString(), data: JSON.stringify({ missed: 5 }) });
+  w.restart();
+  await w.tick();
+  expect(w.lines("HOURLY")).toEqual([]);
+  const [skipped] = w.ops().list({ lane: "schedule:tick" });
+  expect(skipped?.state).toBe("verified");
+  expect(skipped?.detail).toContain("skipped: 5 slot(s) missed");
+  expect(readSourceStatus(w.dir)?.sources.tick).toMatchObject({ lastResult: "skipped 5 missed" });
+});
+
 test("a heavy command job waits for a free slot, releases it, and a failing command is one SCHEDULE_FAILED event", async () => {
   const calls: { argv: readonly string[]; timeoutMs?: number; cwd?: string }[] = [];
   const w = world(async (argv, opts) => {
@@ -222,6 +239,26 @@ test("run-now runs a job once as its own row and leaves its schedule as it was",
   const spec = w.specs.list()[0] as ScheduleSpec;
   expect(scheduleRow(spec, readSourceStatus(w.dir)?.sources.brief, w.clock.at).nextRunAt).toBe(nineKst(23));
   expect(nextSlot(spec, w.clock.at)).toBe(nineKst(23));
+  w.clock.at = nineKst(23) + 1_000;
+  await w.tick();
+  expect(w.lines("DAILY_BRIEF")).toHaveLength(2);
+});
+
+test("a run-now request whose time is no date is set aside and the schedules keep ticking", async () => {
+  const w = world();
+  w.specs.add({ name: "brief", type: "schedule", kind: "DAILY_BRIEF", cron: "0 9 * * *", text: "morning brief", since: SINCE });
+  w.clock.at = SINCE + 3_600_000;
+  const dir = join(w.dir, RUN_NOW_DIR);
+  mkdirSync(dir, { recursive: true });
+  // 1e999 parses as Infinity; 1e300 is finite but past the last date a Date can hold.
+  writeFileSync(join(dir, "0-infinite.json"), '{"name":"brief","at":1e999}');
+  writeFileSync(join(dir, "1-out-of-range.json"), '{"name":"brief","at":1e300}');
+  queueRunNow(w.dir, "brief", w.clock.at);
+  await w.tick();
+  await w.tick();
+  expect(existsSync(join(dir, "0-infinite.json.bad")) && existsSync(join(dir, "1-out-of-range.json.bad"))).toBe(true);
+  expect(w.logged.filter((line) => line.startsWith("SCHEDULE_RUN_NOW_BAD"))).toHaveLength(2);
+  expect(w.lines("DAILY_BRIEF")).toHaveLength(1);
   w.clock.at = nineKst(23) + 1_000;
   await w.tick();
   expect(w.lines("DAILY_BRIEF")).toHaveLength(2);

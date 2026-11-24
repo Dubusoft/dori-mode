@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { Database } from "bun:sqlite";
 import { join } from "node:path";
 
-const [mode, stateDir = ""] = process.argv.slice(2);
+const [mode = "", stateDir = ""] = process.argv.slice(2);
 const signal = (event: string) => fs.writeSync(1, `${event}\n`);
 const barrier = () => {
   if (fs.readSync(0, Buffer.alloc(1), 0, 1, null) !== 1) throw new Error("parent closed barrier");
@@ -48,14 +48,15 @@ if (mode === "hold-fsync") {
   }));
 }
 
-if (mode === "hold-first" || mode === "hold-second") {
+const pausedRead = mode.startsWith("hold-") ? "launch-hold.json" : mode.startsWith("owner-closed-") ? "owner-closed-threads.json" : undefined;
+if (pausedRead && mode !== "hold-fsync") {
   const originalRead = fs.readFileSync;
   let intercepted = false;
   mock.module("node:fs", () => ({
     ...fs,
     readFileSync: (...args: Parameters<typeof fs.readFileSync>) => {
       const result = originalRead(...args);
-      if (!intercepted && String(args[0]) === join(stateDir, "launch-hold.json")) {
+      if (!intercepted && String(args[0]) === join(stateDir, pausedRead)) {
         intercepted = true;
         signal("read");
         barrier();
@@ -63,7 +64,7 @@ if (mode === "hold-first" || mode === "hold-second") {
       return result;
     },
   }));
-  if (mode === "hold-second") {
+  if (mode === "hold-second" || mode === "owner-closed-second") {
     const exec = Database.prototype.exec;
     Database.prototype.exec = function (sql: string) {
       if (sql.includes("BEGIN")) { signal("locking"); barrier(); }
@@ -100,6 +101,9 @@ if (mode === "registry-holder" || mode === "registry-publication-holder" || mode
     if (!(error instanceof LaunchError) || !error.message.includes("already registered")) throw error;
     signal("refused");
   }
+} else if (mode === "owner-closed-first" || mode === "owner-closed-second") {
+  const { recordOwnerClosed } = await import("../../src/thread-followup.ts");
+  recordOwnerClosed(stateDir, mode === "owner-closed-first" ? "901" : "902", 1);
 } else {
   const { enqueueLaunch } = await import("../../src/routing.ts");
   enqueueLaunch(stateDir, {

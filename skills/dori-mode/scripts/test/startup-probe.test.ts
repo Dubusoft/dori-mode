@@ -104,7 +104,7 @@ test("a start that hangs is killed and restarted within TimeoutStartSec + 60 s, 
 });
 
 /** The first-pass timing line of each supervisor task (the sweeps report theirs as first-sweep). */
-const FIRSTS = ["first-autopilot", "first-delivery", "first-inbound", "first-polling", "first-runners", "first-sweep"];
+const FIRSTS = ["first-autopilot", "first-delivery", "first-inbound", "first-notices", "first-polling", "first-reports", "first-runners", "first-sweep"];
 
 test("a normal start logs one STARTUP_TIMINGS line for the steps up to READY=1 and one for each task's first pass", async () => {
   // Given the real supervise() on fakes, stopped as soon as every task has reported its first pass.
@@ -135,7 +135,7 @@ test("a normal start logs one STARTUP_TIMINGS line for the steps up to READY=1 a
   expect(lines.map((line) => line.split(" ")[1]).sort()).toEqual([...FIRSTS, "ready"].sort());
   expect(lines[0]?.startsWith("STARTUP_TIMINGS ready ")).toBe(true);
   expect(steps(label("ready"))).toEqual(["lock", "gateway-lock", "supervisor", "schedules", "waits", "github", "review-gate", "ci-follow", "inbound", "lane-reports", "runners", "ready"]);
-  for (const task of ["inbound", "delivery", "polling", "runners"]) expect(steps(label(`first-${task}`))).toEqual([`task:${task}`]);
+  for (const task of ["inbound", "delivery", "notices", "polling", "reports", "runners"]) expect(steps(label(`first-${task}`))).toEqual([`task:${task}`]);
   expect(steps(label("first-sweep"))).toEqual([
     "loop:sweep:snapshot", "loop:sweep:watch", "loop:sweep:guard", "loop:sweep:dead-panes", "loop:sweep:recover", "loop:sweep:decision-resume", "loop:sweep:freshness",
     "loop:sweep:drift", "loop:sweep:memory-size", "loop:sweep:memory", "loop:sweep:auto-update", "loop:sweep:machine-guard",

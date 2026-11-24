@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Finding, ReviewReceipt } from "./review-receipt.ts";
+import { oneLine } from "./line-text.ts";
 
 /**
  * Author answers to review findings (review fix loop, spec section A).
@@ -34,7 +35,6 @@ const sha256 = (text: string): string => createHash("sha256").update(text, "utf8
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /** Collapse every run of whitespace to one space and trim the ends. */
-const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 /** Name of the answer file the author writes in its lane output directory for a findings job. */
 export const responseFileName = (jobId: string): string => `review-response-${jobId}.json`;

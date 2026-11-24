@@ -11,9 +11,9 @@ import type { DoriConfig } from "../src/config.ts";
 import { UNRESOLVED_FILE } from "../src/decision-obligations.ts";
 import { claimGate } from "../src/ci-follow.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
-import { OUTCOME_LINE_MAX } from "../src/lane-outcomes.ts";
+import { OUTCOME_LINE_MAX, pendingReported } from "../src/lane-outcomes.ts";
 import { sendVerified, UnsafeTextError } from "../src/panes.ts";
-import { type Lane, statusOf, withStatus } from "../src/registry.ts";
+import { type Lane, Registry, statusOf, withStatus } from "../src/registry.ts";
 import { LAUNCH_ACTION, ledgerRows, ledgerState } from "../src/autopilot.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, type World, WT, withSqliteStore } from "./fakes.ts";
@@ -183,6 +183,35 @@ test("after an objection the same evidence claims again", async () => {
   expect(after?.claim?.at).toBe(new Date(T0 + 2 * MIN).toISOString());
 });
 
+test("a claim or an objection whose lane closes just before it is written is reported closed and leaves the archived record as it was", async () => {
+  livePane();
+  const closedAt = new Date(T0).toISOString();
+  // The close lands between the caller's read of the lane and its registry update.
+  const closing = (): FlowDeps => ({ ...at(T0 + MIN), registry: new (class extends Registry {
+    override async update(...args: Parameters<Registry["update"]>) {
+      if (!(await this.read(lane.key))?.closedAt) await this.write(withStatus(lane, "closed", "Done", closedAt, { closedAt }));
+      return super.update(...args);
+    }
+  })(state.dir) });
+  const archive = () => readFileSync(at(T0).registry.archivePath(lane.key), "utf8");
+
+  const claimed = closing();
+  expect(await claimDone(claimed, lane, "merged acme/app#1")).toBe("LANE_DONE_NOT_CLAIMED demo-lane is closed");
+  const closed = archive();
+  expect(JSON.parse(closed)).toMatchObject({ status: "closed", version: 2 });
+  expect(JSON.parse(closed).claim).toBeUndefined();
+  expect(await objectDone(claimed, lane, ["tests red"])).toBe("LANE_NOT_DONE_SKIPPED demo-lane is closed; the objection was not recorded");
+  expect(archive()).toBe(closed);
+
+  await at(T0).registry.write({ ...lane, closedAt: undefined, status: "working" });
+  expect(await objectDone(closing(), lane, ["tests red"])).toBe("LANE_NOT_DONE_SKIPPED demo-lane is closed; the objection was not recorded");
+  const reclosed = JSON.parse(archive()) as Lane;
+  expect(statusOf(reclosed)).toBe("closed");
+  expect(reclosed.objection).toBeUndefined();
+  // The lane was told nothing: no status notice, no claim or objection message.
+  expect(world.ops.filter((e) => e.op === "notify" || e.op === "send")).toEqual([]);
+});
+
 test("claim evidence and objection reasons are capped at 300 chars in event lines, and kept whole in the registry", async () => {
   const evidence = "e".repeat(400);
   expect(await claimDone(at(T0), { ...lane, pane: undefined }, evidence)).toBe(`LANE_DONE_CLAIMED demo-lane - ${"e".repeat(299)}…`);
@@ -242,6 +271,28 @@ test("a close runs through the lane's runner: inspect, then lane.close, with its
   expect(removals()).toEqual([]);
   expect(((await at(T0).registry.read("demo-lane"))?.receipt as { cleanup: string[] }).cleanup).toContain(`worktree ${WT} queued: removed by the closed-lane cleanup once clean and pushed`);
   expect(world.ops.find((e) => e.op === "close")?.args).toEqual({ opts: { cmdId: "op:demo-lane/pane-close/w:p1:1" } });
+});
+
+test("a pane still listed after its close leaves the lane open, and the next close retries it", async () => {
+  livePane();
+  const stuck = at(T0);
+  const r = await closeLane({ ...stuck, ops: { ...stuck.ops, close: async () => ({ closed: "pane", gone: false }) } }, lane, "manual");
+  expect(r.closed).toBe(false);
+  expect(r.lines.at(-1)).toStartWith("REFUSED demo-lane: pane w:p1 is still listed after its close");
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).not.toBe("closed");
+  const again = await closeLane(at(T0 + MIN), lane, "manual");
+  expect(again.closed).toBe(true);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("closed");
+});
+
+test("a runner lane with no recorded pane whose runner still lists its pane after lane.close is left open", async () => {
+  const reserved: Lane = { ...lane, key: "reserved-lane", pane: undefined, runner: "local", status: "paused", launchReservation: "tok" };
+  await at(T0).registry.write(reserved);
+  const d = at(T0);
+  const r = await closeLane({ ...d, ops: { ...d.ops, close: async () => ({ closed: "tab", gone: false }) } }, reserved, "cancelled", { cancelled: { reason: "launch timed out" } });
+  expect(r.closed).toBe(false);
+  expect(r.lines.at(-1)).toStartWith("REFUSED reserved-lane: runner lane reserved-lane is still listed after its close");
+  expect(statusOf((await at(T0).registry.read("reserved-lane"))!)).not.toBe("closed");
 });
 
 test("cancelling a runner lane whose start never reported a pane still sends lane.close for its key", async () => {
@@ -434,7 +485,7 @@ test("a Done=merged claim objects with the reason once a check fails, the head m
 
 test("a fresh claim is read once before it wakes the lead: a conflict, a failed check, a moved head or unpushed work is objected to instead", async () => {
   world.prState = "OPEN";
-  const view = { mergeable: "MERGEABLE", head: "a".repeat(40), checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] as { status: string; conclusion?: string }[] };
+  const view = { mergeable: "MERGEABLE", head: "a".repeat(40), checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }] as { status: string; conclusion?: string; name?: string; startedAt?: string }[] };
   const { bound, deps } = mergeOnly({ state: "OPEN", checks: [] });
   const live = (ms: number): FlowDeps => {
     const base = deps(ms);
@@ -465,9 +516,11 @@ test("a fresh claim is read once before it wakes the lead: a conflict, a failed 
   world.aheadCount = "1";
   await claim(T0 + 3 * MIN);
   expect(await reasons()).toEqual([`unpushed work in ${WT}`]);
-  // None of these woke the lead with a claim; a clean read does, with its snapshot.
+  // None of these woke the lead with a claim; a clean read does, with its snapshot. A check that ran twice at the head
+  // reads by its newest run, so the CANCELLED run a later SUCCESS replaced is no failed check.
   world.aheadCount = "0";
-  expect(await claim(T0 + 4 * MIN)).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 claim ${T0 + 4 * MIN} | verified: pr=#1 head=aaaaaaa checks=none conflict=no sig=0/1`]);
+  view.checks = [{ name: "preview", status: "COMPLETED", conclusion: "CANCELLED", startedAt: "2026-01-01T12:00:00Z" }, { name: "preview", status: "COMPLETED", conclusion: "SUCCESS", startedAt: "2026-01-01T12:00:05Z" }];
+  expect(await claim(T0 + 4 * MIN)).toEqual([`LANE_DONE_CLAIMED demo-lane w:p1 claim ${T0 + 4 * MIN} | verified: pr=#1 head=aaaaaaa checks=green conflict=no sig=0/1`]);
 });
 
 test("a PR GitHub cannot be read for at the claim is UNREAD in the snapshot, never green and never an objection", async () => {
@@ -482,7 +535,7 @@ test("a PR GitHub cannot be read for at the claim is UNREAD in the snapshot, nev
 });
 
 /** A lane whose Done is `pr acme/app feat/x`: its green PR #7 (into `base`) reads live while open; the claim binds it at HEAD. */
-const greenPrLane = (pr: { state: string; base: string }) => {
+const greenPrLane = (pr: { state: string; base: string; mergeable?: string }) => {
   const HEAD = "c".repeat(40);
   const bound: Lane = { ...lane, done: "pr acme/app feat/x" };
   const green = [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }];
@@ -493,7 +546,7 @@ const greenPrLane = (pr: { state: string; base: string }) => {
     const run = async (argv: readonly string[], opts?: { timeoutMs?: number }) => {
       const json = (body: unknown) => ({ code: 0, out: JSON.stringify(body), err: "" });
       if (argv[0] === "gh" && argv[2] === "list" && argv.includes("open")) return json(pr.state === "OPEN" ? [{ number: 7, state: "OPEN", headRefOid: HEAD, isCrossRepository: false }] : []);
-      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: green });
+      if (argv[0] === "gh" && argv[2] === "view" && argv[3] === "7") return json({ state: pr.state, baseRefName: pr.base, headRefOid: HEAD, isDraft: false, mergeable: pr.mergeable ?? "MERGEABLE", mergeStateStatus: pr.mergeable === "CONFLICTING" ? "DIRTY" : "CLEAN", statusCheckRollup: green });
       return base.run(argv, opts);
     };
     return { ...base, run };
@@ -534,6 +587,28 @@ test("a green PR the supervisor never merges (another base) does not hold the cl
   await watchTick(deps(T0 + 10 * MIN));
   expect(await watchTick(deps(T0 + 69 * MIN))).toEqual([]);
   expect((await watchTick(deps(T0 + 70 * MIN)))[0]).toStartWith("LANE_CLOSED demo-lane");
+});
+
+test("a claimed PR that conflicts with its base by the settle is objected to, never closed verified-done, whatever its base or the merge wait", async () => {
+  livePane();
+  const pr: { state: string; base: string; mergeable?: string } = { state: "OPEN", base: "dev" };
+  const { bound, deps } = greenPrLane(pr);
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0), bound, "https://github.com/acme/app/pull/7 green");
+  await watchTick(deps(T0));
+  // Clean at the claim; another merge into dev makes it conflict inside the window.
+  pr.mergeable = "CONFLICTING";
+  expect(await watchTick(deps(T0 + 6 * MIN))).toEqual(["LANE_NOT_DONE demo-lane acme/app#7 conflicts with its base"]);
+  expect(statusOf((await at(T0).registry.read("demo-lane"))!)).toBe("not-done");
+  // Neither a base the supervisor never merges into nor a claim past mergeWaitMaxMin closes a conflicting PR.
+  pr.base = "main";
+  pr.mergeable = undefined;
+  await deps(T0).registry.write(bound);
+  await claimDone(deps(T0 + 10 * MIN), bound, "PR into main green");
+  await watchTick(deps(T0 + 10 * MIN));
+  pr.mergeable = "CONFLICTING";
+  expect(await watchTick(deps(T0 + 80 * MIN))).toEqual(["LANE_NOT_DONE demo-lane acme/app#7 conflicts with its base"]);
+  expect(closedVia()).toHaveLength(0);
 });
 
 test("a watcher restarted inside the window keeps the original deadline and announces the claim once", async () => {
@@ -897,6 +972,30 @@ for (const [name, claim] of notReported) {
     expect(posts).toEqual([]);
   });
 }
+
+test("a claim of a lane reportQuietLanes names is recorded reported with no post and reaches the lead as digest; other lanes still wake it", async () => {
+  livePane();
+  const { posts, post } = recordingPost();
+  const quiet = { reportQuietLanes: ["blog-topics-*", "blog-draft-*"] };
+  const never = () => false;
+  const blog: Lane = { ...lane, key: "blog-draft-20261120" };
+  await at(T0).registry.write(blog);
+  // An English done text of a lane no autopilot attempt names: only the pattern decides.
+  await claimDone(reporting(at(T0), post, quiet), blog, "merged acme/app#1 abc123", undefined, "draft preview posted");
+  const lines = await watchTick(reporting(at(T0), post, quiet, never));
+  expect(lines).toEqual(["LANE_DONE_AUTO_REPORTED blog-draft-20261120 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok report=quiet"]);
+  expect(eventClass(lines[0] ?? "")).toBe("lead-digest");
+  expect(posts).toEqual([]);
+  // The receipt names no message or thread, so it never arms or moves the thread's close button.
+  expect(pendingReported(state.dir).map(({ path: _, ...r }) => r)).toEqual([{ lane: "blog-draft-20261120", at: T0, note: "reportQuietLanes: the lane posts its own results" }]);
+  expect((await watchTick(reporting(at(T0 + 5 * MIN + 1), post, quiet, never)))[0]).toBe("LANE_CLOSED blog-draft-20261120 closed seen-claim");
+  expect(pendingReported(state.dir)).toHaveLength(1);
+  // A lane the patterns do not name reports as before.
+  const other: Lane = { ...lane, key: "blog-publish-1" };
+  await at(T0).registry.write(other);
+  await claimDone(reporting(at(T0), post, quiet), other, "merged acme/app#1 abc123", undefined, KO_TEXT);
+  expect(await watchTick(reporting(at(T0), post, quiet))).toEqual(["LANE_DONE_CLAIMED blog-publish-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
+});
 
 test("autoReport all covers any lane: a clean PR snapshot is auto-reported, pending checks wake the lead", async () => {
   const { posts, post } = recordingPost();

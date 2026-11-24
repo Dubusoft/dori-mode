@@ -1,5 +1,6 @@
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { replaceFileAtomic } from "../durable-write.ts";
 import { machineBackoffMs, machineKind, sshArgv, type GuardMachine, type KindResult, type MachineKind } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Runner } from "../run.ts";
 import { plan, settleOperation, type OperationStore } from "../operations.ts";
@@ -107,8 +108,7 @@ export const fileOutageStore = (stateDir: string, log: (line: string) => void = 
       if (at === undefined ? !all.delete(label) : all.get(label) === at) return;
       if (at !== undefined) all.set(label, at);
       const json = Object.fromEntries([...all].map(([l, escalatedAt]) => [l, { escalatedAt }]));
-      const tmp = `${path}.${process.pid}.tmp`;
-      try { writeFileSync(tmp, `${JSON.stringify(json)}\n`, { mode: 0o600 }); renameSync(tmp, path); } catch (e) {
+      try { replaceFileAtomic(path, `${JSON.stringify(json)}\n`, 0o600); } catch (e) {
         log(`RUNNER_OUTAGE_STATE_WRITE_FAILED machine=${label} ${e instanceof Error ? e.message : String(e)}`);
       }
     },

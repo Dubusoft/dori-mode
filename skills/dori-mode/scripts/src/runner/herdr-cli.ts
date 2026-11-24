@@ -6,8 +6,8 @@ import type { HerdrAction } from "./protocol.ts";
 /**
  * `dori runner herdr <start|restart|stop|status> --machine <label> [--yes]`: sends `host.herdr` (proto 4) to the
  * machine's runner through the supervisor's CLI relay. `restart` and `stop` end herdr and every lane pane on that
- * machine, so they print the open lanes they end and run only with `--yes`. A proto-3 runner is refused before
- * anything is sent: it has no `host.herdr`.
+ * machine, so they print the open lanes they end and run only with `--yes`. A runner whose stored hub row is still
+ * proto 3 is refused before anything is sent: it has no `host.herdr`.
  */
 
 export const HERDR_ACTIONS: readonly HerdrAction[] = ["start", "restart", "stop", "status"];
@@ -51,8 +51,7 @@ export const runnerHerdrMain = async (input: { readonly action: string | undefin
     answer = await deps.calls.call(label, "host.herdr", { action });
   } catch (error) {
     if (!(error instanceof RunnerUnavailable)) throw error;
-    if (error.why === "outdated") deps.err(unsupported(label, proto ?? HOST_HERDR_PROTO - 1));
-    else deps.err(error.message);
+    deps.err(error.message);
     return 2;
   }
   if (answer.state !== "verified") {

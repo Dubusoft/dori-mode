@@ -4,10 +4,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { paneAlive, type Pane } from "../panes.ts";
 import type { Clock } from "../run.ts";
-import { backoffMs, type RunnerClient, yieldTurn } from "./client.ts";
+import { backoffMs, HANDSHAKE_TIMEOUT_MS, type RunnerClient, yieldTurn } from "./client.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { HUB_FILE, type CommitFn, type RunnerHub } from "./hub.ts";
-import { fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
+import { HUB_FILE, RUNNER_SILENT_CLOSE_MS, type CommitFn, type RunnerHub } from "./hub.ts";
+import { BadMacTally, fingerprint, type PendingHello, type Session, type SupervisorAuth } from "./auth.ts";
 import { checkEffectEpoch } from "./fencing.ts";
 import { checkCommand, rejectionText, type RunnerPolicy } from "./policy.ts";
 import {
@@ -18,7 +18,7 @@ import {
 } from "./protocol.ts";
 import type { RunnerState } from "./state.ts";
 import type { Connector, Listener, Transport } from "./transport.ts";
-import { fileCapabilityDetail, isFileOperation, RunnerUnavailable } from "./call.ts";
+import { isFileOperation, realTimers, RunnerUnavailable, type Timers } from "./call.ts";
 import { checkLaneFilesBody } from "../lane-file-contract.ts";
 
 /**
@@ -165,11 +165,14 @@ export type HubHooks = {
   readonly onDisconnected?: (label: string) => void;
   /** Requires enrollment, the signed handshake and frame MACs (auth.ts). Absent: the P1 unauthenticated local socket. */
   readonly auth?: SupervisorAuth;
+  /** The handshake deadline's and the silence watchdog's timers (default real timers). */
+  readonly timers?: Timers;
   readonly log: (line: string) => void;
 };
 
 /** `acceptRunners`' stop function, with the operations on live connections. */
 export type RunnerAccept = (() => void) & {
+  /** Throws `disconnected` unless `label` has an open connection; every admitted proto (at least MIN_PROTO) carries the lane file operations. */
   checkFileCapability(label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void;
   /** Deletes the label's key, sends `hello.reject RUNNER_REVOKED` and closes its connection; false when it held no key. */
   revoke(label: string): boolean;
@@ -201,10 +204,15 @@ type Connection = {
  * Serves runner connections from `listeners` (the local socket and, when configured, the network listener) through
  * `hub`, with one table of live connections across all of them. The first frame must be a hello (or, with
  * `hooks.auth`, an `enroll`); a rejected hello is answered and the connection closed. After it, every frame must name
- * the admitted label. The hub's hello rules (fencing.ts `decideHello`) see the gen of the label's live connection; an
- * admitted hello closes that older connection. An invalid frame, or an event whose commit
- * throws (no ack), closes the connection; the runner reconnects and replays from its hello. Returns a function that
- * stops accepting.
+ * the admitted label. A connection that is neither admitted nor refused (nor answered `enroll.ok`) within
+ * `HANDSHAKE_TIMEOUT_MS` of its accept is logged `RUNNER_HELLO_TIMEOUT runner=<label or -> phase=<phase>` and closed,
+ * so a silent peer holds nothing. The hub's hello rules (fencing.ts `decideHello`) see the gen of the label's live
+ * connection; an admitted hello closes that older connection. An invalid frame, or an event whose commit
+ * throws (no ack), closes the connection; the runner reconnects and replays from its hello. A connection that carries
+ * no frame for `RUNNER_SILENT_CLOSE_MS` (heartbeats come every 15 s) is closed with
+ * `RUNNER_SILENT runner=<label> ...` and, when admitted, `RUNNER_DISCONNECTED`: a link whose TCP died without a FIN
+ * would otherwise look open, so the network listener would not redial and the runner's next hello at the same gen
+ * would be refused as `RUNNER_CONFLICT`. Returns a function that stops accepting (and the watchdogs).
  *
  * With `hooks.auth`:
  * - `enroll` is checked by `SupervisorAuth.enroll`, answered `enroll.ok` (the runner closes) or refused with
@@ -212,8 +220,10 @@ type Connection = {
  * - `hello` is answered with the signed `hello.challenge` (or refused: `RUNNER_AUTH_FAILED`, `RUNNER_REVOKED`); the
  *   next frame must be `auth.proof`. A proof that does not verify is refused with `RUNNER_AUTH_FAILED` and closed;
  *   one that verifies opens the session and only then runs the hub's hello rules.
- * - Every later frame must carry the session MAC; one that does not is dropped and logged
- *   `RUNNER_AUTH_FAILED runner=<label> frame dropped: bad mac type=<type>`, and the connection stays open.
+ * - Every later frame must carry the session MAC; one that does not is dropped. The connection's dropped frames are
+ *   logged once, `RUNNER_AUTH_FAILED runner=<label> frames dropped: bad mac count=<n> last type=<type>, ...`: when the
+ *   count reaches `BAD_MAC_CLOSE_AFTER` the connection is closed with `RUNNER_AUTH_FAILED` so the runner handshakes
+ *   again, and a connection that closes before that logs its count on close.
  * - `runner.rotated` answering the pending `runner.rotate` stores the new key and is acked with `rotate.ok`.
  */
 export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Listener[], hooks: HubHooks): RunnerAccept => {
@@ -221,9 +231,10 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
   const checkFileCapability = (label: string, type: "lane.start" | "lane.recover" | "q.lane.files"): void => {
     const connection = current.get(label);
     if (!connection?.transport.open) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
-    if (connection.proto === undefined || connection.proto < 5) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(connection.proto));
   };
   const auth = hooks.auth;
+  const timers = hooks.timers ?? realTimers;
+  const watchdogs = new Set<() => void>();
   const head = (label: string, gen: number) => ({ runner: label, gen, epoch: hub.epoch });
   const serve = (transport: Transport): void => {
     let label: string | undefined;
@@ -231,6 +242,41 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     let session: Session | undefined;
     let phase: "start" | "proof" | "ready" | "done" = "start";
     let pending: { readonly hello: RunnerControl<"hello">; readonly handshake: PendingHello } | undefined;
+    let silence: unknown;
+    const badMac = new BadMacTally();
+    const reportBadMac = (closing: boolean): void => {
+      const summary = badMac.summary(closing);
+      if (summary) hooks.log(`RUNNER_AUTH_FAILED runner=${label ?? "-"} ${summary}`);
+    };
+    const unwatch = (): void => {
+      if (silence !== undefined) timers.clear(silence);
+      silence = undefined;
+    };
+    // Re-armed by every line; firing means nothing arrived for RUNNER_SILENT_CLOSE_MS.
+    const watch = (): void => {
+      unwatch();
+      silence = timers.set(() => {
+        silence = undefined;
+        if (!transport.open) return;
+        hooks.log(`RUNNER_SILENT runner=${label ?? "-"} no frame for ${RUNNER_SILENT_CLOSE_MS / 1000} s: closing the link so the runner reconnects`);
+        phase = "done";
+        transport.close("RUNNER_SILENT");
+      }, RUNNER_SILENT_CLOSE_MS);
+    };
+    watchdogs.add(unwatch);
+    watch();
+    let deadline: unknown = timers.set(() => {
+      deadline = undefined;
+      if (!transport.open || phase === "ready" || phase === "done") return;
+      hooks.log(`RUNNER_HELLO_TIMEOUT runner=${pending?.hello.body.label ?? "-"} phase=${phase} not admitted within ${HANDSHAKE_TIMEOUT_MS / 1000}s`);
+      phase = "done";
+      transport.close("RUNNER_HELLO_TIMEOUT");
+    }, HANDSHAKE_TIMEOUT_MS);
+    const cancelDeadline = (): void => {
+      if (deadline !== undefined) timers.clear(deadline);
+      deadline = undefined;
+    };
+    watchdogs.add(cancelDeadline);
     const reply = (frame: Frame | undefined): void => {
       if (frame && transport.open) {
         const encoded = encodeFrame(session ? session.seal(frame) : frame);
@@ -242,11 +288,13 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       reply(supervisorControl(head(who, gen), "hello.reject", { code, detail }));
       hooks.log(`${code} runner=${who} ${detail}`);
       phase = "done";
+      cancelDeadline();
       transport.close(code);
     };
     const admit = (hello: RunnerControl<"hello">): void => {
       const live = current.get(hello.body.label);
       const outcome = hub.hello(hello, live?.transport.open ? live.gen : undefined);
+      cancelDeadline();
       reply(outcome.reply);
       if (!outcome.ok) {
         hooks.log(`${outcome.reply.body.code} runner=${hello.body.label} ${outcome.reply.body.detail}`);
@@ -267,6 +315,11 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       hooks.onHello?.(label, hello.body);
     };
     transport.onClose(() => {
+      reportBadMac(false);
+      unwatch();
+      watchdogs.delete(unwatch);
+      cancelDeadline();
+      watchdogs.delete(cancelDeadline);
       if (label !== undefined && current.get(label)?.transport === transport) {
         current.delete(label);
         hub.disconnected(label);
@@ -275,6 +328,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
       }
     });
     transport.onLine((line) => {
+      if (transport.open) watch();
       try {
         const frame = decodeFrame(line, "runner");
         if (phase === "done") return;
@@ -287,6 +341,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
             reply(supervisorControl(head(body.label, frame.gen), "enroll.ok", enrolled.reply));
             hooks.log(`RUNNER_ENROLLED runner=${body.label} hostId=${body.hostId} key=${fingerprint(body.runnerPubKey)}`);
             phase = "done";
+            cancelDeadline();
             return;
           }
           if (frame.type !== "hello" || "seq" in frame) throw new ProtocolError("sequence", `${frame.type} before hello`);
@@ -313,7 +368,11 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
           return;
         }
         if (session && !session.check(frame)) {
-          hooks.log(`RUNNER_AUTH_FAILED runner=${label ?? "-"} frame dropped: bad mac type=${frame.type}`);
+          if (badMac.drop(frame.type)) {
+            reportBadMac(true);
+            phase = "done";
+            transport.close("RUNNER_AUTH_FAILED");
+          }
           return;
         }
         if (label === undefined) throw new ProtocolError("sequence", `${frame.type} before hello`);
@@ -388,7 +447,7 @@ export const acceptRunners = (hub: RunnerHub, listeners: Listener | readonly Lis
     });
   };
   const stops = (Array.isArray(listeners) ? listeners : [listeners as Listener]).map((listener) => listener.onConnection(serve));
-  return Object.assign(() => { for (const stop of stops) stop(); }, {
+  return Object.assign(() => { for (const stop of stops) stop(); for (const unwatch of watchdogs) unwatch(); watchdogs.clear(); }, {
     checkFileCapability,
     connected: (name: string): boolean => current.get(name)?.transport.open === true,
     command<T extends SupervisorCommandType>(name: string, type: T, body: SupervisorCommandBodies[T]): number | undefined {
@@ -734,7 +793,11 @@ export const commandDispatcher = (deps: DispatchDeps) => (raw: unknown): void =>
       else finish(output.detail, "verified", output.result as JsonValue | undefined);
     },
     (error: unknown) => { finish(`RUNNER_CMD_FAILED ${error instanceof Error ? error.message : String(error)}`); },
-  );
+  ).catch((error: unknown) => {
+    // Recording or publishing the result failed: an unrecorded intent is settled at the next boot, a recorded result is
+    // answered again when the supervisor resends the cmdId.
+    deps.log(`RUNNER_CMD_FINISH_FAILED cmdId=${cmdId} type=${type} ${error instanceof Error ? error.message : String(error)}`);
+  });
 };
 
 /** Wraps `connect` so `serveRunner` sees each connection; pass the result to both the client and `serveRunner`. */

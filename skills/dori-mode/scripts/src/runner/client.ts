@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { SECRET_COMMAND_MAX_TIMEOUT_SEC } from "../config.ts";
 import type { Clock } from "../run.ts";
-import { isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
+import { BadMacTally, isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
   CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
@@ -18,15 +18,23 @@ export { backoffMs };
  * The runner side of the connection. One `connectOnce` is: connect, send `hello {proto, gen, label, hostId, cmdAck}`,
  * wait for `hello.ok`, raise `maxEpoch` to its epoch, then send every outbox row with `seq > eventAck` in seq order.
  * Each `ack {eventAck}` frame marks rows up to it acked in the outbox; an ack never moves the cursor backwards.
- * `run` repeats `connectOnce` with the reconnect backoff until aborted. `gen` is the state's current gen: the
- * process bumps it with `RunnerState.boot()` once before the client starts.
+ * Without `hello.ok` or a reject within `HANDSHAKE_TIMEOUT_MS` of the hello, the attempt ends as `RUNNER_CLOSED` with
+ * `RUNNER_HELLO_TIMEOUT ...` logged and the connection closed. `run` repeats `connectOnce` with the reconnect backoff
+ * until aborted. `gen` is the state's current gen: the process bumps it with `RunnerState.boot()` once before the
+ * client starts.
  *
  * With `auth` set (auth.ts), the hello carries a nonce and an ephemeral key; the client checks the supervisor's
  * `hello.challenge` signature against the pinned key and closes with `RUNNER_AUTH_FAILED` when it does not verify,
- * answers `auth.proof`, and from then on seals every frame it sends with the session MAC and drops (logging
- * `RUNNER_AUTH_FAILED`) every received frame whose MAC does not check. Before the handshake only `hello.challenge` and
+ * answers `auth.proof`, and from then on seals every frame it sends with the session MAC and drops every received
+ * frame whose MAC does not check. Those drops are logged once per connection (`RUNNER_AUTH_FAILED frames dropped: bad
+ * mac count=<n> ...`): at `BAD_MAC_CLOSE_AFTER` the client closes the connection with `RUNNER_AUTH_FAILED` and `run`
+ * handshakes again; a connection that closes first logs its count on close. Before the handshake only `hello.challenge` and
  * `hello.reject` are read. `runner.rotate` is handled here: the client answers `runner.rotated` with a new key and
  * makes it current on `rotate.ok`, recording the command in the state so `cmdAck` moves past it.
+ *
+ * The replay reads the outbox `REPLAY_PAGE_ROWS` rows at a time and, when the transport reports backpressure, waits
+ * for it to drain before the next row; live sends hold until the replay is done. `hello.ok` ends the handshake
+ * deadline, so a long replay to a slow peer is not cut by it.
  *
  * A frame over `MAX_FRAME_BYTES` is never sent. When the replay cannot send a row, the attempt ends as
  * `RUNNER_CLOSED` with `RUNNER_REPLAY_FAILED seq=<n> ...` logged and the connection closed, so the reconnect loop
@@ -34,6 +42,14 @@ export { backoffMs };
  */
 
 export const HEARTBEAT_MS = 15_000;
+/** How many outbox rows the replay reads at once (rows are at most `OUTBOX_EVENT_MAX` bytes each). */
+export const REPLAY_PAGE_ROWS = 64;
+/**
+ * How long either end of a connection waits for the handshake to finish: the runner from sending `hello` to `hello.ok`
+ * (or a reject), the supervisor from accepting the connection to admitting it. A peer that stays silent past it is closed,
+ * so a stray connection cannot hold the runner's single network slot, or a supervisor connection, for good.
+ */
+export const HANDSHAKE_TIMEOUT_MS = 10_000;
 /** How long `secretRequest("secret.get")` waits for the supervisor's answer before `RUNNER_SECRET_TIMEOUT`. */
 export const SECRET_TIMEOUT_MS = 30_000;
 /**
@@ -101,7 +117,10 @@ export type ClientDeps = {
   readonly auth?: RunnerAuth;
   /** Receives `RUNNER_AUTH_FAILED ...` and `RUNNER_KEY_ROTATED ...` lines. */
   readonly log?: (line: string) => void;
-  /** Arms the `secretRequest` timeout: calls `fire` after `ms` unless the returned cancel runs first. Default setTimeout. */
+  /**
+   * Arms the handshake, `secretRequest` and `closedLanes` timeouts: calls `fire` after `ms` unless the returned cancel
+   * runs first. Default setTimeout.
+   */
   readonly timer?: (ms: number, fire: () => void) => () => void;
 };
 
@@ -121,10 +140,14 @@ export class RunnerClient {
   private ready = false;
   private settle: ((outcome: ConnectOutcome) => void) | undefined;
   private replayed = 0;
+  /** Disarms the current connection's handshake deadline. */
+  private cancelHandshake: () => void = () => {};
   private closedWaiter: Promise<void> = Promise.resolve();
   /** Set once the supervisor's challenge verified; every frame after that is sealed and checked with it. */
   private session: Session | undefined;
   private pendingHello: PendingRunnerHello | undefined;
+  /** The current connection's frames dropped for a bad MAC. */
+  private badMac = new BadMacTally();
   /** The `proto` of the current connection's `hello.ok`; undefined before it and after a close. */
   private helloProto: number | undefined;
   /** Open `secretRequest`s by rid, each bound to the connection it went out on. */
@@ -163,12 +186,19 @@ export class RunnerClient {
     this.session = undefined;
     this.helloProto = undefined;
     this.pendingHello = this.deps.auth?.startHello();
-    const outcome = new Promise<ConnectOutcome>((resolve) => { this.settle = resolve; });
+    const badMac = new BadMacTally();
+    this.badMac = badMac;
+    let cancelDeadline: () => void = () => {};
+    const outcome = new Promise<ConnectOutcome>((resolve) => {
+      this.settle = (settled) => { cancelDeadline(); resolve(settled); };
+    });
     let markClosed: () => void = () => {};
     this.closedWaiter = new Promise<void>((resolve) => { markClosed = resolve; });
     const offLine = transport.onLine((line) => { if (this.transport === transport) this.handleLine(line); });
     transport.onClose((reason) => {
       offLine();
+      const summary = badMac.summary(false);
+      if (summary) this.log(`RUNNER_AUTH_FAILED ${summary}`);
       if (this.transport === transport) {
         this.transport = undefined;
         this.ready = false;
@@ -197,6 +227,16 @@ export class RunnerClient {
       ...(this.pendingHello ? { nonce: this.pendingHello.nonce, dh: this.pendingHello.dh } : {}),
     };
     transport.send(encodeFrame(runnerControl(this.head(), "hello", hello)));
+    if (this.transport === transport && this.settle) {
+      cancelDeadline = (this.deps.timer ?? defaultTimer)(HANDSHAKE_TIMEOUT_MS, () => {
+        if (this.transport !== transport) return;
+        const detail = `RUNNER_HELLO_TIMEOUT no hello.ok within ${HANDSHAKE_TIMEOUT_MS / 1000}s`;
+        this.log(detail);
+        this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
+        transport.close("RUNNER_HELLO_TIMEOUT");
+      });
+      this.cancelHandshake = cancelDeadline;
+    }
     return outcome;
   }
 
@@ -386,7 +426,7 @@ export class RunnerClient {
           return;
         }
       } else if (!this.session.check(frame)) {
-        this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac type=${frame.type}`);
+        this.badMacFrame(frame.type);
         return;
       }
     }
@@ -400,23 +440,8 @@ export class RunnerClient {
         this.deps.state.observeEpoch(frame.body.epoch);
         this.cursor = frame.body.eventAck;
         this.deps.outbox.ack(this.cursor);
-        let seq = this.cursor;
-        try {
-          for (const row of this.deps.outbox.unacked(this.cursor)) {
-            seq = row.seq;
-            this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
-            this.replayed += 1;
-          }
-        } catch (error) {
-          const detail = `RUNNER_REPLAY_FAILED seq=${seq} ${error instanceof Error ? error.message : String(error)}`;
-          this.log(detail);
-          this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
-          this.transport?.close("RUNNER_REPLAY_FAILED");
-          return;
-        }
-        this.helloProto = frame.body.proto;
-        this.ready = true;
-        this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });
+        this.cancelHandshake();
+        if (this.transport) void this.replay(this.transport, frame.body.proto);
         return;
       }
       case "hello.reject":
@@ -468,16 +493,65 @@ export class RunnerClient {
     }
   }
 
+  /**
+   * Sends every unacked row after the cursor, a page at a time, then marks the connection ready. It runs synchronously
+   * until the transport reports backpressure; while it waits, newly published rows stay in the outbox and a later page
+   * picks them up, so the loop ends only on an empty page, with no wait between that read and `ready`.
+   */
+  private async replay(transport: Transport, proto: number): Promise<void> {
+    let seq = this.cursor;
+    try {
+      for (;;) {
+        const page = this.deps.outbox.unacked(seq, REPLAY_PAGE_ROWS);
+        if (!page.length) break;
+        for (const row of page) {
+          seq = row.seq;
+          this.sendFrame(runnerEvent(this.head(), row.seq, row.type, row.body) as AnyRunnerEvent);
+          this.replayed += 1;
+          const drained = transport.drained?.();
+          if (drained) {
+            await drained;
+            // A close while waiting has already ended the attempt.
+            if (this.transport !== transport) return;
+          }
+        }
+      }
+    } catch (error) {
+      const detail = `RUNNER_REPLAY_FAILED seq=${seq} ${error instanceof Error ? error.message : String(error)}`;
+      this.log(detail);
+      this.finish({ ok: false, code: "RUNNER_CLOSED", detail });
+      this.transport?.close("RUNNER_REPLAY_FAILED");
+      return;
+    }
+    this.helloProto = proto;
+    this.ready = true;
+    this.finish({ ok: true, eventAck: this.cursor, replayed: this.replayed });
+  }
+
   private invalidCommand(line: string): void {
     if (!this.deps.onInvalidCommand) return;
     let raw: unknown;
     try { raw = JSON.parse(line); } catch { return; }
     if (typeof raw !== "object" || raw === null || !("cmdSeq" in raw)) return;
-    if (this.deps.auth && !(this.session && this.session.check(raw as SupervisorFrame))) {
-      this.log(`RUNNER_AUTH_FAILED frame dropped: bad mac on an invalid command`);
+    if (this.deps.auth && !this.session) {
+      this.log(`RUNNER_AUTH_FAILED frame dropped: invalid command before the handshake`);
+      return;
+    }
+    if (this.session && !this.session.check(raw as SupervisorFrame)) {
+      this.badMacFrame("invalid-command");
       return;
     }
     this.deps.onInvalidCommand(raw);
+  }
+
+  /** Counts a received frame dropped for a bad MAC; at `BAD_MAC_CLOSE_AFTER` logs the summary and closes the connection. */
+  private badMacFrame(type: string): void {
+    const transport = this.transport;
+    if (!this.badMac.drop(type) || !transport) return;
+    const summary = this.badMac.summary(true);
+    if (summary) this.log(`RUNNER_AUTH_FAILED ${summary}`);
+    this.finish({ ok: false, code: "RUNNER_AUTH_FAILED", detail: "too many frames with a bad mac" });
+    transport.close("RUNNER_AUTH_FAILED");
   }
 
   private answerChallenge(challenge: SupervisorControlBodies["hello.challenge"]): void {

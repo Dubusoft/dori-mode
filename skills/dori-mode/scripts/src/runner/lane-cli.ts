@@ -33,6 +33,8 @@ export type LaneCliDeps = {
   readonly err: (line: string) => void;
   /** Writes raw text (a secret command's output) to the lane's stdout or stderr; default `process.stdout`/`process.stderr`. */
   readonly write?: (stream: "stdout" | "stderr", text: string) => void;
+  /** Whether `out` reaches a terminal; `secret env` then refuses rather than leave values in scrollback. Default false. */
+  readonly stdoutIsTTY?: boolean;
   readonly heavyDir?: string;
   readonly clock?: Clock;
   readonly spawn?: (argv: readonly string[]) => Promise<number>;
@@ -133,6 +135,7 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
     "usage: dori secret env",
     "usage: dori secret run <op>",
     "  every stored secret arrives in the lane environment at launch; GH_TOKEN supplies GitHub access directly",
+    "  secret env is only for eval \"$(dori secret env)\": with stdout on a terminal it prints no values and exits 2",
     "  production deploys and host work use dori secret run <op> or dori host <op>",
   ].join("\n"),
   host: [
@@ -189,6 +192,10 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
   }
   if (sub === "secret") {
     if (rest.length !== 1 || rest[0] !== "env") { deps.err("usage: dori secret env | dori secret run <op>"); return 2; }
+    if (deps.stdoutIsTTY === true) {
+      deps.err("SECRET_ENV_TTY_REFUSED dori secret env prints every secret in plain text, so it refuses a terminal: use eval \"$(dori secret env)\" (the values are already in the lane environment)");
+      return 2;
+    }
     let values: unknown;
     const code = await send({ kind: "secret" }, (reply) => { values = reply.values; });
     if (code !== 0) return code;

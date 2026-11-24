@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { autopilotLaneKey, DEFAULT_AUTOPILOT, ledgerRows, type ToodoTask } from "../src/autopilot.ts";
-import { type ExecutorDeps, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
+import { type ExecutorDeps, type ExecutorResult, reconcileExecutions, runExecutor } from "../src/autopilot-executor.ts";
+import { AutopilotTick } from "../src/autopilot-tick.ts";
 import { type LaunchInput, SandboxRefusal } from "../src/launch.ts";
 import type { PlacedLaunch } from "../src/launch-service.ts";
 import type { ThreadMember } from "../src/messenger/discord.ts";
 import { SqliteOperations, type Observed, type Operation, type OperationStore, plan, settleOperation } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { dequeueLaunch, enqueueLaunch, launchQueue } from "../src/routing.ts";
-import type { ToodoGuideline, ToodoTaskRecord } from "../src/toodo-client.ts";
+import { ToodoClient, type ToodoFetch, type ToodoGuideline, type ToodoTaskRecord, ToodoUnreadable } from "../src/toodo-client.ts";
 import { storePath } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
@@ -128,7 +129,8 @@ const harness = (initial = task(), attempt = 1) => {
     writeBrief: async (path, brief) => { checkpoint(); calls.brief++; files.set(path, brief); },
     worktreeRoot: (label) => { expect(label).toBe("local"); return worktreeRoot; },
     makeLaneDir: async (path) => { checkpoint(); dirs.push(path); },
-    readBrief: async (path) => { checkpoint(); return files.get(path); },
+    // No crash point: the read-back would swallow it (a crash after thread lands in the brief write instead).
+    readBrief: async (path) => files.get(path),
     notify: (id, line) => { checkpoint(); calls.notify++; notices.set(id, line); },
   });
   return {
@@ -287,6 +289,18 @@ test("pause stops new executions and prevents a held launch from draining", asyn
   expect(launchQueue(dir)[0]?.key).toBe(KEY);
 });
 
+test("a pause that lands while the launch is placed stops before admission, and the same key launches after resume", async () => {
+  const h = harness();
+  const deps = h.fresh();
+  const pausing: ExecutorDeps = { ...deps, place: async (input) => { writeFileSync(join(dir, "pause.json"), "{}"); return deps.place(input); } };
+  expect((await runExecutor(pausing, [12]))[0]).toEqual({ taskId: 12, laneKey: KEY, kind: "paused" });
+  expect(h.calls.admit).toBe(0);
+  expect(store.get("toodo:12/autopilot-admit/1")).toBeUndefined();
+  rmSync(join(dir, "pause.json"));
+  expect((await runExecutor(h.fresh(), [12]))[0]).toEqual({ taskId: 12, laneKey: KEY, kind: "launched" });
+  expect([h.calls.admit, h.calls.launch]).toEqual([1, 1]);
+});
+
 test("scope or guideline changes while held require review and remove the queued launch", async () => {
   const h = harness(); h.held(true);
   await runExecutor(h.fresh(), [12]);
@@ -319,6 +333,56 @@ test("a dependency re-read refuses an open prerequisite", async () => {
   expect(h.calls.start).toBe(0);
 });
 
+/**
+ * The harness's Toodo served over the real client's RPC: every request is counted, and `fail(n, status)` answers the
+ * n-th one (1-based) with that status once.
+ */
+const overRpc = (h: ReturnType<typeof harness>) => {
+  const sent: string[] = [];
+  const failures = new Map<number, number>();
+  const tokenFile = join(dir, "toodo-token");
+  writeFileSync(tokenFile, "tok\n");
+  const deps = (): ExecutorDeps => {
+    const base = h.fresh();
+    const fetch: ToodoFetch = async (url, init) => {
+      sent.push(url.split("/").pop()!);
+      const status = failures.get(sent.length);
+      if (status) return new Response("{}", { status });
+      const args = JSON.parse(init.body as string) as { id?: number; workspaceId?: number; filter?: { ids?: number[] } };
+      const reader = base.toodo();
+      const reply = url.endsWith("/get_task") ? await reader.task(args.id!)
+        : url.endsWith("/list_guidelines") ? await reader.guidelines(args.workspaceId!)
+        : url.endsWith("/get_workspace") ? { repository: await reader.workspaceRepository(args.id!) }
+        : args.filter?.ids ? await reader.tasksByIds(args.filter.ids) : await reader.flaggedTasks();
+      return new Response(JSON.stringify(reply), { status: 200 });
+    };
+    return { ...base, toodo: () => new ToodoClient({ url: "http://toodo.test", tokenFile }, { fetch, sleep: async () => {} }) };
+  };
+  return { deps, sent, fail: (n: number, status: number) => { failures.set(n, status); } };
+};
+
+// One launch reads the contract (get_task, list_tasks for prerequisites, list_guidelines, get_workspace) four times:
+// once to plan it and again before start-task, the thread and the launch. The reservation reads list_tasks twice and
+// start-task reads get_task back before and after its write. All of it runs under the launch lock.
+const LAUNCH_READS_MAX = 4 * 4 + 2 + 2;
+
+test("one launch reads Toodo at most LAUNCH_READS_MAX times", async () => {
+  const h = harness(task({ dependsOn: [3] }));
+  h.dependencies([task({ id: 3, status: "done", resolution: "merged" })]);
+  const rpc = overRpc(h);
+  expect(await runExecutor(rpc.deps(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(rpc.sent.length).toBeLessThanOrEqual(LAUNCH_READS_MAX);
+  expect(rpc.sent.filter((c) => c === "list_guidelines")).toHaveLength(4);
+});
+
+test("one 5xx from Toodo under the launch lock is read again and the launch goes on", async () => {
+  const h = harness();
+  const rpc = overRpc(h);
+  rpc.fail(1, 503);
+  expect(await runExecutor(rpc.deps(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(h.calls.launch).toBe(1);
+});
+
 test("a lead file the description names but cannot ship stops the task before it starts", async () => {
   const file = join(dir, "briefs", "evidence.md");
   const h = harness(task({ description: `Work from \`${file}\`.` }));
@@ -337,7 +401,7 @@ test("failed member addition is partial success and never creates another thread
 for (const boundary of ["prepare", "reserve", "start-task", "thread", "brief", "admit", "settle"]) {
   test(`crash after ${boundary}: fresh executor resumes each effect once`, async () => {
     const h = harness(); h.crashAfter(boundary);
-    await runExecutor(h.fresh(), [12]).catch((e: Error) => { expect(e.message).toBe(`crash after ${boundary}`); });
+    await runExecutor(h.fresh(), [12]);
     expect(h.crashed()).toBe(true);
     expect((await reconcileExecutions(h.fresh(freshStore())))[0]?.kind).toBe("launched");
     expect([h.calls.start, h.calls.thread, h.calls.brief, h.calls.admit, h.calls.launch, h.calls.notify]).toEqual([1, 1, 1, 1, 1, 1]);
@@ -345,6 +409,23 @@ for (const boundary of ["prepare", "reserve", "start-task", "thread", "brief", "
     expect(row("execute").state).toBe("verified");
   });
 }
+
+test("a throw inside an open execution is that task's interrupted result, and the next pass resumes it", async () => {
+  const h = harness(); h.crashAfter("brief");
+  expect(await runExecutor(h.fresh(), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "interrupted", reasons: ["crash after brief"] }]);
+  expect(row("execute").state).toBe("planned");
+  expect(await runExecutor(h.fresh(freshStore()), [12])).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }]);
+  expect(h.calls.thread).toBe(1);
+});
+
+test("an execution row without its required fields is that task's interrupted result naming them, and nothing launches", async () => {
+  const h = harness();
+  plan(store, T0, { lane: "toodo:12", action: "autopilot-execute", target: "1", data: JSON.stringify({ taskId: 12, title: "older shape" }) });
+  expect(await reconcileExecutions(h.fresh())).toEqual([
+    { taskId: 12, kind: "interrupted", reasons: ["AUTOPILOT_EXECUTION_MALFORMED toodo:12/autopilot-execute/1 data has no valid laneKey, contract"] },
+  ]);
+  expect([h.calls.start, h.calls.thread, h.calls.launch]).toEqual([0, 0, 0]);
+});
 
 test("attempted launch with unknown read-back becomes ambiguous and never admits again", async () => {
   const h = harness(); h.held(true);
@@ -360,6 +441,65 @@ test("attempted launch with unknown read-back becomes ambiguous and never admits
   expect(h.calls.launch).toBe(0);
   expect(h.calls.notify).toBe(1);
   expect(ledgerRows(store)[0]?.state).toBe("ambiguous");
+});
+
+/** start_task commits, then its confirmation and every Toodo read time out until `readable` is set. */
+const halfStart = async () => {
+  const h = harness();
+  let unreadable = false;
+  let reads = 0;
+  const deps = (ops: OperationStore = store): ExecutorDeps => {
+    const base = h.fresh(ops);
+    return {
+      ...base,
+      toodo: () => ({ ...base.toodo(), task: async (id) => { reads++; if (unreadable) throw new Error("get_task timed out"); return base.toodo().task(id); } }),
+      writer: { ...base.writer, startTask: async (id, opts) => { await base.writer.startTask(id, opts); unreadable = true; throw new Error("get_task timed out"); } },
+    };
+  };
+  expect((await runExecutor(deps(), [12]))[0]?.kind).toBe("ambiguous");
+  expect(h.notices.get(`toodo:12/autopilot-notice/1`)).toContain("at start-task, before any lane launched");
+  return { h, deps, readable: () => { unreadable = false; }, reads: () => reads };
+};
+const orphanNotices = (h: ReturnType<typeof harness>) => [...h.notices.values()].filter((line) => line.startsWith("AUTOPILOT_EXECUTOR_ORPHAN "));
+
+test("an ambiguous start with no lane is reported orphaned once it reads back, once across ticks and restarts", async () => {
+  const { h, deps, readable } = await halfStart();
+  await reconcileExecutions(deps());
+  expect(orphanNotices(h)).toEqual([]);
+  readable();
+  await reconcileExecutions(deps());
+  await reconcileExecutions(deps(freshStore()));
+  expect(orphanNotices(h)).toHaveLength(1);
+  expect(orphanNotices(h)[0]).toContain(`#12 lane=${KEY} Toodo shows the task in_progress with lane:${KEY}`);
+  expect(orphanNotices(h)[0]).toContain("dori autopilot rearm 12");
+  expect([h.calls.start, h.calls.admit, h.calls.blocker, h.calls.notify]).toEqual([1, 0, 0, 2]);
+  expect(row("execute").state).toBe("ambiguous");
+});
+
+for (const [name, setup] of [
+  ["a registered lane", (h) => { h.lanes.set(KEY, { key: KEY, title: "t", brief: "b", thread: "discord:c/x", openedAt: new Date(T0).toISOString() } as Lane); }],
+  ["a queued launch", () => { enqueueLaunch(dir, { key: KEY, title: "t", brief: "b", done: "pr owner/repo autopilot/12", queuedAt: new Date(T0).toISOString(), reasons: ["no room"] }); }],
+  ["an admit row", () => { store.put({ ...plan(store, T0, { lane: "toodo:12", action: "autopilot-admit", target: "1" }), state: "attempted" }); }],
+  ["a task back in planned", (h) => { h.task({ status: "planned" }); }],
+  ["a task without the lane ref", (h) => { h.task({ refs: task().refs }); }],
+] as const satisfies readonly (readonly [string, (h: ReturnType<typeof harness>) => void])[]) {
+  test(`an ambiguous start with ${name} is not reported orphaned`, async () => {
+    const { h, deps, readable } = await halfStart();
+    readable(); setup(h);
+    await reconcileExecutions(deps());
+    expect(orphanNotices(h)).toEqual([]);
+  });
+}
+
+test("an ambiguous start that read back as not orphaned is not read again on later ticks", async () => {
+  const { h, deps, readable, reads } = await halfStart();
+  readable(); h.task({ status: "planned" });
+  await reconcileExecutions(deps());
+  const after = reads();
+  await reconcileExecutions(deps());
+  await reconcileExecutions(deps(freshStore()));
+  expect(reads()).toBe(after);
+  expect(orphanNotices(h)).toEqual([]);
 });
 
 test("attempted launch with confirmed startup reconciles without another admission", async () => {
@@ -421,6 +561,25 @@ test("a CLI reservation is never adopted by the executor", async () => {
   plan(store, T0, { lane: "toodo:12", action: "autopilot-launch", target: "1", data: JSON.stringify({ laneKey: KEY }) });
   expect((await runExecutor(h.fresh(), [12]))[0]?.kind).toBe("refused");
   expect(h.calls.start).toBe(0);
+});
+
+test("one task's unreadable Toodo keeps the pass's earlier launch and the tick wakes the lead only for that task", async () => {
+  const h = harness();
+  const deps = (): ExecutorDeps => {
+    const base = h.fresh();
+    return { ...base, toodo: () => ({ ...base.toodo(), task: async (id) => { if (id === 13) throw new ToodoUnreadable("get_task timed out"); return base.toodo().task(id); } }) };
+  };
+  let results: ExecutorResult[] = [];
+  const lines: string[] = [];
+  const tick = new AutopilotTick({
+    tickMs: () => 60_000, executorOn: () => true, now: () => T0, log: () => {}, enqueue: (_id, line) => { lines.push(line); },
+    judge: async () => ({ paused: false, slots: 1, verdicts: [12, 13].map((taskId) => ({ taskId, verdict: "LAUNCH" as const, reasons: [] })) }),
+    execute: async (ids) => (results = await runExecutor(deps(), ids)),
+  });
+  await tick.tick();
+  expect(results).toEqual([{ taskId: 12, laneKey: KEY, kind: "launched" }, { taskId: 13, kind: "error", reasons: ["get_task timed out"] }]);
+  expect(h.logs).toContain("AUTOPILOT_EXECUTOR_ERROR #13 get_task timed out");
+  expect(lines).toEqual(["AUTOPILOT_READY #13 slots=1"]);
 });
 
 test("a failed execution never runs again by itself; once the owner re-arms it, the next tick runs attempt 2", async () => {

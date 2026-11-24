@@ -1,27 +1,18 @@
-import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch } from "node:fs";
-import { addKnownSecrets, replaceKnownSecrets } from "./redact.ts";
+import { existsSync, type FSWatcher, mkdirSync, watch } from "node:fs";
+import { replaceKnownSecrets } from "./redact.ts";
 import { SecretStore } from "./secret-store.ts";
 import { homedir } from "node:os";
 import { resolveCredential } from "./credentials.ts";
-import { alertsChannelOf, deliveryConfigError, loadConfig } from "./config.ts";
+import { alertsChannelOf, deliveryConfigError } from "./config.ts";
 import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
-import { defaultRunnerDir } from "./runner/fs-safety.ts";
 import { readRunnerRows } from "./runner/hub.ts";
-import { fileOutageStore, LivenessMonitor, livenessIo } from "./runner/liveness.ts";
-import { type LaneHubDeps, reconcileInventory, runnerJournalHead } from "./runner/lanes-hub.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
-import { type RunnerCall, RunnerCalls, RunnerUnavailable } from "./runner/call.ts";
-import { laneOps, machineRunner, runnerOf } from "./lane-ops.ts";
-import { supervisorCommandRunner, supervisorGranter, supervisorSecretHandler } from "./runner/secret-serve.ts";
-import { cliSocketPath, serveCliRelay } from "./runner/cli-relay.ts";
-import { type LocalChild, type LocalChildDeps, localRunnerArgv, spawnProcess, startLocalRunner } from "./runner/local-child.ts";
-import type { InventoryLane } from "./runner/protocol.ts";
+import type { RunnerCall } from "./runner/call.ts";
+import { laneOps, machineRunner } from "./lane-ops.ts";
+import type { LocalChildDeps } from "./runner/local-child.ts";
 import { type LaneMessageStore, openLaneMessages } from "./lane-messages.ts";
-import { drainRunnerAdmin, LOCAL_RUNNER } from "./runner/serve.ts";
-import { closedLanesOf } from "./runner/cleanup.ts";
-import type { Listener } from "./runner/transport.ts";
-import { listenUnix } from "./runner/unix-transport.ts";
+import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -30,7 +21,7 @@ import { deadPaneTick, newDeadPaneState } from "./dead-panes.ts";
 import { type Emit, watchTick, type FlowDeps } from "./done-flow.ts";
 import { newPendingCleanup } from "./closed-cleanup.ts";
 import { resumeAnsweredGoals } from "./decision-resume.ts";
-import { freshnessTick, scrubForThread } from "./freshness.ts";
+import { freshnessTick, scrubForThread, sweepActLine } from "./freshness.ts";
 import { quotaReport } from "./claude-quota.ts";
 import { sharedQuotaLookup } from "./quota-cache.ts";
 import { recoverLanes, type RecoveryEnqueue } from "./recover.ts";
@@ -50,7 +41,7 @@ import { supervisorDiscord, type SupervisorDiscordOptions } from "./messenger/di
 import { closeThreadButton } from "./messenger/discord-commands.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { postOwnerLine } from "./lane-finish.ts";
-import { appendFollowUp, redirectIfClosed } from "./thread-followup.ts";
+import { appendFollowUp, pruneThreadFollowups, redirectIfClosed } from "./thread-followup.ts";
 import { autoReportPoster } from "./auto-report.ts";
 import { taskBlocker, taskFinisher } from "./task-finish.ts";
 import { ToodoWriter } from "./toodo-client.ts";
@@ -66,7 +57,7 @@ import { reviewSectionOf, reviewStatusTick } from "./review-status.ts";
 import { mergePauseHolds } from "./merge-pause.ts";
 import { newSweepCache, passthroughView, type SweepView, sweepRound } from "./sweep-view.ts";
 import { StartupProbe } from "./startup-probe.ts";
-import { type BuiltinSource, EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
+import { EventSources, type SourceEnqueue, SourceSpecs } from "./event-sources.ts";
 import { autopilotLocalStateKey } from "./autopilot.ts";
 import { judgeCandidates, liveJudgeDeps, RECONCILE_JOB } from "./autopilot-cli.ts";
 import { AUTOPILOT_KICK_EVENTS, AutopilotTick } from "./autopilot-tick.ts";
@@ -76,17 +67,20 @@ import { ToodoEvents } from "./toodo-events.ts";
 import { openOperations, type OperationStore } from "./operations.ts";
 import { routeReports } from "./lane-reports.ts";
 import { type LaneReportStore, openLaneReports } from "./lane-report-store.ts";
-import { firstStatusTick, statusTransportOf } from "./lane-status.ts";
-import { criticalTick, errText, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_STATE_FILE, type PressureIo, pressureIo, warnMachineLanes } from "./supervise-guard.ts";
-import { laneEventReader, openRunnerHub, readBackRunnerStarts, RUNNER_LANE_CURSOR_FILE, type RunnerHubHandle } from "./supervise-hub.ts";
+import { firstStatusTick, type LaneStatusTransport, statusTransportOf } from "./lane-status.ts";
+import { criticalTick, guardAlertDetail, laneMemoryOf, MACHINE_GUARD_STATE_FILE, type PressureIo, pressureIo, warnMachineLanes } from "./supervise-guard.ts";
+import { runnerCallsOf, SupervisorRunners } from "./supervise-runners.ts";
 import { decisionDeliveryTick, reconcileDecisionsAtStart } from "./decision-delivery.ts";
 import { type DecisionContext, openLaneDecision, ownerDecisionTick } from "./owner-decisions.ts";
 import { relayLine, retryDecisionRelays } from "./decision-relay.ts";
+import { errLine } from "./line-text.ts";
 
 /** How long the machine guard reuses `herdr machine list` before reading it again. */
 const MACHINE_LIST_TTL_MS = 10 * 60_000;
 /** After a failed `herdr machine list`, the previous list is kept and the read is retried this much later. */
 const MACHINE_LIST_RETRY_MS = 60_000;
+
+export { RUNNER_HUB_RETRY_MS } from "./supervise-runners.ts";
 
 /** Every text the supervisor itself posts to Discord starts with this, so readers can tell it from the lead. */
 export const SYSTEM_PREFIX = "[System] ";
@@ -131,10 +125,15 @@ export const WATCHDOG_PET_MS = 60_000;
  * tasks keep running; past WATCHDOG_STALL_MS it withholds the watchdog as task:<name>, so systemd restarts the supervisor.
  */
 export const TASK_ALERT_MS = 5 * 60_000;
-/** The supervisor's independent tasks. */
-export const SUPERVISOR_TASKS = ["inbound", "delivery", "sweeps", "polling"] as const;
+/**
+ * The supervisor's independent tasks. `delivery` hands queued events to the lead and nothing else; `notices` (the owner
+ * notices and the lead-side checks, several of which post to Discord) runs beside it, so a slow or failing Discord never
+ * holds back lead delivery. `reports` routes lane reports apart from `polling`, so a slow GitHub poll never holds a
+ * lane question back.
+ */
+export const SUPERVISOR_TASKS = ["inbound", "delivery", "notices", "sweeps", "polling", "reports"] as const;
 export type SupervisorTask = (typeof SUPERVISOR_TASKS)[number];
-/** The fifth task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
+/** The seventh task: liveness, lane events, runner admin, journal pruning; it reopens a hub that failed to open. */
 export const RUNNERS_TASK = "runners";
 /** The autopilot tick's task (autopilot-tick.ts); it judges only while the toodo source is enabled. */
 export const AUTOPILOT_TASK = "autopilot";
@@ -143,10 +142,6 @@ export const AUTOPILOT_PASS_MS = 5_000;
 export const RUNNERS_PASS_MS = 5_000;
 /** How often the polling task delivers queued lane messages (lead steering, CI, rebase), apart from the GitHub poll. */
 export const LANE_MESSAGES_PASS_MS = 30_000;
-/** How often the runners task tries to open a runner hub that failed to open. */
-export const RUNNER_HUB_RETRY_MS = 30_000;
-/** How often the runners task drops old rows from the hub's runner event journal. */
-const RUNNER_JOURNAL_PRUNE_MS = 60 * 60_000;
 
 /**
  * Decides when systemd may be told WATCHDOG=1: only while the foreground loop has made progress (a finished pass, or a
@@ -346,7 +341,7 @@ export const supervisorSweeps = (
     ["recover", async () => recoverLanes(deps, undefined, enqueueRecovery, view)],
     // A lane that parked its goal on its own blocking ask gets it resumed once the answer reached it and its turn ended.
     ["decision-resume", async () => resumeAnsweredGoals(deps, view, admitted)],
-    ["freshness", async () => (await freshnessTick(deps, view, laneReports(), admitted)).map((act) => `${act.kind.toUpperCase()} ${act.lane} ${act.detail}`)],
+    ["freshness", async () => (await freshnessTick(deps, view, laneReports(), admitted)).map(sweepActLine)],
     // Urgent LANE_DRIFT for a working lane overdue on milestones or failing CI head after head; reads the last GitHub poll only.
     ["drift", async (emit) => {
       await driftTick({
@@ -393,7 +388,7 @@ export const supervisorSweeps = (
       const warned = new Map<string, string>();
       await Promise.all(results.map(async ({ machine, sample }) => {
         if (machineGuard.get(machine.label)?.alerting) return;
-        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errText(e)}`);
+        const note = await warnMachineLanes(deps.ops, machine, sample, open, deps.config.guard.memFreeMinPct).catch((e) => `warning failed: ${errLine(e, 160)}`);
         if (note) warned.set(machine.label, note);
       }));
       const lanesOn = (m: GuardMachine): string | undefined => {
@@ -441,7 +436,7 @@ export const runSweeps = async (sweeps: readonly Sweep[], emit: Emit, now: () =>
     try {
       for (const line of await step(put)) await put(line);
     } catch (e) {
-      const message = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+      const message = errLine(e);
       log(`SWEEP_ERROR ${name} ${message}`);
       try { await put(name === "watch" ? `LANE_WATCH_WARN ${message}` : `SWEEP_WARN ${name} ${message}`); }
       catch (w) { log(`SWEEP_WARN_LOST ${name} ${w instanceof Error ? w.message : String(w)}`); }
@@ -507,13 +502,6 @@ const settle = async (tasks: Promise<unknown> | undefined): Promise<void> => {
 };
 
 /**
- * Polling and sweeps enqueue independently of the single serialized lead delivery. There is no single loop: inbound,
- * delivery (with the owner notices and ack ticks), sweeps and GitHub/wait polling each run as their own task, so none
- * waits behind another; a stuck one is reported by name (TASK_STALLED) while the other three keep working, and each sweep
- * is tracked by the watchdog. Each startup step up to READY=1 is timed by `probe` (STARTUP_TIMINGS, STARTUP_SLOW <step>),
- * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
- */
-/**
  * Registers every secret store value with the masking registry and re-registers on changes to the store directory
  * (debounced). Failures are logged as SECRET_STORE_WATCH_FAILED and never thrown; a missing directory is not watched.
  * Returns the function that stops the watch.
@@ -544,18 +532,8 @@ export const watchSecretStore = async (
   return () => { clearTimeout(timer); watcher.close(); };
 };
 
-export const supervise = async (
-  deps: FlowDeps, signal: AbortSignal,
-  options: Partial<Omit<SupervisorDiscordOptions, "emit">> & {
-    readonly gatewayLockDir?: string;
-    /** Starts the local runner child (default Bun.spawn); tests inject one that starts nothing. */
-    readonly spawnRunner?: LocalChildDeps["spawn"];
-    /** The config.json to hot-reload (cli.ts: configPath()); without it nothing is watched. */
-    readonly configFile?: string;
-  } = {},
-  notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
-): Promise<void> => {
-  const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
+/** Refuses to start on a tunable or config value out of its bounds, or on an invalid delivery config. */
+const checkSuperviseConfig = (deps: FlowDeps): void => {
   const bounds: readonly (readonly [Record<string, unknown>, string, string])[] = [
     [deps.tunables, "cacheTtlMin", "positive"], [deps.tunables, "leadContextCapTokens", "positive"],
     [deps.tunables, "githubPollSeconds", "positive"], [deps.tunables, "githubTimeoutMs", "positive"],
@@ -573,6 +551,411 @@ export const supervise = async (
   }
   const deliveryProblem = deliveryConfigError(deps.tunables.delivery);
   if (deliveryProblem) throw new SuperviseError(deliveryProblem);
+};
+
+/**
+ * Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
+ * run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.
+ */
+const openEventSources = (deps: FlowDeps, supervisor: Supervisor, ops: OperationStore, remote: RunnerCall, home: string): EventSources => {
+  // The host's load only (no pane count): a scheduled heavy job's maxLoad.
+  const heavyLoad = async (): Promise<number> => (await sampleHost(deps.run, diskGuardPath(deps.config), async () => -1)).load1;
+  return new EventSources({
+    stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
+    policy: deps.tunables.eventPolicy, log: (line) => { console.error(line); }, remote,
+    schedules: {
+      operations: ops, journaled: (id: string) => supervisor.journaled(id),
+      heavy: {
+        take: async (label: string) => (await trySlot({
+          // One heavy-slot directory per host, shared with the lanes' `dori heavy`.
+          dir: join(home || homedir(), ".dori", "heavy"), slots: deps.config.heavySlots, maxLoad: deps.config.heavyMaxLoad, clock: deps.clock,
+          load: heavyLoad, alive: pidAlive, pid: process.pid,
+        }, label)) ?? undefined,
+        release: releaseSlot,
+      },
+    },
+  });
+};
+
+/**
+ * The autopilot task's pass and the toodo event stream that kicks it. AUTOPILOT_READY counts under the toodo source: it
+ * is what toodo's marked tasks add up to. The executor's deps are rebuilt per call over the live `deps`, so a config
+ * reload applies; the toodo source journals its notices.
+ */
+const autopilotTask = (deps: FlowDeps, ops: OperationStore, registry: EventSources): { readonly events: ToodoEvents; readonly pass: () => Promise<void> } => {
+  const executorDeps = () => liveExecutorDeps(deps, ops, registry.enqueueFor("toodo"), (line) => { console.error(line); });
+  const autopilot = new AutopilotTick({
+    tickMs: () => deps.config.autopilot.tickSec * 1000,
+    executorOn: () => deps.config.autopilot.executor,
+    execute: async (ids) => { const exec = executorDeps(); await reconcileExecutions(exec); return runExecutor(exec, ids); },
+    judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), enqueue: registry.enqueueFor("toodo"), now: deps.clock.now,
+    localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
+    log: (line) => { console.error(line); },
+  });
+  // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.
+  try { if (new SourceSpecs(deps.config.stateDir).remove(RECONCILE_JOB)) console.log(`AUTOPILOT_RECONCILE_JOB_REMOVED ${RECONCILE_JOB}: the supervisor's autopilot tick replaces it`); }
+  catch (e) { console.error(`AUTOPILOT_RECONCILE_JOB_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+  let executorStarted = false;
+  const events = new ToodoEvents({
+    config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: registry.enqueueFor("toodo"),
+    fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
+    onEvent: (event) => { if (AUTOPILOT_KICK_EVENTS.has(event)) autopilot.kick(); },
+  });
+  return {
+    events,
+    pass: async () => {
+      // Switch on: crash reconcile once at start (never fatal); the tick reconciles again on every pass.
+      if (!executorStarted && deps.config.autopilot.executor) {
+        executorStarted = true;
+        try { await reconcileExecutions(executorDeps()); } catch (e) { console.error(`AUTOPILOT_EXECUTOR_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+      }
+      if (deps.tunables.toodoEvents.enabled) await autopilot.tick();
+    },
+  };
+};
+
+/**
+ * The GitHub poll and what reads it. One review gate per supervisor (construction recovers its job store): CI follow-up
+ * merges only what it approved, and a merge of dori's own repo into dev queues the automatic update (the auto-update
+ * sweep runs it).
+ */
+const githubPolling = (deps: FlowDeps, probe: StartupProbe, enqueue: SourceEnqueue) => {
+  const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.clock.now));
+  const ownRepo = doriRepo(deps);
+  const review = probe.step("review-gate", () => new ReviewGate(deps));
+  const follow = probe.step("ci-follow", () => new CiFollowUp(deps, review, {
+    ...defaultCiIo,
+    merged: async (pull, base) => {
+      if (base === "dev" && pull.repo.toLowerCase() === await ownRepo()) noteDevMerge(deps.config.stateDir, `${pull.repo}#${pull.number}`);
+    },
+  }));
+  // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
+  const poll = async (): Promise<void> => {
+    await github.tick(deps, enqueue);
+    await follow.tick(github.openPulls(), enqueue, github.mergedPulls());
+    // Timeouts, reviewer intake and close, snapshot release (review-gate.ts); errors per job are logged there.
+    await review.tick(enqueue);
+  };
+  return { github, review, follow, poll };
+};
+
+type SweepTaskParts = {
+  readonly deps: FlowDeps;
+  readonly supervisor: Supervisor;
+  readonly discord: Discord;
+  readonly review: ReviewGate;
+  readonly registry: EventSources;
+  readonly enqueue: SourceEnqueue;
+  readonly home: string;
+  readonly boot: string;
+  readonly watchdog: Watchdog;
+  readonly probe: StartupProbe;
+  readonly reports: () => LaneReportStore | undefined;
+  readonly runnerGuard: () => RunnerGuardBoard | undefined;
+  readonly openPulls: () => readonly OpenPull[];
+};
+
+/**
+ * The sweeps task's pass: one round of the supervisor's sweeps. The task gets its own span, so its timings never mix
+ * into the startup report, and each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog. The
+ * watcher reads its claim announcements back from the journal.
+ */
+const sweepTask = (p: SweepTaskParts): (() => Promise<void>) => {
+  const { deps, supervisor, registry, enqueue, home } = p;
+  const sweepProbe = p.probe.span();
+  // The supervisor finishes a merged lane's Toodo task and appends the merge to its report (task-finish.ts).
+  // An autopilot task it cannot finish, or whose lane closed cancelled, gets a blocker note instead.
+  const toodoWriter = new ToodoWriter(deps.tunables.toodoWriter);
+  const finishTask = taskFinisher({ writer: toodoWriter, append: (lane, text) => appendFollowUp(deps.config.stateDir, p.discord, lane, text), language: () => deps.config.ownerLanguage });
+  // A clean done claim of a lane config autoReport covers is posted as its report by the supervisor (auto-report.ts).
+  const autoReport = autoReportPoster({ config: deps.config, discord: p.discord, now: deps.clock.now, home: home || homedir(), language: () => deps.config.ownerLanguage });
+  // The watch sweep holds a lane whose review is pending through the same gate CI follow-up merges with (D11).
+  const sweepDeps: FlowDeps = withReviewHold({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter), autoReport }, p.review);
+  const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueue(id, line); }, p.reports, pressureIo(sweepDeps), p.runnerGuard, p.openPulls).map(([name, step]): Sweep => [name, async (emit) =>
+    p.watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
+  const recentWarnings = new Map<string, number>();
+  let sequence = 0;
+  const sweep = async (): Promise<void> => {
+    const failed: string[] = [];
+    await runSweeps(sweeps, async (line, id, meta) => { enqueue(id ?? `sweep:${p.boot}:${sequence++}`, line, meta); }, deps.clock.now, recentWarnings, (line) => {
+      console.error(line);
+      if (line.startsWith("SWEEP_ERROR ")) failed.push(line.slice("SWEEP_ERROR ".length));
+    });
+    if (failed.length) registry.fail("sweeps", failed.join("; "));
+    else registry.ok("sweeps");
+  };
+  return () => sweep()
+    .catch((e: unknown) => { console.error(`SWEEP_ROUND_ERROR ${e instanceof Error ? e.message : String(e)}`); })
+    .finally(() => {
+      if (sweepProbe.active) {
+        sweepProbe.report("first-sweep");
+        sweepProbe.close();
+      }
+    });
+};
+
+/** Lead delivery: flushes queued events to the lead, repairing its pane, and tells the owner when it keeps failing. */
+const leadDelivery = (deps: FlowDeps, supervisor: Supervisor, systemPost: (channel: string, text: string) => Promise<void>, boot: string): RetryingDelivery =>
+  new RetryingDelivery({
+    now: deps.clock.now,
+    flush: () => supervisor.flush(),
+    repair: () => supervisor.repairLeadPane(),
+    enqueue: (id, line) => supervisor.enqueue(id, line),
+    notify: async (text) => {
+      const channel = alertsChannelOf(deps.config);
+      if (!channel) throw new Error("no discordChannels configured");
+      await systemPost(channel, `수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`);
+    },
+    log: (line) => { console.error(line); },
+  }, boot);
+
+/** Records whether the Discord gateway is connected, for `dori status`; a failure is logged, never thrown. */
+const writeHeartbeat = (deps: FlowDeps, inbound: ReturnType<typeof supervisorDiscord> | undefined): void => {
+  try {
+    const gateway = inbound?.state() ?? { connected: false, messageContent: false };
+    writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), ...gateway });
+  } catch (e) {
+    console.error(`GATEWAY_STATUS_ERROR ${e instanceof Error ? e.message : String(e)}`);
+  }
+};
+
+type LaneReportParts = {
+  readonly deps: FlowDeps;
+  readonly ops: OperationStore;
+  readonly reports: LaneReportStore;
+  readonly review: ReviewGate;
+  readonly transport: LaneStatusTransport;
+  readonly decisions: DecisionContext;
+  readonly home: string;
+  readonly enqueue: SourceEnqueue;
+  readonly watchdog: Watchdog;
+};
+
+/**
+ * Routes lane reports, as the 5 s reports task's pass, so a question reaches the lead within one pass and one delivery
+ * tick of being written, however long a GitHub poll takes. A lane question with choices opens an owner decision
+ * thread; failures are logged, never thrown.
+ */
+const laneReportsPass = (p: LaneReportParts): (() => Promise<void>) => {
+  const { deps, reports, transport, decisions, home, enqueue } = p;
+  let nextHistoryPrune = 0;
+  return () => p.watchdog.track("reports", (async () => {
+    const now = deps.clock.now();
+    if (now >= nextHistoryPrune) {
+      p.ops.prune(now);
+      reports.prune(now);
+      nextHistoryPrune = now + 60 * 60_000;
+    }
+    const lines = await routeReports(deps, reports, enqueue, home, transport, (lane, report) => openLaneDecision(decisions, lane, report),
+      reviewSectionOf(deps, p.review));
+    // Review status in each author lane's status message and the owner decision of a reached review limit
+    // (review-status.ts), right after the reports so the two never write one status message at once.
+    lines.push(...await reviewStatusTick({
+      flow: deps, stores: p.review, reports, transport, decisions, home,
+      emit: (id, line) => { enqueue(id, line); },
+    }));
+    return [...lines, ...await firstStatusTick(deps, transport, reports, home)];
+  })())
+    .then((lines) => { for (const line of lines) console.log(line); })
+    .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
+};
+
+type NoticeParts = {
+  readonly deps: FlowDeps;
+  readonly supervisor: Supervisor;
+  readonly discord: Discord;
+  readonly decisions: DecisionContext;
+  readonly laneMessages: () => LaneMessageStore;
+  /** An owner notice goes where the message came from: its Discord channel or thread. */
+  readonly ownerNotice: (channel: string, text: string, id: string) => Promise<void>;
+};
+
+/** The notices task's pass: the owner notices, then the report, decision and thread checks, each failing on its own. */
+const ownerNotices = (p: NoticeParts): (() => Promise<void>) => {
+  const { deps, supervisor, decisions, laneMessages } = p;
+  // One plain line to the owner per message a lead-side check found due; each notice is attempted once per round.
+  const noticeDue = async (
+    kind: "delay" | "ack" | "unhandled", text: string, checkCode: string, failCode: string,
+    findDue: () => ReturnType<typeof supervisor.overdueOwnerMessages>, announce?: string,
+  ): Promise<void> => {
+    let due: ReturnType<typeof supervisor.overdueOwnerMessages>;
+    try { due = findDue(); }
+    catch (e) { console.error(`${checkCode} ${e instanceof Error ? e.message : String(e)}`); return; }
+    for (const { channel, message } of due) {
+      if (announce) console.log(`${announce} ${channel}/${message}`);
+      try {
+        supervisor.noticeAttempt(kind, channel, message);
+        await p.ownerNotice(channel, text, `${kind}:${channel}:${message}`);
+        supervisor.noticeSent(kind, channel, message);
+      }
+      catch (e) { console.error(`${failCode} ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+  };
+  // A finished lane the lead did not report to the owner (dori reported) in time: UNREPORTED wakes the lead. The
+  // supervisor never tells the owner itself.
+  let decisionsReconciled = false;
+  const checkReported = async (): Promise<void> => {
+    await isolate("REPORT_CHECK_ERROR", () => supervisor.reportTick());
+    // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
+    await isolate("RESOLVE_CHECK_ERROR", () => supervisor.resolveTick());
+    // Once per start: direct decision answers' delivery intents against the lane message queue (crash repair).
+    if (!decisionsReconciled) {
+      await isolate("DECISION_RECONCILE_ERROR", async () => {
+        const open = (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed");
+        await reconcileDecisionsAtStart(deps.config.stateDir, laneMessages(), open, deps.clock.now(),
+          (id, line) => supervisor.enqueue(id, line), (line) => { console.error(line); });
+        decisionsReconciled = true;
+      });
+    }
+    // Every round: direct answers' acks close their decisions, the owner's status line follows each answer, and an
+    // answer whose lane session went away is handed to the lead once.
+    await isolate("DECISION_DELIVERY_ERROR", () => decisionDeliveryTick({ ...decisions, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
+      laneMessages(), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed")));
+    // A close text its lane did not take is tried again before the tick raises DECISION_RELAY_FAILED for it.
+    await isolate("DECISION_RELAY_RETRY_ERROR", async () => {
+      for (const d of await retryDecisionRelays(deps)) { const line = relayLine(d); if (line) console.error(line); }
+    });
+    // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
+    await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisions, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
+    // Owner-closed records and closed lanes' last reports past THREAD_FOLLOWUP_KEEP_MS are dropped.
+    await isolate("THREAD_FOLLOWUP_PRUNE_ERROR", async () => { pruneThreadFollowups(deps.config.stateDir, deps.clock.now(), await deps.registry.open()); });
+    // A thread whose work is all finished and reported gets the owner's close button on its last report, and is closed
+    // (archived) once threadCloseAfterHours pass with no click.
+    await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick({
+      button: (thread, message, state) => p.discord.editComponents(thread, message, state === "none" ? [] : closeThreadButton(thread, state === "closed")),
+      archive: (thread) => p.discord.setThread(thread, { archived: true }),
+    }));
+  };
+  return async () => {
+    // An owner message the lead has not taken within a minute gets one plain line in its own channel or thread.
+    await noticeDue("delay", deps.tunables.ownerDelayNotice, "OWNER_NOTICE_ERROR", "OWNER_NOTICE_FAILED",
+      () => supervisor.overdueOwnerMessages(OWNER_NOTICE_AFTER_MS));
+    // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
+    await noticeDue("ack", deps.tunables.ackMissingNotice, "ACK_CHECK_ERROR", "ACK_NOTICE_FAILED",
+      () => supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000), "ACK_MISSING_NOTICE");
+    // A message the lead acked but never linked to lanes or a reply: UNHANDLED wakes it, then the owner gets one line.
+    await noticeDue("unhandled", deps.tunables.unhandledNotice, "HANDLED_CHECK_ERROR", "UNHANDLED_NOTICE_FAILED",
+      () => supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000), "UNHANDLED_NOTICE");
+    await checkReported();
+  };
+};
+
+type PollingParts = {
+  readonly deps: FlowDeps;
+  readonly registry: EventSources;
+  readonly waits: Waits;
+  readonly enqueueWait: SourceEnqueue;
+  readonly enqueueSweep: SourceEnqueue;
+  readonly pollGithub: () => Promise<void>;
+  readonly follow: CiFollowUp;
+  readonly watchdog: Watchdog;
+};
+
+/** The polling task's pass: waits, the GitHub poll when due, queued lane messages when due, and the sources. */
+const pollingPass = (p: PollingParts): (() => Promise<void>) => {
+  const { deps, registry, watchdog } = p;
+  let lastGitHub = -Infinity;
+  let lastLaneMessages = -Infinity;
+  return async () => {
+    const polls = [watchdog.track("waits", registry.guard("waits", p.waits.tick(deps.clock.now, deps.run, p.enqueueWait)))
+      .catch((e: unknown) => { console.error(`WAIT_ERROR ${e instanceof Error ? e.message : String(e)}`); })];
+    if (deps.clock.now() - lastGitHub >= deps.tunables.githubPollSeconds * 1_000) {
+      lastGitHub = deps.clock.now();
+      polls.push(watchdog.track("github", registry.guard("github", p.pollGithub()))
+        .catch((e: unknown) => { console.error(`GITHUB_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
+    }
+    if (deps.clock.now() - lastLaneMessages >= LANE_MESSAGES_PASS_MS) {
+      lastLaneMessages = deps.clock.now();
+      polls.push(watchdog.track("lane-messages", p.follow.deliver(p.enqueueSweep))
+        .catch((e: unknown) => { console.error(`LANE_MESSAGE_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
+    }
+    polls.push(watchdog.track("sources", registry.tick())
+      .catch((e: unknown) => { console.error(`SOURCES_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
+    await Promise.all(polls);
+  };
+};
+
+type TaskName = SupervisorTask | typeof RUNNERS_TASK | typeof AUTOPILOT_TASK;
+
+/**
+ * Runs each task as its own loop until `halted`, so one stuck pass costs only that task. Every pass is tracked as
+ * task:<name>: watchTasks reports one running past TASK_ALERT_MS by name, and past WATCHDOG_STALL_MS it withholds the
+ * watchdog. Each task's first pass is reported as `first-<task>` (the sweeps task reports its own `first-sweep`).
+ */
+const taskRunner = (probe: StartupProbe, watchdog: Watchdog, wait: Pause, halted: AbortSignal) =>
+  (name: TaskName, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
+    const span = name === "sweeps" ? undefined : probe.span();
+    while (!halted.aborted) {
+      // The pass starts only once task:<name> is tracked, so the watchdog names the task before any work it tracks inside.
+      try { await watchdog.track(`task:${name}`, Promise.resolve().then(() => span?.active ? span.step(`task:${name}`, pass) : pass())); }
+      catch (e) { console.error(`TASK_ERROR ${name} ${e instanceof Error ? e.message : String(e)}`); }
+      if (span?.active) {
+        span.report(`first-${name}`);
+        span.close();
+      }
+      await wait(pauseMs, halted);
+    }
+  })();
+
+/**
+ * The foreground loop until `halted`: a task pass running past TASK_ALERT_MS is reported once (TASK_STALLED) to the lead,
+ * a stuck delivery task to the owner too, and its end once (TASK_RECOVERED); every round marks progress and pets the watchdog.
+ */
+const watchTasks = async (
+  deps: FlowDeps, supervisor: Supervisor, watchdog: Watchdog, systemPost: (channel: string, text: string, id?: string) => Promise<void>,
+  boot: string, wait: Pause, halted: AbortSignal,
+): Promise<void> => {
+  const stalled = new Set<string>();
+  while (!halted.aborted) {
+    const busy = new Map(watchdog.busy("task:"));
+    for (const name of stalled) {
+      if ((busy.get(name) ?? 0) >= TASK_ALERT_MS) continue;
+      stalled.delete(name);
+      console.log(`TASK_RECOVERED ${name.slice("task:".length)}`);
+    }
+    for (const [name, ms] of busy) {
+      if (ms < TASK_ALERT_MS || stalled.has(name)) continue;
+      stalled.add(name);
+      const which = name.slice("task:".length);
+      const line = `TASK_STALLED ${which} its pass has run ${Math.round(ms / 60_000)} min without finishing; the other supervisor tasks keep running, and the supervisor restarts if it is still stuck at ${Math.round(WATCHDOG_STALL_MS / 60_000)} min`;
+      const id = `task-stalled:${boot}:${which}:${deps.clock.now() - ms}`;
+      console.error(line);
+      try { supervisor.enqueue(id, line); } catch (e) { console.error(`TASK_STALLED_ENQUEUE_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); }
+      // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the alerts channel (else the
+      // main channel). Not awaited: a hung post must not stop this loop.
+      const channel = alertsChannelOf(deps.config);
+      if (which === "delivery" && channel) {
+        const notice = `도리 경고: 수퍼바이저의 전달 작업이 ${Math.round(ms / 60_000)}분째 끝나지 않고 있습니다. 다른 작업은 계속 돌아가며, ${Math.round(WATCHDOG_STALL_MS / 60_000)}분까지 멈춰 있으면 수퍼바이저가 재시작됩니다. (TASK_STALLED ${which})`;
+        void systemPost(channel, scrubForThread(notice, homedir()), id)
+          .catch((e: unknown) => { console.error(`TASK_STALLED_NOTIFY_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); });
+      }
+    }
+    watchdog.progress();
+    await watchdog.pet();
+    await wait(5_000, halted);
+  }
+};
+
+/**
+ * Polling and sweeps enqueue independently of the single serialized lead delivery. There is no single loop: inbound,
+ * lead delivery, the owner notices with the lead-side checks, sweeps and GitHub/wait polling each run as their own task,
+ * so none waits behind another; a stuck one is reported by name (TASK_STALLED) while the others keep working, and each sweep
+ * is tracked by the watchdog. Each startup step up to READY=1 is timed by `probe` (STARTUP_TIMINGS, STARTUP_SLOW <step>),
+ * so a hang names its step, and each task's first pass is reported as `first-<task>` (`first-sweep` for the sweeps).
+ */
+export const supervise = async (
+  deps: FlowDeps, signal: AbortSignal,
+  options: Partial<Omit<SupervisorDiscordOptions, "emit">> & {
+    readonly gatewayLockDir?: string;
+    /** Starts the local runner child (default Bun.spawn); tests inject one that starts nothing. */
+    readonly spawnRunner?: LocalChildDeps["spawn"];
+    /** The config.json to hot-reload (cli.ts: configPath()); without it nothing is watched. */
+    readonly configFile?: string;
+  } = {},
+  notify: (state: string) => Promise<boolean> = sdNotify, probe = new StartupProbe(), wait: Pause = pause,
+): Promise<void> => {
+  const { gatewayLockDir, spawnRunner, configFile, ...discordOptions } = options;
+  checkSuperviseConfig(deps);
   setDefaultRunTimeout(deps.config.runTimeoutMs);
   let release: (() => void) | undefined;
   let ready = false;
@@ -581,24 +964,10 @@ export const supervise = async (
   let sources: EventSources | undefined;
   let scheduleOps: OperationStore | undefined;
   let reports: LaneReportStore | undefined;
-  let runnerHub: RunnerHubHandle | undefined;
-  let localRunner: LocalChild | undefined;
-  let stopRelay: (() => void) | undefined;
-  let relayListener: Listener | undefined;
+  let runners: SupervisorRunners | undefined;
   let laneMessages: LaneMessageStore | undefined;
   let stopConfigWatch: (() => void) | undefined;
-  // Lane operations go through the hub's RunnerCalls; until the hub is open every call fails closed.
-  const hubCall: RunnerCall = {
-    call: (label, type, body, opts) => {
-      if (!runnerHub) return Promise.reject(new RunnerUnavailable(label, "disconnected", "the runner hub is not open"));
-      return runnerHub.calls.call(label, type, body, opts);
-    },
-    query: (label, type, body, opts) => {
-      if (!runnerHub) return Promise.reject(new RunnerUnavailable(label, "disconnected", "the runner hub is not open"));
-      return runnerHub.calls.query(label, type, body, opts);
-    },
-    connected: (label) => runnerHub?.calls.connected(label) ?? false,
-  };
+  const hubCall = runnerCallsOf(() => runners?.handle);
   // The caller's ops (cli.ts: the CLI relay, which this process serves) are replaced by the hub's own.
   deps = { ...deps, ops: laneOps(hubCall, { now: deps.clock.now, log: (line) => { console.error(line); } }) };
   const watchdog = new Watchdog(deps.clock.now, notify);
@@ -621,8 +990,6 @@ export const supervise = async (
       if (redirected) console.log(`SYSTEM_POST_REDIRECTED ${channel}: closed by the owner, one line went to ${redirected}`);
       else await discord.send(channel, body, id);
     };
-    // An owner notice goes where the message came from: its Discord channel or thread.
-    const ownerNotice = (channel: string, text: string, id: string): Promise<void> => systemPost(channel, text, id);
     const supervisor = probe.step("supervisor", () => new Supervisor(deps, {
       react: (op, channel, message, emoji) => op === "add" ? discord.react(channel, message, emoji) : discord.unreact(channel, message, emoji),
       persistLeadPane: (pane) => { saveLeadPane(stateDir, pane); },
@@ -636,105 +1003,26 @@ export const supervise = async (
       },
     }));
     deps = await ensureManagedPanes(deps, supervisor);
-    // Every built-in enqueues through the source registry, which records its last event and errors. The schedule sources
-    // run too, each run an operation row; a heavy job takes a heavy slot like `dori heavy`, without waiting for one.
     const ops = scheduleOps = probe.step("schedules", () => openOperations(deps.config));
-    // The host's load only (no pane count): a scheduled heavy job's maxLoad.
-    const heavyLoad = async (): Promise<number> => (await sampleHost(deps.run, diskGuardPath(deps.config), async () => -1)).load1;
     const home = process.env.HOME ?? "";
-    const registry = sources = new EventSources({
-      stateDir: deps.config.stateDir, enqueue: (id, line, meta) => supervisor.enqueue(id, line, meta), now: deps.clock.now, run: deps.run,
-      policy: deps.tunables.eventPolicy, log: (line) => { console.error(line); }, remote: hubCall,
-      schedules: {
-        operations: ops, journaled: (id: string) => supervisor.journaled(id),
-        heavy: {
-          take: async (label: string) => (await trySlot({
-            // One heavy-slot directory per host, shared with the lanes' `dori heavy`.
-            dir: join(home || homedir(), ".dori", "heavy"), slots: deps.config.heavySlots, maxLoad: deps.config.heavyMaxLoad, clock: deps.clock,
-            load: heavyLoad, alive: pidAlive, pid: process.pid,
-          }, label)) ?? undefined,
-          release: releaseSlot,
-        },
-      },
-    });
-    const enqueueOf = (name: BuiltinSource): SourceEnqueue => registry.enqueueFor(name);
-    const guarded = <T>(name: BuiltinSource, work: Promise<T>): Promise<T> => registry.guard(name, work);
-    const enqueueSweep = enqueueOf("sweeps");
-    const enqueueWait = enqueueOf("waits");
-    const enqueueGitHub = enqueueOf("github");
-    const enqueueDiscord = enqueueOf("discord");
-    // AUTOPILOT_READY counts under the toodo source: it is what toodo's marked tasks add up to.
-    // The executor's deps are rebuilt per call over the live `deps`, so a config reload applies; the toodo source journals its notices.
-    const executorDeps = () => liveExecutorDeps(deps, ops, enqueueOf("toodo"), (line) => { console.error(line); });
-    const autopilot = new AutopilotTick({
-      tickMs: () => deps.config.autopilot.tickSec * 1000,
-      executorOn: () => deps.config.autopilot.executor,
-      execute: async (ids) => { const exec = executorDeps(); await reconcileExecutions(exec); return runExecutor(exec, ids); },
-      judge: () => judgeCandidates(liveJudgeDeps(deps, ops)), enqueue: enqueueOf("toodo"), now: deps.clock.now,
-      localState: async () => autopilotLocalStateKey(ops, new Set((await deps.registry.open()).map((l) => l.key))),
-      log: (line) => { console.error(line); },
-    });
-    // The tick replaced the hourly autopilot-reconcile schedule job; one left from an earlier version is removed.
-    try { if (new SourceSpecs(deps.config.stateDir).remove(RECONCILE_JOB)) console.log(`AUTOPILOT_RECONCILE_JOB_REMOVED ${RECONCILE_JOB}: the supervisor's autopilot tick replaces it`); }
-    catch (e) { console.error(`AUTOPILOT_RECONCILE_JOB_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-    let executorStarted = false;
-    const toodoEvents = new ToodoEvents({
-      config: deps.tunables.toodoEvents, stateDir: deps.config.stateDir, enqueue: enqueueOf("toodo"),
-      fail: (e) => { registry.fail("toodo", e); }, ok: () => { registry.ok("toodo"); }, log: (line) => { console.error(line); },
-      onEvent: (event) => { if (AUTOPILOT_KICK_EVENTS.has(event)) autopilot.kick(); },
-    });
+    const registry = sources = openEventSources(deps, supervisor, ops, hubCall, home);
+    const enqueueSweep = registry.enqueueFor("sweeps");
+    const enqueueWait = registry.enqueueFor("waits");
+    const enqueueDiscord = registry.enqueueFor("discord");
+    const autopilot = autopilotTask(deps, ops, registry);
     const waits = probe.step("waits", () => new Waits(deps.config.stateDir, deps.tunables.waitMaxFailures, hubCall));
-    const github = probe.step("github", () => new GitHubEvents(deps.config.stateDir, deps.clock.now));
-    const ownRepo = doriRepo(deps);
-    // A merge of dori's own repo into dev queues the automatic update (the auto-update sweep runs it).
-    // One review gate per supervisor (construction recovers its job store): CI follow-up merges only what it approved.
-    const review = probe.step("review-gate", () => new ReviewGate(deps));
-    const follow = ci = probe.step("ci-follow", () => new CiFollowUp(deps, review, {
-      ...defaultCiIo,
-      merged: async (pull, base) => {
-        if (base === "dev" && pull.repo.toLowerCase() === await ownRepo()) noteDevMerge(deps.config.stateDir, `${pull.repo}#${pull.number}`);
-      },
-    }));
-    // CI follow-up reads the poll it follows, so it runs right after each GitHub tick.
-    const pollGithub = async (): Promise<void> => {
-      await github.tick(deps, enqueueGitHub);
-      await follow.tick(github.openPulls(), enqueueGitHub, github.mergedPulls());
-      // Timeouts, reviewer intake and close, snapshot release (review-gate.ts); errors per job are logged there.
-      await review.tick(enqueueGitHub);
-    };
-    // The sweep task gets its own span, so its timings never mix into the startup report.
-    const sweepProbe = probe.span();
-    // Each sweep is tracked: one stuck past WATCHDOG_STALL_MS withholds the watchdog.
-    // The watcher reads its claim announcements back from the journal.
-    // The supervisor finishes a merged lane's Toodo task and appends the merge to its report (task-finish.ts).
-    // An autopilot task it cannot finish, or whose lane closed cancelled, gets a blocker note instead.
-    const toodoWriter = new ToodoWriter(deps.tunables.toodoWriter);
-    const finishTask = taskFinisher({ writer: toodoWriter, append: (lane, text) => appendFollowUp(stateDir, discord, lane, text), language: () => deps.config.ownerLanguage });
-    // A clean done claim of a lane config autoReport covers is posted as its report by the supervisor (auto-report.ts).
-    const autoReport = autoReportPoster({ config: deps.config, discord, now: deps.clock.now, home: home || homedir(), language: () => deps.config.ownerLanguage });
-    // The watch sweep holds a lane whose review is pending through the same gate CI follow-up merges with (D11).
-    const sweepDeps: FlowDeps = withReviewHold({ ...deps, leadDelivered: (id) => supervisor.leadDelivered(id), finishTask, blockTask: taskBlocker(toodoWriter), autoReport }, review);
-    const sweeps = supervisorSweeps(sweepDeps, home, async (line, id) => { enqueueSweep(id, line); }, () => reports, pressureIo(sweepDeps), () => runnerHub?.guard, () => github.openPulls()).map(([name, step]): Sweep => [name, async (emit) =>
-      watchdog.track(`sweep:${name}`, sweepProbe.step(`loop:sweep:${name}`, () => step(emit)))]);
-    const recentWarnings = new Map<string, number>();
+    const { github, review, follow, poll: pollGithub } = githubPolling(deps, probe, registry.enqueueFor("github"));
+    ci = follow;
     const boot = randomUUID();
-    const retry = new RetryingDelivery({
-      now: deps.clock.now,
-      flush: () => supervisor.flush(),
-      repair: () => supervisor.repairLeadPane(),
-      enqueue: (id, line) => supervisor.enqueue(id, line),
-      notify: async (text) => {
-        const channel = alertsChannelOf(deps.config);
-        if (!channel) throw new Error("no discordChannels configured");
-        await systemPost(channel, `수퍼바이저가 리드에게 이벤트를 계속 전달하지 못하고 있습니다. 이벤트는 보관 중이며 계속 재시도합니다. (${text})`);
-      },
-      log: (line) => { console.error(line); },
-    }, boot);
-    let sequence = 0;
+    const sweep = sweepTask({
+      deps, supervisor, discord, review, registry, enqueue: enqueueSweep, home, boot, watchdog, probe,
+      reports: () => reports, runnerGuard: () => runners?.guard, openPulls: () => github.openPulls(),
+    });
+    const retry = leadDelivery(deps, supervisor, systemPost, boot);
     let deliveryError: unknown;
-    const emit = async (id: string, line: string): Promise<void> => { enqueueDiscord(id, line); };
-    const discordInbound = probe.step("inbound", () => supervisorDiscord(deps, {
-      ...discordOptions, token, emit, laneMessages: () => (laneMessages ??= openLaneMessages(deps.config)),
+    const laneMessageStore = (): LaneMessageStore => (laneMessages ??= openLaneMessages(deps.config));
+    const discordInbound = inbound = probe.step("inbound", () => supervisorDiscord(deps, {
+      ...discordOptions, token, emit: async (id, line) => { enqueueDiscord(id, line); }, laneMessages: laneMessageStore,
       http: discordOptions.http ?? ((request) => fetchHttp({
         ...request, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
       })),
@@ -743,278 +1031,21 @@ export const supervise = async (
       statusLookup: discordOptions.statusLookup ?? ((lookupSignal, page) =>
         lookupStatus({ ...deps, config: { ...deps.config, leadPane: supervisor.leadPane } })(lookupSignal, page)),
     }));
-    inbound = discordInbound;
-    const heartbeat = (): void => {
-      try {
-        const gateway = inbound?.state() ?? { connected: false, messageContent: false };
-        writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), ...gateway });
-      } catch (e) {
-        console.error(`GATEWAY_STATUS_ERROR ${e instanceof Error ? e.message : String(e)}`);
-      }
-    };
-    const sweep = async (): Promise<void> => {
-      const failed: string[] = [];
-      await runSweeps(sweeps, async (line, id, meta) => { enqueueSweep(id ?? `sweep:${boot}:${sequence++}`, line, meta); }, deps.clock.now, recentWarnings, (line) => {
-        console.error(line);
-        if (line.startsWith("SWEEP_ERROR ")) failed.push(line.slice("SWEEP_ERROR ".length));
-      });
-      if (failed.length) registry.fail("sweeps", failed.join("; "));
-      else registry.ok("sweeps");
-    };
-    // Lane reports are routed in the 5 s polling pass, so a question reaches the lead within one pass and one delivery
-    // tick of being written.
     const reportStore = reports = probe.step("lane-reports", () => openLaneReports(deps.config));
     // The status message rides the supervisor's own Discord client, so a token from ~/.dori/env works as well as the environment.
     const statusTransport = statusTransportOf(discord);
     // Owner decision threads ride the same client: a lane question with choices opens one (owner-approved exception to
     // the supervisor never talking to the owner), and the decision tick runs with the report checks.
     const decisionCtx: DecisionContext = { config: deps.config, transport: discord, now: deps.clock.now, home };
-    let nextHistoryPrune = 0;
-    const routeLaneReports = (): Promise<void> => watchdog.track("reports", (async () => {
-      const now = deps.clock.now();
-      if (now >= nextHistoryPrune) {
-        ops.prune(now);
-        reportStore.prune(now);
-        nextHistoryPrune = now + 60 * 60_000;
-      }
-      const lines = await routeReports(deps, reportStore, enqueueSweep, home, statusTransport, (lane, report) => openLaneDecision(decisionCtx, lane, report),
-        reviewSectionOf(deps, review));
-      // Review status in each author lane's status message and the owner decision of a reached review limit
-      // (review-status.ts), right after the reports so the two never write one status message at once.
-      lines.push(...await reviewStatusTick({
-        flow: deps, stores: review, reports: reportStore, transport: statusTransport, decisions: decisionCtx, home,
-        emit: (id, line) => { enqueueSweep(id, line); },
-      }));
-      return [...lines, ...await firstStatusTick(deps, statusTransport, reportStore, home)];
-    })())
-      .then((lines) => { for (const line of lines) console.log(line); })
-      .catch((e: unknown) => { console.error(`LANE_REPORTS_ERROR ${e instanceof Error ? e.message : String(e)}`); });
-    const tickSources = (): Promise<void> => watchdog.track("sources", registry.tick())
-      .catch((e: unknown) => { console.error(`SOURCES_ERROR ${e instanceof Error ? e.message : String(e)}`); });
-    // One plain line to the owner per message a lead-side check found due; each notice is attempted once per round.
-    const noticeDue = async (
-      kind: "delay" | "ack" | "unhandled", text: string, checkCode: string, failCode: string,
-      findDue: () => ReturnType<typeof supervisor.overdueOwnerMessages>, announce?: string,
-    ): Promise<void> => {
-      let due: ReturnType<typeof supervisor.overdueOwnerMessages>;
-      try { due = findDue(); }
-      catch (e) { console.error(`${checkCode} ${e instanceof Error ? e.message : String(e)}`); return; }
-      for (const { channel, message } of due) {
-        if (announce) console.log(`${announce} ${channel}/${message}`);
-        try {
-          supervisor.noticeAttempt(kind, channel, message);
-          await ownerNotice(channel, text, `${kind}:${channel}:${message}`);
-          supervisor.noticeSent(kind, channel, message);
-        }
-        catch (e) { console.error(`${failCode} ${channel}/${message}: ${e instanceof Error ? e.message : String(e)}`); }
-      }
-    };
-    // An owner message the lead has not taken within a minute gets one plain line in its own channel or thread.
-    const noticeOverdue = (): Promise<void> => noticeDue("delay", deps.tunables.ownerDelayNotice, "OWNER_NOTICE_ERROR", "OWNER_NOTICE_FAILED",
-      () => supervisor.overdueOwnerMessages(OWNER_NOTICE_AFTER_MS));
-    // A message the lead was handed but never acked is re-pushed, and after a second window the owner gets one line.
-    const noticeUnacked = (): Promise<void> => noticeDue("ack", deps.tunables.ackMissingNotice, "ACK_CHECK_ERROR", "ACK_NOTICE_FAILED",
-      () => supervisor.ackTick(deps.tunables.ackTimeoutSec * 1_000), "ACK_MISSING_NOTICE");
-    // A message the lead acked but never linked to lanes or a reply: UNHANDLED wakes it, then the owner gets one line.
-    const noticeUnhandled = (): Promise<void> => noticeDue("unhandled", deps.tunables.unhandledNotice, "HANDLED_CHECK_ERROR", "UNHANDLED_NOTICE_FAILED",
-      () => supervisor.handledTick(deps.tunables.handledTimeoutMin * 60_000), "UNHANDLED_NOTICE");
-    // A finished lane the lead did not report to the owner (dori reported) in time: UNREPORTED wakes the lead. The
-    // supervisor never tells the owner itself.
-    let decisionsReconciled = false;
-    const checkReported = async (): Promise<void> => {
-      await isolate("REPORT_CHECK_ERROR", () => supervisor.reportTick());
-      // A decision event the lead did not close (dori resolved) in time: UNRESOLVED wakes the lead.
-      await isolate("RESOLVE_CHECK_ERROR", () => supervisor.resolveTick());
-      // Once per start: direct decision answers' delivery intents against the lane message queue (crash repair).
-      if (!decisionsReconciled) {
-        await isolate("DECISION_RECONCILE_ERROR", async () => {
-          const open = (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed");
-          await reconcileDecisionsAtStart(deps.config.stateDir, laneMessages ??= openLaneMessages(deps.config), open, deps.clock.now(),
-            (id, line) => supervisor.enqueue(id, line), (line) => { console.error(line); });
-          decisionsReconciled = true;
-        });
-      }
-      // Every round: direct answers' acks close their decisions, the owner's status line follows each answer, and an
-      // answer whose lane session went away is handed to the lead once.
-      await isolate("DECISION_DELIVERY_ERROR", () => decisionDeliveryTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } },
-        laneMessages ??= openLaneMessages(deps.config), async () => (await deps.registry.list()).filter((lane) => statusOf(lane) !== "closed")));
-      // A close text its lane did not take is tried again before the tick raises DECISION_RELAY_FAILED for it.
-      await isolate("DECISION_RELAY_RETRY_ERROR", async () => {
-        for (const d of await retryDecisionRelays(deps)) { const line = relayLine(d); if (line) console.error(line); }
-      });
-      // Owner decisions: a stuck post, a missing link line, a pending archive, a queued secret request.
-      await isolate("OWNER_DECISION_CHECK_ERROR", () => ownerDecisionTick({ ...decisionCtx, enqueue: (id, line) => supervisor.enqueue(id, line), log: (line) => { console.error(line); } }));
-      // A thread whose work is all finished and reported gets the owner's close button on its last report, and is closed
-      // (archived) once threadCloseAfterHours pass with no click.
-      await isolate("THREAD_AUTO_CLOSE_CHECK_ERROR", () => supervisor.autoCloseTick({
-        button: (thread, message, state) => discord.editComponents(thread, message, state === "none" ? [] : closeThreadButton(thread, state === "closed")),
-        archive: (thread) => discord.setThread(thread, { archived: true }),
-      }));
-    };
-    let lastGitHub = -Infinity;
-    let lastLaneMessages = -Infinity;
-    // The hub always opens: every lane is runner-owned, and the local runner is this process's child. An unsafe runner
-    // directory or a busy socket costs the hub, never the supervisor: the lead gets RUNNER_HUB_DISABLED, every lane
-    // operation fails closed, and the runners task tries again every RUNNER_HUB_RETRY_MS until it opens.
-    let liveness: LivenessMonitor | undefined;
-    let takeLaneEvents: () => Promise<void> = async () => {};
-    const openRunners = async (step: <T>(name: string, work: () => T) => T): Promise<void> => {
-      try {
-        const runnerDir = defaultRunnerDir(home || undefined);
-        // Heartbeats and hellos feed the liveness monitor, built right after the hub because it needs the hub's epoch.
-        let monitor: LivenessMonitor | undefined;
-        // Lane events and hellos are taken one at a time, in arrival order, so a lane.started lands before its reports.
-        let laneWork: Promise<void> = Promise.resolve();
-        const laneDeps: LaneHubDeps = {
-          stateDir: deps.config.stateDir,
-          registry: deps.registry, reports: () => reports, now: deps.clock.now,
-          emit: (id, line) => { enqueueSweep(id, line); },
-          prepareRecovery: async (label, key) => {
-            // Inventory absence means RUNNER_LANE_UNKNOWN; only ordinary recovery scans for a relaunch.
-            runnerHub?.accept.checkFileCapability(label, "lane.recover");
-            return { cmdId: `recover:${key}:${deps.clock.now()}`, notes: [] };
-          },
-          recover: (label, key, prepared) => runnerHub?.accept.command(label, "lane.recover", {
-            cmdId: prepared.cmdId, key, ...(prepared.briefText !== undefined ? { briefText: prepared.briefText } : {}),
-            ...(prepared.files ? { files: prepared.files } : {}),
-          }),
-          close: (label, key, cmdId) => runnerHub?.accept.command(label, "lane.close", { cmdId, key, worktreeChecks: false }),
-          journalHead: () => runnerJournalHead(deps.config.stateDir),
-          // A lane's `dori report ack` arrives as lane.ack and is applied to the lane message store.
-          messages: () => (laneMessages ??= openLaneMessages(deps.config)),
-          // At each hello the runner gets every owned lane's notice back, for `dori lane status` inside the lane.
-          notify: (_label, lane) => deps.ops.notify(lane, {
-            status: lane.status ?? "working",
-            ...(lane.objection ? { objection: lane.objection } : {}),
-            ...(lane.claim ? { claim: { at: lane.claim.at, evidence: lane.claim.evidence } } : {}),
-          }),
-        };
-        // After a supervisor restart, a lane.start an earlier run sent and never saw answered is read back (design 5.6).
-        const readBackStarts = async (label: string, inventory: readonly InventoryLane[]): Promise<void> => {
-          if (runnerHub) await readBackRunnerStarts(runnerHub, deps.registry, label, inventory, enqueueSweep, (line) => { console.log(line); });
-        };
-        const inOrder = (what: string, work: () => Promise<void>): void => {
-          laneWork = laneWork.then(work).catch((e: unknown) => { console.error(`RUNNER_LANE_ERROR ${what} ${e instanceof Error ? e.message : String(e)}`); });
-        };
-        const hub = runnerHub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
-          onHeartbeat: (label) => { void monitor?.heartbeat(label); },
-          onHerdr: (id, line) => { enqueueSweep(id, line); },
-          // A runner's cleanup sweep asks for its closed lanes (lanes.closed): local lanes carry no machine, a remote runner's carry its label.
-          onClosedLanes: async (label) => closedLanesOf(await deps.registry.archived(), label === LOCAL_RUNNER ? undefined : label),
-          // A remote runner's secret.get: decided here with the registry, config and this host's store (secret-serve.ts).
-          onSecret: supervisorSecretHandler({
-            laneOwner: async (key) => { const lane = (await deps.registry.open()).find((l) => l.key === key); return lane && runnerOf(lane); },
-            runnerUnsandboxed: (label) => deps.config.runners?.[label]?.allowUnsandboxed === true,
-            granter: supervisorGranter({ store: new SecretStore(), onGranted: addKnownSecrets }),
-            // A remote runner's secret.run: the op runs here, outside any lane; only its redacted output goes back.
-            commandRunner: supervisorCommandRunner({
-              store: new SecretStore(), onGranted: addKnownSecrets,
-              commands: async () => (await loadConfig()).secretCommands,
-              log: (line) => { console.log(line); },
-            }),
-            log: (line) => { console.log(line); },
-          }),
-          // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);
-          // `job.result` is kept in the runner journal only.
-          onEvent: (label, frame) => {
-            // A runner's own config reload (runner-config.json): reloaded, kept the last good one, or needs a restart.
-            if (frame.type === "runner.config") {
-              const kind = { reloaded: "RUNNER_CONFIG_RELOADED", invalid: "RUNNER_CONFIG_INVALID", restart: "RUNNER_CONFIG_RESTART_NEEDED" }[frame.body.state];
-              enqueueSweep(`runner-config:${label}:${frame.gen}:${frame.seq}`, `${kind} runner=${label} ${frame.body.detail}`);
-              return;
-            }
-            if (frame.type !== "wait.result" || frame.body.outcome !== "WAIT_DONE") return;
-            try { waits.settleRemote(label, frame.body.waitId, enqueueWait); }
-            catch (e) { console.error(`WAIT_ERROR runner=${label} wait=${frame.body.waitId} ${e instanceof Error ? e.message : String(e)}`); }
-          },
-          onHello: (label, body) => {
-            void monitor?.hello(label, body.gen);
-            inOrder(`hello ${label}`, async () => {
-              await reconcileInventory(laneDeps, label, body.inventory ?? []);
-              // Off the lane-event queue: the read-back awaits the runner's answers, which arrive as lane events too.
-              void readBackStarts(label, body.inventory ?? []).catch((e: unknown) => {
-                console.error(`RUNNER_READBACK_ERROR runner=${label} ${e instanceof Error ? e.message : String(e)}`);
-              });
-            });
-          },
-        }));
-        // The lead's `dori` CLI reaches the runners through this process: <runnerDir>/sock/cli next to the control socket.
-        relayListener = listenUnix(cliSocketPath(runnerDir));
-        stopRelay = serveCliRelay(relayListener, hub.calls, (line) => { console.error(line); });
-        // The local runner: `dori runner serve` as this process's child, restarted with backoff, stopped with it.
-        const child = localRunner = startLocalRunner({
-          spawn: spawnRunner ?? spawnProcess, argv: localRunnerArgv(join(import.meta.dir, "cli.ts")),
-          env: Object.fromEntries(Object.entries(process.env).filter((e): e is [string, string] => e[1] !== undefined)),
-          clock: deps.clock, log: (line) => { console.log(line); },
-        }, AbortSignal.any([signal, stop.signal]));
-        // Resume after successfully processed events; an upgrade with no cursor reads the retained journal once.
-        const readLaneEvents = laneEventReader(deps.config.stateDir, laneDeps);
-        takeLaneEvents = () => {
-          inOrder("journal", readLaneEvents);
-          return laneWork;
-        };
-        let livenessSeq = 0;
-        const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines, deps.config.stateDir)).machines);
-        monitor = liveness = new LivenessMonitor({
-          monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations: ops,
-          probe: io.probe,
-          // The local runner is restarted as this process's child, a worker's over ssh.
-          restart: async (label) => {
-            if (label !== LOCAL_RUNNER) return io.restart(label);
-            await child.restart();
-            return { ok: true, detail: "child restart" };
-          },
-          ownedLanes: async (label) => (await deps.registry.open()).filter((l) => l.runner === label).map((l) => l.key),
-          emit: (line) => { enqueueSweep(`runner-liveness:${deps.clock.now()}:${++livenessSeq}`, line); },
-          // A runner outage the lead is woken for is also a system notice in the alerts channel. Not awaited: a hung post
-          // must not stop the liveness tick.
-          alert: (text) => {
-            const channel = alertsChannelOf(deps.config);
-            if (!channel) return;
-            void systemPost(channel, scrubForThread(text, homedir()), `runner-liveness-alert:${boot}:${++livenessSeq}`)
-              .catch((e: unknown) => { console.error(`RUNNER_ALERT_NOTIFY_FAILED ${e instanceof Error ? e.message : String(e)}`); });
-          },
-          // Escalated outages outlive this process: a restart neither wakes the lead again nor loses the ONLINE.
-          outages: fileOutageStore(deps.config.stateDir),
-        });
-        for (const row of readRunnerRows(deps.config.stateDir)) monitor.track(row.label, row.maxGen);
-      } catch (e) {
-        // Whatever opened before the failure is closed, so a retry starts clean and nothing half-open answers calls.
-        stopRelay?.();
-        stopRelay = undefined;
-        relayListener?.close();
-        relayListener = undefined;
-        await localRunner?.stop();
-        localRunner = undefined;
-        runnerHub?.close();
-        runnerHub = undefined;
-        liveness = undefined;
-        takeLaneEvents = async () => {};
-        throw e;
-      }
-    };
-    // Why the hub is not open, while it is not; the lead hears of the outage once and of its end once.
-    let hubDown: string | undefined;
-    let lastHubAttempt = deps.clock.now();
-    const tryOpenRunners = async (step: <T>(name: string, work: () => T) => T): Promise<void> => {
-      lastHubAttempt = deps.clock.now();
-      try { await openRunners(step); }
-      catch (e) {
-        const why = e instanceof Error ? e.message : String(e);
-        console.error(`RUNNER_HUB_DISABLED ${why}`);
-        if (hubDown === undefined) {
-          enqueueSweep(`runner-hub-disabled:${boot}:${lastHubAttempt}`, `RUNNER_HUB_DISABLED ${why}; every lane operation fails until the runner hub opens, the supervisor tries again every ${RUNNER_HUB_RETRY_MS / 1_000} s`);
-        }
-        hubDown = why;
-        return;
-      }
-      if (hubDown !== undefined) {
-        console.log("RUNNER_HUB_OPENED");
-        enqueueSweep(`runner-hub-opened:${boot}:${lastHubAttempt}`, `RUNNER_HUB_OPENED the runner hub is open again (it had failed: ${hubDown})`);
-        hubDown = undefined;
-      }
-    };
-    await tryOpenRunners((name, work) => probe.step(name, work));
+    const routeLaneReports = laneReportsPass({
+      deps, ops, reports: reportStore, review, transport: statusTransport, decisions: decisionCtx, home, enqueue: enqueueSweep, watchdog,
+    });
+    const notices = ownerNotices({ deps, supervisor, discord, decisions: decisionCtx, laneMessages: laneMessageStore, ownerNotice: systemPost });
+    const hub = runners = new SupervisorRunners({
+      deps, home, operations: ops, boot, emit: (id, line) => { enqueueSweep(id, line); }, reports: () => reports, laneMessages: laneMessageStore,
+      settleWait: (label, waitId) => { waits.settleRemote(label, waitId, enqueueWait); }, systemPost, spawnRunner, signal: AbortSignal.any([signal, stop.signal]),
+    });
+    await hub.tryOpen((name, work) => probe.step(name, work));
     // config.json edits apply without a restart: the live keys are written into the config objects every part holds
     // (this loop's and the supervisor core's), so in-flight events, waits, lanes and the gateway are untouched.
     if (configFile) {
@@ -1025,126 +1056,37 @@ export const supervise = async (
       });
       stopConfigWatch = watchConfigFiles([configFile], reload);
     }
-    let lastJournalPrune = -Infinity;
     console.log(`SUPERVISOR_READY ${supervisor.eventLog}`);
     await probe.step("ready", () => notify("READY=1"));
     ready = true;
     probe.report("ready");
     petting = setInterval(() => { void watchdog.pet(); }, WATCHDOG_PET_MS);
-    // Each task is its own loop, so one stuck pass costs only that task. Every pass is tracked as task:<name>: the
-    // loop below reports one running past TASK_ALERT_MS by name, and past WATCHDOG_STALL_MS it withholds the watchdog.
     const halted = AbortSignal.any([signal, stop.signal]);
-    const task = (name: SupervisorTask | typeof RUNNERS_TASK | typeof AUTOPILOT_TASK, pauseMs: number, pass: () => Promise<void>): Promise<void> => (async () => {
-      const span = name === "sweeps" ? undefined : probe.span();
-      while (!halted.aborted) {
-        // The pass starts only once task:<name> is tracked, so the watchdog names the task before any work it tracks inside.
-        try { await watchdog.track(`task:${name}`, Promise.resolve().then(() => span?.active ? span.step(`task:${name}`, pass) : pass())); }
-        catch (e) { console.error(`TASK_ERROR ${name} ${e instanceof Error ? e.message : String(e)}`); }
-        if (span?.active) {
-          span.report(`first-${name}`);
-          span.close();
-        }
-        await wait(pauseMs, halted);
-      }
-    })();
+    const task = taskRunner(probe, watchdog, wait, halted);
     tasks = Promise.all([
       // A long-lived stream, not a pass: it reconnects on its own and is not tracked by the watchdog.
-      toodoEvents.run(halted),
+      autopilot.events.run(halted),
       task("inbound", 5_000, async () => {
-        try { await guarded("discord", discordInbound.tick()); } catch (e) { console.error(`INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        heartbeat();
+        try { await registry.guard("discord", discordInbound.tick()); } catch (e) { console.error(`INBOUND_ERROR ${e instanceof Error ? e.message : String(e)}`); }
+        writeHeartbeat(deps, inbound);
       }),
       task("delivery", 5_000, async () => {
-        await noticeOverdue();
-        await noticeUnacked();
-        await noticeUnhandled();
-        await checkReported();
         if (!retry.due) return;
         // A fatal delivery error ends the supervisor, as in the loop.
         try { await watchdog.track("delivery", retry.tick()); } catch (e) { deliveryError = e; stop.abort(); }
       }),
-      task("sweeps", 30_000, () => sweep()
-        .catch((e: unknown) => { console.error(`SWEEP_ROUND_ERROR ${e instanceof Error ? e.message : String(e)}`); })
-        .finally(() => {
-          if (sweepProbe.active) {
-            sweepProbe.report("first-sweep");
-            sweepProbe.close();
-          }
-        })),
-      task("polling", 5_000, async () => {
-        const polls = [watchdog.track("waits", guarded("waits", waits.tick(deps.clock.now, deps.run, enqueueWait)))
-          .catch((e: unknown) => { console.error(`WAIT_ERROR ${e instanceof Error ? e.message : String(e)}`); })];
-        if (deps.clock.now() - lastGitHub >= deps.tunables.githubPollSeconds * 1_000) {
-          lastGitHub = deps.clock.now();
-          polls.push(watchdog.track("github", guarded("github", pollGithub()))
-            .catch((e: unknown) => { console.error(`GITHUB_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
-        }
-        if (deps.clock.now() - lastLaneMessages >= LANE_MESSAGES_PASS_MS) {
-          lastLaneMessages = deps.clock.now();
-          polls.push(watchdog.track("lane-messages", follow.deliver(enqueueSweep))
-            .catch((e: unknown) => { console.error(`LANE_MESSAGE_ERROR ${e instanceof Error ? e.message : String(e)}`); }));
-        }
-        polls.push(tickSources(), routeLaneReports());
-        await Promise.all(polls);
-      }),
-      task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, async () => {
-        // Switch on: crash reconcile once at start (never fatal); the tick reconciles again on every pass.
-        if (!executorStarted && deps.config.autopilot.executor) {
-          executorStarted = true;
-          try { await reconcileExecutions(executorDeps()); } catch (e) { console.error(`AUTOPILOT_EXECUTOR_RECONCILE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        }
-        if (deps.tunables.toodoEvents.enabled) await autopilot.tick();
-      }),
-      task(RUNNERS_TASK, RUNNERS_PASS_MS, async () => {
-        if (!runnerHub && deps.clock.now() - lastHubAttempt >= RUNNER_HUB_RETRY_MS) await tryOpenRunners((_name, work) => work());
-        const handle = runnerHub;
-        if (!handle) return;
-        try { await liveness?.tick(); } catch (e) { console.error(`RUNNER_LIVENESS_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        try { await takeLaneEvents(); } catch (e) { console.error(`RUNNER_LANE_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        // `dori runner revoke|rotate` queue their request for the live hub; answer them first.
-        try { for (const line of drainRunnerAdmin(deps.config.stateDir, handle.accept, deps.clock.now(), (label) => { liveness?.untrack(label); })) console.log(line); }
-        catch (e) { console.error(`RUNNER_ADMIN_ERROR ${e instanceof Error ? e.message : String(e)}`); }
-        if (deps.clock.now() - lastJournalPrune >= RUNNER_JOURNAL_PRUNE_MS) {
-          lastJournalPrune = deps.clock.now();
-          let cursor = 0;
-          try {
-            const value: unknown = JSON.parse(readFileSync(join(deps.config.stateDir, RUNNER_LANE_CURSOR_FILE), "utf8"));
-            if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) cursor = value;
-          } catch {}
-          handle.journal.prune(lastJournalPrune, cursor);
-        }
-      }),
+      // Owner notices and the lead-side checks post to Discord (each post can take minutes against a failing Discord), so
+      // they run beside lead delivery, never in front of it.
+      task("notices", 5_000, notices),
+      task("sweeps", 30_000, sweep),
+      task("polling", 5_000, pollingPass({ deps, registry, waits, enqueueWait, enqueueSweep, pollGithub, follow, watchdog })),
+      // Lane reports ride their own loop: a GitHub call can hold a polling pass for its whole timeout.
+      task("reports", 5_000, routeLaneReports),
+      task(AUTOPILOT_TASK, AUTOPILOT_PASS_MS, autopilot.pass),
+      task(RUNNERS_TASK, RUNNERS_PASS_MS, () => hub.pass()),
     ]);
     probe.close();
-    const stalled = new Set<string>();
-    while (!halted.aborted) {
-      const busy = new Map(watchdog.busy("task:"));
-      for (const name of stalled) {
-        if ((busy.get(name) ?? 0) >= TASK_ALERT_MS) continue;
-        stalled.delete(name);
-        console.log(`TASK_RECOVERED ${name.slice("task:".length)}`);
-      }
-      for (const [name, ms] of busy) {
-        if (ms < TASK_ALERT_MS || stalled.has(name)) continue;
-        stalled.add(name);
-        const which = name.slice("task:".length);
-        const line = `TASK_STALLED ${which} its pass has run ${Math.round(ms / 60_000)} min without finishing; the other supervisor tasks keep running, and the supervisor restarts if it is still stuck at ${Math.round(WATCHDOG_STALL_MS / 60_000)} min`;
-        const id = `task-stalled:${boot}:${which}:${deps.clock.now() - ms}`;
-        console.error(line);
-        try { supervisor.enqueue(id, line); } catch (e) { console.error(`TASK_STALLED_ENQUEUE_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); }
-        // A stuck delivery task cannot hand the line to the lead, so the owner hears it in the alerts channel (else the
-        // main channel). Not awaited: a hung post must not stop this loop.
-        const channel = alertsChannelOf(deps.config);
-        if (which === "delivery" && channel) {
-          const notice = `도리 경고: 수퍼바이저의 전달 작업이 ${Math.round(ms / 60_000)}분째 끝나지 않고 있습니다. 다른 작업은 계속 돌아가며, ${Math.round(WATCHDOG_STALL_MS / 60_000)}분까지 멈춰 있으면 수퍼바이저가 재시작됩니다. (TASK_STALLED ${which})`;
-          void systemPost(channel, scrubForThread(notice, homedir()), id)
-            .catch((e: unknown) => { console.error(`TASK_STALLED_NOTIFY_FAILED ${which} ${e instanceof Error ? e.message : String(e)}`); });
-        }
-      }
-      watchdog.progress();
-      await watchdog.pet();
-      await wait(5_000, halted);
-    }
+    await watchTasks(deps, supervisor, watchdog, systemPost, boot, wait, halted);
     stop.abort();
     await settle(tasks);
     // Waited for once: the finally below does not spend a second grace on a pass still running.
@@ -1163,10 +1105,7 @@ export const supervise = async (
     await inbound?.close();
     if (inbound) writeGatewayStatus(deps.config.stateDir, { pid: process.pid, at: deps.clock.now(), connected: false, messageContent: false });
     reports?.close();
-    stopRelay?.();
-    relayListener?.close();
-    await localRunner?.stop();
-    runnerHub?.close();
+    await runners?.close();
     laneMessages?.close();
     sources?.close();
     scheduleOps?.close();

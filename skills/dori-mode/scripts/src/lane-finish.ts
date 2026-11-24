@@ -32,7 +32,7 @@ const toMain = async (discord: FinishDiscord, main: string | undefined, text: st
  * A thread the owner closed (closedByOwner) is never posted into: the line goes as one line linking the thread to the
  * thread's parent channel (`main` when Discord names none); a line too long to append goes to `main` the same way. A thread Discord answers 403/404 for falls back to `main`; any other failure
  * throws, so the outbox retries it (the stable id keeps a retried send from duplicating, and a retried append finds its
- * text already there). An archived thread, reopened by a post, is archived again; that read-back failing is logged,
+ * line, tagged with the id, already there). An archived thread, reopened by a post, is archived again; that read-back failing is logged,
  * never retried, since the line is already posted. Returns where it went.
  */
 export const postOwnerLine = async (discord: FinishDiscord, main: string | undefined, thread: string | undefined, text: string, id: string, options: OwnerLineOptions = {}): Promise<string> => {
@@ -45,7 +45,7 @@ export const postOwnerLine = async (discord: FinishDiscord, main: string | undef
       const archived = threadId ? await discord.threadArchived(threadId) : false;
       const report = threadId ? (options.stateDir ? lastReportIn(options.stateDir, threadId)?.message : undefined) ?? await options.statusMessage?.(threadId) : undefined;
       if (threadId && report) {
-        if (await appendToMessage(discord, threadId, report, text, archived)) return threadId;
+        if (await appendToMessage(discord, threadId, report, text, archived, id)) return threadId;
         return await toMain(discord, main, closedThreadLine(threadId, text), id);
       }
       await discord.send(to, text, id);

@@ -62,6 +62,18 @@ test("env refusals and failures print only code and detail to stderr", async () 
   }
 });
 
+test("env refuses a terminal stdout before reading any values", async () => {
+  let called = false;
+  const sock = socket(async () => { called = true; return { ok: true, values: { API_TOKEN: VALUE } }; });
+  const r = io();
+  expect(await laneCliMain(["secret", "env"], { env, connect: sock.connect, stdoutIsTTY: true, ...r.deps })).toBe(2);
+  expect(called).toBe(false);
+  expect(r.out).toEqual([]);
+  expect(r.err).toHaveLength(1);
+  expect(r.err[0]).toStartWith("SECRET_ENV_TTY_REFUSED ");
+  expect(r.err[0]).not.toContain(VALUE);
+});
+
 test("env rejects another lane token before reading any values", async () => {
   let called = false;
   const sock = socket(async () => { called = true; return { ok: true, values: {} }; });

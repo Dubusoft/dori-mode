@@ -46,7 +46,7 @@ const until = (subscribe: (signal: () => void) => () => void, check: () => boole
 
 /**
  * The real supervise(), where the work of `stalled` hangs until the test ends: the inbound Discord
- * catch-up, the delivery task's owner delay notice, the machine-guard sweep's `herdr machine list` (the host guard reads the
+ * catch-up, the delivery task's lead delivery pass, every Discord post (the notices task hangs on its owner delay notice), the machine-guard sweep's `herdr machine list` (the host guard reads the
  * local runner's sample and runs nothing), or the GitHub poll's gh api call (a wait check
  * has its own 10 s budget, so it cannot hold the polling task).
  */
@@ -87,15 +87,33 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
   const base = depsFor(world, clock, state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: OWNER }, discordChannels: ["11"], defaultModel: "test/model",
   });
-  // Outbound Discord posts are accepted; with the delivery task stalled, its owner delay notice never returns.
+  // Outbound Discord posts are accepted, except that with the notices task stalled Discord never answers a post.
   const posts: string[] = [];
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (_url: unknown, init?: RequestInit) => {
     const body = typeof init?.body === "string" ? init.body : "";
     posts.push(body);
     changed();
     const ok = new Response(JSON.stringify({ id: "33" }), { status: 200 });
-    return stalled === "delivery" && body.includes(base.tunables.ownerDelayNotice) ? hang(ok) : ok;
+    return stalled === "notices" ? hang(ok) : ok;
   }, { preconnect: fetch.preconnect }));
+  const flush = Supervisor.prototype.flush;
+  spyOn(Supervisor.prototype, "flush").mockImplementation(function (this: Supervisor) { return stalled === "delivery" ? hang(undefined) : flush.call(this); });
+  // The notices task ends each pass with the report check.
+  let reportTicks = 0;
+  const reportTick = Supervisor.prototype.reportTick;
+  spyOn(Supervisor.prototype, "reportTick").mockImplementation(async function (this: Supervisor) {
+    await reportTick.call(this);
+    reportTicks++;
+    changed();
+  });
+  // Each reports pass reads the pending lane reports once.
+  let reportPasses = 0;
+  const pending = SqliteLaneReports.prototype.pending;
+  spyOn(SqliteLaneReports.prototype, "pending").mockImplementation(function (this: SqliteLaneReports) {
+    reportPasses++;
+    changed();
+    return pending.call(this);
+  });
   const done = { machines: 0, gh: 0 };
   const deps = {
     ...base,
@@ -118,10 +136,10 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     },
   };
   // Journaled before the start: an urgent lane report for delivery, an owner message (overdue once the clock moves, so
-  // the delivery task owes its delay notice), and a wait the polling task checks with gh.
+  // the notices task owes its delay notice), and a wait the polling task checks with gh.
   const seed = new Supervisor(base);
   seed.enqueue("seed:report", REPORT);
-  if (stalled === "delivery") seed.enqueue(`discord:11:${MESSAGE}`, `INBOUND 11 ${MESSAGE} owner: status?`);
+  if (stalled === "notices") seed.enqueue(`discord:11:${MESSAGE}`, `INBOUND 11 ${MESSAGE} owner: status?`);
   seed.close();
   new Waits(state.dir).register({ key: "pr-1", until: "merged acme/app#1", note: "watch the PR", cwd: state.dir }, T0);
   // Only the stalled polling task has a repository to poll on GitHub.
@@ -153,8 +171,10 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     // The inbound pass ends with the gateway heartbeat.
     inbound: () => existsSync(gatewayStatusPath(state.dir)),
     delivery: () => existsSync(log) && readFileSync(log, "utf8").includes(REPORT),
+    notices: () => reportTicks > 0,
     sweeps: () => done.machines > 0,
     polling: () => done.gh > 0,
+    reports: () => reportPasses > 0,
   };
   const subscribe = (signal: () => void) => {
     listeners.add(signal);
@@ -162,12 +182,12 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     return () => { listeners.delete(signal); watcher.close(); };
   };
   const stop = async () => { controller.abort(); release(); await running; };
-  // Once the three working tasks, the runners and autopilot tasks (the hub always opens) and the stall check are parked, each takes its next pass.
+  // Once the five working tasks, the runners and autopilot tasks (the hub always opens) and the stall check are parked, each takes its next pass.
   const next = async () => {
-    await until(subscribe, () => pauses.parked() === 6, 10_000, "the three working tasks, the runners and autopilot tasks and the stall check parked");
+    await until(subscribe, () => pauses.parked() === 8, 10_000, "the five working tasks, the runners and autopilot tasks and the stall check parked");
     pauses.tick();
   };
-  return { clock, errors, posts, hung, working, subscribe, stop, next };
+  return { clock, errors, posts, hung, working, subscribe, stop, next, reportPasses: () => reportPasses };
 };
 
 const others = (stalled: SupervisorTask): SupervisorTask[] => SUPERVISOR_TASKS.filter((task) => task !== stalled);
@@ -188,14 +208,14 @@ test("the report polling path prunes operation and report history at startup and
 }, 30_000);
 
 const stallTest = (stalled: SupervisorTask, then?: (s: ReturnType<typeof setup>) => Promise<void>) =>
-  test(`a stalled ${stalled} task leaves the other three working and is reported by name, then withholds the watchdog`, async () => {
+  test(`a stalled ${stalled} task leaves the others working and is reported by name, then withholds the watchdog`, async () => {
     // Given the real supervise() in task mode with the work of one task hung.
     const s = setup(stalled);
     try {
       await until(s.subscribe, () => s.hung.length > 0, 10_000, `the ${stalled} stall`);
-      // When the other three run beside it, each finishes its work.
+      // When the others run beside it, each finishes its work.
       for (const task of others(stalled)) await until(s.subscribe, s.working[task], 10_000, `the ${task} task working while ${stalled} is stalled`);
-      // The wait check runs beside the hung GitHub poll in the same polling pass, so only the other three show no work.
+      // The wait check runs beside the hung GitHub poll in the same polling pass, so only the others show no work.
       if (stalled !== "polling") expect(s.working[stalled]()).toBe(false);
       // Then the stalled task is reported by name once its pass has run past the alert budget.
       s.clock.at += TASK_ALERT_MS;
@@ -244,5 +264,23 @@ stallTest("inbound");
 // A stalled delivery task cannot hand TASK_STALLED to the lead, so the owner is told in the main channel.
 // The notice is posted without being awaited, so the test waits for the post itself.
 stallTest("delivery", (s) => until(s.subscribe, () => s.posts.some((body) => body.includes("TASK_STALLED delivery")), 10_000, "the TASK_STALLED delivery notice"));
+// Discord never answers a post: the owner delay notice hangs, yet the queued report reaches the lead in the delivery
+// task's first pass (the stall test above waits for it before any second pass).
+stallTest("notices");
 stallTest("sweeps");
 stallTest("polling");
+
+test("lane reports are routed again in the next pass while a GitHub poll hangs", async () => {
+  // Given the real supervise() whose GitHub poll never answers.
+  const s = setup("polling");
+  try {
+    await until(s.subscribe, () => s.hung.length > 0, 10_000, "the hung GitHub poll");
+    await until(s.subscribe, s.working.reports, 10_000, "the first reports pass");
+    const first = s.reportPasses();
+    // When the next 5 s pass is due, the hung poll still holds its polling pass.
+    await s.next();
+    // Then the reports task routes again without waiting for it.
+    await until(s.subscribe, () => s.reportPasses() > first, 10_000, "a second reports pass beside the hung poll");
+    expect(s.hung.length).toBeGreaterThan(0);
+  } finally { await s.stop(); }
+}, 30_000);

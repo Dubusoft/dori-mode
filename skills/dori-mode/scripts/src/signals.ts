@@ -1,8 +1,10 @@
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
-import type { Ran, Runner } from "./run.ts";
+import { ghJson } from "./gh-json.ts";
+import type { Runner } from "./run.ts";
 
 /** `error` means the check failed to run, rather than the condition being unmet. */
 export type Check = { readonly signal: string; readonly ok: boolean; readonly detail: string; readonly error?: string };
@@ -187,9 +189,6 @@ const dig = (v: unknown, path: readonly (string | number)[]): { readonly found: 
 
 const short = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 120);
 const failed = (signal: string, detail: string): Check => ({ signal, ok: false, detail, error: detail });
-const ghFailure = (signal: string, result: Ran): Check | undefined => result.code !== 0 || result.timedOut
-  ? failed(signal, result.err || `gh exited ${result.code}`)
-  : undefined;
 
 export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}): Promise<Check> => {
   const s = signal.trim();
@@ -202,35 +201,24 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
   }
   switch (sig.kind) {
     case "merged": {
-      const r = await run(["gh", "pr", "view", sig.n, "--repo", sig.repo, "--json", "state,mergeCommit"]);
-      const failure = ghFailure(s, r);
-      if (failure) return failure;
-      const j = JSON.parse(r.out) as { state?: string; mergeCommit?: { oid?: string } | null };
+      const r = await ghJson<{ state?: string; mergeCommit?: { oid?: string } | null }>(run, ["gh", "pr", "view", sig.n, "--repo", sig.repo, "--json", "state,mergeCommit"], "object");
+      if (!r.ok) return failed(s, r.error);
+      const j = r.value;
       const sha = j.mergeCommit?.oid ?? "";
-      return { signal: s, ok: j.state === "MERGED" && sha.length > 0, detail: j.state ? `${j.state} ${sha.slice(0, 10)}`.trim() : r.err || "no answer" };
+      return { signal: s, ok: j.state === "MERGED" && sha.length > 0, detail: j.state ? `${j.state} ${sha.slice(0, 10)}`.trim() : "no answer" };
     }
     case "closed": {
-      const r = await run(["gh", "issue", "view", sig.n, "--repo", sig.repo, "--json", "state"]);
-      const failure = ghFailure(s, r);
-      if (failure) return failure;
-      const j = JSON.parse(r.out) as { state?: string };
-      return { signal: s, ok: j.state === "CLOSED", detail: j.state ?? (r.err || "no answer") };
+      const r = await ghJson<{ state?: string }>(run, ["gh", "issue", "view", sig.n, "--repo", sig.repo, "--json", "state"], "object");
+      if (!r.ok) return failed(s, r.error);
+      return { signal: s, ok: r.value.state === "CLOSED", detail: r.value.state ?? "no answer" };
     }
     case "pr": {
       // No cwd: the check reads GitHub only, so a deleted worktree cannot break it.
-      const r = await run(["gh", "pr", "list", "--repo", sig.repo, "--head", sig.branch, "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"]);
-      const failure = ghFailure(s, r);
-      if (failure) return failure;
-      type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: { conclusion?: string; state?: string }[] | null };
-      let prs: Pr[];
-      try {
-        prs = JSON.parse(r.out) as Pr[];
-      } catch {
-        const detail = `gh answered no JSON: ${short(r.out) || "(empty)"}`;
-        return failed(s, detail);
-      }
+      type Pr = { state?: string; isDraft?: boolean; isCrossRepository?: boolean; url?: string; createdAt?: string; statusCheckRollup?: RollupCheck[] | null };
+      const r = await ghJson<Pr[]>(run, ["gh", "pr", "list", "--repo", sig.repo, "--head", sig.branch, "--state", "all", "--json", "number,state,isDraft,statusCheckRollup,isCrossRepository,url,createdAt"], "array");
+      if (!r.ok) return failed(s, r.error);
       // The newest PR decides, so an older merged PR from a reused branch name never counts for new work.
-      const latest = [...prs].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
+      const latest = [...r.value].sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""))[0];
       if (!latest) return { signal: s, ok: false, detail: `no PR from ${sig.branch}` };
       const url = latest.url ?? "";
       if (latest.isCrossRepository) {
@@ -240,7 +228,8 @@ export const checkSignal = async (signal: string, run: Runner, io: SignalIo = {}
       if (latest.state === "MERGED") return { signal: s, ok: true, detail: `MERGED ${url}` };
       if (latest.state !== "OPEN") return { signal: s, ok: false, detail: `${latest.state ?? "no state"} ${url}` };
       if (latest.isDraft) return { signal: s, ok: false, detail: `OPEN draft ${url}` };
-      const checks = latest.statusCheckRollup ?? [];
+      // A check that ran twice at this head is judged by its newest run, so a superseded CANCELLED run is not red.
+      const checks = latestChecks(latest.statusCheckRollup ?? []);
       if (!checks.length) return { signal: s, ok: false, detail: `OPEN with no checks yet ${url}` };
       const notGreen = checks.filter((c) => !["SUCCESS", "SKIPPED", "NEUTRAL"].includes(c.conclusion || c.state || "")).length;
       return notGreen

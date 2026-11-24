@@ -14,8 +14,9 @@ import type { CandidatesReport } from "./autopilot.ts";
  *
  * With the optional `execute` dep and `executorOn()` true (config `autopilot.executor`), every judged tick hands its LAUNCH ids
  * to the executor first (an empty list on a pause or an empty set, so open sequences still resume) and wakes the lead only
- * for ids the executor did not take over: a result of kind review, disabled or refused, or none at all. launched, held,
- * paused, failed and ambiguous ids are the executor's (it journals its own AUTOPILOT_EXECUTOR_* notices). With the switch off
+ * for ids the executor did not take over: a result of kind review, disabled, refused or error (a throw before any execution
+ * existed), or none at all. launched, held, paused, failed, ambiguous and interrupted (a throw inside an open execution,
+ * resumed next pass) ids are the executor's (it journals its own AUTOPILOT_EXECUTOR_* notices). With the switch off
  * nothing is executed and the wake is exactly the one above.
  */
 
@@ -46,7 +47,7 @@ export const readyLine = (ids: readonly number[], slots: number | null, again: b
   `AUTOPILOT_READY ${ids.map((id) => `#${id}`).join(",")} slots=${slots ?? "unlimited"}${again ? " again" : ""}`;
 
 /** Executor outcomes that leave the task to the lead (the executor started nothing and sent no notice for them). */
-const LEAD_KINDS: ReadonlySet<string> = new Set(["review", "disabled", "refused"]);
+const LEAD_KINDS: ReadonlySet<string> = new Set(["review", "disabled", "refused", "error"]);
 
 export class AutopilotTick {
   private nextAt = Number.NEGATIVE_INFINITY;

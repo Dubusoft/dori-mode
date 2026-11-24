@@ -6,7 +6,7 @@ The secret store is a plain sharing channel from the supervisor host to every la
 
 Each secret is one file in `~/.dori/secrets` (mode 0700). Writes always produce `<NAME>.plain`, the raw value with mode 0600.
 
-A legacy `<NAME>.cred` (ciphertext from `systemd-creds --user encrypt`, written by older versions) is still read, decrypted with `systemd-creds --user`, so existing entries keep working without a migration. Updating a `.cred` name writes `<NAME>.plain` and removes the `.cred`.
+A legacy `<NAME>.cred` (ciphertext from `systemd-creds --user encrypt`, written by older versions) is still read, decrypted with `systemd-creds --user`, so existing entries keep working without a migration. Updating a `.cred` name writes `<NAME>.plain` and removes the `.cred`; when both files exist (an update stopped before the removal), the `.plain` value is the one read and listed.
 
 If the directory has any group or other permission bit set, every store command refuses with `SECRET_DIR_UNSAFE` and changes nothing. Fix it with `chmod 700 ~/.dori/secrets`.
 
@@ -21,7 +21,7 @@ A name matches `^[A-Z][A-Z0-9_]{0,63}$` (uppercase, digits, underscore, starting
 | `dori secret list [--json]` | Prints names and backends (`plain` or `cred`). Never values. |
 | `dori secret delete NAME` | Removes the secret's file. |
 
-`add` and `update` read the value from stdin only, never from argv. On a terminal you get a hidden prompt; otherwise all of stdin is taken, minus one trailing newline. An empty value is `SECRET_VALUE_EMPTY`. They print `SECRET_ADDED NAME backend=plain` or `SECRET_UPDATED NAME backend=plain`; `delete` prints `SECRET_DELETED NAME`.
+`add` and `update` read the value from stdin only, never from argv. On a terminal you get a hidden prompt; otherwise all of stdin is taken, minus one trailing newline. An empty value is `SECRET_VALUE_EMPTY`. A value shorter than 8 characters is stored but not masked in outbound text, and they warn `SECRET_NOT_MASKED NAME` on stderr. They print `SECRET_ADDED NAME backend=plain` or `SECRET_UPDATED NAME backend=plain`; `delete` prints `SECRET_DELETED NAME`.
 
 ```sh
 printf %s "$TOKEN" | dori secret add NPM_TOKEN
@@ -39,7 +39,7 @@ A lane's pane command exports its `DORI_LANE_*` variables, then runs `eval "$(<d
 export NPM_TOKEN='...'
 ```
 
-Single quotes in a value are written as `'\''`, so multi-line values survive. On a refusal or failure it prints `<code> <detail>` to stderr, nothing on stdout, and exits 1. The lane still starts, just without values, and the error shows in the pane.
+Single quotes in a value are written as `'\''`, so multi-line values survive. On a refusal or failure it prints `<code> <detail>` to stderr, nothing on stdout, and exits 1. The lane still starts, just without values, and the error shows in the pane. It is only for `eval "$(...)"`: with stdout on a terminal it asks the runner nothing, prints `SECRET_ENV_TTY_REFUSED <detail>` to stderr and exits 2, so a hand-typed `dori secret env` never puts values in pane scrollback or logs.
 
 - **Local runner:** reads its own store.
 - **Remote runner** (`dori runner serve --listen`): holds no store. It sends a sealed `secret.get` control frame with an empty names list, and the supervisor answers with every store value in a sealed `secret.value`. The supervisor refuses a link that isn't authenticated, a lane that isn't open or isn't owned by that runner (logged as `RUNNER_FORGED_SECRET runner=<label> key=<key>`, a sign the runner host is compromised), and every lane of a runner with `runners.<label>.allowUnsandboxed`. An older runner that still sends names gets just those names.

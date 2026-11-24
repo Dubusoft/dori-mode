@@ -2,8 +2,9 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { ledgerRows, ledgerState } from "../src/autopilot.ts";
 import { closeLane } from "../src/done-flow.ts";
-import { type Observed, openOperations, type OperationStore, OPERATIONS_FILE, perform } from "../src/operations.ts";
+import { LAUNCH_ACTION, type Observed, openOperations, type OperationStore, OPERATIONS_FILE, perform, REARM_ACTION } from "../src/operations.ts";
 import type { Lane } from "../src/registry.ts";
 import { SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
@@ -55,6 +56,24 @@ test("operation retention removes only verified rows older than 30 days", () => 
     expect(history.list().map((op) => op.id).sort()).toEqual(["ambiguous", "attempted", "failed", "planned", "recent"]);
     history.prune(T0);
     expect(history.get("recent")?.state).toBe("verified");
+  } finally { history.close(); dir.done(); }
+});
+
+test("operation retention keeps the autopilot ledger, so an old launch still refuses a relaunch", () => {
+  const dir = withState();
+  new SqliteStore(join(dir.dir, SQLITE_FILE), { create: true }).close();
+  const history = openOperations({ stateDir: dir.dir });
+  try {
+    const old = T0 - 31 * 24 * 60 * 60_000;
+    const row = { lane: "toodo:7", state: "verified" as const, detail: "", attempts: 1, at: old, updatedAt: old };
+    history.put({ id: "launch", ...row, action: LAUNCH_ACTION, target: "1", data: JSON.stringify({ laneKey: "ap-7-1" }) });
+    history.put({ id: "rearm", ...row, lane: "toodo:8", action: REARM_ACTION, target: "1" });
+    history.put({ id: "other", ...row, ...spec });
+    history.prune(T0);
+    expect(history.list().map((op) => op.id).sort()).toEqual(["launch", "rearm"]);
+    const rows = ledgerRows(history);
+    expect(ledgerState(rows, 7, new Set()).attempts).toBe(1);
+    expect(ledgerState(rows, 8, new Set()).through).toBe(1);
   } finally { history.close(); dir.done(); }
 });
 

@@ -241,6 +241,32 @@ test("a done claim opens the lane's obligation: listed for inbox take, UNREPORTE
   expect(first?.line).toBe(`UNREPORTED alpha claimed done 5 min ago and the owner has not been told: run dori reported alpha --text TEXT to post the outcome to the owner in its thread. ${CLAIM}`);
 });
 
+test("report checks tick one at a time: a receipt taken by a later tick survives an earlier tick still reading the registry", async () => {
+  // Given a claim past reportTimeoutMin whose first tick hangs in its registry read (lead delivery and the report check
+  // tick from separate supervisor tasks).
+  const f = fixture();
+  const supervisor = new Supervisor(f.deps);
+  supervisor.enqueue("done-claim:alpha:1", CLAIM);
+  f.clock.at += 5 * MIN;
+  const read = f.deps.registry.read.bind(f.deps.registry);
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let entered = () => {};
+  const reading = new Promise<void>((resolve) => { entered = resolve; });
+  let reads = 0;
+  f.deps.registry.read = async (key) => { if (reads++ === 0) { entered(); await held; } return read(key); };
+  const first = supervisor.reportTick();
+  await reading;
+  // When the lead reports while it hangs and the next tick starts.
+  recordReported(f.state.dir, "alpha", f.clock.now());
+  const second = supervisor.reportTick();
+  release();
+  await Promise.all([first, second]);
+  // Then the first tick's reminder stands, and the second tick's receipt is not overwritten by the first tick's stale list.
+  expect(f.unreported()).toHaveLength(1);
+  expect(readJournal(f.state.dir).outcomes[0]).toMatchObject({ lane: "alpha", reportedAt: f.clock.now(), reminders: 1 });
+});
+
 test("the seen-claim close joins the claim's obligation: a reported claim is not owed again", async () => {
   const f = fixture();
   const supervisor = new Supervisor(f.deps);
@@ -490,6 +516,31 @@ const autoClose = () => {
 };
 
 const HOUR = 60 * MIN;
+
+test("a quiet lane's claim (reportQuietLanes) is owed nothing and leaves the thread's close button to the thread's real reports", async () => {
+  const f = autoClose();
+  await f.deps.registry.write(lane("blog-draft-1", { thread: "discord:100/200" }));
+  // done-flow.ts writes the quiet receipt (no message, no thread) before announcing the claim.
+  recordReported(f.state.dir, "blog-draft-1", f.clock.now(), "reportQuietLanes: the lane posts its own results");
+  f.supervisor.enqueue("done-claim:blog-draft-1:1", "LANE_DONE_AUTO_REPORTED blog-draft-1 w:p1 merged acme/app#1 | verified: pr=none sig=ok report=quiet");
+  f.clock.at += 10 * MIN;
+  await f.tick();
+  await f.close("blog-draft-1");
+  f.supervisor.enqueue("closed:blog-draft-1", "LANE_CLOSED blog-draft-1 closed seen-claim toodo=no-task");
+  f.clock.at += 10 * MIN;
+  await f.tick();
+  expect(f.unreported()).toEqual([]);
+  expect(readJournal(f.state.dir).outcomes).toMatchObject([{ lane: "blog-draft-1", reportedAt: T0, quiet: ["closed:blog-draft-1"] }]);
+  expect(readJournal(f.state.dir).outcomes[0].thread).toBeUndefined();
+  expect(f.posts).toEqual([]);
+  expect(f.buttons).toEqual([]);
+  // A real report into the thread still gets the close button as before.
+  await f.deps.registry.write(lane("beta", { thread: "discord:100/200", closedAt: new Date(f.clock.now()).toISOString() }));
+  f.report("beta", { message: "r1" });
+  await f.tick();
+  expect(f.buttons).toEqual(["live 200/r1"]);
+  f.supervisor.close();
+});
 
 test("a finished thread gets the close button on its last report instead of closing, and closes threadCloseAfterHours later", async () => {
   const f = autoClose();

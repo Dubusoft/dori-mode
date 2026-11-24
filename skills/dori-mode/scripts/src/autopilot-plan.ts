@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { AutopilotConfig, ToodoTask } from "./autopilot.ts";
 import { githubRepoFromRemote } from "./git-remote.ts";
-import { LANE_REPORT_NAME } from "./lane-files.ts";
+import { LANE_NOT_ADOPTED_NAME, LANE_REPORT_NAME } from "./lane-files.ts";
 import { LANE_MODES, type LaneMode } from "./registry.ts";
 import { parseSignal } from "./signals.ts";
 import type { ToodoGuideline } from "./toodo-client.ts";
@@ -226,7 +226,11 @@ export const renderBrief = (task: ToodoTask, contract: AutopilotContract, tasks:
       bullet(`결과를 DORI_LANE_OUT/${LANE_REPORT_NAME}에 쓴다: 완료 기준마다 결과와 근거(링크, 파일, 확인한 내용). 다른 산출물도 DORI_LANE_OUT에 둔다. 다 쓴 뒤 done을 보고하면 그 파일이 리드에 설치되어 Done이 된다.`),
     );
   } else {
-    out.push(bullet(`저장소 ${contract.repo}. origin/${contract.base}에서 브랜치 ${contract.branch}를 만들어 ${contract.base}로 PR을 연다. PR 전에 origin/${contract.base}로 리베이스한다.`));
+    out.push(
+      bullet(`저장소 ${contract.repo}. origin/${contract.base}에서 브랜치 ${contract.branch}를 만들어 ${contract.base}로 PR을 연다. PR 전에 origin/${contract.base}로 리베이스한다.`),
+      bullet(`PR 없이 끝나는 일(보고서·조사 등)을 다 했으면 PR을 열지 않고 브랜치도 푸시하지 않는다. DORI_LANE_OUT/${LANE_REPORT_NAME}에 완료 기준마다 결과와 근거(링크, 파일, 확인한 내용)를 쓰고 done을 보고한다. 그 파일이 있고 ${contract.branch}에서 연 PR이 없으면 레인은 Done의 PR 대신 그 보고서로 닫히고 태스크는 기준 체크 후 완료(completed)된다. 이때 ${LANE_NOT_ADOPTED_NAME}는 쓰지 않는다.`),
+      bullet(`조사 결과 수정할 것이 없거나 채택하지 않기로 했으면(not adopted) PR을 열지 않고 브랜치도 푸시하지 않는다. DORI_LANE_OUT/${LANE_NOT_ADOPTED_NAME}에 결론과 근거(확인한 내용, 파일, 링크)를 쓰고 done을 보고한다. 그 파일이 있고 ${contract.branch}에서 연 PR이 없으면 레인은 Done의 PR 대신 그 결론으로 닫히고 태스크는 not_adopted로 마무리된다(${LANE_REPORT_NAME}가 함께 있어도 not_adopted).`),
+    );
   }
   out.push(
     bullet(`Done = ${contract.done}`),

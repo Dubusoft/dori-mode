@@ -7,7 +7,7 @@ import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
-import { laneRepoOf, secretGranter } from "./secret-grant.ts";
+import { laneRepoOf, maskStoreSecrets, secretGranter } from "./secret-grant.ts";
 import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
@@ -158,7 +158,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     if (!releaseServeLock) fail(`RUNNER_ALREADY_SERVING another runner serve holds ${join(runnerDir, SERVE_LOCK)}; stop it (e.g. a leftover dori-runner.service next to dori supervise) before starting this one`);
     const state = new RunnerState(runnerDir, { now: realClock.now });
     const gen = state.boot();
-    const outbox = new Outbox(runnerDir, { now: realClock.now });
+    const outbox = new Outbox(runnerDir, { now: realClock.now, log: (line) => { console.log(line); } });
     // Every runner owns the lanes it starts and observes its host's lanes from herdr and /proc.
     type InventoryLane = { key: string; pane: string; tab: string; session?: string };
     // The lanes only observed (not owned), as of the last observe pass; the owned part is read fresh in each hello.
@@ -361,7 +361,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
       };
     } else {
-      const secretStore = new SecretStore();
+      const secretStore = new SecretStore({ log });
       const runOp = secretCommandRunner({
         store: secretStore,
         commands: async () => (await loadConfig()).secretCommands,
@@ -377,7 +377,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         secrets: secretGranter({ store: secretStore, onGranted: addKnownSecrets }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
-      void new SecretStore().readAll().then((m) => { replaceKnownSecrets(m.values()); }, () => {});
+      void maskStoreSecrets(secretStore, replaceKnownSecrets, log);
     }
     const stopLaneServes = laneListeners.map((listener) => serveLaneSocket(listener, laneSocketLanes, publish, log));
     const stopLaneSocket = (): void => {
@@ -432,7 +432,7 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
   // Inside a lane this bundle is the lane-mode `dori`: report, claim-done and heavy for the lane's own key, nothing else.
   if (process.env.DORI_LANE_KEY) {
     return laneCliMain(args, {
-      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectLane(path)),
+      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectLane(path)), stdoutIsTTY: process.stdout.isTTY === true,
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     });
   }
@@ -454,7 +454,8 @@ export const runnerHostMain = async (args: readonly string[]): Promise<number> =
       // For `dori runner evacuate` over ssh: every event this runner has not had acked, as the frames it would send.
       const runnerDir = defaultRunnerDir();
       const identity = loadIdentity(runnerDir, parsed.values.label ?? LOCAL_RUNNER, hostname());
-      const outbox = new Outbox(runnerDir, { now: realClock.now });
+      // stdout carries the frames, so a missing body file is reported on stderr.
+      const outbox = new Outbox(runnerDir, { now: realClock.now, log: (line) => { console.error(line); } });
       try {
         const frames = outbox.unacked(0).map((row) => ({ v: 1, runner: identity.label, gen: 0, epoch: 0, seq: row.seq, type: row.type, body: row.body }));
         console.log(JSON.stringify(frames));

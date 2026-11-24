@@ -4,13 +4,20 @@ import type { ToodoTask } from "./autopilot.ts";
 
 /**
  * The toodo-server clients. ToodoClient reads for autopilot: `list_tasks`, `get_task` and `list_guidelines` over `POST <url>/api/rpc/<command>` with
- * the bearer token read from `tokenFile` (the same url and token file as the toodo event stream). Every failure (token
- * file missing or empty, network error, timeout, non-200, a reply that is not a task list) throws ToodoUnreadable, so a
- * caller maps any of them to `toodo-unreadable`. A missing task on `get_task` (404) is undefined, not an error.
+ * the bearer token read from `tokenFile` (the same url and token file as the toodo event stream). A read that gets no
+ * answer (network error, timeout) or a 429 or 5xx is sent again after TOODO_RETRY_DELAY_MS, TOODO_READ_ATTEMPTS times in
+ * all: every command is a read, so repeating one is safe. Every failure left (token file missing or empty, the last
+ * attempt failing, another non-200, a reply that is not a task list) throws ToodoUnreadable, so a caller maps any of
+ * them to `toodo-unreadable`. A missing task on `get_task` (404) is undefined, not an error. In a task list, a task not
+ * marked for autopilot whose shape the predicate cannot read is left out with a TOODO_TASK_SKIPPED log line instead (it
+ * reads as absent, and an absent prerequisite is not satisfied); a marked one still throws.
  * ToodoWriter (below) writes to a task over the MCP endpoint and reads every write back.
  */
 
 export const TOODO_TIMEOUT_MS = 10_000;
+/** Kept small: the autopilot executor reads under the launch lock, so every retry holds it longer. */
+export const TOODO_READ_ATTEMPTS = 2;
+export const TOODO_RETRY_DELAY_MS = 500;
 /** list_tasks takes at most this many ids per call. */
 export const TOODO_MAX_IDS = 500;
 
@@ -81,6 +88,18 @@ const toTask = (raw: unknown): ToodoTask => {
   };
 };
 
+/** The tasks of a `list_tasks` reply; one that toTask cannot read is skipped and logged unless it is (or may be) marked for autopilot. */
+const toTasks = (reply: readonly unknown[], log: (line: string) => void): ToodoTask[] => {
+  const out: ToodoTask[] = [];
+  for (const raw of reply) {
+    try { out.push(toTask(raw)); } catch (e) {
+      if (!(e instanceof ToodoUnreadable) || !isRecord(raw) || (raw.autopilot ?? false) !== false) throw e;
+      log(`TOODO_TASK_SKIPPED ${isId(raw.id) ? `#${raw.id}` : "(no id)"} not marked for autopilot: ${e.message}`);
+    }
+  }
+  return out;
+};
+
 /** A workspace guideline as `list_guidelines` returns it: a `rule` agents follow or a `memory` recorded for the workspace. */
 export type ToodoGuideline = {
   readonly id: number;
@@ -105,10 +124,21 @@ const toGuideline = (raw: unknown): ToodoGuideline => {
 export class ToodoClient {
   private readonly fetch: ToodoFetch;
   private readonly timeoutMs: number;
+  private readonly log: (line: string) => void;
+  private readonly sleep: (ms: number) => Promise<void>;
 
-  constructor(private readonly config: ToodoClientConfig, deps: { readonly fetch?: ToodoFetch; readonly timeoutMs?: number } = {}) {
+  /** `log` receives the TOODO_TASK_SKIPPED lines (default: stderr). */
+  constructor(
+    private readonly config: ToodoClientConfig,
+    deps: {
+      readonly fetch?: ToodoFetch; readonly timeoutMs?: number; readonly log?: (line: string) => void;
+      readonly sleep?: (ms: number) => Promise<void>;
+    } = {},
+  ) {
     this.fetch = deps.fetch ?? ((url, init) => fetch(url, init));
     this.timeoutMs = deps.timeoutMs ?? TOODO_TIMEOUT_MS;
+    this.log = deps.log ?? ((line) => { console.error(line); });
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   private token(): string {
@@ -119,22 +149,28 @@ export class ToodoClient {
   private async call(command: "list_tasks" | "get_task" | "list_guidelines" | "get_workspace", args: unknown, allow404 = false): Promise<unknown> {
     const url = `${this.config.url.replace(/\/+$/, "")}/api/rpc/${command}`;
     const token = this.token();
-    let response: Response;
-    let text: string;
-    try {
-      response = await this.fetch(url, {
-        method: "POST",
-        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify(args),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-      text = await response.text();
-    } catch (e) {
-      throw new ToodoUnreadable(`toodo-server ${command} at ${url} failed: ${e instanceof Error ? e.message : String(e)}`);
+    for (let attempt = 1; ; attempt++) {
+      const last = attempt === TOODO_READ_ATTEMPTS;
+      const tried = attempt > 1 ? ` (tried ${attempt} times)` : "";
+      let response: Response;
+      let text: string;
+      try {
+        response = await this.fetch(url, {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+          body: JSON.stringify(args),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        });
+        text = await response.text();
+      } catch (e) {
+        if (!last) { await this.sleep(TOODO_RETRY_DELAY_MS); continue; }
+        throw new ToodoUnreadable(`toodo-server ${command} at ${url} failed${tried}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (allow404 && response.status === 404) return undefined;
+      if (!last && (response.status === 429 || response.status >= 500)) { await this.sleep(TOODO_RETRY_DELAY_MS); continue; }
+      if (response.status !== 200) throw new ToodoUnreadable(`toodo-server ${command} answered HTTP ${response.status}${response.status === 401 ? " (the token was refused)" : ""}${tried}`, response.status);
+      try { return JSON.parse(text) as unknown; } catch { throw new ToodoUnreadable(`toodo-server ${command} answered non-JSON`); }
     }
-    if (allow404 && response.status === 404) return undefined;
-    if (response.status !== 200) throw new ToodoUnreadable(`toodo-server ${command} answered HTTP ${response.status}${response.status === 401 ? " (the token was refused)" : ""}`, response.status);
-    try { return JSON.parse(text) as unknown; } catch { throw new ToodoUnreadable(`toodo-server ${command} answered non-JSON`); }
   }
 
   /** The tasks with these ids that toodo still has (archived or deleted ones are absent), in batches of TOODO_MAX_IDS. */
@@ -144,7 +180,7 @@ export class ToodoClient {
     for (let i = 0; i < unique.length; i += TOODO_MAX_IDS) {
       const reply = await this.call("list_tasks", { filter: { ids: unique.slice(i, i + TOODO_MAX_IDS) } });
       if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_tasks did not answer a task list");
-      out.push(...reply.map(toTask));
+      out.push(...toTasks(reply, this.log));
     }
     return out;
   }
@@ -156,7 +192,7 @@ export class ToodoClient {
   async flaggedTasks(): Promise<ToodoTask[]> {
     const reply = await this.call("list_tasks", { filter: { statuses: ["planned"] } });
     if (!Array.isArray(reply)) throw new ToodoUnreadable("toodo-server list_tasks did not answer a task list");
-    return reply.map(toTask).filter((t) => t.autopilot);
+    return toTasks(reply, this.log).filter((t) => t.autopilot);
   }
 
   /** One task, or undefined when toodo-server has no such task (missing or archived). */
@@ -342,5 +378,10 @@ export class ToodoWriter {
     return this.write(id, (t) => t.status === "done" && t.resolution === "completed" && hasRefs(t, refs), "complete_task", {
       id, refs, ...(opts.note === undefined ? {} : { note: opts.note }),
     });
+  }
+
+  /** Concludes the task not adopted (`done`, `not_adopted`) with its required note; already written when it reads so. */
+  concludeNotAdopted(id: number, note: string): Promise<ToodoWrite> {
+    return this.write(id, (t) => t.status === "done" && t.resolution === "not_adopted", "conclude_task", { id, note: note.trim(), outcome: "not_adopted" });
   }
 }

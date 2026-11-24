@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { ghJson } from "./gh-json.ts";
 import { githubTargets, type OpenPull, sameRepoHead } from "./github-events.ts";
 import { diskGuardPath, sampleHost } from "./host-guard.ts";
 import { launchLane, SandboxRefusal } from "./launch.ts";
@@ -46,6 +48,8 @@ import { parseSignal, splitDone } from "./signals.ts";
  * - an open lane PR the supervisor cannot merge for a reason only a person fixes (claimed at its head but no checks, a
  *   required review, a draft; or green and clean while its lane never claimed at that head) for `mergeStallMin`: urgent
  *   MERGE_STALLED once per head. Pending CI is no stall: the claim's own merge wait (done-flow.ts mergeWait) bounds it.
+ * - an open lane PR whose follow-up throws (gh auth expired, a non-JSON answer, an unreadable store) CI_FOLLOW_STUCK_POLLS
+ *   polls in a row: urgent CI_FOLLOW_STUCK once per head, since nothing above can happen for it until a person fixes that.
  * Each merge and launch is an operation (operations.ts), keyed by PR and head SHA, so a restart never repeats it. The
  * lanes keep waiting on their own CI; nothing here replaces that wait.
  */
@@ -71,6 +75,9 @@ export type CiIo = {
 
 /** A merge GitHub refused this many times stops retrying and goes to the lead as OPERATION_FAILED. */
 export const MERGE_ATTEMPTS = 3;
+
+/** Polls in a row whose follow-up of one PR head threw before the lead hears CI_FOLLOW_STUCK. */
+export const CI_FOLLOW_STUCK_POLLS = 3;
 
 const short = (sha: string): string => sha.slice(0, 7);
 const repoName = (repo: string): string => (repo.split("/")[1] ?? repo).toLowerCase().replace(/[^a-z0-9.-]/g, "-");
@@ -271,7 +278,7 @@ type PrView = {
   readonly isDraft?: boolean;
   readonly mergeable?: string;
   readonly mergeStateStatus?: string;
-  readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+  readonly statusCheckRollup?: readonly RollupCheck[];
   readonly mergeCommit?: { readonly oid?: string } | null;
   readonly isCrossRepository?: boolean;
 };
@@ -279,9 +286,9 @@ type PrView = {
 const PR_FIELDS = "state,baseRefName,headRefOid,isCrossRepository,isDraft,mergeable,mergeStateStatus,statusCheckRollup,mergeCommit";
 
 const viewPull = async (deps: FlowDeps, pull: Pick<OpenPull, "repo" | "number">, fields = PR_FIELDS): Promise<PrView> => {
-  const r = await deps.run(["gh", "pr", "view", String(pull.number), "-R", pull.repo, "--json", fields], { timeoutMs: 20_000 });
-  if (r.code !== 0) throw new Error(`gh pr view ${pull.repo}#${pull.number} exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
-  return JSON.parse(r.out) as PrView;
+  const r = await ghJson<PrView>(deps.run, ["gh", "pr", "view", String(pull.number), "-R", pull.repo, "--json", fields], "object", { timeoutMs: 20_000 });
+  if (!r.ok) throw new Error(`gh pr view ${pull.repo}#${pull.number}${r.code ? ` exit ${r.code}` : ""}: ${r.error}`);
+  return r.value;
 };
 
 const CHECK_OK = new Set(["SUCCESS", "NEUTRAL", "SKIPPED"]);
@@ -309,8 +316,8 @@ const waitsOnMerge = (lane: Lane, pull: Pick<OpenPull, "repo" | "number">): bool
 /**
  * What a fresh read of the PR allows: `merge` only when it is open, into `base` (never main), still at `sha`, from a
  * branch of its own repo (never a fork), not a draft, every check finished green and GitHub calls it MERGEABLE and CLEAN; `conflict` when GitHub reports a
- * conflict; `wait` (with why) otherwise. Green needs at least one check that passed: a rollup of only SKIPPED or NEUTRAL
- * checks is treated like no checks at all.
+ * conflict; `wait` (with why) otherwise. Each check is judged by its newest run (check-rollup.ts). Green needs at least
+ * one check that passed: a rollup of only SKIPPED or NEUTRAL checks is treated like no checks at all.
  */
 export const mergeGate = (view: PrView, sha: string, base: string): { readonly verdict: "merge" | "conflict" | "wait"; readonly why: string } => {
   if (view.state !== "OPEN") return { verdict: "wait", why: `state ${view.state ?? "unknown"}` };
@@ -319,7 +326,7 @@ export const mergeGate = (view: PrView, sha: string, base: string): { readonly v
   if (view.isCrossRepository !== false) return { verdict: "wait", why: "head is not a branch of this repo" };
   if (view.isDraft) return { verdict: "wait", why: "draft" };
   if (view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY") return { verdict: "conflict", why: `mergeable ${view.mergeable} state ${view.mergeStateStatus}` };
-  const checks = view.statusCheckRollup ?? [];
+  const checks = latestChecks(view.statusCheckRollup ?? []);
   if (!checks.length) return { verdict: "wait", why: "no checks" };
   const red = checks.filter((c) => c.__typename === "StatusContext" ? c.state !== "SUCCESS" : c.status !== "COMPLETED" || !CHECK_OK.has(c.conclusion ?? ""));
   if (red.length) return { verdict: "wait", why: `${red.length} check(s) not green` };
@@ -354,6 +361,8 @@ export class CiFollowUp {
   /** Subjects (PR at a head) this process saw stalled, with when it first saw it; dropped once a poll finds it moving. */
   private readonly stalls = new Map<string, { readonly since: number; alerted: boolean }>();
   private stalledNow = new Set<string>();
+  /** Subjects whose follow-up threw on every poll since `count` polls ago; dropped once a poll follows it or no longer lists it. */
+  private readonly failures = new Map<string, { count: number; alerted: boolean }>();
   /** The delivery pass in progress: the GitHub poll's and the supervisor's own pass never run at once. */
   private delivering: Promise<void> = Promise.resolve();
 
@@ -415,6 +424,7 @@ export class CiFollowUp {
     this.stalledNow = new Set();
     // Lowest number first (D4): a claim's PRs into one base are reviewed and merged one at a time, in order.
     const ordered = [...pulls].sort((a, b) => a.repo.toLowerCase().localeCompare(b.repo.toLowerCase()) || a.number - b.number);
+    const failedNow = new Set<string>();
     for (const pull of ordered) {
       const lane = owner.get(`${pull.repo.toLowerCase()}#${pull.number}`);
       if (!lane) continue;
@@ -433,9 +443,13 @@ export class CiFollowUp {
           if (claimGate(fresh, pull).ok) this.stall(fresh, pull, "no checks", "the supervisor merges only after a green check: add or run its checks, or merge it by hand", emit);
         }
       } catch (e) {
-        console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} ${e instanceof Error ? e.message : String(e)}`);
+        const why = (e instanceof Error ? e.message : String(e)).replace(/\s+/g, " ").slice(0, 200);
+        console.error(`CI_FOLLOW_ERROR ${pull.repo}#${pull.number} ${why}`);
+        failedNow.add(subjectOf(pull));
+        this.failed(lane, pull, why, emit);
       }
     }
+    for (const subject of this.failures.keys()) if (!failedNow.has(subject)) this.failures.delete(subject);
     for (const subject of this.stalls.keys()) if (!this.stalledNow.has(subject)) this.stalls.delete(subject);
     // A failing message whose PR moved on (new head, checks no longer failing, merged or closed) is no longer true.
     for (const message of this.messages.list({ states: OPEN_MESSAGE_STATES })) {
@@ -464,9 +478,9 @@ export class CiFollowUp {
       if (!issue || !pull || this.settled.has(row.id)) continue;
       try {
         const readBack: ReadBack = async () => {
-          const r = await deps.run(["gh", "issue", "view", String(issue.number), "-R", issue.repo, "--json", "state"], { timeoutMs: 20_000 });
-          if (r.code !== 0) return "unknown";
-          const state = (JSON.parse(r.out) as { state?: string }).state;
+          const r = await ghJson<{ state?: string }>(deps.run, ["gh", "issue", "view", String(issue.number), "-R", issue.repo, "--json", "state"], "object", { timeoutMs: 20_000 });
+          if (!r.ok) return "unknown";
+          const state = r.value.state;
           return state === "CLOSED" ? "done" : state === "OPEN" ? "not-done" : "unknown";
         };
         const spec: OperationSpec = { lane: row.lane, action: row.action, target: row.target };
@@ -658,6 +672,20 @@ export class CiFollowUp {
     if (seen.alerted || now - seen.since < min * 60_000) return;
     seen.alerted = true;
     emit(`merge-stalled:${subject}`, `MERGE_STALLED ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} ${why} for ${min}+ min: ${hint} ${pull.url}`);
+  }
+
+  /**
+   * Counts this poll's thrown follow-up of `pull`; at CI_FOLLOW_STUCK_POLLS in a row the lead hears CI_FOLLOW_STUCK, once
+   * per PR head in this process (the journal dedupes the same id after a restart).
+   */
+  private failed(lane: Lane, pull: OpenPull, why: string, emit: CiEmit): void {
+    const subject = subjectOf(pull);
+    const seen = this.failures.get(subject) ?? { count: 0, alerted: false };
+    this.failures.set(subject, seen);
+    seen.count++;
+    if (seen.alerted || seen.count < CI_FOLLOW_STUCK_POLLS) return;
+    seen.alerted = true;
+    emit(`ci-follow-stuck:${subject}`, `CI_FOLLOW_STUCK ${pull.repo}#${pull.number} lane=${lane.key} head=${short(pull.sha)} follow-up failed ${seen.count} polls in a row: ${why}; the supervisor cannot message, merge or unstick this PR until that is fixed (gh login, GitHub, the state store) ${pull.url}`);
   }
 
   private async conflict(lane: Lane, pull: OpenPull, emit: CiEmit): Promise<void> {

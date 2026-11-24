@@ -20,9 +20,9 @@ import { withState } from "./fakes.ts";
 
 const AT = "2026-11-01T00:00:00.000Z";
 const LANES = [
-  { key: "r1-closed", cwd: "/w/repo-r1-closed", worktrees: ["/w/repo-r1-closed-2"], machine: "r1", openedAt: AT, closedAt: AT },
-  { key: "r1-open", cwd: "/w/repo-r1-open", machine: "r1", openedAt: AT },
-  { key: "r2-closed", cwd: "/w/repo-r2-closed", machine: "r2", openedAt: AT, closedAt: AT },
+  { key: "r1-closed", remoteCwd: "/w/repo-r1-closed", worktrees: ["/w/repo-r1-closed-2"], machine: "r1", openedAt: AT, closedAt: AT },
+  { key: "r1-open", remoteCwd: "/w/repo-r1-open", machine: "r1", openedAt: AT },
+  { key: "r2-closed", remoteCwd: "/w/repo-r2-closed", machine: "r2", openedAt: AT, closedAt: AT },
   { key: "local-closed", cwd: "/w/repo-local-closed", openedAt: AT, closedAt: AT },
 ] as unknown as Lane[];
 

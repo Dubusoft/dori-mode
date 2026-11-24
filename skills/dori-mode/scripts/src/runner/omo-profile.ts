@@ -1,5 +1,7 @@
-import { chmodSync, existsSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync, mkdirSync, copyFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, statSync, mkdirSync, copyFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+
+import { replaceFileAtomic } from "../durable-write.ts";
 
 /**
  * The omo profile a macOS lane runs under (templates/lane-sandbox-macos.sh sets OMO_PROFILE to it). omo wraps its memory
@@ -47,9 +49,8 @@ export const ensureOmoLaneProfile = (home: string): string | undefined => {
   mkdirSync(dirname(file), { recursive: true });
   const mode = old === undefined ? 0o644 : statSync(file).mode & 0o777;
   if (old !== undefined) copyFileSync(file, `${file}.bak.${OMO_LANE_PROFILE}`);
-  const tmp = `${file}.${OMO_LANE_PROFILE}-${process.pid}`;
-  writeFileSync(tmp, next);
-  chmodSync(tmp, mode);
-  renameSync(tmp, file);
+  replaceFileAtomic(file, next, mode);
+  // The umask may have narrowed the created mode; put back exactly the mode the file had.
+  chmodSync(file, mode);
   return `OMO_LANE_PROFILE_ADDED ${file}: profiles.${OMO_LANE_PROFILE}.memory.reflection.sandbox is off`;
 };

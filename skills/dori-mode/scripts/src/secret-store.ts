@@ -1,7 +1,8 @@
 /** One 0600 plain file per secret under the 0700 supervisor store; legacy credentials remain readable. */
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { replaceFileDurable } from "./durable-write.ts";
 import { run, type Runner } from "./run.ts";
 import { SECRET_NAME } from "./secret-name.ts";
 
@@ -22,7 +23,7 @@ export class SecretStoreError extends Error {
   }
 }
 
-export type SecretStoreDeps = { readonly dir?: string; readonly run?: Runner };
+export type SecretStoreDeps = { readonly dir?: string; readonly run?: Runner; readonly log?: (line: string) => void };
 
 const EXTENSIONS: readonly { readonly ext: string; readonly backend: SecretBackend }[] = [
   { ext: ".cred", backend: "cred" },
@@ -32,10 +33,12 @@ const EXTENSIONS: readonly { readonly ext: string; readonly backend: SecretBacke
 export class SecretStore {
   readonly dir: string;
   private readonly runner: Runner;
+  private readonly log: (line: string) => void;
 
   constructor(deps: SecretStoreDeps = {}) {
     this.dir = deps.dir ?? secretsDir();
     this.runner = deps.run ?? run;
+    this.log = deps.log ?? ((line) => { console.error(line); });
   }
 
   /** Stores a new secret; SECRET_EXISTS when the name is taken. */
@@ -54,19 +57,21 @@ export class SecretStore {
     return this.write(name, value);
   }
 
-  /** The stored names with their backend, sorted by name. */
+  /** The stored names with the backend read() uses, sorted by name. */
   list(): readonly SecretEntry[] {
     if (!existsSync(this.dir)) return [];
     this.checkDirMode();
-    const entries: SecretEntry[] = [];
+    const backends = new Map<string, SecretBackend>();
     for (const file of readdirSync(this.dir)) {
       for (const { ext, backend } of EXTENSIONS) {
         if (!file.endsWith(ext)) continue;
         const name = file.slice(0, -ext.length);
-        if (SECRET_NAME.test(name)) entries.push({ name, backend });
+        if (SECRET_NAME.test(name) && backends.get(name) !== "plain") backends.set(name, backend);
       }
     }
-    return entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    return [...backends]
+      .map(([name, backend]) => ({ name, backend }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
   /** Removes a secret's file(s); SECRET_MISSING when there are none. */
@@ -78,30 +83,39 @@ export class SecretStore {
     for (const file of found) rmSync(file, { force: true });
   }
 
-  /** The secret's value; SECRET_MISSING when absent, SECRET_DECRYPT_FAILED when systemd-creds refuses. */
+  /**
+   * The secret's value; SECRET_MISSING when absent, SECRET_DECRYPT_FAILED when systemd-creds refuses. The .plain file
+   * wins over a legacy .cred: writes only produce .plain, so a .cred beside it is one a write did not get to remove.
+   */
   async read(name: string): Promise<string> {
     this.checkName(name);
     if (existsSync(this.dir)) this.checkDirMode();
-    const cred = join(this.dir, `${name}.cred`);
-    if (existsSync(cred)) {
-      const res = await this.runner(["systemd-creds", "decrypt", "--user", `--name=${name}`, cred, "-"]);
-      if (res.code !== 0) throw new SecretStoreError("SECRET_DECRYPT_FAILED", `SECRET_DECRYPT_FAILED: ${name}: ${res.err}`);
-      return res.out;
-    }
     const plain = join(this.dir, `${name}.plain`);
     if (existsSync(plain)) {
       // A hand-written file (echo VALUE > NAME.plain) ends in a newline the value never had.
       const text = readFileSync(plain, "utf8");
       return text.endsWith("\n") ? text.slice(0, -1) : text;
     }
+    const cred = join(this.dir, `${name}.cred`);
+    if (existsSync(cred)) {
+      const res = await this.runner(["systemd-creds", "decrypt", "--user", `--name=${name}`, cred, "-"]);
+      if (res.code !== 0) throw new SecretStoreError("SECRET_DECRYPT_FAILED", `SECRET_DECRYPT_FAILED: ${name}: ${res.err}`);
+      return res.out;
+    }
     throw new SecretStoreError("SECRET_MISSING", `SECRET_MISSING: secret ${name} does not exist`);
   }
 
-  /** Every readable secret by name; strict pulls reject instead of skipping unreadable entries. */
+  /**
+   * Every readable secret by name; strict pulls reject instead of skipping unreadable entries. A skipped entry is logged
+   * as SECRET_STORE_READ_SKIPPED with its name and error code only: the error text may quote what systemd-creds printed.
+   */
   async readAll(strict = false): Promise<ReadonlyMap<string, string>> {
     const values = new Map<string, string>();
     for (const { name } of this.list()) {
-      try { values.set(name, await this.read(name)); } catch (error) { if (strict) throw error; }
+      try { values.set(name, await this.read(name)); } catch (error) {
+        if (strict) throw error;
+        this.log(`SECRET_STORE_READ_SKIPPED ${name}${error instanceof SecretStoreError ? ` ${error.code}` : ""}`);
+      }
     }
     return values;
   }
@@ -130,14 +144,7 @@ export class SecretStore {
   }
 
   private async write(name: string, value: string): Promise<SecretEntry> {
-    const tmp = join(this.dir, `.${name}.tmp`);
-    try {
-      writeFileSync(tmp, value, { mode: 0o600 });
-      chmodSync(tmp, 0o600);
-      renameSync(tmp, join(this.dir, `${name}.plain`));
-    } finally {
-      rmSync(tmp, { force: true });
-    }
+    replaceFileDurable(join(this.dir, `${name}.plain`), value, 0o600);
     rmSync(join(this.dir, `${name}.cred`), { force: true });
     return { name, backend: "plain" };
   }

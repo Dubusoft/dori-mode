@@ -157,6 +157,14 @@ test("a pr signal is not live while a check is pending, before any check exists,
   }
 });
 
+test("a pr signal judges each check by its newest run at the head: a superseded CANCELLED run is not red, a newest one is", async () => {
+  const preview = (conclusion: string, startedAt: string) => ({ __typename: "CheckRun", name: "preview", workflowName: "Deploy", status: "COMPLETED", conclusion, startedAt });
+  const rerun = [preview("CANCELLED", "2026-11-20T01:00:00Z"), preview("SUCCESS", "2026-11-20T01:00:05Z")];
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([pr({ statusCheckRollup: rerun })]).fake, io)).toMatchObject({ ok: true, detail: `OPEN, 1 checks green ${URL7}` });
+  const lastCancelled = [preview("SUCCESS", "2026-11-20T01:00:00Z"), preview("CANCELLED", "2026-11-20T01:00:05Z")];
+  expect(await checkSignal("pr acme/app feat/x", ghPrs([pr({ statusCheckRollup: lastCancelled })]).fake, io)).toMatchObject({ ok: false, detail: `OPEN, 1 of 1 checks not green ${URL7}` });
+});
+
 test("a pr signal judges the newest PR, so an old merged PR from a reused branch name does not count", async () => {
   const newer = "https://github.com/acme/app/pull/9";
   const prs = [pr({ state: "MERGED", createdAt: "2026-10-01T00:00:00Z" }), pr({ number: 9, url: newer, createdAt: "2026-11-05T00:00:00Z", statusCheckRollup: [{ conclusion: "" }] })];
@@ -168,6 +176,23 @@ test("a pr signal reports an error, not an unmet condition, when gh fails, answe
   expect((await checkSignal("pr acme/app feat/x", ghPrs("<html>").fake, io)).error).toStartWith("gh answered no JSON");
   const fork = await checkSignal("pr acme/app feat/x", ghPrs([pr({ isCrossRepository: true, state: "MERGED" })]).fake, io);
   expect(fork).toMatchObject({ ok: false, error: `${URL7} comes from a fork; pr signals support same-repo branches only` });
+});
+
+test("a gh signal whose answer is a warning, nothing, or JSON of the wrong shape is a failed check with an error, never a throw", async () => {
+  const cases: [string, string, string][] = [
+    ["merged acme/app#7", "warning: cache stale", "gh answered no JSON"],
+    ["merged acme/app#7", "", "gh answered no JSON"],
+    ["merged acme/app#7", "[]", "gh answered JSON that is not an object"],
+    ["closed acme/app#2", "<html>proxy</html>", "gh answered no JSON"],
+    ["pr acme/app feat/x", "{}", "gh answered JSON that is not an array"],
+  ];
+  for (const [signal, out, error] of cases) {
+    const c = await checkSignal(signal, ghPrs(out).fake, io);
+    expect(c).toMatchObject({ signal, ok: false });
+    expect(c.error).toStartWith(error);
+  }
+  const all = await checkDone("merged acme/app#7; closed acme/app#2", ghPrs("warning: cache stale").fake, io);
+  expect(all.map((c) => c.ok)).toEqual([false, false]);
 });
 
 test("a pr Done line is accepted at launch, and a pr signal without a repo is refused", async () => {

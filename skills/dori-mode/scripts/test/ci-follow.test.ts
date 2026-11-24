@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { CiFollowUp, type CiIo, type CiReview, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
+import { CI_FOLLOW_STUCK_POLLS, CiFollowUp, type CiIo, type CiReview, ciMessageId, laneDown, launchMergeLane, mergeLaneKey, rebaseMessageId } from "../src/ci-follow.ts";
 import { loadConfig } from "../src/config.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -628,6 +628,42 @@ test("a merged lane PR that cannot be read back wakes the lead once as MERGE_UNV
   ]);
   expect(views()).toBe(3);
   expect(eventClass(lines("MERGE_UNVERIFIED")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
+});
+
+/** Runs `body` with console.error muted: the follow-up logs each CI_FOLLOW_ERROR there. */
+const muted = async (body: () => Promise<void>): Promise<void> => {
+  const original = console.error;
+  console.error = () => {};
+  try { await body(); } finally { console.error = original; }
+};
+
+test("an open lane PR whose follow-up throws CI_FOLLOW_STUCK_POLLS polls in a row wakes the lead once as urgent CI_FOLLOW_STUCK", async () => {
+  gh.viewCode = 1;
+  const ci = follow();
+  await muted(async () => {
+    for (let i = 1; i < CI_FOLLOW_STUCK_POLLS; i++) await ci.tick([pull({ checks: "green" })], emit);
+    expect(lines("CI_FOLLOW_STUCK")).toEqual([]);
+    await ci.tick([pull({ checks: "green" })], emit);
+    await ci.tick([pull({ checks: "green" })], emit);
+  });
+  expect(events.filter(([, l]) => l.startsWith("CI_FOLLOW_STUCK"))).toEqual([
+    [`ci-follow-stuck:acme/app#7@${SHA}`, expect.stringMatching(/^CI_FOLLOW_STUCK acme\/app#7 lane=demo-lane head=abcdef1 follow-up failed 3 polls in a row: gh pr view acme\/app#7 exit 1: HTTP 502; /)],
+  ]);
+  expect(eventClass(lines("CI_FOLLOW_STUCK")[0] ?? "", deps.tunables.eventPolicy)).toBe("lead-urgent");
+});
+
+test("a poll that follows the PR without an error starts the CI_FOLLOW_STUCK count again", async () => {
+  gh.view = greenView({ mergeStateStatus: "BLOCKED" });
+  const ci = follow();
+  await muted(async () => {
+    for (const code of [1, 1, 0, 1, 1]) {
+      gh.viewCode = code;
+      await ci.tick([pull({ checks: "green" })], emit);
+    }
+  });
+  expect(lines("CI_FOLLOW_STUCK")).toEqual([]);
+  await muted(() => ci.tick([pull({ checks: "green" })], emit));
+  expect(lines("CI_FOLLOW_STUCK")).toHaveLength(1);
 });
 
 test("GH_PR checks_failing and conflicting are digest; an eventPolicy in the config file is ignored", async () => {

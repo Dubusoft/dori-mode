@@ -7,6 +7,7 @@ import { staleOwnerEvents } from "./inbox.ts";
 import { Discord } from "./messenger/discord.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { realClock } from "./run.ts";
+import { oneLine } from "./line-text.ts";
 
 export type DecisionCliDeps = {
   readonly flow: FlowDeps;
@@ -25,7 +26,6 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
   const ds = await import("./decision-store.ts");
   const { decisionChoicesProblem, inputRequestProblem } = await import("./runner/decision-text.ts");
   const [sub, ...subArgs] = rest;
-  const flat = (text: string): string => text.replace(/\s+/g, " ").trim();
   /** Discord is reached only when a call needs it; `token` already resolved, else read on first use. */
   const decisionContext = (token?: string, withReceipts = false): import("./owner-decisions.ts").DecisionContext => {
     let transport: Discord | undefined;
@@ -99,9 +99,9 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
     if (fromEvent !== undefined && !validEventId(fromEvent)) refuse(`--from-event ${fromEvent} is not an event id`);
     const token = messengerToken("DORI_DISCORD_TOKEN");
     const asked = request
-      ? od.requestSpec({ need: flat(v.question ?? ""), reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true, ...(v.file !== undefined ? { file: flat(v.file) } : {}) })
-      : { question: flat(v.question ?? ""), options: (v.option ?? []).map(flat), recommend: Number((v.recommend ?? "").trim()),
-        reason: flat(v.reason ?? ""), waiting: flat(v.waiting ?? ""), blocking: v.nonblocking !== true };
+      ? od.requestSpec({ need: oneLine(v.question ?? ""), reason: oneLine(v.reason ?? ""), waiting: oneLine(v.waiting ?? ""), blocking: v.nonblocking !== true, ...(v.file !== undefined ? { file: oneLine(v.file) } : {}) })
+      : { question: oneLine(v.question ?? ""), options: (v.option ?? []).map((text) => oneLine(text)), recommend: Number((v.recommend ?? "").trim()),
+        reason: oneLine(v.reason ?? ""), waiting: oneLine(v.waiting ?? ""), blocking: v.nonblocking !== true };
     const opened = await od.openOwnerDecision(decisionContext(token), {
       ...asked, source: "lead",
       ...(task !== undefined ? { task } : {}), ...(laneKey ? { lane: laneKey } : {}), ...(relayTo ? { relayTo } : {}), ...(origin ? { origin } : {}),

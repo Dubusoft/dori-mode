@@ -6,8 +6,9 @@ import {
 } from "./decision-store.ts";
 import { type LaneMessage, type LaneMessageStore, queueLaneMessage, updateLaneMessage } from "./lane-messages.ts";
 import { RUNNER_LANE_CLI } from "./launch-footer.ts";
-import { choiceLabel, closeOwnerDecision, errorText, short, syncDecisionButtons, type TickDeps } from "./owner-decisions.ts";
+import { choiceLabel, closeOwnerDecision, short, syncDecisionButtons, type TickDeps } from "./owner-decisions.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
+import { errLine } from "./line-text.ts";
 
 /*
  * Decision answers straight to the lane (references/messaging.md): the store side. Each direct answer is an answer
@@ -316,10 +317,10 @@ export const decisionDeliveryTick = async (deps: TickDeps, store: LaneMessageSto
         if (d.notice) await deps.transport.edit(d.thread, d.notice.message, text);
         const message = d.notice?.message ?? await deps.transport.send(d.thread, text, `decision-notice:${d.id}`);
         patchOne(stateDir, d.id, (x) => ({ ...x, notice: { message, text } }));
-      } catch (e) { log(`DECISION_NOTICE_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`); }
+      } catch (e) { log(`DECISION_NOTICE_FAILED ${d.id} r${r.rev}: ${errLine(e)}; retried next round`); }
     }
     try { await syncDecisionButtons(deps, d); }
-    catch (e) { log(`DECISION_BUTTONS_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`); }
+    catch (e) { log(`DECISION_BUTTONS_FAILED ${d.id} r${r.rev}: ${errLine(e)}; retried next round`); }
     if (r.delivery.state !== "acked" || r.choice === undefined) continue;
     await deps.enqueue(`decision-acked:${d.id}:r${r.rev}`, ackedLine(d, r));
     try {
@@ -327,7 +328,7 @@ export const decisionDeliveryTick = async (deps: TickDeps, store: LaneMessageSto
       await closeOwnerDecision(deps, d.id, { text: received, ownerText: received, choice: r.choice, force: true });
       log(`DECISION_CLOSED_ON_ACK ${d.id} r${r.rev} ${r.delivery.id}`);
     } catch (e) {
-      if (!(e instanceof OwnerDecisionError && e.code === "DECISION_ALREADY_CLOSED")) log(`DECISION_CLOSE_ON_ACK_FAILED ${d.id} r${r.rev}: ${errorText(e)}; retried next round`);
+      if (!(e instanceof OwnerDecisionError && e.code === "DECISION_ALREADY_CLOSED")) log(`DECISION_CLOSE_ON_ACK_FAILED ${d.id} r${r.rev}: ${errLine(e)}; retried next round`);
     }
   }
 };

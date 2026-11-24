@@ -616,211 +616,268 @@ export class LeadLifecycle {
     if (JSON.stringify(next) !== JSON.stringify(carried)) writeCarried(stateDir, next);
   }
 
+  /**
+   * Drives a lead restart through its phases: a soft restart that reuses an idle lead, stopping the old lead, launching
+   * the new one, and confirming it. Every phase change is journaled with setRestart, so a restart interrupted at any
+   * point resumes from its phase. An attempt that must go again at once (a reused lead that lost readiness, a first
+   * hung start) returns the next restart, and this loop runs it.
+   */
   async restart(restart: Restart): Promise<void> {
+    for (let next: Restart | undefined = restart; next;) next = await this.restartAttempt(next);
+  }
+
+  /** One pass through the phases from restart.phase; returns the restart to run next, or undefined when this one ended. */
+  private async restartAttempt(restart: Restart): Promise<Restart | undefined> {
     const { deps } = this;
     const promptSession = restart.phase.startsWith("soft-ready:") ? restart.phase.slice("soft-ready:".length) : restart.session;
     const promptPath = join(deps.config.stateDir, `lead-${promptSession}.md`);
-    let soft = restart.phase.startsWith("soft-ready:");
-    let sendSoft = false;
-    let softStartedAt: number | undefined;
-    if (soft && !(await softLive(deps))) {
+    if (restart.phase.startsWith("soft-ready:") && !(await softLive(deps))) {
       console.log("LEAD_SOFT_RESTART_FAILED reused lead is not ready; falling back to a process restart");
       restart = { ...restart, session: promptSession, phase: "soft-failed" };
       this.setRestart(restart);
-      soft = false;
     }
-    if (restart.phase === "stopping" && !restart.force) {
-      const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-      if (pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done")) {
-        const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.leadCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
-        const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-        if (hit.pid && latest?.agent && (latest.agent_status === "idle" || latest.agent_status === "done")) {
-          const old = (await this.sessionFile(pane.cwd ?? deps.config.leadCwd)).id || hit.id;
-          if (restart.request) this.journal = { ...this.journal, models: restart.request.models };
-          softStartedAt = deps.clock.now();
-          this.owners.record(restart.events);
-          restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: `soft:${old}` };
-          this.setRestart(restart);
-          this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
-          sendSoft = true;
-        }
-      }
-    }
-    if (restart.phase.startsWith("soft:")) {
-      const old = restart.phase.slice("soft:".length);
-      // The reused lead gets the prompt itself, on one line so a single Enter submits it. A file named in a "Read it"
-      // prompt is removed once the restart is confirmed, which can be before the new lead's first tool call reads it.
-      const softPrompt = this.startupPrompt(restart).split("\n").join(" ");
-      try {
-        if (sendSoft) {
-          this.carryOver(restart);
-          const entry = leadModels(this.leadConfig())[0];
-          if (!entry) throw new TransientSuperviseError("soft restart model is missing");
-          await softCommand(deps, "/new");
-          // The editor is back before omo has switched to the new session; anything typed meanwhile lands in the old
-          // session or is lost, so the next command waits until the new session has finished starting.
-          const started = await softSessionStarted(deps, old, softStartedAt);
-          if (!started) throw new TransientSuperviseError("new session did not start after /new");
-          // /new keeps the process's model and thinking. A bare lead model is compared, and typed, as provider/model:
-          // omo's /model picker does not submit a bare name on the first Enter.
-          const current = sessionModel(started);
-          const model = qualifiedModel(entry.model, current.model, [leadModels(deps.config)[0]?.model, deps.config.defaultModel]);
-          const commands = [
-            ...(current.model === model ? [] : [`/model ${model}`]),
-            ...(entry.thinking && current.thinking !== entry.thinking ? [`/thinking ${entry.thinking}`] : []),
-          ];
-          for (const command of commands) await softCommand(deps, command);
-          await softCommand(deps, softPrompt, true);
-        }
-        // A soft start journaled before the prompt was typed inline is recognised by its file path.
-        const session = await softEvidence(deps, old, [JSON.stringify(softPrompt).slice(1, -1), promptPath], softStartedAt);
-        if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
-        const table = await procTable(deps.run);
-        const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-        const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.leadCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
-        if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
-        const targets = await ownedTargets(deps, table, undefined, old);
-        const protectedPids = new Set<number>();
-        for (let pid: number | undefined = hit.pid; pid && !protectedPids.has(pid); pid = table.find((p) => p.pid === pid)?.ppid) protectedPids.add(pid);
-        for (const pid of protectedPids) targets.delete(pid);
-        await killTargets(deps, targets);
-        restart = { ...restart, session, phase: `soft-ready:${restart.session}` };
-        this.setRestart(restart);
-        soft = true;
-        console.log(`LEAD_SOFT_RESTARTED ${deps.config.leadPane} ${session}`);
-      } catch (e) {
-        if (!(e instanceof Error)) throw e;
-        console.log(`LEAD_SOFT_RESTART_FAILED ${e.message.replace(/\s+/g, " ")}; falling back to a process restart`);
-        restart = { ...restart, phase: "soft-failed" };
-        this.setRestart(restart);
-      }
-    }
+    let softStartedAt: number | undefined;
+    if (restart.phase === "stopping" && !restart.force) ({ restart, startedAt: softStartedAt } = await this.beginSoft(restart));
+    if (restart.phase.startsWith("soft:")) restart = await this.softHandOff(restart, promptPath, softStartedAt);
     if (restart.phase === "stopping" || restart.phase === "soft-failed") {
-      const softFailed = restart.phase === "soft-failed";
-      let moved: string | undefined;
-      let stopped: boolean;
-      try { stopped = await stopLead(deps, softFailed || restart.force); }
-      catch (e) {
-        if (!(e instanceof TransientSuperviseError) || !LEAD_STAYS.test(e.message)) throw e;
-        // The old lead's tree was killed but stays in the pane (e.g. a TUI that broke mid-draw keeps the terminal busy).
-        // After the limit the lead moves to a new pane instead of waiting on this one forever.
-        const failures = (restart.unconfirmed ?? 0) + 1;
-        restart = { ...restart, unconfirmed: failures };
-        this.setRestart(restart);
-        if (failures < UNCONFIRMED_LIMIT) throw e;
-        const saved = await this.saveLeadScreen();
-        moved = await this.replaceLeadPane();
-        if (!moved) throw e;
-        this.announceMoved(restart.session, `이전 리드가 ${failures}번의 종료 시도에도 끝나지 않음`, moved, saved);
-        stopped = true;
-      }
-      if (!stopped) {
-        // The lead woke while identity/ownership was being resolved. Deliver
-        // warm rather than interrupting it or abandoning the queued event.
-        if (!softFailed) this.owners.record(restart.events);
-        this.setRestart(undefined);
-        return;
-      }
-      // The restart cap counts forced restarts once the lead really stopped; an owner's request and a
-      // demand-driven cold start never count.
-      if (!restart.request && restart.force) this.core.noteForcedRestart("forced");
-      if (restart.request) {
-        this.journal = { ...this.journal, models: restart.request.models };
-      }
-      // Log the cold batch before launch. The old monitor is gone. The new lead
-      // takes these lines with dori inbox take and tails strictly after this batch.
-      if (!softFailed) {
-        this.owners.record(restart.events);
-        restart = { ...restart, offset: statSync(this.core.eventLog).size };
-      }
-      restart = { ...restart, phase: "starting", ...(restart.unconfirmed ? { unconfirmed: 0 } : {}) };
-      this.setRestart(restart);
-      if (!softFailed) this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
-      // The next attempt launches into the new pane with the supervisor's updated lead pane.
-      if (moved) throw new TransientSuperviseError(`LEAD_PANE_REPLACED the old lead did not exit; lead pane recreated as ${moved}, relaunching as ${restart.session}`);
+      const stopped = await this.stopOldLead(restart);
+      if (!stopped) return undefined;
+      restart = stopped;
     }
-    if (restart.phase === "starting") {
-      this.carryOver(restart);
-      const prompt = this.startupPrompt(restart);
-      // `pane run` types the command: into anything but a plain shell it lands in that program's input
-      // (e.g. an agent started by hand). Checked before "submitted", so a refusal retries cleanly.
-      // Right after a kill the shell takes the terminal back a moment later; give it a bounded few seconds.
-      let info = await processInfo(deps);
-      for (let attempt = 0; attempt < 10 && info && !plainShell(info); attempt++) {
-        await deps.clock.sleep(500);
-        info = await processInfo(deps);
+    if (restart.phase === "starting") restart = await this.launchLead(restart, promptPath);
+    if (restart.phase.startsWith("soft-ready:")) {
+      if (!(await softLive(deps))) {
+        console.log("LEAD_SOFT_RESTART_FAILED reused lead lost readiness; falling back to a process restart");
+        const next: Restart = { ...restart, session: promptSession, phase: "soft-failed" };
+        this.setRestart(next);
+        return next;
       }
-      if (!info) throw new TransientSuperviseError(`cannot verify a plain shell in lead pane ${deps.config.leadPane}; lead launch not sent`);
-      if (!plainShell(info)) {
-        const fg = (info.foreground_processes ?? []).filter((p) => p.pid !== info.shell_pid).map((p) => p.argv?.[0] ?? `pid ${p.pid ?? "?"}`).join(", ");
-        throw new TransientSuperviseError(`LEAD_PANE_BUSY ${deps.config.leadPane}: foreground is not a plain shell (${fg || `process group ${info.foreground_process_group_id}`}); refusing to type the lead launch into it`);
-      }
-      // Persist intent before admission. On an uncertain response, recovery only
-      // verifies this exact session; it never blindly submits the prompt twice.
-      restart = { ...restart, phase: "submitted" };
-      this.setRestart(restart);
-      // File inclusion avoids the terminal's canonical input line limit for a
-      // burst of events or a full-length multibyte Discord message.
-      const fd = openSync(promptPath, "w", 0o600);
-      try { writeFileSync(fd, prompt); fsyncSync(fd); } finally { closeSync(fd); }
-      const agent = leadCommand(this.leadConfig(), `@${promptPath}`);
-      const executable = agent[0];
-      if (!executable) throw new SuperviseError("agentCommand must name an executable");
-      const argv = [
-        "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable,
-        ...leadPermissionArgs([...deps.config.leadArgs, ...agent.slice(1)]), "--session-id", restart.session,
-        "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
-        ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
-      ];
-      const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
-      if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${restart.session}`);
+    } else {
+      if (!(await confirmLead(deps, restart.session))) return this.unconfirmedStart(restart);
+      if (!(await awaitStartupEvidence(deps, restart.session))) return this.hungStart(restart, promptPath);
     }
-    let confirmed = soft ? await softLive(deps) : await confirmLead(deps, restart.session);
-    if (soft && !confirmed) {
-      console.log("LEAD_SOFT_RESTART_FAILED reused lead lost readiness; falling back to a process restart");
-      const next: Restart = { ...restart, session: promptSession, phase: "soft-failed" };
+    this.finishRestart(restart, promptPath);
+    return undefined;
+  }
+
+  /**
+   * Starts a soft restart when the lead is idle: the reused lead gets /new instead of a process restart. Returns the
+   * soft:<old session> restart and when it began, or the restart unchanged when the lead is busy or unidentified.
+   */
+  private async beginSoft(restart: Restart): Promise<{ readonly restart: Restart; readonly startedAt?: number }> {
+    const { deps } = this;
+    const idle = (pane: Pane | undefined): boolean => !!pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done");
+    const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    if (!pane || !idle(pane)) return { restart };
+    const hit = await resolveSession(deps.config.leadPane, pane.cwd ?? deps.config.leadCwd, await procTable(deps.run), { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
+    const latest = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    if (!hit.pid || !idle(latest)) return { restart };
+    const old = (await this.sessionFile(pane.cwd ?? deps.config.leadCwd)).id || hit.id;
+    if (restart.request) this.journal = { ...this.journal, models: restart.request.models };
+    const startedAt = deps.clock.now();
+    this.owners.record(restart.events);
+    const next: Restart = { ...restart, offset: statSync(this.core.eventLog).size, phase: `soft:${old}` };
+    this.setRestart(next);
+    this.owners.react(next.events, [["add", COLD_START_EMOJI]]);
+    return { restart: next, startedAt };
+  }
+
+  /**
+   * The soft:<old> phase: types /new, the model and the startup prompt into the reused lead when startedAt is set (this
+   * attempt began the soft restart), then confirms the new session and stops the old session's owned processes.
+   * Returns the soft-ready restart, or soft-failed for a process restart to take over.
+   */
+  private async softHandOff(restart: Restart, promptPath: string, startedAt: number | undefined): Promise<Restart> {
+    const { deps } = this;
+    const old = restart.phase.slice("soft:".length);
+    // The reused lead gets the prompt itself, on one line so a single Enter submits it. A file named in a "Read it"
+    // prompt is removed once the restart is confirmed, which can be before the new lead's first tool call reads it.
+    const softPrompt = this.startupPrompt(restart).split("\n").join(" ");
+    try {
+      if (startedAt !== undefined) {
+        this.carryOver(restart);
+        const entry = leadModels(this.leadConfig())[0];
+        if (!entry) throw new TransientSuperviseError("soft restart model is missing");
+        await softCommand(deps, "/new");
+        // The editor is back before omo has switched to the new session; anything typed meanwhile lands in the old
+        // session or is lost, so the next command waits until the new session has finished starting.
+        const started = await softSessionStarted(deps, old, startedAt);
+        if (!started) throw new TransientSuperviseError("new session did not start after /new");
+        // /new keeps the process's model and thinking. A bare lead model is compared, and typed, as provider/model:
+        // omo's /model picker does not submit a bare name on the first Enter.
+        const current = sessionModel(started);
+        const model = qualifiedModel(entry.model, current.model, [leadModels(deps.config)[0]?.model, deps.config.defaultModel]);
+        const commands = [
+          ...(current.model === model ? [] : [`/model ${model}`]),
+          ...(entry.thinking && current.thinking !== entry.thinking ? [`/thinking ${entry.thinking}`] : []),
+        ];
+        for (const command of commands) await softCommand(deps, command);
+        await softCommand(deps, softPrompt, true);
+      }
+      // A soft start journaled before the prompt was typed inline is recognised by its file path.
+      const session = await softEvidence(deps, old, [JSON.stringify(softPrompt).slice(1, -1), promptPath], startedAt);
+      if (!session) throw new TransientSuperviseError("no new session containing the startup prompt path");
+      const table = await procTable(deps.run);
+      const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+      const hit = await resolveSession(deps.config.leadPane, pane?.cwd ?? deps.config.leadCwd, table, { run: deps.run, sessionsDir: deps.tunables.sessionsDir });
+      if (!hit.pid) throw new TransientSuperviseError("cannot identify reused lead process");
+      const targets = await ownedTargets(deps, table, undefined, old);
+      const protectedPids = new Set<number>();
+      for (let pid: number | undefined = hit.pid; pid && !protectedPids.has(pid); pid = table.find((p) => p.pid === pid)?.ppid) protectedPids.add(pid);
+      for (const pid of protectedPids) targets.delete(pid);
+      await killTargets(deps, targets);
+      const next: Restart = { ...restart, session, phase: `soft-ready:${restart.session}` };
       this.setRestart(next);
-      return this.restart(next);
+      console.log(`LEAD_SOFT_RESTARTED ${deps.config.leadPane} ${session}`);
+      return next;
+    } catch (e) {
+      if (!(e instanceof Error)) throw e;
+      console.log(`LEAD_SOFT_RESTART_FAILED ${e.message.replace(/\s+/g, " ")}; falling back to a process restart`);
+      const next: Restart = { ...restart, phase: "soft-failed" };
+      this.setRestart(next);
+      return next;
     }
-    if (!confirmed) {
-      const unconfirmed = (restart.unconfirmed ?? 0) + 1;
-      restart = { ...restart, unconfirmed };
+  }
+
+  /**
+   * The stopping and soft-failed phases: stops the old lead (moving the lead to a new pane when it will not leave this
+   * one) and logs the cold batch. Returns the starting restart, or undefined when the lead woke and takes the events warm.
+   */
+  private async stopOldLead(restart: Restart): Promise<Restart | undefined> {
+    const { deps } = this;
+    const softFailed = restart.phase === "soft-failed";
+    let moved: string | undefined;
+    let stopped: boolean;
+    try { stopped = await stopLead(deps, softFailed || restart.force); }
+    catch (e) {
+      if (!(e instanceof TransientSuperviseError) || !LEAD_STAYS.test(e.message)) throw e;
+      // The old lead's tree was killed but stays in the pane (e.g. a TUI that broke mid-draw keeps the terminal busy).
+      // After the limit the lead moves to a new pane instead of waiting on this one forever.
+      const failures = (restart.unconfirmed ?? 0) + 1;
+      restart = { ...restart, unconfirmed: failures };
       this.setRestart(restart);
-      // A session with startup evidence did initialise (it may be blocked on a dialog or show a provider error):
-      // it is never killed or given a second copy of the events; a human inspects it.
-      if (unconfirmed < UNCONFIRMED_LIMIT || hasStartupEvidence(deps, restart.session)) {
-        throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session}; events retained, inspect the lead before retrying`);
-      }
-      // This session never initialised and will not confirm. Save the screen while the failure is still on it, stop
-      // exactly its tree, move the lead to a new pane, and give the same events and offset a fresh session, as a hung
-      // start does. A process that will not stop does not hold the lead in this pane.
+      if (failures < UNCONFIRMED_LIMIT) throw e;
       const saved = await this.saveLeadScreen();
-      try { await stopHung(deps, restart.session); } catch (e) {
-        if (!(e instanceof TransientSuperviseError)) throw e;
-        console.error(`LEAD_STOP_FAILED ${restart.session}: ${e.message}`);
-      }
-      const pane = await this.replaceLeadPane();
-      if (pane) this.announceMoved(restart.session, `새 리드가 ${unconfirmed}번 확인하는 동안 시작되지 않음`, pane, saved);
-      const next = this.abandon(restart);
-      console.log(`LEAD_STARTUP_ABANDONED ${restart.session} -> ${next.session}`);
-      throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session} after ${unconfirmed} checks; ${pane ? `lead pane recreated as ${pane}` : "lead pane kept"}, relaunching as ${next.session}`);
+      moved = await this.replaceLeadPane();
+      if (!moved) throw e;
+      this.announceMoved(restart.session, `이전 리드가 ${failures}번의 종료 시도에도 끝나지 않음`, moved, saved);
+      stopped = true;
     }
-    if (!soft && !(await awaitStartupEvidence(deps, restart.session))) {
-      // The process answered herdr but omo never initialised (no holder file, no session jsonl).
-      // Stop exactly that process tree; the same events and tail offset go to a fresh session.
-      await stopHung(deps, restart.session);
-      if (existsSync(promptPath)) unlinkSync(promptPath);
-      const strikes = (restart.strikes ?? 0) + 1;
-      const next: Restart = { ...restart, session: randomUUID(), strikes, phase: "starting", unconfirmed: 0 };
-      this.setRestart(next);
-      if (strikes === 1) {
-        console.log(`LEAD_STARTUP_HUNG_RETRY ${restart.session}`);
-        return this.restart(next);
-      }
-      console.log(`LEAD_STARTUP_HUNG ${restart.session}`);
-      this.owners.react(restart.events, [["remove", COLD_START_EMOJI], ["add", HUNG_EMOJI]]);
-      throw new TransientSuperviseError(`LEAD_STARTUP_HUNG ${restart.session}; events retained, relaunch deferred to backoff`);
+    if (!stopped) {
+      // The lead woke while identity/ownership was being resolved. Deliver
+      // warm rather than interrupting it or abandoning the queued event.
+      if (!softFailed) this.owners.record(restart.events);
+      this.setRestart(undefined);
+      return undefined;
     }
+    // The restart cap counts forced restarts once the lead really stopped; an owner's request and a
+    // demand-driven cold start never count.
+    if (!restart.request && restart.force) this.core.noteForcedRestart("forced");
+    if (restart.request) {
+      this.journal = { ...this.journal, models: restart.request.models };
+    }
+    // Log the cold batch before launch. The old monitor is gone. The new lead
+    // takes these lines with dori inbox take and tails strictly after this batch.
+    if (!softFailed) {
+      this.owners.record(restart.events);
+      restart = { ...restart, offset: statSync(this.core.eventLog).size };
+    }
+    restart = { ...restart, phase: "starting", ...(restart.unconfirmed ? { unconfirmed: 0 } : {}) };
+    this.setRestart(restart);
+    if (!softFailed) this.owners.react(restart.events, [["add", COLD_START_EMOJI]]);
+    // The next attempt launches into the new pane with the supervisor's updated lead pane.
+    if (moved) throw new TransientSuperviseError(`LEAD_PANE_REPLACED the old lead did not exit; lead pane recreated as ${moved}, relaunching as ${restart.session}`);
+    return restart;
+  }
+
+  /** The starting phase: types the lead launch into a plain shell in the lead pane; returns the submitted restart. */
+  private async launchLead(restart: Restart, promptPath: string): Promise<Restart> {
+    const { deps } = this;
+    this.carryOver(restart);
+    const prompt = this.startupPrompt(restart);
+    // `pane run` types the command: into anything but a plain shell it lands in that program's input
+    // (e.g. an agent started by hand). Checked before "submitted", so a refusal retries cleanly.
+    // Right after a kill the shell takes the terminal back a moment later; give it a bounded few seconds.
+    let info = await processInfo(deps);
+    for (let attempt = 0; attempt < 10 && info && !plainShell(info); attempt++) {
+      await deps.clock.sleep(500);
+      info = await processInfo(deps);
+    }
+    if (!info) throw new TransientSuperviseError(`cannot verify a plain shell in lead pane ${deps.config.leadPane}; lead launch not sent`);
+    if (!plainShell(info)) {
+      const fg = (info.foreground_processes ?? []).filter((p) => p.pid !== info.shell_pid).map((p) => p.argv?.[0] ?? `pid ${p.pid ?? "?"}`).join(", ");
+      throw new TransientSuperviseError(`LEAD_PANE_BUSY ${deps.config.leadPane}: foreground is not a plain shell (${fg || `process group ${info.foreground_process_group_id}`}); refusing to type the lead launch into it`);
+    }
+    // Persist intent before admission. On an uncertain response, recovery only
+    // verifies this exact session; it never blindly submits the prompt twice.
+    const submitted: Restart = { ...restart, phase: "submitted" };
+    this.setRestart(submitted);
+    // File inclusion avoids the terminal's canonical input line limit for a
+    // burst of events or a full-length multibyte Discord message.
+    const fd = openSync(promptPath, "w", 0o600);
+    try { writeFileSync(fd, prompt); fsyncSync(fd); } finally { closeSync(fd); }
+    const agent = leadCommand(this.leadConfig(), `@${promptPath}`);
+    const executable = agent[0];
+    if (!executable) throw new SuperviseError("agentCommand must name an executable");
+    const argv = [
+      "env", "DORI_SUPERVISED=1", ...(deps.tunables.leadDiet ? LEAD_DIET_ENV : []), executable,
+      ...leadPermissionArgs([...deps.config.leadArgs, ...agent.slice(1)]), "--session-id", submitted.session,
+      "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
+      ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
+    ];
+    const launched = await deps.run(["herdr", "pane", "run", deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`]);
+    if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${submitted.session}`);
+    return submitted;
+  }
+
+  /** The launched lead did not confirm: counts the check and retries later, or abandons the session for a fresh one. */
+  private async unconfirmedStart(restart: Restart): Promise<never> {
+    const { deps } = this;
+    const unconfirmed = (restart.unconfirmed ?? 0) + 1;
+    restart = { ...restart, unconfirmed };
+    this.setRestart(restart);
+    // A session with startup evidence did initialise (it may be blocked on a dialog or show a provider error):
+    // it is never killed or given a second copy of the events; a human inspects it.
+    if (unconfirmed < UNCONFIRMED_LIMIT || hasStartupEvidence(deps, restart.session)) {
+      throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session}; events retained, inspect the lead before retrying`);
+    }
+    // This session never initialised and will not confirm. Save the screen while the failure is still on it, stop
+    // exactly its tree, move the lead to a new pane, and give the same events and offset a fresh session, as a hung
+    // start does. A process that will not stop does not hold the lead in this pane.
+    const saved = await this.saveLeadScreen();
+    try { await stopHung(deps, restart.session); } catch (e) {
+      if (!(e instanceof TransientSuperviseError)) throw e;
+      console.error(`LEAD_STOP_FAILED ${restart.session}: ${e.message}`);
+    }
+    const pane = await this.replaceLeadPane();
+    if (pane) this.announceMoved(restart.session, `새 리드가 ${unconfirmed}번 확인하는 동안 시작되지 않음`, pane, saved);
+    const next = this.abandon(restart);
+    console.log(`LEAD_STARTUP_ABANDONED ${restart.session} -> ${next.session}`);
+    throw new TransientSuperviseError(`STARTUP_UNCONFIRMED ${restart.session} after ${unconfirmed} checks; ${pane ? `lead pane recreated as ${pane}` : "lead pane kept"}, relaunching as ${next.session}`);
+  }
+
+  /**
+   * The process answered herdr but omo never initialised (no holder file, no session jsonl). Stops exactly that process
+   * tree and returns a fresh session with the same events and tail offset; a second hung start defers to backoff.
+   */
+  private async hungStart(restart: Restart, promptPath: string): Promise<Restart> {
+    await stopHung(this.deps, restart.session);
+    if (existsSync(promptPath)) unlinkSync(promptPath);
+    const strikes = (restart.strikes ?? 0) + 1;
+    const next: Restart = { ...restart, session: randomUUID(), strikes, phase: "starting", unconfirmed: 0 };
+    this.setRestart(next);
+    if (strikes === 1) {
+      console.log(`LEAD_STARTUP_HUNG_RETRY ${restart.session}`);
+      return next;
+    }
+    console.log(`LEAD_STARTUP_HUNG ${restart.session}`);
+    this.owners.react(restart.events, [["remove", COLD_START_EMOJI], ["add", HUNG_EMOJI]]);
+    throw new TransientSuperviseError(`LEAD_STARTUP_HUNG ${restart.session}; events retained, relaunch deferred to backoff`);
+  }
+
+  /** The new lead is up: hands it the events and clears the restart. */
+  private finishRestart(restart: Restart, promptPath: string): void {
+    const { deps } = this;
     // The new lead can read now: every message handed to it (in its log or carried over) and still waiting for its ack gets a
     // fresh window from here, so neither a cold-start batch nor a message the old lead never acked is escalated while
     // this lead boots. A message that arrived during startup and is not delivered yet gets its window when it is.

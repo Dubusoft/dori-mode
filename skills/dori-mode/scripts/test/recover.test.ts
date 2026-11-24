@@ -14,6 +14,7 @@ import type { StartupVerdict, TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
 import { markHerdr } from "./herdr-world.ts";
 import { tryStateLock } from "../src/state-lock.ts";
+import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { eventClass } from "../src/event-policy.ts";
 
 type Deps = ReturnType<typeof depsFor>;
@@ -591,6 +592,19 @@ test.each([{ live: false, reason: "missing-pane" }, { live: true, reason: "missi
   expect(opsOf(world, "recover", "start")).toEqual([]);
   expect(events[0]).toContain("lane closed");
   expect((await deps.registry.read(lane.key))?.status).toBe("closed");
+});
+
+test("never relaunches a remote lane whose PR the supervisor merged, though its Done signal does not read merged yet", async () => {
+  const { deps, world, lane } = await fixture();
+  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app" });
+  const store = openOperations({ stateDir: state.dir });
+  try {
+    const op = plan(store, 0, { lane: lane.key, action: "merge", target: `a/b#1@${"a".repeat(40)}` });
+    settleOperation(store, 0, op.id, "verified", "");
+  } finally { store.close(); }
+  const events = await recoverLanes(deps, lane.key);
+  expect(events[0]).toStartWith(`LANE_RECOVERY_SKIPPED recover-lane - missing-pane: CI_MERGED a/b#1@${"a".repeat(40)}`);
+  expect(opsOf(world, "recover", "start")).toEqual([]);
 });
 
 test("the supervisor journals a skipped recovery under one id per lane, generation and reason", async () => {

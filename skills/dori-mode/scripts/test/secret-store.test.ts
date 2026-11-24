@@ -64,6 +64,18 @@ test("legacy cred reads decrypt --user; updating replaces it with plain", async 
   expect(await store.read("API_KEY")).toBe("replacement");
 });
 
+test("an update interrupted before removing the legacy cred still reads the new plain value", async () => {
+  mkdirSync(dir, { mode: 0o700 });
+  writeFileSync(join(dir, "API_KEY.cred"), Buffer.from("old").toString("base64"), { mode: 0o600 });
+  writeFileSync(join(dir, "API_KEY.plain"), "new", { mode: 0o600 });
+  const fake = fakeCreds();
+  const store = new SecretStore({ dir, run: fake.run });
+  expect(await store.read("API_KEY")).toBe("new");
+  expect(store.list()).toEqual([{ name: "API_KEY", backend: "plain" }]);
+  expect([...(await store.readAll(true))]).toEqual([["API_KEY", "new"]]);
+  expect(fake.calls).toEqual([]);
+});
+
 test("a failed legacy decrypt remains SECRET_DECRYPT_FAILED", async () => {
   mkdirSync(dir, { mode: 0o700 });
   writeFileSync(join(dir, "A.cred"), "legacy");
@@ -110,8 +122,12 @@ describe("store rules", () => {
     const failing: Runner = async (argv, o) => (argv[0] === "systemd-creds" && argv[1] === "decrypt" && String(argv[argv.length - 2]).endsWith("BAD.cred")
       ? { code: 1, out: "", err: "bad" }
       : fakeCreds().run(argv, o));
-    expect([...(await new SecretStore({ dir, run: failing }).readAll())]).toEqual([["GOOD", VALUE]]);
-    expect(await codeOf(new SecretStore({ dir, run: failing }).readAll(true))).toBe("SECRET_DECRYPT_FAILED");
+    const lines: string[] = [];
+    expect([...(await new SecretStore({ dir, run: failing, log: (line) => { lines.push(line); } }).readAll())]).toEqual([["GOOD", VALUE]]);
+    // Name and code only: the systemd-creds error text ("bad") stays out of the log.
+    expect(lines).toEqual(["SECRET_STORE_READ_SKIPPED BAD SECRET_DECRYPT_FAILED"]);
+    expect(await codeOf(new SecretStore({ dir, run: failing, log: (line) => { lines.push(line); } }).readAll(true))).toBe("SECRET_DECRYPT_FAILED");
+    expect(lines).toHaveLength(1);
   });
 
   test("an existing dir with group/other bits is refused and left alone", async () => {

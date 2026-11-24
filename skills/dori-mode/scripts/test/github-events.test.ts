@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
-import { GitHubEvents, githubSummary, githubTargets, PRE_SQLITE_GITHUB_FILE } from "../src/github-events.ts";
+import { GitHubEvents, githubSummary, githubTargets, importGithub, PRE_SQLITE_GITHUB_FILE } from "../src/github-events.ts";
 import { Repos } from "../src/repos.ts";
 import type { Ran, Runner } from "../src/run.ts";
 import { SQLITE_FILE } from "../src/store.ts";
@@ -241,6 +241,25 @@ test("a repo timeout still lets a healthy repo emit its decision event", async (
   await f.github.tick({ ...f.deps, run }, f.emit);
   expect(f.events.some((e) => e.line.startsWith("GH_PR acme/app#7 comment "))).toBe(true);
   expect(f.events.some((e) => e.line.startsWith("HOST_GITHUB slow/repo poll_failed "))).toBe(true);
+});
+
+test("CI follow-up sees a finished green PR even when the repo's issue poll keeps timing out", async () => {
+  const f = await fixture();
+  const head = { ...pull().head, sha: "def" };
+  const next = pull({ head, updated_at: "2026-10-20T00:00:00Z" });
+  f.responses.set("repos/acme/app/pulls?state=all&sort=updated&direction=desc&per_page=100", ok([next]));
+  f.responses.set("repos/acme/app/pulls/7", ok(next));
+  f.responses.set("repos/acme/app/commits/def/check-runs?per_page=100", ok({ check_runs: [{ status: "completed", conclusion: "success" }] }));
+  f.responses.set("repos/acme/app/commits/def/status?per_page=100", ok({ state: "pending", statuses: [] }));
+  f.responses.set(ISSUES, { code: 124, out: "", err: "timeout" });
+
+  for (let tick = 0; tick < 2; tick++) {
+    await f.github.tick(f.deps, f.emit);
+    expect(f.github.openPulls()).toMatchObject([{ number: 7, sha: "def", checks: "green" }]);
+    expect(readGithub(f.state.dir).repos["acme/app"].pulls["7"]).toMatchObject({ sha: "abc", checks: "none" });
+  }
+  expect(f.events.filter((e) => e.line.includes("poll_failed")).map((e) => e.line))
+    .toEqual(["HOST_GITHUB acme/app poll_failed gh api HTTP unavailable exit=124"]);
 });
 
 test("a repo poll cut short keeps what it read: the next tick resumes after the finished PRs instead of starting over", async () => {
@@ -509,6 +528,22 @@ test("closed PR history keeps its baseline but drops activity and unused cached 
   f.responses.set("repos/acme/app/issues/7/comments?per_page=100", ok([old, { ...old, id: 2, created_at: later.updated_at }], '"c2"'));
   await poller(f.state.dir).tick(f.deps, f.emit);
   expect(f.events.filter((e) => e.line.includes(" comment ")).map((e) => e.id)).toEqual([`github:acme/app#7:issues/7/comments:2::`]);
+});
+
+test("a github-events.json repo, pulls or cache entry that is not an object is refused as malformed", () => {
+  const state = withState();
+  cleanups.push(state.done);
+  const db = new Database(":memory:");
+  cleanups.push(() => db.close());
+  const file = join(state.dir, "github-events.json");
+  for (const [repos, what] of [
+    [{ "acme/app": 5 }, "repo acme/app is not an object"],
+    [{ "acme/app": { pulls: { 7: "open" }, cache: {} } }, "repo acme/app pulls 7 is not an object"],
+    [{ "acme/app": { pulls: {}, cache: [] } }, "repo acme/app cache is not an object"],
+  ] as const) {
+    writeFileSync(file, JSON.stringify({ repos, failures: {} }));
+    expect(() => importGithub(db, state.dir, 0)).toThrow(`STORE_IMPORT_MALFORMED ${file} ${what}`);
+  }
 });
 
 test("github-events.json moves into the store at the first sqlite start: slimmed, read back, kept read-only, never replayed", async () => {

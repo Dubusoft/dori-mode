@@ -85,14 +85,13 @@ Samples without
 `herdr` have no effect on herdr state (the watch may still be confirming its first failure).
 
 Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
-verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action. A protocol 3
-runner is never sent it: the call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action.
 
 Protocol 7 adds the command `lane.attach {key, tree}` (`dori attach`): the runner validates `tree` like a `lane.start`
 input tree, writes it into the running lane's existing `briefs/<key>.files` directory under the next free `a<NNNN>`
 group (in place, so a sandbox that bound that directory at start sees it; the combined directory keeps the launch caps),
 and answers `{dir}`, that group's path. A lane without a file run (adopted, or started before lane files) refuses it
-with `LANE_ATTACH_UNMANAGED`. A protocol 6 runner is never sent it (`RUNNER_UNAVAILABLE ... outdated`).
+with `LANE_ATTACH_UNMANAGED`.
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
@@ -100,8 +99,7 @@ A verified `cmd.result` carries `result` per command type: `lane.start` and `lan
 `lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.attach` `{dir}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
 `lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
 managed, paused}`. A runner effect that only returns a
-detail sends no `result`. The supervisor never sends a protocol 3 command or any query to a runner that said hello
-with protocol 2: such a call fails at once as `RUNNER_UNAVAILABLE runner=<label> outdated`.
+detail sends no `result`.
 
 ## Queries
 
@@ -146,7 +144,10 @@ verifies with the stored key. A failed signature on either side closes the conne
 unenrolled label or another host is refused the same way, a revoked one with `RUNNER_REVOKED`. The session key is
 HKDF over the X25519 shared secret, salted with both nonces, with both identity keys as info, so someone who only
 watched the handshake cannot compute it. From then on every frame both ways carries a `mac`, compared in constant
-time; a frame with a missing or wrong `mac` is dropped and logged `RUNNER_AUTH_FAILED ... bad mac`. Authentication is
+time; a frame with a missing or wrong `mac` is dropped. Each end logs its drops once per connection, as
+`RUNNER_AUTH_FAILED ... bad mac count=<n> ...`: after `BAD_MAC_CLOSE_AFTER` (8) of them it closes the connection with
+`RUNNER_AUTH_FAILED` so the runner handshakes again and gets a fresh session key, and a connection that closes sooner
+logs its count on close. Authentication is
 always on for the unix socket and the WebSocket listener alike.
 
 **Rotation.** `dori runner rotate <label>` sends `runner.rotate` to the connected runner. It writes a new key pair
@@ -165,7 +166,10 @@ the `runners` task drains every 5 seconds; a request not answered within 2 minut
 
 A worker's runner listens and the supervisor dials it. The runner runs
 `dori runner serve --label <label> --listen <host>:<port>` and accepts one WebSocket connection at a time; a second
-connection while one is open is refused. The supervisor reads `<stateDir>/runner-endpoints.json`, an object mapping
+connection while one is open is refused. Both ends bound the handshake to 10 s: the runner closes a connection that
+has not answered its `hello` with `hello.ok` or `hello.reject` by then (`RUNNER_HELLO_TIMEOUT`) and reconnects after
+the backoff, and the supervisor closes a connection it has not admitted, refused or answered `enroll.ok` within 10 s
+of accepting it. A peer that takes the runner's slot and stays silent therefore holds it for at most 10 s. The supervisor reads `<stateDir>/runner-endpoints.json`, an object mapping
 labels to `host:port` (`{"worker-a":"100.101.1.2:7411","worker-b":"[fd12::1]:7411"}`), dials each endpoint next to
 its local unix socket, and redials after a failure or close with backoff: 1 s doubling to 60 s, scaled by a random
 0.8 to 1.2. It rereads the file every second, so an added, changed or removed endpoint takes effect without a
@@ -318,9 +322,9 @@ the hello `unknown-field`, so update the supervisor before its runners.
 A wait (`dori wait --machine`), poll source or command schedule (`--machine`) that names a runner is carried out on
 it. The supervisor keeps the scheduling, dedupe and journal; it sends each check or run over `RunnerCall` and waits
 for the `cmd.result`. A runner that is not connected fails the call at once with `RUNNER_UNAVAILABLE`. Both commands
-need protocol 5 (`NEEDS_PROTO`); there is no protocol bump. A runner without the handler answers `cmd.result failed
-RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and `cwd` must be absolute,
-existing and under `allowedRoots`.
+came with protocol 5, so every admitted runner carries them; there is no protocol bump. A runner without the handler
+answers `cmd.result failed RUNNER_CMD_UNSUPPORTED <type>`. Under `jobs: deny` both are refused (`jobs-denied`), and
+`cwd` must be absolute, existing and under `allowedRoots`.
 
 | Command | Body | `cmd.result` result |
 | --- | --- | --- |
@@ -374,8 +378,11 @@ committed. When the hub receives `seq`:
 
 If the commit throws, `eventAck` doesn't move and no ack is sent. So `eventAck` never runs ahead of the journal,
 and the journal holds events in `seq` order. After a reconnect the runner replays every outbox row above the
-`eventAck` from `hello.ok`, in order, before sending anything new. A lower ack than the runner already holds is
-ignored.
+`eventAck` from `hello.ok`, in order, before sending anything new. It reads the outbox 64 rows at a time and, when
+the socket reports backpressure, waits for it to drain before the next row, so a large backlog is neither loaded
+nor queued at once; `hello.ok` ends the handshake deadline, so a slow replay is not cut by it. A message the socket
+drops closes the link with `RUNNER_SEND_DROPPED`: the peer sees the close at once instead of waiting out a lost
+control frame, and a lost event replays after the reconnect. A lower ack than the runner already holds is ignored.
 
 Runner events land in the hub's own `runner_events` table, never in the lead's journal, and are pruned after 7 days.
 
@@ -453,9 +460,13 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   machine. A worker that already has `~/.dori/runner/keys/supervisor.pub` skips enrollment: a reinstall or an upgrade
   keeps its keys.
 - On macOS, the launchd user agent `~/Library/LaunchAgents/com.dori.runner.plist` (from
-  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials. While it
+  `templates/dori-runner-launchd.plist`, `KeepAlive`) runs the same command, also without credentials. A reinstall or
+  upgrade rewrites the plist from the template but keeps the string entries an operator added to its
+  `EnvironmentVariables` (such as `DORI_CLEANUP_TARGETS`); the template's own `PATH` and `LANG` always take the new
+  values. When the old plist cannot be read, the install prints `RUNNER_PLIST_ENV_LOST <plist>`. While it
   serves, the runner holds `caffeinate -i -s -w <its pid>` so an idle Mac does not sleep: asleep, it runs the runner
-  only in short DarkWake windows, heartbeats stop and the supervisor drops the link every few minutes. `-s` is what
+  only in short DarkWake windows, heartbeats stop and the supervisor closes the link after 120 s without a frame
+  (`RUNNER_SILENT`, see Liveness and restarts), so it redials each time the Mac wakes. `-s` is what
   keeps a DarkWake from going back to sleep, and macOS honors it only on AC power; on battery, and with the lid closed,
   the Mac still sleeps. When `caffeinate` cannot start or exits, the runner logs `RUNNER_AWAKE_FAILED` and keeps serving.
   Before each `lane.start` a macOS runner also checks BrowserSkill once, outside the lane sandbox and without holding
@@ -625,8 +636,6 @@ pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a 
   `RUNNER_HERDR_LANES machine=<label> ...` with the machine's open lanes (and the lead pane for `local`), and sends the
   command only with `--yes`; without it, it exits 2 with `RUNNER_HERDR_CONFIRM`. After a restart the recovery sweep
   relaunches those lanes in new tabs on their sessions; after a stop their recovery is held until `start`.
-- A runner whose hub row shows protocol 3 is refused before anything is sent: `RUNNER_HERDR_UNSUPPORTED` names
-  `dori runner install --machine <label>` to upgrade it.
 
 The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
 with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
@@ -642,8 +651,7 @@ for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the
   check or runner call.
 - `dori status` shows `herdr <정상|다운|멈춤|미확인>` on each machine line.
 - `dori doctor`'s `runner <label>` check is FAIL while that machine's herdr is down (fix `dori runner herdr start
-  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`); a protocol 3 runner's fix
-  starts with `dori runner install --machine <label>`. Its local `herdr` check points a worker machine (a runner
+  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`). Its local `herdr` check points a worker machine (a runner
   labelled other than `local` in `~/.dori/runner/runner.json`) at the lead host's `dori runner herdr start` or, without
   a herdr unit, `dori runner install`; the lead host keeps `systemctl --user start herdr-server.service`.
 - On the lead host the local runner reports as `machine=local`. While that herdr is down or hung the supervisor does
@@ -749,7 +757,8 @@ Each target runs in one of three modes: `on` removes (sessions are moved), `repo
 and changes nothing (a dry run; `git worktree prune --dry-run --verbose` for the worktree records), `off` skips it.
 Every target defaults to `on` except `closedNodeModules`, the build-output targets, `metroCache` and the developer-cache targets, which start at `report`; a target added later starts at
 `report` until its reports have been read. The runner's
-environment sets them, read at each sweep:
+environment sets them, read at each sweep (on a macOS worker, in the agent plist's `EnvironmentVariables`, which a
+reinstall or upgrade keeps):
 
 | Variable | Effect |
 |---|---|
@@ -832,20 +841,40 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 9, so a supervisor accepts runners at 9 and 8. Protocol 8 added `secret.put` (since removed; the protocol number stays); protocol 9 adds
-`lanes.closed` / `lanes.closed.result`, and a proto 8 runner still runs lanes and secrets while `dori doctor` warns
-that its cleanup sweep skips the closed lanes' `node_modules`. Earlier versions: Protocol 6 adds the four secret control frames
-(see [Secrets over the link](#secrets-over-the-link)); `secretsSupported(proto)` (`proto >= SECRET_PROTO`) is the gate.
-Protocol 7 adds `lane.attach`; a proto 6 runner still starts and recovers lanes and takes secrets, and `dori doctor`
-warns that it refuses `dori attach`. A proto 5 runner is refused (`RUNNER_PROTO_MISMATCH`, too old).
-**Upgrade the supervisor before its runners**: a proto 6 runner still connects to a proto 7 supervisor, but a proto 7
-runner is refused by a proto 6 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). The runner's `state.sqlite` gained the
-nullable `commands.result_json` column in protocol 3.
+The current protocol is 9, so a supervisor accepts runners at 9 and 8 (`checkProto`). Any other runner is refused at
+hello with `RUNNER_PROTO_MISMATCH`: one at 7 or below as too old (`dori runner update` upgrades it), one at 10 or
+above as newer than the supervisor. Protocol 9 adds `lanes.closed` / `lanes.closed.result`; a proto 8 runner still
+runs lanes and secrets while `dori doctor` warns that its cleanup sweep skips the closed lanes' `node_modules`.
+Protocol 8 added `secret.put` (since removed; the protocol number stays).
+
+**Upgrade the supervisor before its runners**: a proto 8 runner still connects to a proto 9 supervisor, but a proto 9
+runner is refused by a proto 8 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). Bring every runner
+to the supervisor's version before the next bump: a supervisor at protocol 10 would accept 10 and 9 and refuse a
+runner still at 8.
+
+Historical note (runners below protocol 8 can no longer connect): protocol 3 added the queries, the `cmd.result`
+`result` and the other protocol 3 fields above, and the runner's `state.sqlite` gained the nullable
+`commands.result_json` column; protocol 4 added herdr state and `host.herdr`; protocol 5 added the runner file
+operations, `wait.check` and `job.run`; protocol 6 added the four secret control frames (see
+[Secrets over the link](#secrets-over-the-link)); protocol 7 added `lane.attach`. The supervisor keeps no per-command
+proto table: a connected runner speaks at least `MIN_PROTO` (`PROTO - 1`), which carries every command and query, and
+only lane file operations fail closed while a connected runner's proto is not known yet. The remaining per-feature
+checks (`secretsSupported`, the `host.herdr` check on a stored runner row) date from those versions and never refuse a
+runner the current window accepts.
 
 ## Liveness and restarts
 
 The supervisor judges each runner by when its heartbeats arrive, on its own monotonic clock; a runner's wall clock is
 never used. A supervisor start counts as the last time it saw each runner it knows.
+
+The link itself has its own, shorter watch. A connection that carries no frame for 120 s (`RUNNER_SILENT_CLOSE_MS`;
+heartbeats come every 15 s) is closed by the supervisor with `RUNNER_SILENT runner=<label> ...` and, once admitted,
+`RUNNER_DISCONNECTED runner=<label>`. A TCP link that died without a FIN (sleep, a network change, a reboot) would
+otherwise look open: the supervisor would not redial the worker, and the runner's next hello at the same gen would be
+refused as `RUNNER_CONFLICT`. Once it is closed the supervisor redials and the same-gen hello is admitted. On the
+worker side the listening socket pings a link that has been idle for 120 s and closes it when the ping goes unanswered
+(a few minutes in all), so a worker does not keep refusing the redial as `runner already connected` behind a dead
+link.
 
 | Silent for | What happens |
 |---|---|
@@ -995,8 +1024,7 @@ reaches herdr. Windows has no lane herdr socket.
 sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked
 first. A grant replies `{"ok": true, "values": {"NPM_TOKEN": "...", ...}}`;
 a refusal replies `{"ok": false, "code": "RUNNER_SECRET_DENIED", "detail": "..."}` (or `RUNNER_SECRET_FAILED`). The
-local runner answers from its own store. A remote runner at protocol 6 asks the supervisor over the link (below);
-a protocol 5 runner answers `RUNNER_SECRET_UNSUPPORTED` and never receives a value. The lane reply is never journaled,
+local runner answers from its own store. A remote runner asks the supervisor over the link (below). The lane reply is never journaled,
 logged or put in the outbox. See [secrets.md](secrets.md).
 
 ### Secrets over the link

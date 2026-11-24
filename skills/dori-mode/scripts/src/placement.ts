@@ -1,3 +1,5 @@
+import { availableParallelism } from "node:os";
+
 import type { DoriConfig, GuardThresholds, PlacementConfig } from "./config.ts";
 import { doneRepos } from "./signals.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
@@ -8,6 +10,8 @@ import type { WorkspaceEntry } from "./runner/protocol.ts";
 
 /** The reserved machine name for this host. */
 export const LOCAL_MACHINE = "local";
+/** This host holds launches while its 1-minute load exceeds its core count times this. */
+export const LOAD_PER_CORE_MAX = 4;
 
 export type PlacementInput = { readonly machine?: string; readonly cwd?: string; readonly done: string; readonly pane?: string; readonly workspace?: string };
 
@@ -118,6 +122,8 @@ export type MachineCheck = {
   readonly machine: string; readonly verdict: LaunchVerdict; readonly summary: string; readonly freeSlots?: number;
   /** Admission inputs from the same observation; absent for an unobservable or offline machine. */
   readonly paneCap?: number; readonly paneCount?: number; readonly paneIds?: readonly string[];
+  /** placement.maxLanes for this machine, for this host its cores when unset; absent: no lane cap. */
+  readonly laneCap?: number;
 };
 
 const freeSlots = (panes: number, t: GuardThresholds): { freeSlots?: number } =>
@@ -161,7 +167,9 @@ const unobservable = (machine: string, error: unknown): string => {
  * Whether `machine` ("local" or a label) has room for one more lane, with a short metrics summary ("" on failure). The
  * machine's runner observes it (`q.machine.observe`: its guard sample and pane list); a machine without a connected runner
  * cannot host a lane, so it holds. A remote machine is judged at the thresholds its runner-config.json sets (the
- * observation's `guard`), config.guard for every key it does not set; the local machine always at config.guard.
+ * observation's `guard`), config.guard for every key it does not set; the local machine always at config.guard, and it
+ * also holds while its 1-minute load exceeds its cores x LOAD_PER_CORE_MAX. `laneCap` is placement.maxLanes[machine];
+ * this host without an entry is capped at its cores, because the load hold lags a burst of launches.
  */
 export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: string): Promise<MachineCheck> => {
   let seen;
@@ -171,10 +179,16 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
     return { machine, verdict: { ok: false, reasons: [unobservable(machine, error)] }, summary: "" };
   }
   const s = seen.sample;
-  if (machine === LOCAL_MACHINE) return {
-    machine, verdict: canLaunch(s, config.guard), summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard),
-    paneCap: config.guard.panesMax, paneCount: s.panes, paneIds: seen.panes.map((p) => p.pane_id),
-  };
+  const cap = config.placement.maxLanes?.[machine] ?? (machine === LOCAL_MACHINE ? availableParallelism() : undefined);
+  const laneCap = cap === undefined ? {} : { laneCap: cap };
+  if (machine === LOCAL_MACHINE) {
+    const cores = availableParallelism(), limit = cores * LOAD_PER_CORE_MAX;
+    const reasons = [...canLaunch(s, config.guard).reasons, ...(s.load1 > limit ? [`load ${s.load1.toFixed(1)} > ${limit} (${cores} cores x ${LOAD_PER_CORE_MAX})`] : [])];
+    return {
+      machine, verdict: { ok: reasons.length === 0, reasons }, summary: summaryOf(s.memFreePct, s.diskFreeGb, s.panes), ...freeSlots(s.panes, config.guard),
+      paneCap: config.guard.panesMax, paneCount: s.panes, paneIds: seen.panes.map((p) => p.pane_id), ...laneCap,
+    };
+  }
   const panes = s.panes >= 0 ? seen.panes.length : -1;
   const result: SampleResult = {
     ok: true,
@@ -183,7 +197,7 @@ export const checkMachine = async (ops: LaneOps, config: DoriConfig, machine: st
   const guard: GuardThresholds = { ...config.guard, ...seen.guard };
   return {
     machine, verdict: machineVerdict(result, panes, guard, machine), summary: summaryOf(s.memFreePct, s.diskFreeGb, panes), ...freeSlots(panes, guard),
-    paneCap: guard.panesMax, paneCount: panes, paneIds: seen.panes.map((p) => p.pane_id),
+    paneCap: guard.panesMax, paneCount: panes, paneIds: seen.panes.map((p) => p.pane_id), ...laneCap,
   };
 };
 

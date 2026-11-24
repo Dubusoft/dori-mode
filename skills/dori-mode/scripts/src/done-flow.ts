@@ -1,9 +1,10 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
-import type { DoriConfig } from "./config.ts";
+import { type DoriConfig, reportQuietLane } from "./config.ts";
 import { githubTargets } from "./github-events.ts";
 import { type Claim, type ClaimedPull, type Lane, type Registry, statusOf, withStatus } from "./registry.ts";
+import { ghJson } from "./gh-json.ts";
 import { type Clock, iso, type Ran, type Runner } from "./run.ts";
 import { OPEN_STATES, openOperations, type Operation, operationId, type OperationStore, plan, type ReadBack, settleOperation } from "./operations.ts";
 import { acquireStateLock, StateLockError, tryStateLock } from "./state-lock.ts";
@@ -15,15 +16,16 @@ import { LaneOpsError, type LaneOps, type PaneRef } from "./lane-ops.ts";
 import { deliverLaneMessage, MERGE_VERIFY, queueSteering } from "./ci-follow.ts";
 import { blockedOutcome, finishedOutcome, type LaneMerge, type LaneMergeRead, notCompletedLine, type TaskBlocker, taskCompleted, type TaskFinish, type TaskFinisher } from "./task-finish.ts";
 import { openLaneMessages } from "./lane-messages.ts";
-import { checkLaneReportText, installLaneReports, laneReportFile, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
+import { checkLaneReportText, installLaneReports, laneNotAdoptedFile, laneReportFile, validateLaneOutput, verifyLaneFileReceipt } from "./lane-files.ts";
 import { LaneFileError } from "./lane-file-contract.ts";
 import type { LaneFileReceipt } from "./runner/protocol.ts";
 import type { Tunables } from "./tunables.ts";
 import { type Act, actRecorded, type LaneRead, probeWorktree, readLane, type Step, withOperations } from "./flow-io.ts";
 import { type CleanupQueue, cleanupPending, closedWorktreeSweep, type PendingCleanup, QUEUED_WORKTREE, remoteWorktrees } from "./closed-cleanup.ts";
 import { isLaneOutcomeLine, LANE_FAILED_EVENT, laneAttempt, laneOutcomeEventId, markLaneToodo, settleLaneOutcome, toodoMarkOf } from "./autopilot.ts";
-import { OUTCOME_LINE_MAX } from "./lane-outcomes.ts";
-import { type AutoReportPost, openAsks, writtenIn } from "./auto-report.ts";
+import { OUTCOME_LINE_MAX, recordReported } from "./lane-outcomes.ts";
+import { type AutoReportPost, openAsks, QUIET_REPORT, writtenIn } from "./auto-report.ts";
+import { latestChecks, type RollupCheck } from "./check-rollup.ts";
 
 export type FlowDeps = {
   readonly newFileRunId?: () => string;
@@ -151,19 +153,17 @@ export const claimBindings = async (run: Runner, ops: Pick<LaneOps, "inspect">, 
     if (row.isCrossRepository !== false || row.state !== "OPEN" || typeof row.number !== "number" || typeof row.headRefOid !== "string" || !/^[0-9a-f]{40}$/.test(row.headRefOid)) return;
     found.set(`${repo}#${row.number}`, { repo, number: row.number, sha: row.headRefOid });
   };
-  const read = async (repo: string, argv: readonly string[]): Promise<void> => {
-    const r = await run([...argv], { timeoutMs: 20_000 });
-    try {
-      if (r.code !== 0) throw new Error(`exit ${r.code}: ${(r.err || r.out).trim().slice(0, 160)}`);
-      const body: unknown = JSON.parse(r.out);
-      for (const row of Array.isArray(body) ? body : [body]) if (row && typeof row === "object") add(repo, row as PrRow);
-    } catch (e) {
-      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${e instanceof Error ? e.message : String(e)}`);
+  const read = async (repo: string, argv: readonly string[], shape: "object" | "array"): Promise<void> => {
+    const r = await ghJson<PrRow | readonly PrRow[]>(run, argv, shape, { timeoutMs: 20_000 });
+    if (!r.ok) {
+      console.error(`CLAIM_PR_UNREAD ${lane.key} ${argv.slice(0, 4).join(" ")} ${repo}: ${r.code ? `exit ${r.code}: ` : ""}${r.error}`);
+      return;
     }
+    for (const row of Array.isArray(r.value) ? r.value : [r.value]) if (row && typeof row === "object") add(repo, row);
   };
   for (const [repo, targets] of await githubTargets([lane], ops)) {
-    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS]);
-    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS]);
+    for (const n of targets.numbers) await read(repo, ["gh", "pr", "view", String(n), "-R", repo, "--json", PR_ROW_FIELDS], "object");
+    for (const branch of targets.branches) await read(repo, ["gh", "pr", "list", "-R", repo, "--state", "open", "--head", branch, "--json", PR_ROW_FIELDS], "array");
   }
   return [...found.values()];
 };
@@ -197,13 +197,19 @@ export const claimDone = async (deps: FlowDeps, lane: Lane, evidence: string, fi
   if (recorded?.claim && (status === "done-claimed" || status === "verified-done") && recorded.claim.evidence === evidence) {
     return `LANE_DONE_ALREADY_CLAIMED ${lane.key} ${recorded.claim.at} ${eventText(evidence)}`;
   }
+  const notClaimed = `LANE_DONE_NOT_CLAIMED ${lane.key} is closed`;
+  if (recorded?.closedAt) return notClaimed;
   const pulls = await claimBindings(deps.run, deps.ops, lane);
   const at = iso(deps.clock);
+  let closed = false;
   await deps.registry.update(lane.key, (current) => {
     if (fileReceipt && (!current || current.closedAt || current.fileRun?.id !== fileReceipt.run.id))
       throw stale();
+    // Closed meanwhile: the archived record keeps the claim it closed on (or none), not this one.
+    if (current?.closedAt) { closed = true; return undefined; }
     return withStatus(current ?? lane, "done-claimed", evidence, at, { claim: { at, evidence, emitted: false, pulls, ...(text ? { text } : {}) } });
   });
+  if (closed) return notClaimed;
   // `dori lane status` inside the lane answers from what its runner was told (D16).
   await deps.ops.notify(lane, { status: "done-claimed", claim: { at, evidence } });
   if (lane.pane) {
@@ -244,7 +250,13 @@ const steerLane = async (deps: FlowDeps, lane: Lane, kind: "claim" | "not-done",
 
 export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly string[]): Promise<string> => {
   const at = iso(deps.clock);
-  await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } }));
+  let closed = false;
+  await deps.registry.update(lane.key, (current) => {
+    // An objection that reaches a closed lane is not recorded: the archived record stays as the close left it.
+    if (current?.closedAt) { closed = true; return undefined; }
+    return withStatus(current ?? lane, "not-done", reasons.join("; "), at, { objection: { at, reasons } });
+  });
+  if (closed) return `LANE_NOT_DONE_SKIPPED ${lane.key} is closed; the objection was not recorded`;
   // The reasons reach the lane through its runner (`dori lane status`, D16), before the lane is told to read them.
   await deps.ops.notify(lane, { status: "not-done", objection: { at, reasons } });
   // The reasons are never typed: they carry command output and paths, and a pane is a shell line. The lane reads them.
@@ -274,6 +286,18 @@ export type CloseOptions = {
    */
   readonly cancelled?: { readonly reason: string };
   /**
+   * An autopilot lane that found nothing to change (notAdoptedConclusion): its `pr` Done signals with no PR from their
+   * branch are not required, every other signal still is. `conclusion` is the lead-host path of its `not-adopted.md`;
+   * the close is recorded with it and the task is concluded not adopted (task-finish.ts).
+   */
+  readonly notAdopted?: { readonly conclusion: string };
+  /**
+   * An autopilot lane that finished work whose deliverable is no PR (a report or research, noPrClose): its `pr` Done
+   * signals with no PR from their branch are not required, every other signal still is. `report` is the lead-host path
+   * of its `report.md`; the close is recorded with it and the task is completed on that report (task-finish.ts).
+   */
+  readonly reported?: { readonly report: string };
+  /**
    * Done checks the caller read just before (a claim's settlement): reused instead of read again. The worktrees are
    * still re-read under the close lock. Never persisted: a resumed close reads afresh.
    */
@@ -298,11 +322,14 @@ export const closeRunning = (deps: FlowDeps, key: string): boolean => {
 const paneGone = (deps: FlowDeps, lane: Lane, match: (pane: { readonly pane_id: string; readonly tab_id?: string }) => boolean): ReadBack => async () =>
   (await deps.ops.panes(lane.machine)).some(match) ? "not-done" : "done";
 
+/** The error of a `lane.close` its runner answered with the lane's pane still listed (`gone: false`). */
+const STILL_LISTED = "still listed after closing";
+
 /** The lane's runner closes its tab (else its pane), `lane.close`; a refusal or an ambiguous answer is data for the read-back. */
 const closeEffect = (deps: FlowDeps, lane: Lane) => async (cmdId: string): Promise<Ran> => {
   try {
     const r = await deps.ops.close(lane, { cmdId });
-    return r.gone ? { code: 0, out: `closed ${r.closed}`, err: "" } : { code: 1, out: "", err: `still listed after closing ${r.closed}` };
+    return r.gone ? { code: 0, out: `closed ${r.closed}`, err: "" } : { code: 1, out: "", err: `${STILL_LISTED} ${r.closed}` };
   } catch (e) {
     if (e instanceof LaneOpsError) return { code: 1, out: "", err: e.message };
     throw e;
@@ -334,7 +361,7 @@ export const closeLane = async (deps: FlowDeps, lane: Lane, note: string, opts: 
         if (store.get(id)?.state === "planned") settleOperation(store, deps.clock.now(), id, "verified", "lane recorded closed");
         return { closed: true, lines: [`CLOSED ${lane.key} already closed`, ...autopilotOutcome(deps, store, fresh)] };
       }
-      const data = JSON.stringify({ note, force: Boolean(opts.force), ...(opts.cancelled ? { cancelled: opts.cancelled } : {}) });
+      const data = JSON.stringify({ note, force: Boolean(opts.force), ...(opts.cancelled ? { cancelled: opts.cancelled } : {}), ...(opts.notAdopted ? { notAdopted: opts.notAdopted } : {}), ...(opts.reported ? { reported: opts.reported } : {}) });
       const prior = store.get(id);
       if (!prior) plan(store, deps.clock.now(), { lane: lane.key, action: CLOSE_ACTION, target: lane.key, data });
       else store.put({ ...prior, state: "planned", detail: "close planned", data, updatedAt: deps.clock.now() });
@@ -376,6 +403,45 @@ const blockFailedAttempt = async (deps: FlowDeps, lane: Lane, result: { readonly
   return told(said);
 };
 
+/** A Done check that failed only because no PR from its `pr` signal's branch exists at all. */
+const noPrYet = (check: Check): boolean => {
+  if (check.ok || check.error !== undefined) return false;
+  try {
+    const signal = parseSignal(check.signal);
+    return signal.kind === "pr" && check.detail === `no PR from ${signal.branch}`;
+  } catch { return false; }
+};
+
+/** How an autopilot lane with no PR closes: not adopted on its conclusion, or completed on its report. */
+type NoPrClose = Pick<CloseOptions, "notAdopted" | "reported">;
+
+/**
+ * How the claim of an autopilot lane with no PR closes instead of being objected to, when the lane is an autopilot launch
+ * attempt and every Done signal that does not hold is a `pr` signal with no PR from its branch (a lane that opened a PR
+ * settles on that PR): with the `not-adopted.md` its claim installed, it investigated and adopted no change, so it closes
+ * not adopted; else with its installed `report.md`, it finished work whose deliverable is no PR, so it closes on that
+ * report and its task is completed. Undefined with neither file.
+ */
+const noPrClose = async (deps: FlowDeps, lane: Lane, checks: readonly Check[]): Promise<NoPrClose | undefined> => {
+  const failing = checks.filter((c) => !c.ok);
+  if (!failing.length || !failing.every(noPrYet)) return undefined;
+  const conclusion = laneNotAdoptedFile(deps.config.stateDir, lane.key);
+  const report = laneReportFile(deps.config.stateDir, lane.key);
+  const close: NoPrClose | undefined = existsSync(conclusion) ? { notAdopted: { conclusion } } : existsSync(report) ? { reported: { report } } : undefined;
+  if (!close) return undefined;
+  return (await withOperations(deps, async (store) => laneAttempt(store, lane.key) !== undefined)) ? close : undefined;
+};
+
+/** The path a closed lane's receipt records under `field.key` (`notAdopted.conclusion`, `reported.report`), else undefined. */
+const receiptPath = (lane: Lane, field: "notAdopted" | "reported", key: "conclusion" | "report"): string | undefined => {
+  const receipt = lane.receipt;
+  if (typeof receipt !== "object" || receipt === null || !(field in receipt)) return undefined;
+  const value: unknown = (receipt as Record<string, unknown>)[field];
+  if (typeof value !== "object" || value === null || !(key in value)) return undefined;
+  const path: unknown = (value as Record<string, unknown>)[key];
+  return typeof path === "string" ? path : undefined;
+};
+
 /** The cancel reason a closed lane's receipt records (`dori close --cancelled`), else undefined. */
 const cancelledReason = (lane: Lane): string | undefined => {
   const receipt = lane.receipt;
@@ -404,6 +470,8 @@ const closeSequence = async (
   deps: FlowDeps, lane: Lane, note: string, opts: CloseOptions, act: Act, store: OperationStore,
 ): Promise<{ readonly closed: boolean; readonly lines: string[] }> => {
   const cancelled = opts.cancelled;
+  const notAdopted = opts.notAdopted;
+  const reported = opts.reported;
   let read: LaneRead;
   try {
     read = await readLane(deps, lane, { done: !cancelled && !opts.pre });
@@ -418,8 +486,10 @@ const closeSequence = async (
     ...(fallback ? [fallback] : []),
     ...(cancelled ? [`SIGNAL SKIPPED ${lane.key}: cancelled by the lead: ${cancelled.reason}`] : []),
     ...checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`),
+    ...(notAdopted ? [`SIGNAL SKIPPED ${lane.key}: not adopted, no PR needed: ${notAdopted.conclusion}`] : []),
+    ...(reported ? [`SIGNAL SKIPPED ${lane.key}: completed with no PR, on its report: ${reported.report}`] : []),
   ];
-  if (checks.some((c) => !c.ok)) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live (to give the lane up: dori close ${lane.key} --cancelled --reason TEXT)`] };
+  if (checks.some((c) => !c.ok && !((notAdopted || reported) && noPrYet(c)))) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: a Done signal is not live (to give the lane up: dori close ${lane.key} --cancelled --reason TEXT)`] };
   if (!opts.force) {
     const unpushed = unpushedIn(read.worktrees);
     if (unpushed.length) return { closed: false, lines: [...lines, `REFUSED ${lane.key}: ${unpushed.join("; ")} (commit and push it, or dori close --force)`] };
@@ -479,29 +549,36 @@ const closeSequence = async (
     queue.branches.push(target);
     cleanup.push(`branch ${target.branch} queued: deleted by the closed-lane cleanup after its worktrees go, only while it is at ${target.repo}#${target.n} merged head ${target.sha.slice(0, 10)}`);
   }
+  // A lane whose agent may still run is never recorded closed: it would be left with no record to report through or
+  // to close again. The failed close operation stays retryable, so the next close tries it again.
+  const stillListed = (what: string, detail: string) => ({ closed: false, lines: [...lines, ...cleanup,
+    `REFUSED ${lane.key}: ${what} is still listed after its close (${detail.slice(0, 120)}); the lane is left open, close it again`] });
   // The lane's thread stays open: only the owner closes it, with the button on the lead's report.
   if (lane.tab) {
     const tab = lane.tab;
     const step = await act("tab-close", tab, closeEffect(deps, lane), paneGone(deps, lane, (p) => p.tab_id === tab));
     if (step.state === "ambiguous") return ambiguous(step);
-    cleanup.push(step.state === "verified" ? `tab ${tab} closed` : `tab ${tab} not closed`);
+    if (step.state !== "verified") return stillListed(`tab ${tab}`, step.err);
+    cleanup.push(`tab ${tab} closed`);
   } else if (lane.pane) {
     const pane = lane.pane;
     const step = await act("pane-close", pane, closeEffect(deps, lane), paneGone(deps, lane, (p) => p.pane_id === pane));
     if (step.state === "ambiguous") return ambiguous(step);
-    cleanup.push(step.state === "verified" ? `pane ${pane} closed` : `pane ${pane} not closed`);
+    if (step.state !== "verified") return stillListed(`pane ${pane}`, step.err);
+    cleanup.push(`pane ${pane} closed`);
   } else if (lane.runner) {
     // No pane yet: a start may still be out (a cancelled reservation). lane.close by key stops a lane the runner
     // already recorded; a start that lands after the close is stopped by the supervisor (LANE_STARTED_AFTER_CLOSE).
     const r = await closeEffect(deps, lane)(`close-by-key:${lane.key}:${deps.clock.now()}`);
+    if (r.err.startsWith(STILL_LISTED)) return stillListed(`runner lane ${lane.key}`, r.err);
     cleanup.push(r.code === 0 ? `runner lane ${lane.key} ${r.out}` : `runner lane ${lane.key} not closed: ${r.err.slice(0, 120)}`);
   }
   const at = iso(deps.clock);
   const operations = store.list({ lane: lane.key }).filter((op) => op.action !== CLOSE_ACTION).map((op) => ({ id: op.id, state: op.state }));
-  const receipt = { checks, note, cleanup, ...(cancelled ? { cancelled } : {}), ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations,
+  const receipt = { checks, note, cleanup, ...(cancelled ? { cancelled } : {}), ...(notAdopted ? { notAdopted } : {}), ...(reported ? { reported } : {}), ...(lane.machine ? { worktreeCheck: { status: "skipped", detail: remoteWorktreeNote(lane) } } : {}), operations,
     ...(queue.worktrees.length || queue.branches.length ? { queue } : {}) };
   await deps.registry.update(lane.key, (current) => withStatus(current ?? lane, "closed", note, at, { closedAt: at, receipt }));
-  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}${cancelled ? " cancelled" : ""}`] };
+  return { closed: true, lines: [...lines, ...(lane.machine ? [`WORKTREE_CHECK SKIPPED ${lane.key}: ${remoteWorktreeNote(lane)}`] : []), `CLOSED ${lane.key}${cancelled ? " cancelled" : notAdopted ? " not-adopted" : reported ? " reported" : ""}`] };
 };
 
 /**
@@ -525,8 +602,8 @@ export const resumeOperations = async (deps: FlowDeps, push: Emit): Promise<void
       if (lane) await pushOutcomes(push, lane, outcome);
       continue;
     }
-    const { note, force, cancelled } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean; cancelled?: { reason: string } };
-    const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force), ...(cancelled ? { cancelled } : {}) });
+    const { note, force, cancelled, notAdopted, reported } = JSON.parse(op.data ?? "{}") as { note?: string; force?: boolean; cancelled?: { reason: string }; notAdopted?: { conclusion: string }; reported?: { report: string } };
+    const result = await closeLane(deps, lane, note ?? "closed after an interrupted close", { force: Boolean(force), ...(cancelled ? { cancelled } : {}), ...(notAdopted ? { notAdopted } : {}), ...(reported ? { reported } : {}) });
     const last = result.lines.at(-1) ?? "";
     if (result.closed) {
       await push(closedEvent(lane.key, note ?? "", result.lines), undefined, laneMeta(lane));
@@ -542,16 +619,17 @@ const WAIT_FIELDS = "state,headRefOid,isDraft,mergeable,mergeStateStatus,statusC
 const CHECK_FAILED = new Set(["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "ERROR"]);
 type WaitView = {
   readonly state?: string; readonly headRefOid?: string; readonly isDraft?: boolean; readonly mergeable?: string; readonly mergeStateStatus?: string;
-  readonly statusCheckRollup?: readonly { readonly __typename?: string; readonly status?: string; readonly conclusion?: string; readonly state?: string }[];
+  readonly statusCheckRollup?: readonly RollupCheck[];
 };
 
+/** The PR's failed checks, judged by each check's newest run (check-rollup.ts): a run a newer one replaced never counts. */
 const failedChecks = (view: WaitView) =>
-  (view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
+  latestChecks(view.statusCheckRollup ?? []).filter((c) => c.__typename === "StatusContext" ? c.state === "FAILURE" || c.state === "ERROR" : c.status === "COMPLETED" && CHECK_FAILED.has(c.conclusion ?? ""));
 const conflicting = (view: WaitView): boolean => view.mergeable === "CONFLICTING" || view.mergeStateStatus === "DIRTY";
 
 /** The PR's checks in one word: a failed one wins, then one still running; a PR with no checks reads none, never green. */
 const checksWord = (view: WaitView): string => {
-  const rollup = view.statusCheckRollup ?? [];
+  const rollup = latestChecks(view.statusCheckRollup ?? []);
   if (failedChecks(view).length) return "failed";
   if (rollup.some((c) => c.__typename === "StatusContext" ? c.state === "PENDING" || c.state === "EXPECTED" : c.status !== "COMPLETED")) return "pending";
   return rollup.length ? "green" : "none";
@@ -576,9 +654,8 @@ const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly sn
   let clean = pulls.length <= SNAPSHOT_PRS;
   for (const bound of pulls.slice(0, SNAPSHOT_PRS)) {
     const ref = `${bound.repo}#${bound.number}`;
-    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
-    let view: WaitView | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
+    const r = await ghJson<WaitView>(deps.run, ["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", WAIT_FIELDS], "object", { timeoutMs: 20_000 });
+    const view = r.ok ? r.value : undefined;
     if (!view) { parts.push(`pr=#${bound.number} head=${bound.sha.slice(0, 7)} checks=UNREAD conflict=UNREAD`); clean = false; continue; }
     const head = view.headRefOid ?? bound.sha;
     if (view.state !== "OPEN") { parts.push(`pr=#${bound.number} head=${head.slice(0, 7)} state=${view.state ?? "UNREAD"}`); clean = false; continue; }
@@ -600,11 +677,14 @@ const preverifyClaim = async (deps: FlowDeps, lane: Lane): Promise<{ readonly sn
     reasons.unshift(...unpushedIn(read.worktrees.filter((wt) => wt.exists && wt.error === undefined && wt.dirty !== undefined && wt.ahead !== undefined)));
     if (unread) parts.push("git=UNREAD");
     const checks = read.checks;
-    if (checks) sig = !checks.length ? "none" : checks.every((c) => c.ok) ? "ok" : `${checks.filter((c) => c.ok).length}/${checks.length}`;
+    if (checks) {
+      const noPr = checks.every((c) => c.ok) ? undefined : await noPrClose(deps, lane, checks);
+      sig = !checks.length ? "none" : checks.every((c) => c.ok) ? "ok" : noPr?.notAdopted ? "not-adopted" : noPr?.reported ? "reported" : `${checks.filter((c) => c.ok).length}/${checks.length}`;
+    }
   } catch (e) {
     console.error(`CLAIM_PREVERIFY_UNREAD ${lane.key}: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return { snapshot: `verified: ${parts.join(" ")} sig=${sig}`, reasons, clean: clean && sig === "ok" && !parts.includes("git=UNREAD") && !reasons.length };
+  return { snapshot: `verified: ${parts.join(" ")} sig=${sig}`, reasons, clean: clean && (sig === "ok" || sig === "not-adopted" || sig === "reported") && !parts.includes("git=UNREAD") && !reasons.length };
 };
 
 /**
@@ -621,19 +701,33 @@ const autoReportable = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: b
 };
 
 /**
- * The auto report of a fresh claim: its message id once posted (kept on the claim right away, so a pass repeated after a
- * crash never posts it twice), the urgent LANE_AUTO_REPORT_FAILED line when the post failed (the claim then wakes the
+ * Whether a claim is reported quietly: config `reportQuietLanes` names the lane (it posts its own results to the owner),
+ * it is no review lane, and it has no objection on record and nothing open for the lead (openAsks). Its done text, its
+ * language and the preverify snapshot do not matter: nothing is posted, and the close still re-reads the Done signals,
+ * so a failing one comes back to the lead as LANE_NOT_DONE.
+ */
+const quietReportable = (deps: FlowDeps, lane: Lane): boolean =>
+  reportQuietLane(deps.config, lane.key) && !lane.review && !lane.objection && !openAsks(deps.config.stateDir, lane.key).length;
+
+/**
+ * The auto report of a fresh claim: its message id once posted, or QUIET_REPORT once a quiet lane's receipt is written
+ * (kept on the claim right away, so a pass repeated after a crash never posts or records it twice), the urgent LANE_AUTO_REPORT_FAILED line when the post failed (the claim then wakes the
  * lead as before), or undefined when the claim is not one the supervisor reports.
  */
 const autoReportClaim = async (deps: FlowDeps, lane: Lane, claim: Claim, clean: boolean): Promise<{ readonly message: string } | { readonly failed: string } | undefined> => {
   if (claim.autoReported) return { message: claim.autoReported };
-  if (!deps.autoReport || !(await autoReportable(deps, lane, claim, clean))) return undefined;
-  const post = deps.autoReport;
   let message: string;
-  try {
-    message = await post(lane, claim);
-  } catch (e) {
-    return { failed: `LANE_AUTO_REPORT_FAILED ${lane.key} ${eventText((e instanceof Error ? e.message : String(e)).replace(/\s+/g, " "), 200)}: the claim was not reported to the owner; report it yourself (dori reported ${lane.key} --text TEXT)` };
+  if (quietReportable(deps, lane)) {
+    // The lane posts its own results: the receipt is written with no post, so no thread or message is recorded for it.
+    recordReported(deps.config.stateDir, lane.key, deps.clock.now(), "reportQuietLanes: the lane posts its own results");
+    message = QUIET_REPORT;
+  } else {
+    if (!deps.autoReport || !(await autoReportable(deps, lane, claim, clean))) return undefined;
+    try {
+      message = await deps.autoReport(lane, claim);
+    } catch (e) {
+      return { failed: `LANE_AUTO_REPORT_FAILED ${lane.key} ${eventText((e instanceof Error ? e.message : String(e)).replace(/\s+/g, " "), 200)}: the claim was not reported to the owner; report it yourself (dori reported ${lane.key} --text TEXT)` };
+    }
   }
   const at = claim.at;
   await deps.registry.patch(lane.key, (current) => (current.claim?.at === at ? { claim: { ...current.claim, autoReported: message } } : undefined));
@@ -664,10 +758,9 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
     const ref = `${s.repo}#${s.n}`;
     const bound = (lane.claim?.pulls ?? []).find((p) => p.repo.toLowerCase() === s.repo.toLowerCase() && String(p.number) === s.n);
     if (!bound) { why.push(`${ref} was not open at a head the claim recorded, so it is not merged for this claim (push, then claim again)`); continue; }
-    const r = await deps.run(["gh", "pr", "view", s.n, "-R", s.repo, "--json", WAIT_FIELDS], { timeoutMs: 20_000 });
-    let view: WaitView | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView) : undefined; } catch { view = undefined; }
-    if (!view) continue;
+    const r = await ghJson<WaitView>(deps.run, ["gh", "pr", "view", s.n, "-R", s.repo, "--json", WAIT_FIELDS], "object", { timeoutMs: 20_000 });
+    if (!r.ok) continue;
+    const view = r.value;
     const failed = failedChecks(view);
     if (view.state !== "OPEN") why.push(`${ref} is ${view.state ?? "unknown"}`);
     else if (view.headRefOid !== bound.sha) why.push(`${ref} head moved to ${(view.headRefOid ?? "unknown").slice(0, 10)} after the claim at ${bound.sha.slice(0, 10)} (claim again)`);
@@ -685,21 +778,24 @@ const mergeWait = async (deps: FlowDeps, lane: Lane, failing: readonly Check[], 
  * ends at its green PR (a `pr` signal is live while the PR is open), and the supervisor merges only a lane that is
  * still claimed (ci-follow.ts claimGate), so closing first would leave that PR unmerged. It waits while a bound PR into
  * `ciMergeBase` is OPEN at exactly the bound head, not a draft, not conflicting, with no failed check, for less than
- * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. Anything the
- * supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes the lane as before.
+ * `mergeWaitMaxMin` since the window started; a PR that cannot be read this pass keeps the wait. A bound PR still open
+ * that conflicts with its base is `why` instead, whatever its base or the wait: the lane must resolve it, so closing
+ * would leave it unmerged. Anything else the supervisor cannot merge as it stands (MERGE_STALLED tells the lead) closes
+ * the lane as before.
  */
-const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<boolean> => {
-  if (deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000) return false;
+const boundMergeWait = async (deps: FlowDeps, lane: Lane, start: number): Promise<{ readonly waiting: boolean; readonly why: string[] }> => {
+  const waitOver = deps.clock.now() - start >= deps.tunables.mergeWaitMaxMin * 60_000;
+  const why: string[] = [];
+  let waiting = false;
   for (const bound of lane.claim?.pulls ?? []) {
-    const r = await deps.run(["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], { timeoutMs: 20_000 });
-    let view: (WaitView & { readonly baseRefName?: string }) | undefined;
-    try { view = r.code === 0 ? (JSON.parse(r.out) as WaitView & { readonly baseRefName?: string }) : undefined; } catch { view = undefined; }
-    if (!view) return true;
-    if (view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
-    if (conflicting(view)) continue;
-    if (!failedChecks(view).length) return true;
+    const r = await ghJson<WaitView & { readonly baseRefName?: string }>(deps.run, ["gh", "pr", "view", String(bound.number), "-R", bound.repo, "--json", `${WAIT_FIELDS},baseRefName`], "object", { timeoutMs: 20_000 });
+    if (!r.ok) { waiting ||= !waitOver; continue; }
+    const view = r.value;
+    if (view.state === "OPEN" && conflicting(view)) { why.push(`${bound.repo}#${bound.number} conflicts with its base`); continue; }
+    if (waitOver || view.state !== "OPEN" || view.baseRefName !== deps.config.ciMergeBase || view.headRefOid !== bound.sha || view.isDraft) continue;
+    if (!failedChecks(view).length) waiting = true;
   }
-  return false;
+  return { waiting: waiting && !why.length, why };
 };
 
 /**
@@ -713,16 +809,22 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
   if (blocked.length) return { line: await objectDone(deps, lane, blocked) };
   const checks = read.checks ?? [];
   const failing = checks.filter((c) => !c.ok);
-  if (failing.length) {
+  // An autopilot lane with no PR closes on its conclusion (not adopted) or its report (completed) instead of its PR.
+  const noPr = failing.length ? await noPrClose(deps, lane, checks) : undefined;
+  if (failing.length && !noPr) {
     const wait = await mergeWait(deps, lane, failing, start);
     if (wait.waiting) return undefined;
     return { line: await objectDone(deps, lane, [...failing.map((c) => `${c.signal} -> ${c.detail}`), ...wait.why]) };
   }
-  if (await boundMergeWait(deps, lane, start)) return undefined;
+  if (!noPr) {
+    const wait = await boundMergeWait(deps, lane, start);
+    if (wait.why.length) return { line: await objectDone(deps, lane, wait.why) };
+    if (wait.waiting) return undefined;
+  }
   // The close's intent is durable before the lane reads verified-done: a crash from here on resumes it.
   await withOperations(deps, async (store) => {
     const prior = store.get(closeId(lane.key));
-    const data = JSON.stringify({ note: `Done: ${evidence}`, force: false });
+    const data = JSON.stringify({ note: `Done: ${evidence}`, force: false, ...noPr });
     if (!prior) plan(store, deps.clock.now(), { lane: lane.key, action: CLOSE_ACTION, target: lane.key, data });
     else if (prior.state !== "planned") store.put({ ...prior, state: "planned", detail: "close planned", data, updatedAt: deps.clock.now() });
   });
@@ -732,13 +834,14 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string, start: numbe
   await deps.registry.update(lane.key, (current) => {
     const fresh = current ?? lane;
     if (statusOf(fresh) !== "done-claimed" || fresh.claim?.at !== lane.claim?.at) { superseded.status = statusOf(fresh); return undefined; }
-    return (verified = withStatus(fresh, "verified-done", "Done signals read back live", iso(deps.clock)));
+    const detail = noPr?.notAdopted ? `not adopted, no PR needed: ${noPr.notAdopted.conclusion}` : noPr?.reported ? `completed with no PR, on its report: ${noPr.reported.report}` : "Done signals read back live";
+    return (verified = withStatus(fresh, "verified-done", detail, iso(deps.clock)));
   });
   if (superseded.status) {
     await withOperations(deps, async (store) => settleOperation(store, deps.clock.now(), closeId(lane.key), "failed", `superseded: lane is ${superseded.status}`));
     return { line: `LANE_SETTLE_SKIPPED ${lane.key} is now ${superseded.status}; the done claim being settled was superseded, not closed` };
   }
-  const result = await closeLane(deps, verified, `Done: ${evidence}`, { pre: { checks } });
+  const result = await closeLane(deps, verified, `Done: ${evidence}`, { pre: { checks }, ...noPr });
   if (!result.closed) {
     const signals = result.lines.filter((l) => l.startsWith("SIGNAL NOT"));
     return { line: await objectDone(deps, (await deps.registry.read(lane.key)) ?? verified, signals.length ? signals : result.lines.filter((l) => l.startsWith("REFUSED"))) };
@@ -840,10 +943,10 @@ export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<LaneMergeR
   if (!pulls.size) return { why: "no PR of the lane is recorded (no claimed or supervisor-merged PR)" };
   const merges: LaneMerge[] = [];
   for (const { repo, number } of pulls.values()) {
-    const r = await deps.run(["gh", "pr", "view", String(number), "-R", repo, "--json", "state,url,baseRefName,mergeCommit"], { timeoutMs: 20_000 });
-    let view: { readonly state?: string; readonly url?: string; readonly baseRefName?: string; readonly mergeCommit?: { readonly oid?: string } | null } | undefined;
-    try { view = r.code === 0 ? JSON.parse(r.out) : undefined; } catch { view = undefined; }
-    if (!view) return { why: `${repo}#${number} could not be read: ${(r.err || r.out).replace(/\s+/g, " ").slice(0, 120)}` };
+    type MergeView = { readonly state?: string; readonly url?: string; readonly baseRefName?: string; readonly mergeCommit?: { readonly oid?: string } | null };
+    const r = await ghJson<MergeView>(deps.run, ["gh", "pr", "view", String(number), "-R", repo, "--json", "state,url,baseRefName,mergeCommit"], "object", { timeoutMs: 20_000 });
+    if (!r.ok) return { why: `${repo}#${number} could not be read: ${r.error}` };
+    const view = r.value;
     const sha = view.mergeCommit?.oid;
     if (view.state !== "MERGED" || !sha) return { why: `${repo}#${number} reads ${view.state ?? "unknown"}${sha ? "" : " with no merge commit"}` };
     merges.push({ repo, number, url: view.url ?? `https://github.com/${repo}/pull/${number}`, base: view.baseRefName ?? "its base", sha });
@@ -852,12 +955,12 @@ export const laneMerges = async (deps: FlowDeps, lane: Lane): Promise<LaneMergeR
 };
 
 /**
- * The report of a repo-less autopilot lane (its Done names no repo, so it has no PR): the `report.md` its claim installed
- * on the lead host, which completes its task in place of a merge, or why it is not there.
+ * The report of an autopilot lane with no PR (a repo-less lane, or one closed on its report): the `report.md` its claim
+ * installed on the lead host, which completes its task in place of a merge, or why it is not there.
  */
 const laneReport = (deps: FlowDeps, lane: Lane): LaneMergeRead => {
   const report = laneReportFile(deps.config.stateDir, lane.key);
-  return existsSync(report) ? { report } : { why: `no report of the repo-less lane at ${report}` };
+  return existsSync(report) ? { report } : { why: `no report of the lane at ${report}` };
 };
 
 /** The supervisor's task follow-up of a lane it closed (deps.finishTask), or undefined when it has none to run. */
@@ -883,12 +986,17 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
   }
   // Finished at an earlier close of the lane (a resumed close): nothing is written or told again.
   const mark = attempt ? toodoMarkOf(attempt) : undefined;
-  if (mark !== undefined) return { tag: mark === "done" ? "done" : "failed", lines: [] };
+  if (mark !== undefined) return { tag: mark === "done" || mark === "not-adopted" ? mark : "failed", lines: [] };
   let finish: TaskFinish;
   let why: string | undefined;
   try {
-    // With no merge (or, repo-less, no report) read back the finisher completes nothing; it only reads whether the task is already done.
-    finish = await deps.finishTask(lane, task, attempt && !doneRepos(lane.done).length ? laneReport(deps, lane) : await laneMerges(deps, lane));
+    // A lane closed not adopted concludes its task with its conclusion, one closed on its report (or repo-less) completes it
+    // on that report; the lane passed in may predate its close receipt.
+    const closed = attempt ? ((await deps.registry.read(lane.key)) ?? lane) : undefined;
+    const notAdopted = closed ? receiptPath(closed, "notAdopted", "conclusion") : undefined;
+    const reported = closed ? receiptPath(closed, "reported", "report") !== undefined : false;
+    // With no merge (or no report) read back the finisher completes nothing; it only reads whether the task is already done.
+    finish = await deps.finishTask(lane, task, notAdopted ? { notAdopted } : attempt && (reported || !doneRepos(lane.done).length) ? laneReport(deps, lane) : await laneMerges(deps, lane));
   } catch (e) {
     why = e instanceof Error ? e.message : String(e);
     finish = { tag: "failed", lines: [notCompletedLine(lane, task, why)] };
@@ -899,7 +1007,7 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
   // The finisher says why in its TOODO_TASK_NOT_COMPLETED line; the note keeps only the reason.
   const reason = why ?? (finish.lines[0] ?? finish.tag).replace(/^TOODO_TASK_NOT_COMPLETED \S+ #\d+ /, "").replace(/; finish it yourself .*$/, "");
   const said = !done && deps.blockTask ? await deps.blockTask(lane, task, reason) : undefined;
-  const marked = done ? "done" : said?.startsWith("blocker recorded") ? "blocked" : "failed";
+  const marked = done ? (finish.tag === "not-adopted" ? "not-adopted" : "done") : said?.startsWith("blocker recorded") ? "blocked" : "failed";
   let unmarked: string | undefined;
   try { await withOperations(deps, async (store) => markLaneToodo(store, deps.clock.now(), lane.key, marked)); } catch (e) {
     unmarked = `launch attempt not marked ${marked}: ${e instanceof Error ? e.message : String(e)}`;
@@ -912,14 +1020,15 @@ export const finishClosedTask = async (deps: FlowDeps, lane: Lane): Promise<Task
 /**
  * Why a done-claimed lane's PR counts as merged, or undefined: the supervisor merged it (a verified
  * `merge` operation of the lane, its CI_MERGED), a `merged` Done signal's PR reads MERGED, or GitHub reports a PR merged
- * into `ciMergeBase` from a lane worktree's branch at exactly that worktree's HEAD.
+ * into `ciMergeBase` from a lane worktree's branch at exactly that worktree's HEAD. A remote lane has only the first
+ * two: its worktrees are not read from here (D10), while the operation ledger and `gh` are the lead host's own.
  */
 export const mergeConfirmed = async (deps: FlowDeps, lane: Lane): Promise<string | undefined> => {
-  if (lane.machine) return undefined;
   const op = await withOperations(deps, async (store) => store.list({ lane: lane.key }).find((o) => o.action === "merge" && o.state === "verified"));
   if (op) return `CI_MERGED ${op.target}`;
   const signalled = (await readBindings(lane.done, deps.run)).find((b) => !("error" in b));
   if (signalled) return `${signalled.repo}#${signalled.n} merged`;
+  if (lane.machine) return undefined;
   const read = await readLane(deps, lane);
   const cwd = await cwdWorktree(deps, lane, read, false);
   const { atHead } = await readBranchBindings(deps.run, [...(cwd ? [cwd] : []), ...read.worktrees], deps.config.ciMergeBase);

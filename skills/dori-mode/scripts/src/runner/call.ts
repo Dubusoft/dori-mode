@@ -12,7 +12,7 @@ import { checkLaneFilesBody } from "../lane-file-contract.ts";
  */
 
 /**
- * `outdated`: the label's hello proto is below what the command or query needs (`NEEDS_PROTO`). `lost`: the CLI relay
+ * `outdated`: a file operation for a label whose hello proto is not known yet. `lost`: the CLI relay
  * closed after the request was sent, so the command may have reached the runner.
  */
 export type CallWhy = "disconnected" | "timeout" | "outdated" | "lost";
@@ -48,20 +48,8 @@ export const COMMAND_TIMEOUTS: Partial<Record<DurableCommandType, number>> = {
   "lane.start": 90_000, "lane.recover": 90_000, "lane.close": 60_000, "lane.git": 60_000, "lane.pause": 30_000, "host.herdr": 90_000,
 };
 
-/** The lowest proto that carries each type; anything not listed is proto 2 (today's commands). */
-export const NEEDS_PROTO: Partial<Record<DurableCommandType | QueryType, number>> = {
-  "lane.start": 5, "lane.recover": 5, "q.lane.files": 5,
-  "lane.adopt": 3, "lane.pause": 3, "lane.resume": 3, "lane.notify": 3, "lane.git": 3,
-  "q.panes": 3, "q.screen": 3, "q.process": 3, "q.stat": 3, "q.lane.inspect": 3, "q.machine.observe": 3,
-  "host.herdr": 4,
-  "wait.check": 5, "job.run": 5,
-  "lane.attach": 7,
-};
 export const isFileOperation = (type: string): type is "lane.start" | "lane.recover" | "q.lane.files" =>
   type === "lane.start" || type === "lane.recover" || type === "q.lane.files";
-export const fileCapabilityDetail = (proto: number | undefined): string => proto === undefined
-  ? "lane files require proto 5 (runner proto unknown); run dori runner update, wait for its hello, and retry"
-  : `lane files require proto 5 (runner proto ${proto}); run dori runner update`;
 
 /**
  * A new cmdId. `lane-start:<key>:<ms>` and `recover:<key>:<ms>` keep the shapes lanes-hub.ts parses; every other type
@@ -149,11 +137,9 @@ export class RunnerCalls implements RunnerCall {
 
   private gate(label: string, type: DurableCommandType | QueryType): void {
     if (!this.deps.accept.connected(label)) throw new RunnerUnavailable(label, "disconnected", `no admitted connection for ${type}`);
-    const need = NEEDS_PROTO[type];
-    const proto = this.deps.proto(label);
-    if (isFileOperation(type) && (proto === undefined || proto < 5)) throw new RunnerUnavailable(label, "outdated", fileCapabilityDetail(proto));
-    if (need !== undefined && proto !== undefined && proto < need) {
-      throw new RunnerUnavailable(label, "outdated", `${type} needs runner proto ${need}, the runner speaks ${proto}`);
+    // A known proto was admitted (at least MIN_PROTO), which carries every type; only lane files fail closed on an unknown one.
+    if (isFileOperation(type) && this.deps.proto(label) === undefined) {
+      throw new RunnerUnavailable(label, "outdated", "lane files need the runner's proto (unknown); wait for its hello and retry");
     }
   }
 
@@ -165,11 +151,12 @@ export class RunnerCalls implements RunnerCall {
     const cmdId = opts.cmdId ?? newCmdId(type, (body as { key?: string }).key, this.deps.now(), this.n);
     if (type === "lane.start" || type === "lane.recover") checkLaneFilesBody((body as { key?: string }).key!, { ...body, cmdId });
     const timeoutMs = opts.timeoutMs ?? COMMAND_TIMEOUTS[type] ?? CALL_TIMEOUT_MS;
-    const answer = this.wait(this.cmdWaiters, cmdId, label, timeoutMs,
-      () => new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
     const key = (body as { key?: string }).key;
     const recorded = ATTEMPT_TYPES.has(type) && this.deps.attempts !== undefined;
+    // Recorded before the waiter exists: a failed write throws with no waiter or timer left behind.
     if (recorded) this.deps.attempts?.record(label, type, cmdId, key, body);
+    const answer = this.wait(this.cmdWaiters, cmdId, label, timeoutMs,
+      () => new RunnerUnavailable(label, "timeout", `no cmd.result for ${type} ${cmdId} within ${timeoutMs} ms`));
     let sent;
     try { sent = this.deps.accept.command(label, type, { ...body, cmdId } as SupervisorCommandBodies[T]); }
     catch (e) {

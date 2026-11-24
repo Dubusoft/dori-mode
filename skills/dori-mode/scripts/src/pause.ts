@@ -4,6 +4,7 @@ import type { FlowDeps } from "./done-flow.ts";
 import { type CommandResults, type GoalOutcome } from "./runner/protocol.ts";
 import { LaneOpsError, type LaneOps } from "./lane-ops.ts";
 import { type Lane, type LaneStatus, statusOf, withStatus } from "./registry.ts";
+import { laneAgentGone, recoverLanes, type RecoveryLane } from "./recover.ts";
 import { passthroughView, type SweepView } from "./sweep-view.ts";
 
 /**
@@ -76,10 +77,13 @@ export const pauseLane = async (deps: FlowDeps & Ops, lane: Lane, note: string):
   if (goal !== "confirmed") return { lane, lines: [`PAUSE_UNVERIFIED ${lane.key} /goal pause ${goal}; lane left ${status}`], code: 3 };
   const at = new Date(deps.clock.now()).toISOString();
   let paused: Lane = lane;
+  let closed: Lane | undefined;
   await deps.registry.update(lane.key, (current) => {
-    const fresh = current ?? lane;
-    return (paused = withStatus(fresh, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
+    // Closed while its goal was being paused: the archived record stays as the close left it.
+    if (current?.closedAt) { closed = current; return undefined; }
+    return (paused = withStatus(current ?? lane, "paused", note, at, { pausedFrom: status, pausedSeenWorking: undefined, lastFreshnessNote: undefined }));
   });
+  if (closed) return { lane: closed, lines: [`NOT_PAUSED ${lane.key} is closed, not working`], code: 2 };
   const running = await isWorking(deps.ops, lane);
   if (running && !(await stopTurn(deps.ops, lane))) {
     // The goal is paused, so the lane stays paused and the freshness sweep keeps interrupting it.
@@ -118,6 +122,11 @@ export const resumeLane = async (deps: FlowDeps & Ops, lane: Lane, note: string,
     deps.registry.update(lane.key, (current) => (ours(current) ? { ...current, resuming: undefined, resumingAt: undefined } as ResumingLane : undefined));
   const { goal, execution } = await goalResume(deps.ops, claimed);
   if (goal !== "confirmed") {
+    // No goal command reaches an agent that is gone (its pane missing, or left with only its shell): a lane paused from
+    // working is relaunched instead, as the same attempt. A launch reservation is paused only to keep recovery off it.
+    if (beforePause(claimed) === "working" && !claimed.launchReservation && (await laneAgentGone(deps, claimed))) {
+      return relaunchResumed(deps, claimed, note, owns);
+    }
     await unclaim();
     return { lane: claimed, lines: [`RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`], code: 3 };
   }
@@ -152,6 +161,38 @@ export const resumeLane = async (deps: FlowDeps & Ops, lane: Lane, note: string,
     result = { lane: (await deps.registry.read(lane.key)) ?? claimed, lines: [`NOT_RESUMED ${lane.key} was paused again during the resume; /goal pause ${again}`], code: 2 };
   }
   return result;
+};
+
+/**
+ * The resume of a paused lane whose agent is gone: under the claim the lane goes back to working (its recovery count
+ * starts over, since the owner asked for it), then recovery relaunches it at once through its runner: same key, worktree
+ * and brief, continuing its own session when it has one. The relaunched session may still hold the goal the pause
+ * stopped, so `/goal resume` follows. Without a confirmed relaunch the lane stays working and the recovery sweep retries.
+ */
+const relaunchResumed = async (deps: FlowDeps & Ops, claimed: ResumingLane, note: string, owns?: (current: Lane) => boolean): Promise<PauseResult> => {
+  const { key } = claimed;
+  const committed = await deps.registry.update(key, (current) => {
+    if (!current || statusOf(current) !== "paused" || (current as ResumingLane).resuming !== claimed.resuming || (owns && !owns(current))) return undefined;
+    const now = deps.clock.now();
+    const fresh: ResumingLane & RecoveryLane = { ...current, resuming: undefined, resumingAt: undefined, recoveryExhausted: undefined };
+    return withStatus(fresh, "working", note, new Date(now).toISOString(), {
+      lastReplyAt: now, pausedFrom: undefined, pausedSeenWorking: undefined, lastFreshnessNote: undefined, recoveryAttempts: undefined, recoveryPending: undefined,
+    });
+  });
+  if (!committed) {
+    await deps.registry.update(key, (current) => (current && (current as ResumingLane).resuming === claimed.resuming ? { ...current, resuming: undefined, resumingAt: undefined } as ResumingLane : undefined));
+    const current = await deps.registry.read(key);
+    return { lane: current ?? claimed, lines: [`NOT_RESUMED ${key} is ${current ? statusOf(current) : "gone"}, changed during the resume; its agent is gone, nothing relaunched`], code: 2 };
+  }
+  const events = await recoverLanes(deps, key);
+  const recovered = events.find((line) => line.startsWith(`LANE_RECOVERED ${key} `));
+  const lane = (await deps.registry.read(key)) ?? committed;
+  if (!recovered) {
+    return { lane, lines: [`RESUME_UNVERIFIED ${key} its agent was gone; lane set working, but its relaunch is not confirmed (the recovery sweep retries it)`, ...events], code: 3 };
+  }
+  const { goal } = await goalResume(deps.ops, lane);
+  await notifyStatus(deps.ops, lane);
+  return { lane, lines: [`RESUMED ${key} as working, its agent was gone and was relaunched in ${lane.pane ?? "-"}; /goal resume ${goal}`, ...events], code: 0 };
 };
 
 export type PausedCheck = { readonly lane: Lane; readonly outcome: "working-while-paused"; readonly stopped: boolean } | null;

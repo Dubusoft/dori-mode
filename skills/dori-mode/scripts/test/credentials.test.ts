@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { envFileValue, resolveCredential } from "../src/credentials.ts";
+import { envFileValue, parseEnvFile, resolveCredential } from "../src/credentials.ts";
 import { withState } from "./fakes.ts";
 
 const SECRET = "file-secret-value";
@@ -14,6 +14,16 @@ test("envFileValue reads plain, exported and quoted values and treats blank as u
   expect(envFileValue("A=1\nDORI_DISCORD_TOKEN=abc\n", "DORI_DISCORD_TOKEN")).toBe("abc");
   expect(envFileValue('export DORI_DISCORD_TOKEN="q q"', "DORI_DISCORD_TOKEN")).toBe("q q");
   expect(envFileValue("DORI_DISCORD_TOKEN=", "DORI_DISCORD_TOKEN")).toBeUndefined();
+});
+
+test("parseEnvFile keeps a quoted value whole across lines and reads every entry after it", () => {
+  const text = 'A=1\r\nKEY="line one\nline \\"two\\""\nexport B=\'x\ny\' # note\nC="open\n';
+  expect(parseEnvFile(text)).toEqual([["A", "1"], ["KEY", 'line one\nline "two"'], ["B", "x\ny"], ["C", '"open']]);
+});
+
+test("envFileValue matches the name exactly, not as a pattern", () => {
+  expect(envFileValue("AXB=1\n", "A.B")).toBeUndefined();
+  expect(envFileValue("# DORI_DISCORD_TOKEN=x\nXDORI_DISCORD_TOKEN=y\n", "DORI_DISCORD_TOKEN")).toBeUndefined();
 });
 
 test("resolveCredential prefers the process environment over the env file", () => {

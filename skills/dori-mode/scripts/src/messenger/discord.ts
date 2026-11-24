@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { Clock } from "../run.ts";
 import { guardText, type Http, MessengerError, withBackoff } from "./http.ts";
-import { splitDiscordMessage } from "./discord-split.ts";
+import { realNewlines, splitDiscordMessage } from "./discord-split.ts";
 
 const retryAfter = (body: string): number | undefined => {
   try {
@@ -24,8 +24,20 @@ export const DISCORD_MESSAGES_PAGE = 100;
  */
 export type DiscordMessage = { readonly id: string; readonly type: number; readonly authorId: string; readonly content: string; readonly reference?: string };
 
+/** A file `Discord.sendFiles` uploads with a message: its file name as Discord shows it, and its bytes. */
+export type DiscordFile = { readonly name: string; readonly data: Uint8Array<ArrayBuffer> };
+/** Most bytes one message may upload, in all: the limit Discord gives every upload in a server without boosts. */
+export const DISCORD_UPLOAD_MAX = 10 * 1024 * 1024;
+/** Most files one message may carry. */
+export const DISCORD_FILES_MAX = 10;
+
 /** How `Discord.startThread` left the owner: joined by the add, already a member, not configured, or the add's error. */
 export type ThreadMember = "added" | "already" | "skipped" | { readonly failed: string };
+
+/** A thread read (`Discord.threadState`) found a channel that is not a thread. */
+export class NotThreadError extends Error {
+  constructor(readonly channel: string) { super(`discord channel ${channel} is not a thread`); }
+}
 
 export class Discord {
   constructor(
@@ -48,16 +60,39 @@ export class Discord {
    * Without a stable id, identical content in the same channel is treated as a retry; use distinct ids for repeats.
    */
   async send(channelId: string, content: string, stableId?: string, components?: readonly unknown[], flags?: number): Promise<string> {
+    return this.post(channelId, content, stableId, { ...(components ? { components } : {}), ...(flags ? { flags } : {}) });
+  }
+
+  /** As `send`, with `files` uploaded on the last chunk, under the whole text (at most DISCORD_FILES_MAX, DISCORD_UPLOAD_MAX in all). */
+  async sendFiles(channelId: string, content: string, stableId: string, files: readonly DiscordFile[]): Promise<string> {
+    return this.post(channelId, content, stableId, { files });
+  }
+
+  private async post(channelId: string, content: string, stableId: string | undefined,
+    extra: { readonly components?: readonly unknown[]; readonly flags?: number; readonly files?: readonly DiscordFile[] }): Promise<string> {
     let first: string | undefined;
-    const chunks = splitDiscordMessage(guardText(content));
+    const path = `/channels/${channelId}/messages`;
+    const chunks = splitDiscordMessage(guardText(realNewlines(content)));
     for (const [index, chunk] of chunks.entries()) {
       const nonce = createHash("sha256").update(JSON.stringify([channelId, stableId ?? content, index])).digest("hex").slice(0, 25);
-      // Components (buttons) ride on the last chunk, under the whole text.
-      const extra = components && index === chunks.length - 1 ? { components } : {};
-      const id = (await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...extra, ...(flags ? { flags } : {}) })).id;
+      const last = index === chunks.length - 1;
+      // Components (buttons) and files ride on the last chunk, under the whole text.
+      const body = { content: chunk, allowed_mentions: { parse: [] }, nonce, enforce_nonce: true, ...(extra.components && last ? { components: extra.components } : {}), ...(extra.flags ? { flags: extra.flags } : {}) };
+      const id = (last && extra.files?.length ? await this.upload(path, body, extra.files) : await this.call<{ id: string }>("POST", path, body)).id;
       first ??= id;
     }
     return first ?? "";
+  }
+
+  /** A message-create POST carrying `files` as multipart form data: the JSON body as payload_json, each file as files[n]. */
+  private async upload(path: string, body: Record<string, unknown>, files: readonly DiscordFile[]): Promise<{ id: string }> {
+    const form = new FormData();
+    form.append("payload_json", JSON.stringify({ ...body, attachments: files.map((file, id) => ({ id, filename: file.name })) }));
+    for (const [index, file] of files.entries()) form.append(`files[${index}]`, new Blob([file.data]), file.name);
+    // No Content-Type: fetch sets multipart/form-data with its boundary.
+    const res = await withBackoff(this.http, this.clock, { method: "POST", url: `${this.base}${path}`, headers: { Authorization: `Bot ${this.botToken}` }, body: form }, undefined, retryAfter);
+    if (res.status >= 300) throw new MessengerError(`discord POST ${path}: ${res.status} ${res.body.slice(0, 160)}`, res.status);
+    return JSON.parse(res.body) as { id: string };
   }
 
   /**
@@ -67,7 +102,7 @@ export class Discord {
   async executeWebhook(webhookUrl: string, content: string, identity: { readonly username: string; readonly avatarUrl?: string }): Promise<string> {
     if (!/^https:\/\/(?:[a-z]+\.)?discord(?:app)?\.com\/api\/(?:v\d+\/)?webhooks\/\d+\/[\w-]+$/.test(webhookUrl)) throw new MessengerError("discord webhook: not a Discord webhook URL", 0);
     const body = JSON.stringify({
-      content: guardText(content), username: identity.username.slice(0, 80), allowed_mentions: { parse: [] },
+      content: guardText(realNewlines(content)), username: identity.username.slice(0, 80), allowed_mentions: { parse: [] },
       ...(identity.avatarUrl ? { avatar_url: identity.avatarUrl } : {}),
     });
     const res = await withBackoff(this.http, this.clock, { method: "POST", url: `${webhookUrl}?wait=true`, headers: { "Content-Type": "application/json" }, body }, undefined, retryAfter);
@@ -78,7 +113,7 @@ export class Discord {
   }
 
   async edit(channelId: string, messageId: string, content: string): Promise<void> {
-    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(content) });
+    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guardText(realNewlines(content)) });
   }
 
   async editComponents(channelId: string, messageId: string, components: readonly unknown[]): Promise<void> {
@@ -173,7 +208,7 @@ export class Discord {
   async threadState(threadId: string): Promise<{ readonly archived: boolean; readonly parent: string | undefined; readonly lastMessageId?: string | undefined }> {
     const channel = await this.call<{ thread_metadata?: { archived?: unknown }; parent_id?: unknown; last_message_id?: unknown }>("GET", `/channels/${threadId}`);
     const archived = channel.thread_metadata?.archived;
-    if (typeof archived !== "boolean") throw new Error(`discord channel ${threadId} is not a thread`);
+    if (typeof archived !== "boolean") throw new NotThreadError(threadId);
     return {
       archived, parent: typeof channel.parent_id === "string" && channel.parent_id ? channel.parent_id : undefined,
       lastMessageId: typeof channel.last_message_id === "string" && channel.last_message_id ? channel.last_message_id : undefined,

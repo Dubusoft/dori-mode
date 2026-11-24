@@ -1,22 +1,25 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { LAUNCH_ACTION, ledgerRows } from "../src/autopilot.ts";
 import { claimDone, closeLane, finishClosedTask, type FlowDeps, watchTick } from "../src/done-flow.ts";
 import { eventClass } from "../src/event-policy.ts";
 import type { Lane } from "../src/registry.ts";
-import { laneReportFile } from "../src/lane-files.ts";
+import { laneNotAdoptedFile, laneReportFile } from "../src/lane-files.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { mergeFactLine, taskBlocker, taskFinisher } from "../src/task-finish.ts";
 import { appendFollowUp, type FollowUpDiscord, recordLastReport, recordOwnerClosed } from "../src/thread-followup.ts";
 import { ToodoWriter } from "../src/toodo-client.ts";
-import { depsFor, fakeClock, newWorld, withSqliteStore, withState, type World } from "./fakes.ts";
+import { depsFor, fakeClock, newWorld, visible, withSqliteStore, withState, type World } from "./fakes.ts";
 
 type Criterion = { id: number; text: string; kind: string; state: string; evidence: string | null };
 type Task = { id: number; status: string; resolution: string | null; refs: string[]; notes: { kind: string; body: string }[]; criteria: Criterion[] };
 
-/** A fake toodo `/mcp` endpoint with toodo's result shape; complete_task is refused while a criterion is not met. */
+/**
+ * A fake toodo `/mcp` endpoint with toodo's result shape; complete_task is refused on a task already done (as toodo's
+ * transition rules do) and while a criterion is not met.
+ */
 const fakeToodo = (task: Task) => {
   const calls: { name: string; args: Record<string, unknown> }[] = [];
   const ok = (id: unknown, value: unknown) => Response.json({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify(value) }] } });
@@ -38,8 +41,14 @@ const fakeToodo = (task: Task) => {
         return ok(rpc.id, task);
       }
       if (name === "complete_task") {
+        if (task.status === "done") return refuse(rpc.id, "invalidTransition");
         if (task.criteria.some((c) => c.state !== "met")) return refuse(rpc.id, "criteriaUnmet");
         task.status = "done"; task.resolution = "completed"; task.refs.push(...(a.refs as string[]));
+        return ok(rpc.id, task);
+      }
+      if (name === "conclude_task") {
+        if (task.status === "done") return refuse(rpc.id, "taskDone");
+        task.status = "done"; task.resolution = String(a.outcome); task.notes.push({ kind: "conclusion", body: String(a.note) });
         return ok(rpc.id, task);
       }
       if (name === "report_blocker") {
@@ -59,7 +68,7 @@ const fakeDiscord = (archivedThreads: readonly string[] = []) => {
   const sends: string[][] = [];
   const discord: FollowUpDiscord = {
     send: async (channel, content) => { sends.push([channel, content]); return "new"; },
-    edit: async (channel, message, content) => { edits.push([channel, message, content]); contents.set(`${channel}/${message}`, content); },
+    edit: async (channel, message, content) => { edits.push([channel, message, visible(content)]); contents.set(`${channel}/${message}`, content); },
     content: async (channel, message) => contents.get(`${channel}/${message}`) ?? "",
     threadArchived: async (thread) => archivedThreads.includes(thread),
     threadState: async (thread) => ({ archived: archivedThreads.includes(thread), parent: "work" }),
@@ -180,6 +189,16 @@ test("a task toodo refuses to complete wakes the lead with the reason, and the m
   expect(eventClass(lines[2] ?? "")).toBe("lead-digest");
   expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
   expect(fake.sends).toEqual([]);
+});
+
+test("a merged lane whose task the lead already completed with other refs says toodo=done, warns no one, and still appends the merge", async () => {
+  const task: Task = { ...inProgress([manual(1, true)]), status: "done", resolution: "completed", refs: ["https://github.com/acme/app/pull/2"] };
+  const fake = fakeDiscord();
+  const { lines, calls } = await closeMerged(lane, task, fake.discord);
+  expect(lines).toEqual([`LANE_CLOSED demo-lane closed seen-claim toodo=done ${PR}`, `MERGE_FACT demo-lane ${PR} merge=${SHA}; report appended (m1)`]);
+  expect(calls.map((c) => c.name)).toEqual(["get_task"]);
+  expect(task.refs).toEqual(["https://github.com/acme/app/pull/2"]);
+  expect(fake.edits).toEqual([["900", "m1", "report\n머지 acme/app#1 (abc1234)"]]);
 });
 
 test("a lane whose PR does not read back merged with a merge SHA wakes the lead and its task is left alone", async () => {
@@ -307,7 +326,7 @@ test("a repo-less autopilot lane without its report leaves the task open with a 
   const task = inProgress([manual(1)]);
   const { report, finish } = await finishRepoless(task, fakeDiscord().discord);
   expect(finish?.tag).toBe("unmerged");
-  expect(finish?.lines[0]).toContain(`no report of the repo-less lane at ${report}`);
+  expect(finish?.lines[0]).toContain(`no report of the lane at ${report}`);
   expect(task.status).toBe("in_progress");
   expect(task.notes.map((n) => n.kind)).toEqual(["blocker"]);
 });
@@ -326,6 +345,104 @@ test("a repo-less autopilot lane is completed with its installed report as evide
   expect(task.refs).toEqual([]);
   expect(fake.edits).toEqual([["900", "m1", "report\nToodo #951 완료"]]);
   expect(attemptData()).toMatchObject({ toodo: "done" });
+});
+
+/**
+ * Autopilot lane `ap-951-1` (Done = a PR from autopilot/951) claims done with no PR, with or without the `not-adopted.md`
+ * and `report.md` its claim installs, and the claim settles five minutes later with the supervisor's finisher.
+ */
+const settleNoPr = async (task: Task, conclusion?: string, report?: string) => {
+  reserveAutopilot();
+  const subject: Lane = { ...apLane, done: "pr acme/app autopilot/951" };
+  // The research dir beside the state dir is shared by this file's tests: start from no installed files.
+  const file = laneNotAdoptedFile(at(T0).config.stateDir, subject.key);
+  rmSync(dirname(file), { recursive: true, force: true });
+  for (const [path, text] of [[file, conclusion], [laneReportFile(at(T0).config.stateDir, subject.key), report]] as const) {
+    if (text === undefined) continue;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  }
+  recordLastReport(state.dir, subject.key, { channel: "900", message: "m1", at: T0 });
+  world.prList = [];
+  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  const toodo = fakeToodo(task);
+  stops.push(toodo.stop);
+  await at(T0).registry.write(subject);
+  await claimDone(at(T0), subject, "investigated: nothing to change");
+  const announced = await watchTick(at(T0));
+  const writer = new ToodoWriter({ url: toodo.url, tokenFile: join(state.dir, "mcp-token") });
+  const fake = fakeDiscord();
+  const finishTask = taskFinisher({ writer, append: (l, text) => appendFollowUp(state.dir, fake.discord, l, text), language: () => "Korean" });
+  const lines = await watchTick({ ...at(T0 + 5 * MIN + 1), finishTask, blockTask: taskBlocker(writer) });
+  return { announced, lines, calls: toodo.calls, edits: fake.edits, lane: await at(T0).registry.read(subject.key) };
+};
+
+test("an autopilot lane that concludes not adopted with no PR closes without an objection and its task is concluded not_adopted", async () => {
+  const task = inProgress([manual(1)]);
+  const { announced, lines, edits, lane: closed } = await settleNoPr(task, "# Not adopted\nHigh findings: 0.\n");
+  expect(announced[0]).toEndWith("| verified: pr=none sig=not-adopted");
+  expect(lines.filter((l) => l.startsWith("LANE_NOT_DONE ") || l.startsWith("AUTOPILOT_LANE_FAILED ") || l.startsWith("TOODO_TASK_NOT_COMPLETED "))).toEqual([]);
+  const conclusion = laneNotAdoptedFile(at(T0).config.stateDir, "ap-951-1");
+  expect(lines).toEqual([
+    "LANE_CLOSED ap-951-1 closed seen-claim toodo=not-adopted",
+    `TOODO_TASK_NOT_ADOPTED ap-951-1 #951 conclusion=${conclusion}; report appended (m1)`,
+    "AUTOPILOT_LANE_DONE #951 lane=ap-951-1 attempt=1 toodo=not-adopted: toodo task #951 concluded not adopted and read back by the supervisor",
+  ]);
+  for (const line of lines) expect(eventClass(line)).toBe("lead-digest");
+  expect(task.status).toBe("done");
+  expect(task.resolution).toBe("not_adopted");
+  // No blocker: the conclusion is the task's note.
+  expect(task.notes.map((n) => n.kind)).toEqual(["conclusion"]);
+  expect(task.notes[0]?.body).toStartWith("# Not adopted\nHigh findings: 0.\n\nConclusion: ");
+  expect(closed?.closedAt).toBeDefined();
+  expect(closed?.receipt).toMatchObject({ notAdopted: { conclusion } });
+  expect(edits).toEqual([["900", "m1", "report\nToodo #951 not adopted로 마무리"]]);
+  expect(attemptData()).toMatchObject({ outcome: "done", toodo: "not-adopted" });
+});
+
+test("an autopilot lane that finished its work with no PR closes on its report and its task is completed, not concluded not_adopted", async () => {
+  const task = inProgress([manual(1), manual(2)]);
+  const { announced, lines, edits, lane: closed } = await settleNoPr(task, undefined, "# Report\n1. done\n2. done\n");
+  expect(announced[0]).toEndWith("| verified: pr=none sig=reported");
+  const report = laneReportFile(at(T0).config.stateDir, "ap-951-1");
+  expect(lines).toEqual([
+    "LANE_CLOSED ap-951-1 closed seen-claim toodo=done",
+    `TOODO_TASK_COMPLETED ap-951-1 #951 report=${report}; report appended (m1)`,
+    "AUTOPILOT_LANE_DONE #951 lane=ap-951-1 attempt=1 toodo=done: toodo task #951 completed and read back by the supervisor",
+  ]);
+  for (const line of lines) expect(eventClass(line)).toBe("lead-digest");
+  expect(task.status).toBe("done");
+  expect(task.resolution).toBe("completed");
+  expect(task.criteria.map((c) => [c.state, c.evidence?.startsWith(`report ${report} `) ?? false])).toEqual([["met", true], ["met", true]]);
+  expect(task.notes.map((n) => n.kind)).toEqual([]);
+  expect(closed?.receipt).toMatchObject({ reported: { report } });
+  expect(edits).toEqual([["900", "m1", "report\nToodo #951 완료"]]);
+  expect(attemptData()).toMatchObject({ outcome: "done", toodo: "done" });
+});
+
+test("a lane that installed both not-adopted.md and report.md is concluded not_adopted", async () => {
+  const task = inProgress([manual(1)]);
+  const { lines } = await settleNoPr(task, "nothing to change", "# Report\n");
+  expect(lines[0]).toBe("LANE_CLOSED ap-951-1 closed seen-claim toodo=not-adopted");
+  expect(task.resolution).toBe("not_adopted");
+});
+
+test("a not-adopted lane whose task the lead already finished closes with toodo=done and writes nothing", async () => {
+  const task: Task = { ...inProgress([manual(1, true)]), status: "done", resolution: "completed" };
+  const { lines, calls } = await settleNoPr(task, "nothing to change");
+  expect(lines[0]).toBe("LANE_CLOSED ap-951-1 closed seen-claim toodo=done");
+  expect(lines.some((l) => l.startsWith("AUTOPILOT_LANE_FAILED ") || l.startsWith("LANE_NOT_DONE "))).toBe(false);
+  expect(calls.map((c) => c.name)).toEqual(["get_task"]);
+  expect(task.notes).toEqual([]);
+});
+
+test("an autopilot lane that claims with no PR and no not-adopted conclusion is still objected to", async () => {
+  const task = inProgress([manual(1)]);
+  const { lines, calls, lane: open } = await settleNoPr(task);
+  expect(lines).toEqual(["LANE_NOT_DONE ap-951-1 pr acme/app autopilot/951 -> no PR from autopilot/951"]);
+  expect(open?.closedAt).toBeUndefined();
+  expect(calls).toEqual([]);
+  expect(task.status).toBe("in_progress");
 });
 
 test("a cancelled autopilot lane gets its blocker recorded once and its failure line says so", async () => {

@@ -2,8 +2,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { replaceFileAtomic } from "./durable-write.ts";
+import { withStateLockSync } from "./state-lock.ts";
+import { NotThreadError } from "./messenger/discord.ts";
 import { DISCORD_MESSAGE_LIMIT } from "./messenger/discord-split.ts";
-import { guardText } from "./messenger/http.ts";
+import { guardText, MessengerError } from "./messenger/http.ts";
 import { resolveTarget } from "./messenger/target.ts";
 import type { Lane } from "./registry.ts";
 import type { AppendOutcome } from "./task-finish.ts";
@@ -15,38 +17,87 @@ import type { AppendOutcome } from "./task-finish.ts";
  * the owner channel) as one line that links the thread instead.
  */
 
-/** Threads the owner closed with the close-thread button, thread id -> when (epoch ms); written by `dori supervise`. */
+/**
+ * Threads the owner closed with the close-thread button, thread id -> when (epoch ms); written by `dori supervise`.
+ * Old records are dropped by pruneThreadFollowups.
+ */
 export const OWNER_CLOSED_FILE = "owner-closed-threads.json";
-/** Each lane's last `dori reported` post into a thread, lane key -> { channel, message, at }; written by `dori reported`. */
+/**
+ * Each lane's last `dori reported` post into a thread, lane key -> { channel, message, at }; written by `dori reported`.
+ * Closed lanes' old records are dropped by pruneThreadFollowups.
+ */
 export const LAST_REPORTS_FILE = "last-reports.json";
+
+/** How long an owner-closed record or a closed lane's last report is kept, like a closed decision (DECISION_KEEP_CLOSED_MS). */
+export const THREAD_FOLLOWUP_KEEP_MS = 30 * 24 * 60 * 60_000;
+
+/** Held while OWNER_CLOSED_FILE or LAST_REPORTS_FILE is read, changed and written back (the supervisor and the CLI both write them). */
+export const THREAD_FOLLOWUP_LOCK = "thread-followup.lock.sqlite";
 
 export type LastReport = { readonly channel: string; readonly message: string; readonly at: number };
 
-const readObject = (path: string): Record<string, unknown> => {
+/** A state file that exists but is not a JSON object. */
+export class MalformedStateFileError extends Error {}
+
+/** The file's object; a missing file is an empty one, any other read error or a file that is not a JSON object throws. */
+const loadObject = (path: string): Record<string, unknown> => {
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw e;
+  }
   let value: unknown;
-  try { value = JSON.parse(readFileSync(path, "utf8")); } catch { return {}; }
-  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  try { value = JSON.parse(text); } catch (e) { throw new MalformedStateFileError(`${path} is malformed: ${e instanceof Error ? e.message : String(e)}`); }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new MalformedStateFileError(`${path} is malformed: not a JSON object`);
+  return value as Record<string, unknown>;
 };
 
-const writeObject = (path: string, value: Record<string, unknown>): void => {
-  replaceFileAtomic(path, JSON.stringify(value), 0o600);
+/** Malformed contents already warned about (path + content hash), so a polling reader warns once per corruption. */
+const warned = new Set<string>();
+
+/** For readers: a malformed file warns and reads as empty; it stays on disk for the owner to repair (writers refuse it). */
+const readObject = (path: string): Record<string, unknown> => {
+  try { return loadObject(path); } catch (e) {
+    if (!(e instanceof MalformedStateFileError)) throw e;
+    const key = `${path}\0${Bun.hash(readFileSync(path))}`;
+    if (!warned.has(key)) {
+      warned.add(key);
+      console.error(`THREAD_STATE_WARNING ${e.message}; it reads as empty and is not written until it is repaired or removed`);
+    }
+    return {};
+  }
 };
 
-export const readOwnerClosed = (stateDir: string): Record<string, number> =>
-  Object.fromEntries(Object.entries(readObject(join(stateDir, OWNER_CLOSED_FILE)))
-    .filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])));
+/**
+ * Reads `file` under THREAD_FOLLOWUP_LOCK, lets `change` make the next object (undefined: leave the file as it is) and
+ * writes it back (tmp + rename). A malformed file throws instead of being overwritten.
+ */
+const updateObject = (stateDir: string, file: string, change: (current: Record<string, unknown>) => Record<string, unknown> | undefined): void => {
+  withStateLockSync(join(stateDir, THREAD_FOLLOWUP_LOCK), () => {
+    const path = join(stateDir, file);
+    const next = change(loadObject(path));
+    if (next) replaceFileAtomic(path, JSON.stringify(next), 0o600);
+  });
+};
 
-/** Records that the owner closed `thread` at `at` (tmp + rename). */
+const ownerClosedOf = (value: Record<string, unknown>): Record<string, number> =>
+  Object.fromEntries(Object.entries(value).filter((entry): entry is [string, number] => typeof entry[1] === "number" && Number.isFinite(entry[1])));
+
+export const readOwnerClosed = (stateDir: string): Record<string, number> => ownerClosedOf(readObject(join(stateDir, OWNER_CLOSED_FILE)));
+
+/** Records that the owner closed `thread` at `at`. */
 export const recordOwnerClosed = (stateDir: string, thread: string, at: number): void => {
-  writeObject(join(stateDir, OWNER_CLOSED_FILE), { ...readOwnerClosed(stateDir), [thread]: at });
+  updateObject(stateDir, OWNER_CLOSED_FILE, (current) => ({ ...ownerClosedOf(current), [thread]: at }));
 };
 
 /** Drops `thread`'s close record: the thread is open again. */
 export const forgetOwnerClosed = (stateDir: string, thread: string): void => {
-  const closed = readOwnerClosed(stateDir);
-  if (!(thread in closed)) return;
-  delete closed[thread];
-  writeObject(join(stateDir, OWNER_CLOSED_FILE), closed);
+  updateObject(stateDir, OWNER_CLOSED_FILE, (current) => {
+    const closed = ownerClosedOf(current);
+    if (!(thread in closed)) return undefined;
+    delete closed[thread];
+    return closed;
+  });
 };
 
 const isLastReport = (value: unknown): value is LastReport => {
@@ -54,12 +105,33 @@ const isLastReport = (value: unknown): value is LastReport => {
   return typeof v === "object" && v !== null && typeof v.channel === "string" && typeof v.message === "string" && typeof v.at === "number";
 };
 
-export const readLastReports = (stateDir: string): Record<string, LastReport> =>
-  Object.fromEntries(Object.entries(readObject(join(stateDir, LAST_REPORTS_FILE))).filter((entry): entry is [string, LastReport] => isLastReport(entry[1])));
+const lastReportsOf = (value: Record<string, unknown>): Record<string, LastReport> =>
+  Object.fromEntries(Object.entries(value).filter((entry): entry is [string, LastReport] => isLastReport(entry[1])));
 
-/** Records `lane`'s last report message (tmp + rename). */
+export const readLastReports = (stateDir: string): Record<string, LastReport> => lastReportsOf(readObject(join(stateDir, LAST_REPORTS_FILE)));
+
+/** Records `lane`'s last report message. */
 export const recordLastReport = (stateDir: string, lane: string, report: LastReport): void => {
-  writeObject(join(stateDir, LAST_REPORTS_FILE), { ...readLastReports(stateDir), [lane]: report });
+  updateObject(stateDir, LAST_REPORTS_FILE, (current) => ({ ...lastReportsOf(current), [lane]: report }));
+};
+
+/**
+ * The supervisor's pass over both files: an owner-closed record THREAD_FOLLOWUP_KEEP_MS old whose thread no open lane
+ * is bound to, and a last report THREAD_FOLLOWUP_KEEP_MS old of a lane that is not open, are dropped. A closed lane
+ * keeps its last report until then, so the close button and the merge line still find it. A file with nothing to drop
+ * is not locked or written, and a malformed one is only warned about (readObject).
+ */
+export const pruneThreadFollowups = (stateDir: string, now: number, open: readonly Pick<Lane, "key" | "thread">[]): void => {
+  const openKeys = new Set(open.map((lane) => lane.key));
+  const openThreads = new Set(open.flatMap((lane) => threadOfRef(lane.thread) ?? []));
+  const closedExpired = (thread: string, at: number): boolean => now - at >= THREAD_FOLLOWUP_KEEP_MS && !openThreads.has(thread);
+  const reportExpired = (lane: string, report: LastReport): boolean => now - report.at >= THREAD_FOLLOWUP_KEEP_MS && !openKeys.has(lane);
+  if (Object.entries(readOwnerClosed(stateDir)).some(([thread, at]) => closedExpired(thread, at))) {
+    updateObject(stateDir, OWNER_CLOSED_FILE, (current) => Object.fromEntries(Object.entries(ownerClosedOf(current)).filter(([thread, at]) => !closedExpired(thread, at))));
+  }
+  if (Object.entries(readLastReports(stateDir)).some(([lane, report]) => reportExpired(lane, report))) {
+    updateObject(stateDir, LAST_REPORTS_FILE, (current) => Object.fromEntries(Object.entries(lastReportsOf(current)).filter(([lane, report]) => !reportExpired(lane, report))));
+  }
 };
 
 /** The latest report message posted into `thread` by any lane, or undefined. */
@@ -79,12 +151,20 @@ export type FollowUpDiscord = {
 /**
  * Whether the owner closed `thread` and it is still closed: a close is recorded and Discord still reports the thread
  * archived. A recorded thread that is open again (the owner wrote in it) has its record dropped and counts as open.
- * A thread with no record is open without asking Discord. A closed thread comes back with its parent channel, where a
- * line redirected from it goes (undefined when Discord names none: the caller's owner channel then); an open one is undefined.
+ * A thread with no record is open without asking Discord. A recorded id Discord reports is not a thread (a plain channel)
+ * cannot be closed, and one Discord no longer knows (404: deleted) cannot be posted into or reopened: either way its record
+ * is dropped and it counts as open. Any other failed read (403, 5xx) is thrown, keeping the record. A closed thread comes
+ * back with its parent channel, where a line redirected from it goes (undefined when Discord names none: the caller's owner
+ * channel then); an open one is undefined.
  */
 export const closedByOwner = async (stateDir: string, discord: Pick<FollowUpDiscord, "threadState">, thread: string): Promise<{ readonly parent: string | undefined } | undefined> => {
   if (readOwnerClosed(stateDir)[thread] === undefined) return undefined;
-  const state = await discord.threadState(thread);
+  let state: { readonly archived: boolean; readonly parent: string | undefined };
+  try { state = await discord.threadState(thread); } catch (e) {
+    if (!(e instanceof NotThreadError) && !(e instanceof MessengerError && e.status === 404)) throw e;
+    forgetOwnerClosed(stateDir, thread);
+    return undefined;
+  }
   if (state.archived) return { parent: state.parent };
   forgetOwnerClosed(stateDir, thread);
   return undefined;
@@ -146,22 +226,41 @@ export const redirectHookPost = async (
 };
 
 /**
+ * The invisible tag an append with stable id `id` carries at the start of its line: U+2060 around 32 zero-width bits
+ * (U+200B = 0, U+200C = 1) of the id's hash, so a retry can find its own line wherever later appends moved it.
+ */
+export const appendMarker = (id: string): string =>
+  `\u2060${[...Bun.hash.crc32(id).toString(2).padStart(32, "0")].map((bit) => (bit === "0" ? "\u200b" : "\u200c")).join("")}\u2060`;
+
+/** Archives `channel` again after an edit; a failure is logged, not thrown (the edit already landed, or its own error wins). */
+const rearchive = async (discord: FollowUpDiscord, channel: string): Promise<void> => {
+  await discord.setThread(channel, { archived: true }).catch((e: unknown) => {
+    console.error(`THREAD_REARCHIVE_FAILED ${channel} ${e instanceof Error ? e.message : String(e)}; the thread is left open`);
+  });
+};
+
+/**
  * Appends `text` on a new line to message `message` in `channel` by editing it; no new message is posted. A thread
  * Discord archived on its own (not closed by the owner; check closedByOwner first) is unarchived for the edit and archived
- * again. A message that already ends with `text` (a retried append) is left as it is. Returns false, editing nothing,
- * when the result would not fit one Discord message.
+ * again; a failed re-archive is logged (THREAD_REARCHIVE_FAILED) and never hides the edit's own error. With `stableId`
+ * the line carries its appendMarker and a message that already holds it (a retried append) is left as it is; the same
+ * text under another id, or with no id, is appended again. Returns false, editing nothing, when the result would not
+ * fit one Discord message.
  */
-export const appendToMessage = async (discord: FollowUpDiscord, channel: string, message: string, text: string, archived: boolean): Promise<boolean> => {
+export const appendToMessage = async (discord: FollowUpDiscord, channel: string, message: string, text: string, archived: boolean, stableId?: string): Promise<boolean> => {
   const current = await discord.content(channel, message);
-  if (current.endsWith(`\n${text}`)) return true;
-  const next = `${current}\n${text}`;
+  const marker = stableId === undefined ? "" : appendMarker(stableId);
+  if (marker && current.includes(marker)) return true;
+  const next = `${current}\n${marker}${text}`;
   if (guardText(next).length > DISCORD_MESSAGE_LIMIT) return false;
   if (archived) await discord.setThread(channel, { archived: false });
   try {
     await discord.edit(channel, message, next);
-  } finally {
-    if (archived) await discord.setThread(channel, { archived: true });
+  } catch (e) {
+    if (archived) await rearchive(discord, channel);
+    throw e;
   }
+  if (archived) await rearchive(discord, channel);
   return true;
 };
 
@@ -176,6 +275,7 @@ export const appendFollowUp = async (stateDir: string, discord: FollowUpDiscord,
   if (!last) return { appended: false, why: "the lane has no report or status message" };
   if (await closedByOwner(stateDir, discord, last.channel)) return { appended: false, why: `thread ${last.channel} is closed` };
   const archived = await discord.threadArchived(last.channel).catch(() => false);
-  if (!(await appendToMessage(discord, last.channel, last.message, text, archived))) return { appended: false, why: "the report would pass Discord's message limit" };
+  // A fact line (a merge, a finished task) states one fact: the same text for the same lane is that fact again.
+  if (!(await appendToMessage(discord, last.channel, last.message, text, archived, `follow-up:${lane.key}:${text}`))) return { appended: false, why: "the report would pass Discord's message limit" };
   return { appended: true, message: last.message };
 };

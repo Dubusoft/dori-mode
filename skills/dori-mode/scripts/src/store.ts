@@ -5,6 +5,7 @@ import { Database } from "bun:sqlite";
 import { replaceFileDurable } from "./durable-write.ts";
 import type { Wake } from "./lead-wakes.ts";
 import type { AwaitingAck, Journal, JournalEvent, Notice, OutboxItem, Restart } from "./supervise.ts";
+import { DAY_MS } from "./time-ms.ts";
 
 /**
  * Where the supervisor journal lives (config `store`): `supervisor.sqlite` (WAL), the only store. Each save writes only
@@ -33,7 +34,6 @@ export const DEFAULT_LEAD = "dori";
 
 export class StoreError extends Error {}
 
-const DAY_MS = 24 * 60 * 60_000;
 /**
  * Retention per class (sqlite store, Appendix D). Unresolved work is never pruned: undelivered events, the events of
  * tracked owner messages, a pending restart and open PRs. Delivered event bodies leave after `eventBodyMs` for a dedupe
@@ -78,7 +78,7 @@ export interface JournalStore {
 }
 
 /** Rename only after the new contents reach disk; a crash leaves either complete version. */
-export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600, `${path}.tmp`);
+export const saveJsonFile = (path: string, value: unknown): void => replaceFileDurable(path, JSON.stringify(value), 0o600);
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -206,7 +206,10 @@ export class SqliteStore implements JournalStore {
       const check = this.db.query("PRAGMA quick_check").get() as { quick_check?: string } | null;
       if (check?.quick_check !== "ok") throw new StoreError(`STORE_CORRUPT ${path}: ${check?.quick_check ?? "no result"}`);
       this.db.exec(SCHEMA);
-      const version = Number(this.meta("schema_version") ?? 1);
+      // A version that is not a positive integer would pass both checks below as NaN and silently skip every migration.
+      const stored = this.meta("schema_version") ?? "1";
+      if (!/^[1-9][0-9]*$/.test(stored)) throw new StoreError(`STORE_SCHEMA ${path}: unreadable version ${JSON.stringify(stored)}`);
+      const version = Number(stored);
       if (version > SCHEMA_VERSION) throw new StoreError(`STORE_SCHEMA ${path}: version ${version}, this code reads ${SCHEMA_VERSION}`);
       for (const [to, ddl] of MIGRATIONS) {
         if (to > version) this.db.transaction(() => { if (typeof ddl === "string") this.db.exec(ddl); else ddl(this.db); this.setMeta("schema_version", String(to)); })();
