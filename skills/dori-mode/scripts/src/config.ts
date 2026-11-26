@@ -250,8 +250,8 @@ export type DoriConfig = {
    */
   readonly review?: ReviewConfig;
   /**
-   * Whose clean done claims the supervisor reports to the owner itself (done-flow.ts, auto-report.ts): `autopilot` (the
-   * default) the lanes an autopilot launch attempt names, `all` every lane but review lanes, `off` none, so every claim
+   * Whose clean done claims the supervisor reports to the owner itself (done-flow.ts, auto-report.ts): `all` (the default)
+   * every lane but review lanes, `autopilot` only the lanes an autopilot launch attempt names, `off` none, so every claim
    * wakes the lead as LANE_DONE_CLAIMED and the lead reports it.
    */
   readonly autoReport: AutoReportScope;
@@ -325,7 +325,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   placement: { defaultMachine: "local", fallback: [] },
   drift: DEFAULT_DRIFT,
   autopilot: DEFAULT_AUTOPILOT,
-  autoReport: "autopilot",
+  autoReport: "all",
   reportQuietLanes: [],
   threadCloseAfterHours: 24,
 });
@@ -353,9 +353,9 @@ const reviewConfig = (raw: unknown): ReviewConfig => {
   return { repos: (raw.repos as string[]).map((repo) => repo.trim()) };
 };
 
-/** The config's `autoReport`, trimmed; absent is `autopilot`. Throws TypeError unless it is one of AUTO_REPORT_SCOPES. */
+/** The config's `autoReport`, trimmed; absent is `all`. Throws TypeError unless it is one of AUTO_REPORT_SCOPES. */
 const autoReport = (raw: unknown): AutoReportScope => {
-  if (raw == null) return "autopilot";
+  if (raw == null) return "all";
   const value = typeof raw === "string" ? raw.trim() : raw;
   if (!AUTO_REPORT_SCOPES.some((scope) => scope === value)) throw new TypeError(`autoReport must be one of ${AUTO_REPORT_SCOPES.join("|")}, not ${JSON.stringify(raw)}`);
   return value as AutoReportScope;
