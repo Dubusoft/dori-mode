@@ -955,7 +955,7 @@ test("a failed auto post wakes the lead with LANE_AUTO_REPORT_FAILED and the usu
 
 const URGENT_CLAIM = "LANE_DONE_CLAIMED ap-12-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok";
 const notReported: [string, (post: AutoReportPost) => Promise<string[]>][] = [
-  ["a lane no autopilot attempt names", (post) => claimAp(post, KO_TEXT, { autopilot: false })],
+  ["under autoReport autopilot, a lane no autopilot attempt names", (post) => claimAp(post, KO_TEXT, { autopilot: false, patch: { autoReport: "autopilot" } })],
   ["autoReport off", (post) => claimAp(post, KO_TEXT, { patch: { autoReport: "off" } })],
   ["a done text not in the owner's language", (post) => claimAp(post, "Fixed the login bug; the PR is green")],
   ["a claim with no done text (dori claim-done)", (post) => claimAp(post, undefined)],
@@ -973,7 +973,7 @@ for (const [name, claim] of notReported) {
   });
 }
 
-test("a claim of a lane reportQuietLanes names is recorded reported with no post and reaches the lead as digest; other lanes still wake it", async () => {
+test("a claim of a lane reportQuietLanes names is recorded reported with no post and reaches the lead as digest; other lanes are posted", async () => {
   livePane();
   const { posts, post } = recordingPost();
   const quiet = { reportQuietLanes: ["blog-topics-*", "blog-draft-*"] };
@@ -990,11 +990,12 @@ test("a claim of a lane reportQuietLanes names is recorded reported with no post
   expect(pendingReported(state.dir).map(({ path: _, ...r }) => r)).toEqual([{ lane: "blog-draft-20261120", at: T0, note: "reportQuietLanes: the lane posts its own results" }]);
   expect((await watchTick(reporting(at(T0 + 5 * MIN + 1), post, quiet, never)))[0]).toBe("LANE_CLOSED blog-draft-20261120 closed seen-claim");
   expect(pendingReported(state.dir)).toHaveLength(1);
-  // A lane the patterns do not name reports as before.
+  // A lane the patterns do not name takes the default autoReport path: its clean claim is posted, not recorded quiet.
   const other: Lane = { ...lane, key: "blog-publish-1" };
   await at(T0).registry.write(other);
   await claimDone(reporting(at(T0), post, quiet), other, "merged acme/app#1 abc123", undefined, KO_TEXT);
-  expect(await watchTick(reporting(at(T0), post, quiet))).toEqual(["LANE_DONE_CLAIMED blog-publish-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok"]);
+  expect(await watchTick(reporting(at(T0), post, quiet))).toEqual(["LANE_DONE_AUTO_REPORTED blog-publish-1 w:p1 merged acme/app#1 abc123 | verified: pr=none sig=ok report=m-1"]);
+  expect(posts.map((p) => p.key)).toEqual(["blog-publish-1"]);
 });
 
 test("autoReport all covers any lane: a clean PR snapshot is auto-reported, pending checks wake the lead", async () => {
