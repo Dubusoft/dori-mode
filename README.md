@@ -26,7 +26,7 @@ Then open your agent inside herdr and say "Dori mode".
 ## Requirements
 
 - [bun](https://bun.sh) 1.3 or newer, and git
-- [herdr](https://herdr.dev), the terminal multiplexer the lanes run in
+- [herdr](https://herdr.dev), the terminal multiplexer the lanes run in (optional on a host whose `leadRuntime` and `laneRuntime` are `hc`, herdr-core)
 - a coding agent that loads skills (built for [OmO](https://github.com/code-yeongyu/oh-my-openagent); the agent command is configurable)
 - `gh` (the GitHub CLI) for checking merged PRs and closed issues; `npm` for published versions
 - [agent-messenger](https://github.com/agent-messenger/agent-messenger) for the bot itself

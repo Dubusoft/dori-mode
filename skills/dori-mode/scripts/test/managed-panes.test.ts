@@ -103,6 +103,25 @@ test("a local launch is refused, not sent to herdr's focused workspace, when her
   expect(w.ops.some((e) => e.op === "start")).toBe(false);
 });
 
+test("a local launch on a host whose runner-config sets laneRuntime hc neither looks up nor needs the herdr lanes workspace", async () => {
+  const s = state();
+  const w = newWorld();
+  const home = join(s.dir, "home");
+  mkdirSync(join(home, ".dori", "runner"), { recursive: true });
+  writeFileSync(join(home, ".dori", "runner", "runner-config.json"), JSON.stringify({ laneRuntime: "hc" }));
+  const saved = process.env.HOME;
+  process.env.HOME = home;
+  cleanups.push(() => { process.env.HOME = saved; });
+  const calls: string[] = [];
+  // Every herdr call fails, as on a host with herdr deleted.
+  const deps = { ...depsFor(w, fakeClock(T0), s.dir, { defaultModel: "m1" }), run: async (argv: readonly string[]): Promise<Ran> => { calls.push(argv.join(" ")); return argv[0] === "lane-sandbox" ? { code: 0, out: "", err: "" } : { code: 1, out: "", err: "herdr: command not found" }; } };
+  const brief = join(s.dir, "brief.md");
+  writeFileSync(brief, "# brief\n");
+  await launchLane(deps, { key: "lane-h", title: "h", brief, done: "command [\"true\"]", thread: "none", cwd: "/repo" });
+  expect((w.ops.find((e) => e.op === "start" && e.key === "lane-h")?.args as { tabWorkspace?: string }).tabWorkspace).toBeUndefined();
+  expect(calls.filter((c) => c.startsWith("herdr "))).toEqual([]);
+});
+
 test("the runner opens a lane tab in tabWorkspace and a relaunch uses the workspace it is given, else the recorded one", async () => {
   const s = state();
   const runnerDir = join(s.dir, "runner");

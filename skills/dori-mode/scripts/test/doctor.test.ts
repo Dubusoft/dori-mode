@@ -427,6 +427,39 @@ test("herdr unreachable on a worker machine points at the lead host's runner her
   expect(find(await runDoctor(f.deps), "herdr")).toMatchObject({ level: "FAIL", fix: "systemctl --user start herdr-server.service" });
 });
 
+test("a lead host on hc for its lead and local lanes passes with herdr absent: herdr is not checked, hc-core is", async () => {
+  const gone: Ran = { code: 127, out: "", err: "herdr: command not found" };
+  const hcHost: Record<string, Ran> = {
+    "herdr workspace list": gone, "herdr pane list": gone, "pgrep -f herdr server": no(),
+    "systemctl --user is-enabled herdr-server.service": no("not-found", 4), "systemctl --user is-active herdr-server.service": no("inactive", 3),
+    "systemctl --user is-enabled hc-core.service": ok("enabled"), "systemctl --user is-active hc-core.service": ok("active"),
+    "hc --version": ok("hc 0.1.22"),
+    "hc --json ls": ok(JSON.stringify({ terminals: [{ address: "t1", state: "live" }] })),
+    "hc --json get t1": ok(JSON.stringify({ address: "t1", state: "live" })),
+  };
+  const hcConfig = { ...fixture().deps.config, leadRuntime: "hc" as const, leadPane: "hc:t1", laneWorkspace: "w1" };
+  const hcFixture = (run: Record<string, Ran> = {}) => {
+    const f = fixture({ run: { ...hcHost, ...run }, deps: { config: hcConfig } });
+    writeFileSync(join(f.deps.home, ".dori", "runner", "runner-config.json"), JSON.stringify({ laneRuntime: "hc" }), { mode: 0o600 });
+    return f;
+  };
+  const f = hcFixture();
+  const checks = await runDoctor(f.deps);
+  expect(checks.filter((c) => c.level === "FAIL" && /herdr/i.test(`${c.id} ${c.detail} ${c.fix ?? ""}`))).toEqual([]);
+  expect(find(checks, "herdr")).toMatchObject({ level: "OK", detail: "not used on this host (leadRuntime=hc, laneRuntime=hc)" });
+  expect(find(checks, "unit hc-core")).toMatchObject({ level: "OK" });
+  expect(find(checks, "leadPane")).toMatchObject({ level: "OK", detail: "hc:t1 exists in hc" });
+  expect(checks.find((c) => c.id === "unit herdr-server" || c.id === "lanes workspace")).toBeUndefined();
+  expect(f.calls.filter((c) => c.startsWith("herdr ") || c.includes("herdr-server"))).toEqual([]);
+
+  const missing = hcFixture({ "systemctl --user is-enabled hc-core.service": no("not-found", 4), "systemctl --user is-active hc-core.service": no("inactive", 3) });
+  expect(find(await runDoctor(missing.deps), "unit hc-core")).toMatchObject({ level: "FAIL", fix: "dori setup --autostart" });
+  // A local lane still on a herdr pane keeps herdr in use until it is gone.
+  const lingering = hcFixture();
+  await new Registry(lingering.deps.config.stateDir).write({ key: "old-lane", title: "t", thread: "none", brief: "/b", done: "d", openedAt: new Date(NOW).toISOString(), pane: "w1:p3" });
+  expect(find(await runDoctor(lingering.deps), "herdr")).toMatchObject({ level: "FAIL", detail: "server not reachable" });
+});
+
 test("missing WorkingDirectory, missing dirs, missing config keys and a missing lead pane are FAIL", async () => {
   const wd = fixture({ run: { "systemctl --user show dori-supervisor.service --property=WorkingDirectory --value": ok("") } });
   expect(find(await runDoctor(wd.deps), "supervisor WorkingDirectory").detail).toContain("200/CHDIR");

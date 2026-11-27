@@ -11,7 +11,8 @@ import { agentArgv, argvModel, outsideDenyRules, powershellLaunchLine, quote, re
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { cmdRefused, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
-import { infoOf, listRuntime, paneRuntime, runtimeOfPane, sessionRuntime, type RuntimeKind } from "../runtime/index.ts";
+import { infoOf, listRuntime, paneRuntime, runtimeOfPane, sessionRuntime, setListedRuntimes, type RuntimeKind } from "../runtime/index.ts";
+import { herdrInUse } from "./herdr-watch.ts";
 import { addInput, captureOutput, laneFilePaths, prepareInput, removeLaneTree, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { checkLaneFilesBody, LaneFileError, treeDigest } from "../lane-file-contract.ts";
 import { laneProcessAlive, turnStop } from "./observe.ts";
@@ -164,7 +165,13 @@ type Launched = { readonly pane: string; readonly tab: string; readonly resumed:
 
 export class RunnerLanes {
   constructor(private readonly deps: RunnerLanesDeps) {
-    if (deps.policy.laneRuntime === "hc" || Object.values(this.records()).some((r) => runtimeOfPane(r.pane) === "hc")) listRuntime("hc");
+    // Asked at each listPanes, so the listed runtimes follow a policy reload (laneRuntime) and every lane open and close
+    // with no sync call at each listing site: herdr while herdrInUse (the HerdrWatch gate), hc while the policy selects
+    // it or a lane lives on it. A host on hc with no herdr lane never runs the herdr binary.
+    setListedRuntimes(() => {
+      const panes = Object.values(this.records()).map((r) => r.pane);
+      return { herdr: herdrInUse(deps.policy.laneRuntime, panes), hc: deps.policy.laneRuntime === "hc" || panes.some((p) => runtimeOfPane(p) === "hc") };
+    });
   }
 
   /**

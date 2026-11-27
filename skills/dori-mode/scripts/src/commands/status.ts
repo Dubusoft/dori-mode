@@ -1,4 +1,7 @@
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { loadConfig } from "../config.ts";
+import { listHostRuntimes } from "../host-runtimes.ts";
 import { Registry } from "../registry.ts";
 import { realClock, run, setDefaultRunTimeout } from "../run.ts";
 import { defaultRunnerDir } from "../runner/fs-safety.ts";
@@ -18,7 +21,10 @@ export const statusMain = async (args: readonly string[]): Promise<number> => {
   await convertJsonState(cfg.stateDir);
   setDefaultRunTimeout(cfg.runTimeoutMs);
   try {
-    const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry: new Registry(cfg.stateDir), runnerDir: defaultRunnerDir() });
+    const registry = new Registry(cfg.stateDir);
+    // Here, not in collectStatus: the supervisor's status lookup runs that too and keeps its own listed runtimes.
+    listHostRuntimes(cfg, homedir(), existsSync(registry.dir) ? await registry.open() : []);
+    const status = await collectStatus({ run, clock: realClock, config: cfg, tunables: BUILT_IN, registry, runnerDir: defaultRunnerDir() });
     console.log(json ? JSON.stringify(status, null, 2) : statusPage(status, page));
   } catch (e) {
     // A state dir whose json store did not convert has no database to read (STORE_CONVERT_FAILED was printed above).

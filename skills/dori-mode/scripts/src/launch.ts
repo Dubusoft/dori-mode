@@ -4,6 +4,7 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
+import { localLanesOnHerdr } from "./host-runtimes.ts";
 import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
@@ -380,8 +381,10 @@ const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<Ta
 /**
  * The herdr workspace a local lane's new tab opens in: the supervisor-managed lanes workspace, found again or created and
  * recorded when herdr lost it. A launch never falls back to herdr's focused workspace, so a herdr failure refuses it.
+ * Undefined, with no herdr call, when the local runner opens its lanes on hc (runner-config `laneRuntime`).
  */
-export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, log: (line: string) => void): Promise<string> => {
+export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, log: (line: string) => void): Promise<string | undefined> => {
+  if (!localLanesOnHerdr()) return undefined;
   try {
     return await ensureLaneWorkspace(deps.run, deps.config.stateDir, deps.config.leadCwd, log);
   } catch (error) {

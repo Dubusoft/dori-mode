@@ -14,6 +14,8 @@ import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
 import { paneRow } from "./panes.ts";
 import { runtimeOfPane, type RuntimeKind } from "./runtime/index.ts";
+import { HC_CORE_UNIT } from "./runtime/hc.ts";
+import { hostRuntimes, hostServices, localLanePanes, localLaneRuntime } from "./host-runtimes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { type Lane, type Registry, statusOf } from "./registry.ts";
 import { Repos } from "./repos.ts";
@@ -29,7 +31,6 @@ import { openOwnerDecisions } from "./owner-decisions.ts";
 import type { Tunables } from "./tunables.ts";
 import { oneLine } from "./line-text.ts";
 
-export const SERVICES = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const LEGACY_PRESENCE = "dori-presence.service";
 
 export type UnitState = { readonly name: string; readonly enabled: string; readonly active: string };
@@ -382,11 +383,13 @@ const laneRepoPr = (l: Lane): { repo?: string; pr?: number } => {
 /** Read-only and no LLM: unit states, files under stateDir, one herdr pane list. */
 export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   const now = d.clock.now();
-  const [services, lead, open] = await Promise.all([
-    Promise.all([...SERVICES, LEGACY_PRESENCE].map((name) => unitState(d.run, name))),
+  const [lead, open] = await Promise.all([
     leadState(d),
     existsSync(d.registry.dir) ? d.registry.open() : Promise.resolve([]),
   ]);
+  // Without a runner dir the local laneRuntime is unknown and reads as herdr, the default.
+  const runtimes = hostRuntimes(d.config, d.runnerDir ? localLaneRuntime(d.runnerDir) : undefined, localLanePanes(open));
+  const services = await Promise.all([...hostServices(runtimes), LEGACY_PRESENCE].map((name) => unitState(d.run, name)));
   const gh = githubSummary(d.config.stateDir);
   const pendingRestart = pendingLeadRestart(d.config.stateDir);
   const pause = readPause(autopilotPausePath(d.config.stateDir));
@@ -583,7 +586,8 @@ const LEAD_WORDS: Readonly<Record<LeadState["state"], string>> = { warm: "활동
 type Problem = { readonly label: string; readonly line: string };
 const problems = (s: Status, now: number): Problem[] => {
   const out: Problem[] = [];
-  const bad = s.services.filter((u) => (u.name === LEGACY_PRESENCE ? u.active === "active" : u.active !== "active" || u.enabled !== "enabled"));
+  // hc-core is a oneshot that only starts the core (`hc server start`): enabled is all it needs to be.
+  const bad = s.services.filter((u) => (u.name === LEGACY_PRESENCE ? u.active === "active" : u.enabled !== "enabled" || (u.name !== HC_CORE_UNIT && u.active !== "active")));
   for (const u of bad) out.push({ label: `${unitName(u)} ${RUN_WORDS[u.active] ?? u.active}`, line: `서비스 ${unitName(u)}: ${unitWords(u)}` });
   if (s.gateway.state !== "live") out.push({ label: `게이트웨이 ${gatewayWords(s.gateway)}`, line: `Discord 게이트웨이: ${gatewayDetail(s.gateway)}` });
   const g = s.github;

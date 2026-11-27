@@ -8,7 +8,7 @@ import type { Ran, Runner } from "../src/run.ts";
 import { Repos, ReposError } from "../src/repos.ts";
 import { DORI_CONFIG_KEYS } from "../src/config-keys.ts";
 import { envFileValue } from "../src/credentials.ts";
-import { CONFIG_REMOVALS_FILE, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY } from "../src/setup.ts";
+import { CONFIG_REMOVALS_FILE, envSet, mergeConfig, type Prompter, renderTemplate, runSetup, saveConfig, type SetupDeps, SetupError, SETUP_KEYS_FILE, UNITS, NOTIFY_UNIT, FAILURE_NOTIFY, HC_BOOT_PREP } from "../src/setup.ts";
 import { CONFIG_SCHEMA_VERSION } from "../src/config-schema.ts";
 import { withState } from "./fakes.ts";
 
@@ -154,6 +154,29 @@ test("autostart writes the notify unit and an executable notify script but enabl
   expect(existsSync(join(d.unitDir, NOTIFY_UNIT))).toBe(true);
   const enable = herdr.calls.find((c) => c[0] === "systemctl" && c[2] === "enable");
   expect(enable).toEqual(["systemctl", "--user", "enable", ...UNITS]);
+});
+
+test("on a lead host on hc (leadRuntime and local laneRuntime hc) autostart installs and starts hc-core, skips herdr and keeps an old herdr unit", async () => {
+  const d = deps({ bins: { dori: "/opt/bun/bin/dori", hc: "/opt/hc/bin/hc", shell: "/bin/zsh" } });
+  await Bun.write(d.configPath, JSON.stringify({ leadRuntime: "hc" }));
+  await Bun.write(join(d.home, ".dori", "runner", "runner-config.json"), JSON.stringify({ laneRuntime: "hc" }));
+  await Bun.write(join(d.unitDir, "herdr-server.service"), "old unit\n");
+  expect(await runSetup(d, { token: TOKEN, channels: [CHANNEL], autostart: true })).toBe(0);
+  expect(log).toContain("SETUP herdr skipped: not used on this host (leadRuntime=hc, laneRuntime=hc)");
+  expect(readdirSync(d.unitDir).sort()).toEqual(["dori-failure-notify@.service", "dori-supervisor.service", "hc-core.service", "herdr-server.service"]);
+  expect(readFileSync(join(d.unitDir, "herdr-server.service"), "utf8")).toBe("old unit\n");
+  const unit = readFileSync(join(d.unitDir, "hc-core.service"), "utf8");
+  expect(unit).toContain("ExecStart=/opt/hc/bin/hc server start\n");
+  expect(unit).toMatch(/^Environment=PATH=\/opt\/bun\/bin:\/opt\/hc\/bin:/m);
+  expect(unit).not.toMatch(/@\w+@/);
+  expect(readFileSync(join(d.home, ".dori", "dori-boot-prep.sh"), "utf8")).toBe(HC_BOOT_PREP);
+  expect(herdr.calls.filter((c) => c[0] === "herdr")).toEqual([]);
+  expect(herdr.calls.filter((c) => c[0] === "systemctl" && (c[2] === "enable" || c[2] === "start")).map((c) => c.join(" "))).toEqual([
+    "systemctl --user enable hc-core.service dori-supervisor.service",
+    "systemctl --user start hc-core.service",
+  ]);
+  expect(log).toContain("SETUP start them now with: systemctl --user start dori-supervisor.service");
+  expect(log.at(-1)).toBe("SETUP_DONE");
 });
 
 test("non-interactive setup writes env 600, config with herdr ids and units, never logs the token, and a second run changes nothing", async () => {

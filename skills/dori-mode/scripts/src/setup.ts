@@ -6,16 +6,36 @@ import { CONFIG_SCHEMA_KEY, CONFIG_SCHEMA_VERSION, ConfigSchemaError, migrateCon
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import { envFileValue } from "./credentials.ts";
 import type { Http } from "./messenger/http.ts";
-import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
+import { HERDR_UNIT, hostRuntimes, type HostRuntimes, hostServices, localLanePanes, localLaneRuntime, runtimesNote } from "./host-runtimes.ts";
+import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, readManagedPanes, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
 import { listPanes } from "./panes.ts";
+import { Registry } from "./registry.ts";
 import { Repos } from "./repos.ts";
+import { defaultRunnerDir } from "./runner/fs-safety.ts";
+import { HC_CORE_UNIT, HC_INSTALL_URL } from "./runtime/hc.ts";
 import type { Runner } from "./run.ts";
 
 export class SetupError extends Error {}
 
 export const TOKEN_KEY = "DORI_DISCORD_TOKEN";
+/**
+ * The units of a host on herdr alone (the default); hostServices gives a host's own set. A literal: setup.ts is loaded
+ * inside an import cycle (runner/fs-safety.ts imports it), so nothing imported may run while it initialises.
+ */
 export const UNITS = ["herdr-server.service", "dori-supervisor.service"] as const;
 export const BOOT_PREP = "dori-boot-prep.sh";
+/**
+ * The boot prep script of a lead host that does not use herdr: templates/dori-boot-prep.sh waits for the herdr server and
+ * fails without one, which would stop the supervisor. On hc there is nothing to wait for: the hc client starts its core
+ * itself and hc-core.service starts it at boot.
+ */
+export const HC_BOOT_PREP = [
+  "#!/usr/bin/env bash",
+  "# Runs before `dori supervise` (systemd ExecStartPre). Written by `dori setup` on a lead host that does not use herdr",
+  "# (leadRuntime and the local laneRuntime are hc): nothing to wait for, the hc client starts its core itself.",
+  "echo \"BOOT_PREP herdr not used on this host\"",
+  "",
+].join("\n");
 /** Started by OnFailure= of the units above; never enabled itself. */
 export const NOTIFY_UNIT = "dori-failure-notify@.service";
 export const FAILURE_NOTIFY = "dori-failure-notify.sh";
@@ -40,7 +60,7 @@ export type SetupDeps = {
   readonly envPath: string;
   readonly unitDir: string;
   readonly templatesDir: string;
-  readonly bins: { readonly dori: string; readonly herdr?: string; readonly shell: string };
+  readonly bins: { readonly dori: string; readonly herdr?: string; readonly hc?: string; readonly shell: string };
 };
 
 export type SetupInput = {
@@ -327,15 +347,28 @@ export const renderTemplate = (text: string, values: Readonly<Record<string, str
     return v;
   });
 
-export const templateValues = (d: SetupDeps, workDir: string): Record<string, string> => {
-  if (!d.bins.herdr) throw new SetupError("herdr is not on PATH; install it (https://herdr.dev) before turning on autostart");
-  const bins = [dirname(d.bins.dori), dirname(d.bins.herdr), join(d.home, ".bun", "bin"), join(d.home, ".local", "bin"), "/usr/local/bin", "/usr/bin", "/bin"];
+/** Fills a template's `@NAME@` markers (the format templates/hc-core.service shares with `dori runner install`). */
+export const fillMarkers = (text: string, values: Readonly<Record<string, string>>): string =>
+  text.replace(/@(\w+)@/g, (_, name: string) => {
+    const v = values[name];
+    if (v === undefined) throw new SetupError(`template value @${name}@ is missing`);
+    if (/[\n\r]/.test(v)) throw new SetupError(`template value @${name}@ spans lines`);
+    return v;
+  });
+
+/** The values the unit templates take; the herdr binary is required only while herdr is used, hc's only while hc is. */
+export const templateValues = (d: SetupDeps, workDir: string, rt: Pick<HostRuntimes, "herdr" | "hc"> = { herdr: true, hc: false }): Record<string, string> => {
+  if (rt.herdr && !d.bins.herdr) throw new SetupError("herdr is not on PATH; install it (https://herdr.dev) before turning on autostart");
+  if (rt.hc && !d.bins.hc) throw new SetupError(`hc is not on PATH; install it (curl -fsSL ${HC_INSTALL_URL} | sh) before turning on autostart`);
+  const used = [...(rt.herdr && d.bins.herdr ? [d.bins.herdr] : []), ...(rt.hc && d.bins.hc ? [d.bins.hc] : [])];
+  const bins = [dirname(d.bins.dori), ...used.map((bin) => dirname(bin)), join(d.home, ".bun", "bin"), join(d.home, ".local", "bin"), "/usr/local/bin", "/usr/bin", "/bin"];
   return {
+    ...(rt.herdr && d.bins.herdr ? { HERDR_BIN: d.bins.herdr } : {}),
+    ...(rt.hc && d.bins.hc ? { HC_BIN: d.bins.hc } : {}),
     HOME: d.home,
     PATH: [...new Set(bins)].join(":"),
     SHELL: d.bins.shell,
     DORI_BIN: d.bins.dori,
-    HERDR_BIN: d.bins.herdr,
     ENV_FILE: d.envPath,
     CONFIG: d.configPath,
     WORK_DIR: workDir,
@@ -344,11 +377,19 @@ export const templateValues = (d: SetupDeps, workDir: string): Record<string, st
   };
 };
 
-export const renderAutostart = (d: SetupDeps, workDir: string): Map<string, { content: string; mode: number }> => {
-  const values = templateValues(d, workDir);
+/**
+ * The autostart files for this host's units (hostServices): herdr-server.service only while herdr is used, hc-core.service
+ * (its `@HC_BIN@` and `@PATH@` filled) while hc is, the supervisor, the failure notifier and the boot prep script, which
+ * waits for herdr only on a host that uses it (HC_BOOT_PREP otherwise).
+ */
+export const renderAutostart = (d: SetupDeps, workDir: string, rt: Pick<HostRuntimes, "herdr" | "hc"> = { herdr: true, hc: false }): Map<string, { content: string; mode: number }> => {
+  const values = templateValues(d, workDir, rt);
   const out = new Map<string, { content: string; mode: number }>();
-  for (const unit of [...UNITS, NOTIFY_UNIT]) out.set(join(d.unitDir, unit), { content: renderTemplate(readFileSync(join(d.templatesDir, unit), "utf8"), values), mode: 0o644 });
-  out.set(values.BOOT_PREP as string, { content: renderTemplate(readFileSync(join(d.templatesDir, BOOT_PREP), "utf8"), values), mode: 0o755 });
+  for (const unit of [...hostServices(rt), NOTIFY_UNIT]) {
+    const text = readFileSync(join(d.templatesDir, unit), "utf8");
+    out.set(join(d.unitDir, unit), { content: unit === HC_CORE_UNIT ? fillMarkers(text, values) : renderTemplate(text, values), mode: 0o644 });
+  }
+  out.set(values.BOOT_PREP as string, { content: rt.herdr ? renderTemplate(readFileSync(join(d.templatesDir, BOOT_PREP), "utf8"), values) : HC_BOOT_PREP, mode: 0o755 });
   out.set(values.FAILURE_NOTIFY as string, { content: renderTemplate(readFileSync(join(d.templatesDir, FAILURE_NOTIFY), "utf8"), values), mode: 0o755 });
   return out;
 };
@@ -560,8 +601,10 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     : `SETUP decisionsChannel unset: owner decisions go to the requesting channel; optional, add "decisionsChannel": "<channel id>" to ${d.configPath} to open them in one channel`);
 
   let serverUp = false;
+  const runtimes = await setupRuntimes(d, config, stateAbs);
   const herdrStep = input.herdr ?? true;
-  if (advanced ? await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", herdrStep) : herdrStep) {
+  if (!runtimes.herdr) d.log(`SETUP herdr skipped: not used on this host (${runtimesNote(runtimes)})`);
+  else if (advanced ? await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", herdrStep) : herdrStep) {
     if (!d.bins.herdr) {
       problems.push("herdr");
       d.log("SETUP herdr not found on PATH; install it (https://herdr.dev) and run dori setup again");
@@ -584,8 +627,8 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     }
   } else d.log("SETUP herdr skipped");
 
-  if (await d.prompt.confirm("Start herdr and the supervisor automatically at boot (systemd user units)?", input.autostart ?? false)) {
-    problems.push(...(await autostart(d, workDir, serverUp, advanced)));
+  if (await d.prompt.confirm(`Start ${runtimes.herdr ? "herdr" : "hc"} and the supervisor automatically at boot (systemd user units)?`, input.autostart ?? false)) {
+    problems.push(...(await autostart(d, workDir, serverUp, advanced, runtimes)));
   } else d.log("SETUP autostart skipped");
 
   d.log(problems.length ? `SETUP_DONE with problems: ${[...new Set(problems)].join(", ")}` : "SETUP_DONE");
@@ -598,12 +641,31 @@ const ensureDir = (d: SetupDeps, dir: string): void => {
   d.log(`SETUP created ${dir}`);
 };
 
-/** `advanced` asks before each step; otherwise the one autostart answer accepts them all. */
-const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advanced: boolean): Promise<string[]> => {
+/**
+ * host-runtimes.ts for the host setup configures: the config being written (`leadRuntime`), the recorded lead pane, the
+ * local runner's runner-config `laneRuntime` and the open local lanes (none when the registry cannot be read).
+ */
+const setupRuntimes = async (d: SetupDeps, config: Json, stateDir: string): Promise<HostRuntimes> => {
+  const registry = new Registry(stateDir);
+  let lanes: Awaited<ReturnType<Registry["open"]>> = [];
+  if (existsSync(registry.dir)) try { lanes = await registry.open(); } catch { lanes = []; }
+  return hostRuntimes(
+    { leadRuntime: config.leadRuntime === "hc" ? "hc" : "herdr", leadPane: readManagedPanes(stateDir).leadPane ?? "" },
+    localLaneRuntime(defaultRunnerDir(d.home)), localLanePanes(lanes),
+  );
+};
+
+/**
+ * `advanced` asks before each step; otherwise the one autostart answer accepts them all. Writes and enables this host's
+ * units (hostServices): herdr-server.service only while herdr is used (an existing one is never removed), and
+ * hc-core.service while hc is, started at once (`hc server start` is safe while a core runs).
+ */
+const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advanced: boolean, rt: HostRuntimes): Promise<string[]> => {
   const problems: string[] = [];
-  const files = renderAutostart(d, workDir);
+  const units = hostServices(rt);
+  const files = renderAutostart(d, workDir, rt);
   const confirm = advanced ? d.prompt.confirm : async () => true;
-  if (!(await confirm(`Write ${UNITS.join(", ")} to ${d.unitDir} and the boot prep script?`, true))) {
+  if (!(await confirm(`Write ${units.join(", ")} to ${d.unitDir} and the boot prep script?`, true))) {
     d.log("SETUP autostart units not written; stopping autostart here");
     return problems;
   }
@@ -639,10 +701,12 @@ const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advan
   if (installed.out.split(/\s+/).includes(legacy)) {
     await step("Disable and stop the legacy presence unit? The supervisor now owns Discord presence and slash commands.", ["systemctl", "--user", "disable", "--now", legacy]);
   }
-  await step("Enable the units so they start at boot?", ["systemctl", "--user", "enable", ...UNITS]);
+  await step("Enable the units so they start at boot?", ["systemctl", "--user", "enable", ...units]);
+  if (rt.hc) await step("Start the hc core now?", ["systemctl", "--user", "start", HC_CORE_UNIT]);
+  const rest = units.filter((u) => u !== HC_CORE_UNIT);
   if (serverUp) {
     d.log("SETUP herdr server is already running (started by hand?); herdr-server.service is enabled but not started so it does not fight for the socket");
-    d.log(`SETUP start the rest now with: systemctl --user start ${UNITS.filter((u) => u !== "herdr-server.service").join(" ")}`);
-  } else d.log(`SETUP start them now with: systemctl --user start ${UNITS.join(" ")}`);
+    d.log(`SETUP start the rest now with: systemctl --user start ${rest.filter((u) => u !== HERDR_UNIT).join(" ")}`);
+  } else d.log(`SETUP start them now with: systemctl --user start ${rest.join(" ")}`);
   return problems;
 };

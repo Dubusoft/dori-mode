@@ -26,7 +26,7 @@ GitHub 로그인으로 저장소를 `~/.dori/src`에 받고(그 체크아웃의 
 ## 필요한 것
 
 - [bun](https://bun.sh) 1.3 이상, git
-- [herdr](https://herdr.dev): 레인이 돌아가는 터미널 멀티플렉서
+- [herdr](https://herdr.dev): 레인이 돌아가는 터미널 멀티플렉서 (`leadRuntime`과 `laneRuntime`이 `hc`(herdr-core)인 호스트에서는 없어도 됩니다)
 - 스킬을 읽는 코딩 에이전트 ([OmO](https://github.com/code-yeongyu/oh-my-openagent) 기준으로 만들었고, 에이전트 실행 명령은 설정으로 바꿀 수 있습니다)
 - PR 머지와 이슈 종료 확인용 `gh`(GitHub CLI), 배포 버전 확인용 `npm`
 - 봇 자체를 위한 [agent-messenger](https://github.com/agent-messenger/agent-messenger)
