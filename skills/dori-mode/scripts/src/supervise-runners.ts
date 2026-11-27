@@ -23,7 +23,7 @@ import type { Listener } from "./runner/transport.ts";
 import { listenUnix } from "./runner/unix-transport.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { scrubForThread } from "./freshness.ts";
-import { readGuardMachines } from "./remote-guard.ts";
+import { listGuardMachines } from "./remote-guard.ts";
 import type { OperationStore } from "./operations.ts";
 import type { LaneReportStore } from "./lane-report-store.ts";
 import { laneEventReader, openRunnerHub, readBackRunnerStarts, readLaneCursor, type RunnerHubHandle } from "./supervise-hub.ts";
@@ -191,7 +191,6 @@ export class SupervisorRunners {
       };
       const hub = this.hub = step("runners", () => openRunnerHub(deps.config.stateDir, runnerDir, deps.clock.now, () => performance.now(), (line) => { console.log(line); }, {
         onHeartbeat: (label) => { void monitor?.heartbeat(label).catch(livenessFailed(`heartbeat runner=${label}`)); },
-        onHerdr: (id, line) => { emit(id, line); },
         // A runner's cleanup sweep asks for its closed lanes (lanes.closed): local lanes carry no machine, a remote runner's carry its label.
         onClosedLanes: async (label) => closedLanesOf(await deps.registry.archived(), label === LOCAL_RUNNER ? undefined : label),
         // A remote runner's secret.get: decided here with the registry, config and this host's store (secret-serve.ts).
@@ -249,7 +248,7 @@ export class SupervisorRunners {
         return laneWork;
       };
       let livenessSeq = 0;
-      const io = livenessIo(deps.run, LOCAL_RUNNER, async () => (await readGuardMachines(deps.run, deps.config.guardMachines, deps.config.stateDir)).machines);
+      const io = livenessIo(deps.run, LOCAL_RUNNER, async () => listGuardMachines(deps.config.guardMachines, deps.config.stateDir));
       monitor = this.liveness = new LivenessMonitor({
         monotonic: () => performance.now(), now: deps.clock.now, epoch: hub.hub.epoch, operations,
         probe: io.probe,

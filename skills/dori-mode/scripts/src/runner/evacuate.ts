@@ -8,7 +8,7 @@ import type { AnyRunnerEvent } from "./protocol.ts";
  * not stored twice (same `source`) and none is lost; (2) every open lane the runner owns is told, through that runner
  * (`lane.send`) while it still runs, that its reports will fail until the runner is back; (3) the runner's service is
  * stopped. `Lane.runner` is kept: the runner is the only path to its lanes, so there is nothing to fall back to. The
- * lanes keep running: their panes belong to herdr, not to the runner. A step that fails is reported and the later
+ * lanes keep running: their panes belong to hc, not to the runner. A step that fails is reported and the later
  * steps still run.
  */
 

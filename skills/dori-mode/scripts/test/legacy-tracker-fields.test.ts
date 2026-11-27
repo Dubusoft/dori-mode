@@ -23,14 +23,10 @@ afterEach(() => { store.close(); state.done(); });
 
 test("a lane stored with toodoTask and an open toodo-reconcile row from an old version close and pass cleanly", async () => {
   const w: World = newWorld();
-  w.panes = [{ pane_id: "w:p1", workspace_id: "w" }];
+  w.panes = [{ pane_id: "hc:t1", workspace_id: "" }];
   const base = depsFor(w, fakeClock(T0), state.dir);
-  const run: FlowDeps["run"] = async (argv, opts) => {
-    if (argv[0] === "herdr" && argv[2] === "close") w.panes = w.panes.filter((p) => p.pane_id !== argv[3]);
-    return base.run(argv, opts);
-  };
-  const deps: FlowDeps = { ...base, run, exists: () => false, operations: store };
-  const old = { key: "old-lane", title: "old", thread: "none", pane: "w:p1", brief: "/b.md", done: "merged acme/app#7", cwd: "/repo", openedAt: new Date(T0).toISOString(), toodoTask: 211 };
+  const deps: FlowDeps = { ...base, exists: () => false, operations: store };
+  const old = { key: "old-lane", title: "old", thread: "none", pane: "hc:t1", brief: "/b.md", done: "merged acme/app#7", cwd: "/repo", openedAt: new Date(T0).toISOString(), toodoTask: 211 };
   await deps.registry.write(old as Lane);
   plan(store, T0, { lane: "gone-lane", action: "toodo-reconcile", target: "5" });
 

@@ -145,7 +145,7 @@ export const admitLaunch = async (deps: FlowDeps, input: LaunchInput, placed: Pl
       key: input.key, title: input.title, done: input.done, brief: input.brief, queuedAt: new Date().toISOString(), reasons: [verdict.reasons.join(" | ")],
       ...(placed.cwd ? { cwd: placed.cwd } : {}), ...(repos.length ? { repos } : {}), ...(input.thread ? { thread: input.thread } : {}), ...(input.model ? { model: input.model } : {}),
       ...(input.mode === "mass-ulw" ? { mode: input.mode } : {}), ...(input.task !== undefined ? { task: input.task } : {}),
-      ...(placed.machine ? { machine: placed.machine } : {}), ...(input.pane ? { pane: input.pane } : {}), ...(input.workspace ? { workspace: input.workspace } : {}),
+      ...(placed.machine ? { machine: placed.machine } : {}),
       ...(input.grants?.length ? { grants: input.grants } : {}),
       ...(input.review ? { review: true as const } : {}),
     });

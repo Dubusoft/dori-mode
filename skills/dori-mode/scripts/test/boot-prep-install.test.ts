@@ -17,13 +17,14 @@ const unitWith = (dir: string, pre: string): void =>
 test("an outdated boot-prep script is replaced, the old copy kept and the mode 755", () => {
   const dir = tempDir();
   const script = join(dir, "dori-boot-prep.sh");
-  writeFileSync(script, "#!/bin/sh\nherdr tab create --label dori-lead\n");
+  const oldScript = "#!/bin/sh\necho 'old boot prep'\n";
+  writeFileSync(script, oldScript);
   unitWith(dir, `ExecStartPre=-${script}`);
 
   expect(refreshBootPrep(dir, dir)).toBe(`BOOT_PREP_UPDATED ${script} from templates/dori-boot-prep.sh; the previous copy is ${script}.bak`);
   expect(readFileSync(script)).toEqual(readFileSync(BOOT_PREP_TEMPLATE));
   expect(statSync(script).mode & 0o777).toBe(0o755);
-  expect(readFileSync(`${script}.bak`, "utf8")).toBe("#!/bin/sh\nherdr tab create --label dori-lead\n");
+  expect(readFileSync(`${script}.bak`, "utf8")).toBe(oldScript);
 });
 
 test("an identical script is left untouched", () => {

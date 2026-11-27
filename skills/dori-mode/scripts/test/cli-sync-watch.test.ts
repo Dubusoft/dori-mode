@@ -94,7 +94,7 @@ test("dori watch suppresses repeated warnings per lane and reason until they cle
       watchTick: async () => results[tick++] ?? [],
     }));
     mock.module(${lanePerms}, () => ({
-      callerLane: async () => undefined,
+      callerLane: () => undefined,
       laneActRefusal: () => undefined,
       laneSendRefusal: () => undefined,
     }));

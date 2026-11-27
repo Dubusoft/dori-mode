@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { encodedPowerShell, machineKind, sshArgv, type GuardMachine, type KindResult } from "../remote-guard.ts";
 import { RUN_TIMEOUT_CODE, type Ran, type Runner } from "../run.ts";
-import { HERDR_LAUNCHD_LABEL, HERDR_UNIT, RUNNER_LAUNCHD_LABEL } from "./install.ts";
+import { RUNNER_LAUNCHD_LABEL } from "./install.ts";
 import { readRunnerEndpoints } from "./endpoints.ts";
 import { HUB_FILE, readRunnerRows } from "./hub.ts";
 import { readRunnerMachines } from "./machines.ts";
@@ -13,8 +13,8 @@ import { stepper, type Progress } from "./steps.ts";
 /**
  * `dori runner remove LABEL`'s remote half, the inverse of installRunner: stops and deletes the runner on a worker over
  * ssh. POSIX workers get `removeScript` on the stdin of the fixed command `sh -s`; Windows workers get
- * `windowsRemoveScript` as an encoded PowerShell command. herdr is never stopped or restarted (that would end every
- * lane on the host): only its unit or launchd agent is disabled and deleted, and its binary stays. `~/.dori/runner`
+ * `windowsRemoveScript` as an encoded PowerShell command. hc's core and its autostart unit or agent are left alone
+ * (stopping the core would end every lane on the host). `~/.dori/runner`
  * goes, keys included, so a later install enrolls fresh; `~/.dori` itself stays.
  */
 
@@ -40,14 +40,11 @@ export const removeScript = (): string => [
   'if [ "$OS" = Linux ]; then',
   `  systemctl --user disable --now ${RUNNER_UNIT} >/dev/null 2>&1 || :`,
   `  rm -f "$HOME/.config/systemd/user/${RUNNER_UNIT}" || exit 1`,
-  // Disabled only: a running herdr keeps every lane on this host alive.
-  `  systemctl --user disable ${HERDR_UNIT} >/dev/null 2>&1 || :`,
-  `  rm -f "$HOME/.config/systemd/user/${HERDR_UNIT}" || exit 1`,
   "  systemctl --user daemon-reload >/dev/null 2>&1 || :",
   'elif [ "$OS" = Darwin ]; then',
   '  D=$(cat "$HOME/.dori/runner/launchd-domain" 2>/dev/null || echo "gui/$(id -u)")',
   `  launchctl bootout "$D/${RUNNER_LAUNCHD_LABEL}" >/dev/null 2>&1 || :`,
-  `  rm -f "$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist" "$HOME/Library/LaunchAgents/${HERDR_LAUNCHD_LABEL}.plist" || exit 1`,
+  `  rm -f "$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist" || exit 1`,
   "fi",
   'rm -rf "$HOME/.dori/runner" || exit 1',
   "printf 'DORI_REMOVED\\n'",
@@ -83,20 +80,12 @@ const removeResult = (r: Ran): RemoveResult => {
 export type RemovePlan =
   | { readonly kind: "remote"; readonly machine: GuardMachine }
   | { readonly kind: "local" }
-  | { readonly kind: "unknown"; readonly detail?: string };
+  | { readonly kind: "unknown" };
 
-/**
- * A label that is not a known machine is cleaned up locally only when the machine list is complete (a failed herdr
- * listing may hide a reachable worker) and the label has local state; otherwise it is unknown.
- */
-export const planRemove = (
-  machines: { readonly ok: boolean; readonly machines: readonly GuardMachine[]; readonly detail?: string },
-  label: string,
-  hasLocalState: boolean,
-): RemovePlan => {
-  const machine = machines.machines.find((m) => m.label === label);
+/** A label among `machines` is uninstalled over ssh; any other is cleaned up locally when it has local state, else unknown. */
+export const planRemove = (machines: readonly GuardMachine[], label: string, hasLocalState: boolean): RemovePlan => {
+  const machine = machines.find((m) => m.label === label);
   if (machine) return { kind: "remote", machine };
-  if (!machines.ok) return { kind: "unknown", ...(machines.detail !== undefined ? { detail: machines.detail } : {}) };
   return hasLocalState ? { kind: "local" } : { kind: "unknown" };
 };
 
@@ -126,7 +115,7 @@ export const removeRunner = async (deps: RemoveDeps, req: RemoveRequest): Promis
     return { ok: false, code, detail: k.detail };
   }
   step("connect", "done", k.kind);
-  step("uninstall", "start", k.kind === "windows" ? "stop and unregister the scheduled task, delete ~/.dori/runner" : "stop and delete the runner service, disable herdr's, delete ~/.dori/runner");
+  step("uninstall", "start", k.kind === "windows" ? "stop and unregister the scheduled task, delete ~/.dori/runner" : "stop and delete the runner service, delete ~/.dori/runner");
   const r = k.kind === "windows"
     ? await deps.run(sshArgv(req.machine.target, encodedPowerShell(windowsRemoveScript())), { timeoutMs: REMOVE_TIMEOUT_MS })
     : await deps.run(sshArgv(req.machine.target, "sh -s"), { stdin: removeScript(), timeoutMs: REMOVE_TIMEOUT_MS });

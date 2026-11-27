@@ -5,7 +5,7 @@ import { omoSessionsDir } from "../config.ts";
 import { type HostSample, sampleHost } from "../host-guard.ts";
 import { listPanes, type Pane, readScreen } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
-import { paneRuntime } from "../runtime/index.ts";
+import { sessionRuntime } from "../runtime/index.ts";
 import { procTable, resolveSession } from "../session-id.ts";
 import { checkDone, type SignalIo } from "../signals.ts";
 import { gitFacts } from "./lane-git.ts";
@@ -57,7 +57,7 @@ export const defaultSessionsDir = (): string => omoSessionsDir();
 
 type Body<T extends QueryType> = Omit<QueryBodies[T], "qid">;
 
-/** `q.panes`: herdr's pane list of this host. */
+/** `q.panes`: hc's pane list of this host. */
 export const queryPanes = async (deps: Pick<QueryDeps, "run">): Promise<QueryResults["q.panes"]> => ({ panes: await listPanes(deps.run) });
 
 /** `q.screen`: the visible screen, or the last `lines` (at most SCREEN_MAX_LINES) of scrollback and screen. */
@@ -68,7 +68,7 @@ export const queryScreen = async (deps: Pick<QueryDeps, "run">, body: Body<"q.sc
 
 /** The process-info of `pane` from the runtime holding it, or that runtime's error text. */
 export const queryProcess = (deps: Pick<QueryDeps, "run">, body: Body<"q.process">): Promise<QueryResults["q.process"]> =>
-  paneRuntime(deps.run, body.pane).processInfo(body.pane);
+  sessionRuntime(deps.run).processInfo(body.pane);
 
 /** `q.stat`: whether each path exists on this host. */
 export const queryStat = (deps: Pick<QueryDeps, "exists">, body: Body<"q.stat">): QueryResults["q.stat"] => {
@@ -77,7 +77,7 @@ export const queryStat = (deps: Pick<QueryDeps, "exists">, body: Body<"q.stat">)
 };
 
 /**
- * `q.lane.inspect`: lane `key`'s status from herdr's pane list (`laneStatus`), its pane row and process-info when
+ * `q.lane.inspect`: lane `key`'s status from hc's pane list (`laneStatus`), its pane row and process-info when
  * listed, its cwd (the query's `cwd`, else the record's) and whether it exists, and on request:
  * - `git`: toplevel/origin/branch of the cwd, the lane's worktrees in the cwd and `roots` with dirty/ahead, and the
  *   `branches` asked;

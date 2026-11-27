@@ -106,11 +106,11 @@ describe("laneOps: one runner call per method", () => {
     ["resume", (o) => o.resume(remote), { fn: "call", label: "box", type: "lane.resume", body: { key: "far" } }, { goal: "confirmed" }],
     ["start", (o) => o.start({
       key: "demo", machine: "box", briefText: "B", done: "merged a/b#1", thread: "t", cwd: "/srv/demo", sandbox: true, mode: "ulw", model: "m",
-      keywords: "ulw", session: "s1", target: { pane: "w9:p1" }, heavySlots: 2, heavyMaxLoad: 4, cmdId: "lane-start:demo:1",
+      keywords: "ulw", session: "s1", heavySlots: 2, heavyMaxLoad: 4, cmdId: "lane-start:demo:1",
     }), {
       fn: "call", label: "box", type: "lane.start", body: {
         key: "demo", briefText: "B", done: "merged a/b#1", thread: "t", cwd: "/srv/demo", agentProfile: "sandboxed", mode: "ulw", model: "m",
-        sandbox: true, expectedLaneGen: 0, keywords: "ulw", session: "s1", target: { pane: "w9:p1" }, heavySlots: 2, heavyMaxLoad: 4,
+        sandbox: true, expectedLaneGen: 0, keywords: "ulw", session: "s1", heavySlots: 2, heavyMaxLoad: 4,
       }, opts: { cmdId: "lane-start:demo:1" },
     }, { pane: "w1:p1", tab: "w1:t1", startup: { verdict: "ok", detail: "" } }],
     ["adopt", (o) => o.adopt({ key: "demo", pane: "w1:p1", cwd: "/repo/demo", mode: "ulw", model: "m" }),

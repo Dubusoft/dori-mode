@@ -20,7 +20,7 @@ export const decisionMain = async (rest: string[], { flow: deps, die, messengerT
   const { config } = deps;
   // `dori decision open|close|list`: owner decisions (owner-decisions.ts), lead-only.
   const { callerLane, laneDecisionRefusal } = await import("./lane-perms.ts");
-  const refusal = laneDecisionRefusal(await callerLane(deps));
+  const refusal = laneDecisionRefusal(callerLane());
   if (refusal) die(refusal);
   const od = await import("./owner-decisions.ts");
   const ds = await import("./decision-store.ts");

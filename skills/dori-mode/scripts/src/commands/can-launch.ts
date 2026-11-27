@@ -1,6 +1,5 @@
 import { listGuardMachines } from "../remote-guard.ts";
 import { placementReports } from "../launch-service.ts";
-import { run } from "../run.ts";
 import { recordLaunchVerdict } from "../routing.ts";
 import { checkMachine, LOCAL_MACHINE, planLaunch, resolvePlacement, verdictLine } from "../placement.ts";
 import { type CliCommand } from "./context.ts";
@@ -14,7 +13,7 @@ export const canLaunchCommand: CliCommand = {
     done: { type: "string" },
   },
   run: async ({ config, deps, flags, opt }) => {
-    const listed = flags.values.all ? await listGuardMachines(run, config.guardMachines, config.stateDir) : [];
+    const listed = flags.values.all ? listGuardMachines(config.guardMachines, config.stateDir) : [];
     const reports = flags.values.all ? [] : await placementReports(config.stateDir);
     const input = { machine: opt("machine"), cwd: opt("cwd"), done: opt("done") ?? "" };
     const p = flags.values.all ? undefined : resolvePlacement(input, config.placement, reports);

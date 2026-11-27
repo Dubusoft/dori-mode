@@ -5,14 +5,14 @@ import type { EventMeta } from "../supervise-journal.ts";
 import { decideHello, recordHello, resetGen, type StoredRunner } from "./fencing.ts";
 import {
   PROTO, checkProto, journalId, supervisorControl,
-  type AnyRunnerEvent, type HerdrHealth, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
+  type AnyRunnerEvent, type RunnerControl, type RunnerEventBodies, type RunnerFrame, type SupervisorControl, type SupervisorFrame,
   type WorkspaceEntry,
 } from "./protocol.ts";
 
 /**
  * The supervisor side of the runner protocol. Runner rows live in `<stateDir>/runners.sqlite` (0600, WAL), table
  * `runners {label, hostId, eventAck, cmdSeq, maxGen, proto, version, lastHelloAt, cmdAck}` plus the later columns
- * (LATER_COLUMNS, among them `herdr` and `herdrSince` from herdr-down.ts). An event is committed to
+ * (LATER_COLUMNS). An event is committed to
  * the journal through the injected `commit` (`Supervisor.enqueue` in production) under id `runner:<label>:<seq>`, and
  * only after that returns is `eventAck` advanced and persisted. Only the next expected seq (`eventAck + 1`) is
  * committed: a frame past a gap is not committed and leaves `eventAck` where it is, so the runner's replay after its
@@ -73,10 +73,6 @@ export type RunnerRow = {
   readonly outbox?: { readonly unacked: number; readonly oldestAgeMs: number };
   /** How many lanes the last hello's inventory listed. */
   readonly lanes?: number;
-  /** The runner's machine's herdr as its guard samples showed it (herdr-down.ts); absent until a sample carried a pane count. */
-  readonly herdr?: HerdrHealth["state"];
-  /** Supervisor wall time `herdr` was entered. */
-  readonly herdrSince?: number;
   /** The machine readings of the runner's last `guard.sample` (absent until one arrived). */
   readonly machine?: RunnerMachine;
   /** The repos the last hello that reported any declared and detected (kept while the runner is away); absent: never reported. */
@@ -166,14 +162,14 @@ type DbRow = {
   label: string; hostId: string | null; eventAck: number; cmdSeq: number; maxGen: number; cmdAck: number;
   proto: number | null; version: string | null; lastHelloAt: number | null;
   lastHeartbeatAt: number | null; disconnectedAt: number | null; outboxUnacked: number | null; outboxOldestAgeMs: number | null;
-  lanes: number | null; herdr: string | null; herdrSince: number | null; machine: string | null; workspaces: string | null;
+  lanes: number | null; machine: string | null; workspaces: string | null;
 };
 
-const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, herdr, herdrSince, machine, workspaces";
+const COLUMNS = "label, hostId, eventAck, cmdSeq, maxGen, cmdAck, proto, version, lastHelloAt, lastHeartbeatAt, disconnectedAt, outboxUnacked, outboxOldestAgeMs, lanes, machine, workspaces";
 /** Columns added after the first table layout, with their types; an older table gets them on open. */
 const LATER_COLUMNS = {
   lastHeartbeatAt: "INTEGER", disconnectedAt: "INTEGER", outboxUnacked: "INTEGER", outboxOldestAgeMs: "INTEGER", lanes: "INTEGER",
-  herdr: "TEXT", herdrSince: "INTEGER", machine: "TEXT", workspaces: "TEXT",
+  machine: "TEXT", workspaces: "TEXT",
 } as const;
 
 const toRow = (r: DbRow): RunnerRow => ({
@@ -190,8 +186,6 @@ const toRow = (r: DbRow): RunnerRow => ({
   ...(r.disconnectedAt !== null ? { disconnectedAt: r.disconnectedAt } : {}),
   ...(r.outboxUnacked !== null && r.outboxOldestAgeMs !== null ? { outbox: { unacked: r.outboxUnacked, oldestAgeMs: r.outboxOldestAgeMs } } : {}),
   ...(r.lanes !== null ? { lanes: r.lanes } : {}),
-  ...(r.herdr === "up" || r.herdr === "down" || r.herdr === "hung" || r.herdr === "elevated" ? { herdr: r.herdr } : {}),
-  ...(r.herdrSince !== null ? { herdrSince: r.herdrSince } : {}),
   ...(() => { const machine = parseMachine(r.machine); return machine ? { machine } : {}; })(),
   ...(() => { const workspaces = parseWorkspaces(r.workspaces); return workspaces ? { workspaces } : {}; })(),
 });
@@ -374,11 +368,6 @@ export class RunnerHub {
     if (frame.type === "hello") return this.hello(frame as RunnerControl<"hello">).reply;
     if (frame.type === "heartbeat") this.heartbeat(frame as RunnerControl<"heartbeat">);
     return undefined;
-  }
-
-  /** Saves the runner's machine's herdr state (herdr-down.ts) and when it was entered. */
-  setHerdr(label: string, state: HerdrHealth["state"], since: number): void {
-    this.db.query("UPDATE runners SET herdr = ?, herdrSince = ? WHERE label = ?").run(state, since, label);
   }
 
   /** Saves the readings of a runner's `guard.sample`, stamped with the supervisor's wall clock, for `dori status`. */

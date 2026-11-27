@@ -29,6 +29,11 @@ const omo = (input: string, footer = "(\u{1F63A} OmO Native by Q Kim)"): string 
   `\u2500\u2500 \u2022 Working (1s \u2022 esc to interrupt) ${"\u2500".repeat(40)}\n\u276f ${input}\n${"\u2500".repeat(80)}\n/repo \u2022 0/1M (0.0%) (auto)\n${footer}`;
 const EMPTY = omo("");
 
+/** A launch line typed into an hc terminal (`hc send <addr> -- cd <dir> && omo ...`). */
+const isLaunch = (call: readonly string[]): boolean => call[0] === "hc" && call[2] === "send" && (call[5] ?? "").startsWith("cd ");
+/** Text typed into an hc terminal other than a launch line. */
+const isTyped = (call: readonly string[]): boolean => call[0] === "hc" && call[2] === "send" && !(call[5] ?? "").startsWith("cd ");
+
 const fixture = (extra: Record<string, unknown> = {}) => {
   const state = withState();
   cleanups.push(state.done);
@@ -42,7 +47,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);
   writeFileSync(file, "{}\n");
   utimesSync(file, clock.now() / 1000, clock.now() / 1000);
-  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle" };
+  const pane = { pane_id: "hc:t1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle" };
   world.panes.push(pane);
   let active = session;
   let pid = 101;
@@ -55,16 +60,28 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     const ok = (out = "") => ({ code: 0, out, err: "" });
     if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${active}` : "");
     if (argv[0] === "ps" && argv[1] === "eww") return ok("PI_SESSION_ID=other");
-    if (argv[0] === "herdr" && argv[2] === "list") return ok(JSON.stringify({ result: { panes: world.panes } }));
-    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", active] }] : [] } } }));
     if (argv[0] === "kill") {
       if (argv[2] === String(pid)) { pid = 0; pane.agent = ""; pane.agent_status = ""; }
       return ok();
     }
-    if (argv[0] === "herdr" && argv[2] === "run") {
-      const path = /@([^'\s]+)/.exec(argv[4] ?? "")?.[1];
+    if (argv[0] === "hc" && argv[1] === "--version") return ok("hc 0.1.22\n");
+    const [verb, addr = ""] = argv[0] === "hc" ? argv.slice(2) : [];
+    const at = world.panes.find((p) => p.pane_id === `hc:${addr}`);
+    if (verb === "ls") return ok(JSON.stringify({ terminals: world.panes.filter((p) => p.pane_id.startsWith("hc:")).map((p) => ({ address: p.pane_id.slice(3), state: "live" })) }));
+    if (verb === "get") {
+      if (!at) return { code: 1, out: "", err: `no terminal ${addr}` };
+      return ok(JSON.stringify({
+        address: addr, state: "live", cwd: at.cwd, created_ms: 1, pid: 10,
+        status: at.agent ? { app: at.agent, state: at.agent_status } : null,
+        foreground: at === pane && pid ? { pid, argv: ["omo", "--session-id", active] } : null,
+      }));
+    }
+    if (verb === "read") return ok(JSON.stringify({ text: world.screens?.length ? (world.screens.shift() ?? world.screen) : world.screen }));
+    const text = verb === "send" ? argv[5] ?? "" : undefined;
+    if (text?.startsWith("cd ")) {
+      const path = /@([^'\s]+)/.exec(text)?.[1];
       prompt = path ? readFileSync(path, "utf8") : undefined;
-      active = /--session-id ([\w-]+)/.exec(argv[4] ?? "")?.[1] ?? "";
+      active = /--session-id ([\w-]+)/.exec(text)?.[1] ?? "";
       pid = 201;
       mkdirSync(join(dir, "session-holders", active), { recursive: true });
       writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
@@ -72,10 +89,9 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       pane.agent_status = "idle";
       return ok();
     }
-    if (argv[0] === "herdr" && argv[2] === "wait") return ok();
-    if (argv[0] === "herdr" && argv[2] === "read") return ok(world.screens?.length ? (world.screens.shift() ?? world.screen) : world.screen);
-    if (argv[0] === "herdr" && argv[2] === "send-text") { onSend?.(); return ok(); }
-    if (argv[0] === "herdr" && argv[2] === "send-keys") {
+    // hc pastes the text and presses Enter in one `send`; `keys` presses Enter again.
+    if (verb === "send" || verb === "keys") {
+      if (verb === "send") onSend?.();
       if (onEnter) pane.agent_status = onEnter;
       return ok();
     }
@@ -84,9 +100,10 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const deps = { ...depsFor(world, clock, state.dir, config), run };
   return {
     state, deps, pane, clock, calls, world, file,
-    texts: () => calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? ""),
-    enters: () => calls.filter((call) => call[0] === "herdr" && call[2] === "send-keys").length,
-    launches: () => calls.filter((call) => call[0] === "herdr" && call[2] === "run"),
+    texts: () => calls.filter(isTyped).map((call) => call[5] ?? ""),
+    /** Enters pressed: each typed text is submitted with one, and `hc keys` presses one more. */
+    enters: () => calls.filter((call) => isTyped(call) || (call[0] === "hc" && call[2] === "keys")).length,
+    launches: () => calls.filter(isLaunch),
     prompt: () => prompt,
     onEnter: (status: string | undefined) => { onEnter = status; },
     onSend: (hook: () => void) => { onSend = hook; },
@@ -317,8 +334,8 @@ test("a new lead is not escalated before escalateMin after its start, and gets a
   }
   expect(f.launches()).toHaveLength(1);
   // The new lead did not take: the pass that started it already gave it a pointer, and no second restart follows for escalateMin.
-  const launched = f.calls.findIndex((call) => call[2] === "run");
-  expect(f.calls.findLastIndex((call) => call[2] === "send-text")).toBeGreaterThan(launched);
+  const launched = f.calls.findIndex(isLaunch);
+  expect(f.calls.findLastIndex(isTyped)).toBeGreaterThan(launched);
   for (let i = 0; i < 4; i++) {
     f.clock.at += 60_000;
     await flush(supervisor);
@@ -705,7 +722,7 @@ test("push mode enqueues no ACK_MISSING but the owner still gets the ack notice"
   expect(readJournal(f.state.dir).events.some((event: { line: string }) => event.line.startsWith("ACK_MISSING"))).toBe(false);
 });
 
-test("nothing untaken and due makes no herdr call at all", async () => {
+test("nothing untaken and due makes no terminal call at all", async () => {
   const f = fixture({ delivery: delivery() });
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");

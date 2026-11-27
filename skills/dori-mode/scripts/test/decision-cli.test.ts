@@ -130,9 +130,8 @@ test("decision close refuses with DECISION_STALE and the unread lines (exit 3) w
   expect((await cli(["decision", "close", "d1", "--text", "x", "--tasks", "0"])).code).toBe(2);
 });
 
-test("a pane registered to a lane is refused decision with LANE_PERMISSION_DENIED (exit 1)", async () => {
-  await new Registry(dir).write({ key: "ap-7-1", title: "t", brief: "b", done: "d", thread: "discord:1/2", pane: "w:p9", status: "working" } as never);
-  const r = await cli(["decision", "list"], { HERDR_PANE_ID: "w:p9" });
-  expect(r.code).toBe(1);
-  expect(r.err).toStartWith("LANE_PERMISSION_DENIED lane ap-7-1 may not run decision; it is lead-only.");
+test("a lane (DORI_LANE_KEY) is refused decision with DORI_CLI_LANE_ONLY (exit 2)", async () => {
+  const r = await cli(["decision", "list"], { DORI_LANE_KEY: "ap-7-1" });
+  expect(r.code).toBe(2);
+  expect(r.err).toStartWith("DORI_CLI_LANE_ONLY decision:");
 });

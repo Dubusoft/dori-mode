@@ -13,7 +13,6 @@ const home = (): string => { const dir = mkdtempSync(join(tmpdir(), "dori-secret
 const dori = async (h: string, args: readonly string[], stdin = ""): Promise<{ code: number; out: string; err: string }> => {
   const env: Record<string, string> = { ...(process.env as Record<string, string>), HOME: h };
   delete env.DORI_LANE_KEY;
-  delete env.HERDR_PANE_ID;
   const p = Bun.spawn([process.execPath, CLI, "secret", ...args], { env, stdin: new Blob([stdin]), stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
   return { code, out, err };

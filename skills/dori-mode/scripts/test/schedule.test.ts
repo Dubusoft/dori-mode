@@ -282,7 +282,7 @@ test("the real supervisor runs a due job through the registry", async () => {
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => new Response(JSON.stringify({ id: "33" }), { status: 200 }), { preconnect: fetch.preconnect }));
   const clock = fakeClock(nineKst(23) + 10_000);
   const w = newWorld();
-  w.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  w.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(w, clock, state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: "123456789012345" }, discordChannels: ["11"], defaultModel: "test/model",
   });

@@ -7,7 +7,7 @@ import { closedWorktreeSweep } from "../src/closed-cleanup.ts";
 import { freshnessTick } from "../src/freshness.ts";
 import { githubTargets } from "../src/github-events.ts";
 import { type LaneOps, LaneOpsError, machineRunner, runnerOf } from "../src/lane-ops.ts";
-import { adoptLane, launchLane, paneShell } from "../src/launch.ts";
+import { adoptLane, launchLane } from "../src/launch.ts";
 import { footer } from "../src/launch-footer.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { type Lane, statusOf } from "../src/registry.ts";
@@ -72,36 +72,24 @@ const expectRemote = () => {
   for (const label of routed) expect(label).toBe(MACHINE);
 };
 
-test("remote --pane launch checks the pane and starts the lane through the machine's runner and persists machine", async () => {
+test("a remote launch starts the lane through the machine's runner and persists machine", async () => {
   const d = deps();
   shellPane();
   const input = lane();
   await Bun.write(input.brief, "execute the requested work\n");
   // An identical local pane ID must not make the remote pane owned.
   await d.registry.write(lane({ key: "local-owner", machine: undefined }));
-  const result = await launchLane(d, { ...input, pane: "w:p3" });
+  const result = await launchLane(d, input);
   expectRemote();
   expect(result.startup).toStartWith("STARTUP_OK remote-lane w:p3");
   expect(await d.registry.read(input.key)).toMatchObject({ machine: MACHINE, runner: MACHINE, pane: "w:p3", tab: "w:t3", remoteCwd: "/remote-only/repo" });
-  expect(startInput()).toMatchObject({ machine: MACHINE, cwd: "/remote-only/repo", target: { pane: "w:p3" } });
+  expect(startInput()).toMatchObject({ machine: MACHINE, cwd: "/remote-only/repo" });
   // Heavy slots are the lead host's; a remote lane's runner keeps its own.
   expect(startInput()).not.toHaveProperty("heavySlots");
-  expect(opsOf("processInfo").map((e) => e.args)).toEqual([{ machine: MACHINE, pane: "w:p3" }]);
+  expect(opsOf("processInfo")).toEqual([]);
   // A remote directory is never checked as a local checkout.
   expect(opsOf("inspect")).toEqual([]);
   expect(world.calls).toEqual([]);
-});
-
-test("remote --workspace launch resolves the shell pane from that machine's inventory", async () => {
-  const d = deps();
-  shellPane();
-  const input = lane({ pane: undefined });
-  await Bun.write(input.brief, "work\n");
-  const result = await launchLane(d, { ...input, workspace: "w" });
-  expect(result.lane.pane).toBe("w:p3");
-  expectRemote();
-  expect(opsOf("panes").map((e) => e.args)).toContainEqual({ machine: MACHINE });
-  expect(startInput()).toMatchObject({ target: { pane: "w:p3" } });
 });
 
 test("a plain remote launch without --cwd names no directory (the runner's defaultCwd), never the lead's leadCwd", async () => {
@@ -115,16 +103,16 @@ test("a plain remote launch without --cwd names no directory (the runner's defau
   expect(bare.lane.remoteCwd).toBeUndefined();
 });
 
-test("plain remote launch never sends the lead's workspace or leadCwd", async () => {
+test("plain remote launch never sends the lead's leadCwd", async () => {
   const d = deps();
-  const config = { ...d.config, laneWorkspace: "local-only-workspace" };
+  const config = { ...d.config, leadCwd: "/lead-only-dir" };
   await Bun.write(lane().brief, "work\n");
   world.startResult = { pane: "w:p8", tab: "w:t8", startup: { verdict: "ok", detail: "" } };
   expect((await launchLane({ ...d, config }, lane({ pane: undefined }))).lane.tab).toBe("w:t8");
   expectRemote();
   expect(startInput()).toMatchObject({ machine: MACHINE, cwd: "/remote-only/repo" });
   expect(startInput()).not.toHaveProperty("target");
-  expect(JSON.stringify(startInput())).not.toContain("local-only-workspace");
+  expect(JSON.stringify(startInput())).not.toContain("/lead-only-dir");
   expect(await d.registry.read("remote-lane")).toMatchObject({ remoteCwd: "/remote-only/repo" });
   expect((await d.registry.read("remote-lane"))?.cwd).toBeUndefined();
 });
@@ -142,33 +130,12 @@ test("a remote launch hands the complete brief text to the machine's runner, nev
   expect(JSON.stringify(start)).not.toContain(state.dir);
 });
 
-test("a cmd.exe pane is refused before anything runs or registers", async () => {
-  const d = deps();
-  world.panes = [{ pane_id: "w:p3", workspace_id: "w", cwd: "D:\\dev\\worktrees\\app" }];
-  world.inspection = { process: { shell_pid: 4100, foreground_processes: [{ pid: 4100, name: "cmd.exe", argv: ["C:\\Windows\\System32\\cmd.exe"] }] } as never };
-  const input = lane();
-  await Bun.write(input.brief, "work\n");
-  await expect(launchLane(d, { ...input, pane: "w:p3" })).rejects.toThrow("runs cmd.exe");
-  expect(opsOf("start")).toEqual([]);
-  expect(await d.registry.read(input.key)).toBeNull();
-});
-
-test("pane shell detection reads the shell process, then a Windows drive cwd", () => {
-  const info = (name: string) => ({ shell_pid: 1, foreground_processes: [{ pid: 1, name }] });
-  expect(paneShell(info("powershell.exe"))).toBe("powershell");
-  expect(paneShell(info("pwsh"))).toBe("pwsh");
-  expect(paneShell(info("CMD.EXE"))).toBe("cmd");
-  expect(paneShell(info("-zsh"))).toBe("posix");
-  expect(paneShell(undefined, "D:\\dev")).toBe("powershell");
-  expect(paneShell(undefined, "/home/u")).toBe("posix");
-});
-
 test("remote footer reports through the runner's lane CLI; local footer through dori report; neither types into a pane", () => {
   const remote = footer(lane());
   expect(remote).toContain('~/.dori/runner/bin/dori report remote-lane done --text "<one line>"');
   expect(remote).not.toContain("dori claim-done remote-lane");
   expect(remote).not.toContain("[REPORT]");
-  expect(remote).not.toContain("lead:p1");
+  expect(remote).not.toContain("hc:t1");
   const local = footer(lane({ machine: undefined }));
   expect(local).toContain('When done: dori report remote-lane done --text "<one line>" --evidence "<PR link and head SHA, closed issue, version>"');
   expect(local).not.toContain("~/.dori/runner/bin/dori");
@@ -214,16 +181,6 @@ test("adopt without --machine refuses a pane id the local runner does not list; 
   expect((await adoptLane(d, { ...lane(), pane: "w:p3" })).machine).toBe(MACHINE);
 });
 
-test("launch --pane without --machine refuses a pane id only the machine lists; nothing starts or registers", async () => {
-  const d = deps();
-  shellPane();
-  const input = lane({ machine: undefined, cwd: undefined });
-  await Bun.write(input.brief, "work\n");
-  await expect(launchLane(d, { ...input, pane: "w:p3" })).rejects.toThrow("pane w:p3 does not exist on this host; a pane on another machine needs --machine LABEL");
-  expect(opsOf("start")).toEqual([]);
-  expect(await d.registry.read(input.key)).toBeNull();
-});
-
 test("a remote start the runner refuses is not registered as a launched lane", async () => {
   const d = deps(true, { start: async () => { throw new LaneOpsError("LANE_OP_FAILED", MACHINE, "RUNNER_LANE_START_FAILED machine disconnected"); } });
   const input = lane({ pane: undefined });
@@ -265,14 +222,6 @@ test("local entries stay local without machine: every call goes to the local run
   expect(routed.length).toBeGreaterThan(0);
   // sync lists every machine a lane is on; with no remote lane that is only this host.
   expect(routed.every((label) => label === "local")).toBe(true);
-});
-
-test("byPane distinguishes a local pane from the same ID on a saved machine", async () => {
-  const d = deps();
-  await d.registry.write(lane());
-  await d.registry.write(lane({ key: "local-lane", machine: undefined }));
-  expect((await d.registry.byPane("w:p3"))?.key).toBe("local-lane");
-  expect((await d.registry.byPane("w:p3", MACHINE))?.key).toBe("remote-lane");
 });
 
 test("remote pause pauses the goal and interrupts only the remote turn, through the machine's runner", async () => {
@@ -336,11 +285,11 @@ test("dead-panes scopes remote reads and state independently from local IDs", as
   expect(reads.some((r) => r.pane === "w:p9")).toBe(false);
 });
 
-test("dead-panes reads a remote lane pane in any workspace, whatever the local lanes workspace is", async () => {
+test("dead-panes reads a remote lane pane in any workspace", async () => {
   const d = deps();
   world.panes = [{ pane_id: "w:p3", workspace_id: "w" }];
   world.screen = "agent has stopped";
-  const config = { ...d.config, laneWorkspace: "local-only-workspace" };
+  const config = d.config;
   const seen = new Set<string>();
   const memory = newDeadPaneState();
   expect(await deadPaneTick(d.ops, config, seen, "hour", memory, [lane()])).toEqual([]);
@@ -349,7 +298,7 @@ test("dead-panes reads a remote lane pane in any workspace, whatever the local l
 
 test("dead-panes never alerts on a remote host's own panes over several sweeps", async () => {
   const d = deps();
-  // The machine's herdr lists the lane's working pane plus panes no lane owns: a plain shell and another workspace's pane.
+  // The machine's runner lists the lane's working pane plus panes no lane owns: a plain shell and another workspace's pane.
   world.panes = [
     { pane_id: "w:p3", workspace_id: "w", agent: "pi", agent_status: "working" },
     { pane_id: "w:p9", workspace_id: "w" },
@@ -451,13 +400,13 @@ test("remote session lookup cannot mistake a local matching PID for its session"
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
     calls.push([...argv]);
-    return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 100 } } }) };
+    return { code: 0, err: "", out: JSON.stringify({ address: "t3", state: "live", pid: 100 }) };
   };
-  const result = await resolveSession("w:p3", "/repo", [{ pid: 200, ppid: 100, cmd: "omo --session-id wrong-local" }], {
+  const result = await resolveSession("hc:t3", "/repo", [{ pid: 200, ppid: 100, cmd: "omo --session-id wrong-local" }], {
     run, sessionsDir: "/local/sessions", listDir: () => { throw new Error("must not read local sessions"); },
   }, { machine: MACHINE });
   expect(result).toEqual({ id: "", via: "none" });
-  expect(calls).toEqual([["herdr", "pane", "process-info", "--pane", "w:p3"]]);
+  expect(calls).toEqual([["hc", "--json", "get", "t3"]]);
 });
 
 test("GitHub supervision keeps remote signal targets without asking any runner for remote paths", async () => {

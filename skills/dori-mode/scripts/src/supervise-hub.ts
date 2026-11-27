@@ -10,7 +10,6 @@ import {
 } from "./runner/lanes-hub.ts";
 import { COMMAND_RETENTION_MS } from "./runner/durability.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
-import { HerdrDownInference } from "./runner/herdr-down.ts";
 import { realTimers, RunnerCalls, RunnerUnavailable, type Timers } from "./runner/call.ts";
 import type { InventoryLane, SupervisorCommandBodies } from "./runner/protocol.ts";
 import {
@@ -96,8 +95,6 @@ export type RunnerHubOptions = Pick<HubHooks, "onHeartbeat" | "onHello" | "onEve
   readonly hostId?: string;
   /** The call/query timeout and link silence timers (default real timers). */
   readonly timers?: Timers;
-  /** A runner machine's herdr went down or came back (`HERDR_DOWN` / `HERDR_UP`), already saved on its hub row. */
-  readonly onHerdr?: (id: string, line: string) => void;
 };
 
 /**
@@ -146,13 +143,6 @@ export const openRunnerHub = (
   } catch (e) { auth?.close(); hub.close(); journal.close(); throw e; }
   const network = dialWs({ endpoints: () => readRunnerEndpoints(stateDir), log, ...options.network });
   const guard = new RunnerGuardBoard(monotonic);
-  const herdr = new HerdrDownInference({
-    read: (label) => {
-      const row = hub.runner(label);
-      return row?.herdr ? { state: row.herdr, since: row.herdrSince ?? 0 } : undefined;
-    },
-    save: (label, record) => { hub.setHerdr(label, record.state, record.since); },
-  }, now);
   // The proto each label said hello with on its current connection: RunnerCalls refuses newer types to a proto-2 runner.
   const protos = new Map<string, number>();
   let calls: RunnerCalls | undefined;
@@ -164,8 +154,6 @@ export const openRunnerHub = (
     onEvent: (label, frame) => {
       guard.event(label, frame);
       if (frame.type === "guard.sample") hub.setMachine(label, frame.body);
-      const changed = herdr.event(label, frame);
-      if (changed) { log(changed.line); options.onHerdr?.(changed.id, changed.line); }
       calls?.onEvent(label, frame);
       options.onEvent?.(label, frame);
     },

@@ -8,6 +8,7 @@ import { RunnerLanes } from "../src/runner/lanes.ts";
 import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
 import { checkCommand, POLICY_FILE } from "../src/runner/policy.ts";
 import { workspaceReport } from "../src/runner/workspaces.ts";
+import { hcAnswer, launchLines, newHcWorld } from "./runner-hc-world.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
@@ -66,19 +67,18 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const runnerDir = join(home, ".dori", "runner");
   mkdirSync(runnerDir, { recursive: true, mode: 0o700 });
   const calls: string[][] = [];
+  const world = newHcWorld();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     run: async (argv) => {
       calls.push([...argv]);
       if (argv[0] === "lane-sandbox" && argv.includes("--check")) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
-      return { code: 0, out: "", err: "" } as Ran;
+      return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
     },
   });
   const started = await lanes.start(start);
-  expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" }, cwd: start.cwd, model: start.model });
-  const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
+  expect(started.result).toEqual({ pane: "hc:t1", tab: "", startup: { verdict: "ok", detail: "ready" }, cwd: start.cwd, model: start.model });
+  const command = launchLines(calls)[0] ?? "";
   expect(command).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; lane-sandbox omo --model m1 --thinking medium --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");
   // The wrapper's check ran before anything else of the launch.
@@ -94,14 +94,13 @@ test("a sandboxed lane.start whose sandboxCheck fails is refused sandbox-unavail
   const policy = localPolicy({ ...defaultConfig(home), leadCwd: repo, worktreeRoot: "" }, { home, tmp: home });
   const calls: string[][] = [];
   const published: string[] = [];
+  const world = newHcWorld();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: (type) => { published.push(type); }, startup: async () => ({ verdict: "ok", detail: "ready" }),
     run: async (argv) => {
       calls.push([...argv]);
       if (argv[0] === "lane-sandbox") return { code: 3, out: "", err: "lane-sandbox: bwrap not found on PATH\n" } as Ran;
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
-      return { code: 0, out: "", err: "" } as Ran;
+      return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
     },
   });
   const start = {

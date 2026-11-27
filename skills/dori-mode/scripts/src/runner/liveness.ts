@@ -36,7 +36,7 @@ import { remoteRunnerCli, remoteRunnerService } from "./service.ts";
  *   `HOST_GUARD ONLINE`. A supervisor started during that outage carries it over: no new `HOST_GUARD OFFLINE` or
  *   `RUNNER_OFFLINE` for it, and its reconnect says `HOST_GUARD ONLINE`.
  *
- * A restart never touches herdr or a lane pane: the runner's unit is its own, so the lanes keep running through it.
+ * A restart never touches hc or a lane pane: the runner's unit is its own, so the lanes keep running through it.
  */
 
 export const RESTART_CONFIRM_MS = 2 * 60_000;

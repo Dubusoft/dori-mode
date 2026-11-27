@@ -30,7 +30,7 @@ const greenView = (patch: Record<string, unknown> = {}) => ({
   statusCheckRollup: [{ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }], mergeCommit: null, ...patch,
 });
 
-/** herdr and git from fakes.ts; `gh pr view` / `gh pr merge` from a PR whose merge flips it to MERGED. */
+/** hc and git from fakes.ts; `gh pr view` / `gh pr merge` from a PR whose merge flips it to MERGED. */
 const runner = (w: World, gh: Gh): Runner => {
   const base = fakeRunner(w);
   return async (argv, opts): Promise<Ran> => {
@@ -504,7 +504,7 @@ for (const [name, setup, reason] of [
 test("laneDown: a closed lane is down; an unreadable pane list counts as live", () => {
   expect(laneDown({ ...lane, closedAt: new Date(T0).toISOString() }, [idle])).toBe("lane closed");
   expect(laneDown(lane, [idle])).toBeUndefined();
-  expect(laneDown(lane, new Error("herdr down"))).toBeUndefined();
+  expect(laneDown(lane, new Error("hc unreachable"))).toBeUndefined();
 });
 
 test("a conflicting lane PR gets one merge lane through an operation; when none can start the lead hears CI_CONFLICT and nothing is retried", async () => {

@@ -12,7 +12,6 @@ import { type Lane, Registry } from "../src/registry.ts";
 import { type LaneOps, LaneOpsError } from "../src/lane-ops.ts";
 import type { StartupVerdict, TurnEvidence } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, sent, withState, withSqliteStore, type World } from "./fakes.ts";
-import { markHerdr } from "./herdr-world.ts";
 import { tryStateLock } from "../src/state-lock.ts";
 import { openOperations, plan, settleOperation } from "../src/operations.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -43,7 +42,7 @@ const fixture = async () => {
     control.attempted = (await d.registry.read(lane.key))?.recoveryAttempts ?? 0;
     await control.duringCreate?.();
     control.next++;
-    if (control.fail) throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover herdr tab create failed");
+    if (control.fail) throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.recover hc run failed");
     const pane = `new:p${control.next}`;
     world.panes.push({ pane_id: pane, tab_id: `new:t${control.next}`, workspace_id: "w", agent: "omo", agent_status: "working" });
     return { pane, tab: `new:t${control.next}` };
@@ -51,7 +50,7 @@ const fixture = async () => {
   const ops: LaneOps = {
     ...d.ops,
     panes: async (machine) => {
-      if (control.listFails) { world.ops.push({ op: "panes", args: { machine } }); throw new LaneOpsError("LANE_OP_FAILED", "local", "herdr pane list failed"); }
+      if (control.listFails) { world.ops.push({ op: "panes", args: { machine } }); throw new LaneOpsError("LANE_OP_FAILED", "local", "hc ls failed"); }
       return d.ops.panes(machine);
     },
     processInfo: async (ref) => {
@@ -243,7 +242,7 @@ test.each([
   expect(world.calls.filter((call) => call[0] === "notify").map((call) => call[2])).toEqual([`[sandbox] ${SKIP}`, "LANE_RECOVERED recover-lane new:p1 " + reason]);
 });
 
-/** The lane's pane with only its shell left: herdr names no agent, process-info shows no omo. */
+/** The lane's pane with only its shell left: hc names no agent, process-info shows no omo. */
 const shellOnly = (world: World, control: { argv: string[] }): void => {
   world.panes = [{ pane_id: "old:p1", tab_id: "old:t1", workspace_id: "w" }];
   control.argv = ["bash"];
@@ -295,26 +294,6 @@ test("a remote lane whose pane is unknown is recovered by its own runner, never 
   expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
 });
 
-test.each(["down", "hung"] as const)("while a machine's herdr is %s its lanes are held without spending attempts, and recovered once herdr is back", async (state) => {
-  const { deps, world, lane } = await fixture();
-  await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app" });
-  // A local lane (no machine, the local runner) on a host whose herdr is fine is recovered as usual meanwhile.
-  await deps.registry.write({ ...lane, key: "local-lane" });
-  markHerdr(deps.config.stateDir, "worker-a", state, 0);
-  for (let round = 0; round < RECOVERY_LIMIT + 1; round++) {
-    expect((await recoverLanes(deps)).filter((l) => l.includes(lane.key))).toEqual([]);
-  }
-  expect(opsOf(world, "recover", "start").map((e) => e.key)).toEqual(["local-lane"]);
-  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBeUndefined();
-  expect((await deps.registry.read(lane.key))?.recoveryPending).toBeUndefined();
-  // Asked for by key, the hold says so.
-  expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERY_HELD recover-lane herdr is down on machine=worker-a; recovery resumes once it reads again"]);
-
-  markHerdr(deps.config.stateDir, "worker-a", "up", 1);
-  expect(await recoverLanes(deps, lane.key)).toEqual(["LANE_RECOVERED recover-lane new:p2 missing-pane", "STARTUP_OK recover-lane new:p2"]);
-  expect((await deps.registry.read(lane.key))?.recoveryAttempts).toBe(1);
-});
-
 test("before its runner's hello a lane is held without an error or a spent attempt, and recovered after it", async () => {
   const { deps, world, lane } = await fixture();
   // Right after a supervisor restart: the local runner has not said hello yet (the sweep's pane view may still answer).
@@ -334,17 +313,18 @@ test("a runner that drops in the middle of a recovery holds the lane instead of 
   expect(await recoverLanes(dropping)).toEqual([]);
   expect(await recoverLanes(dropping, lane.key)).toEqual(["LANE_RECOVERY_HELD recover-lane runner=local is not connected; recovery resumes once it says hello"]);
   // Any other failure is still reported.
-  const failing = { ...deps, ops: { ...deps.ops, recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "herdr tab create failed"); } } };
+  const failing = { ...deps, ops: { ...deps.ops, recover: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "hc run failed"); } } };
   expect((await recoverLanes(failing))[0]).toStartWith("LANE_RECOVERY_ERROR recover-lane ");
 });
 
-test("a held lane resumes its own session when herdr is back", async () => {
+test("a held lane resumes its own session once its runner says hello", async () => {
   const { deps, world, lane } = await fixture();
   await deps.registry.write({ ...lane, pane: undefined, tab: undefined, machine: "worker-a", runner: "worker-a", cwd: undefined, remoteCwd: "/w/app", session: "ses_1" });
-  markHerdr(deps.config.stateDir, "worker-a", "down", 0);
-  expect(await recoverLanes(deps)).toEqual([]);
-  markHerdr(deps.config.stateDir, "worker-a", "up", 1);
-  expect(await recoverLanes(deps)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
+  let hello = false;
+  const restarted = { ...deps, ops: { ...deps.ops, connected: () => hello } };
+  expect(await recoverLanes(restarted)).toEqual([]);
+  hello = true;
+  expect(await recoverLanes(restarted)).toEqual(["LANE_RECOVERED recover-lane new:p1 missing-pane session-resumed", "STARTUP_OK recover-lane new:p1"]);
   expect(opsOf(world, "recover").map((e) => (e.args as { opts?: { session?: string } }).opts?.session)).toEqual(["ses_1"]);
 });
 
@@ -625,7 +605,7 @@ test("the supervisor journals a skipped recovery under one id per lane, generati
   expect(new Set(enqueued.map(([id]) => id)).size).toBe(2);
 });
 
-// Captured 10-23 from live omo 5.1.44 panes (herdr process-info argv and the status bar's last lines).
+// Captured 10-23 from live omo 5.1.44 panes (process-info argv and the status bar's last lines).
 const SONNET = "anthropic-subscription/claude-sonnet-5-5";
 const OMO = "/home/dev/.omo/binary-runtime/5.1.44/omo";
 const MCP_CHILD = [OMO, "/home/dev/.omo/binary-runtime/5.1.44/plugin/runtime/ast-grep-mcp/cli.js", "mcp"];

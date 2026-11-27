@@ -4,19 +4,19 @@ import { join } from "node:path";
 
 /**
  * The lane boundary (design 3.3): supervisor modules reach lanes only through `lane-ops.ts`. A top-level `src/*.ts`
- * module outside the runner, the herdr primitives and the lead modules must not import a value from `./panes.ts` nor
- * carry the argv literal "herdr".
+ * module outside the runner, the pane primitives and the lead modules must not import a value from `./panes.ts` nor
+ * carry the argv literal "hc" (the terminal runtime's binary).
  */
 
 const SRC = join(import.meta.dir, "..", "src");
 
-/** Runner-side primitives and lead modules: herdr access there is not lane access through the supervisor. */
+/** Pane primitives and lead modules: terminal access there is not lane access through the supervisor. */
 const EXEMPT: ReadonlySet<string> = new Set([
-  "panes.ts", "session-id.ts", "herdr-machines.ts",
+  "panes.ts", "session-id.ts",
   "supervise-lead-lifecycle.ts", "lead-process.ts", "lead-soft-restart.ts", "supervise-push.ts", "supervise-delivery.ts", "status.ts", "doctor.ts", "setup.ts", "lane-reports.ts", "managed-panes.ts",
 ]);
 
-type Offence = "herdr" | "panes";
+type Offence = "hc" | "panes";
 
 const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 
@@ -38,7 +38,7 @@ const importsPanesValue = (code: string): boolean => {
 const offences = (source: string): Offence[] => {
   const code = stripComments(source);
   return [
-    ...(/\[\s*["']herdr["']/.test(code) ? ["herdr" as const] : []),
+    ...(/\[\s*["']hc["']/.test(code) ? ["hc" as const] : []),
     ...(importsPanesValue(code) ? ["panes" as const] : []),
   ];
 };
@@ -50,7 +50,7 @@ const scan = (): Record<string, Offence[]> => Object.fromEntries(
 );
 
 describe("lane-ops boundary", () => {
-  test("no supervisor module reaches herdr or the pane primitives", () => {
+  test("no supervisor module reaches the terminal runtime or the pane primitives", () => {
     expect(scan()).toEqual({});
   });
 
@@ -64,8 +64,8 @@ describe("lane-ops boundary", () => {
     expect(offences(`import { type Pane,\n  type Delivery } from "./panes.ts";`)).toEqual([]);
     expect(offences(`export { readScreen } from "./panes.ts";`)).toEqual(["panes"]);
     expect(offences(`const p = await import("./panes.ts");`)).toEqual(["panes"]);
-    expect(offences(`await run(["herdr", "pane", "list"]);`)).toEqual(["herdr"]);
-    expect(offences(`// run(["herdr"])\n/* "herdr" */\nconst x = 1;`)).toEqual([]);
+    expect(offences(`await run(["hc", "--json", "ls"]);`)).toEqual(["hc"]);
+    expect(offences(`// run(["hc"])\n/* "hc" */\nconst x = 1;`)).toEqual([]);
     expect(offences(`import { x } from "./panes-extra.ts";`)).toEqual([]);
   });
 });

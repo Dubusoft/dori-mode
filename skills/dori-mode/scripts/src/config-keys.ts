@@ -5,7 +5,6 @@ import { readFileSync } from "node:fs";
 
 import { AUTO_REPORT_SCOPES, CONFIG_FILE_KEYS, DEFAULT_LANE_SANDBOX, defaultConfig, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
 import { DEFAULT_POLICY, effectiveWorktreeRoot, GUARD_KEYS, RUNNER_POLICY_KEYS } from "./runner/policy.ts";
-import { RUNTIME_KINDS } from "./runtime/types.ts";
 import { writeFileAtomic } from "./setup.ts";
 
 export type Json = Record<string, unknown>;
@@ -41,18 +40,17 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("buttonHooks", "json", "Owner-only Discord button hooks: name -> argv"),
   spec("hooks", "json", "Hook commands (threadReply, transcribe)"),
   spec("ciMergeBase", "string", "The only base branch the supervisor merges lane PRs into"),
-  spec("ignorePanes", "list", "herdr panes the sweeps ignore"),
+  spec("ignorePanes", "list", "Panes the sweeps ignore"),
   spec("autopilot", "json", "Autopilot (always on; dori autopilot pause stops it): tickSec, quota threshold, merge base, executor (default false)"),
   spec("review", "json", "PR review gate: { repos: [\"owner/repo\", ...] } (case-insensitive); unlisted or empty: lane PRs merge without review"),
   spec("memoryLimits", "json", "Lead memory limits: humanMaxKb (15), systemMaxTokens (omo's advisory, 30000), triggerPct (80: past it the lead is woken at once)"),
   spec("autoReport", "enum", "Whose clean done claims the supervisor reports to the owner itself instead of waking the lead (off restores the lead's report)", { values: [...AUTO_REPORT_SCOPES] }),
   spec("reportQuietLanes", "list", "Lane key patterns (* wildcard) whose lanes post their own results: their done claims are recorded reported with no post and no lead report"),
   spec("threadCloseAfterHours", "json", "Hours a finished work thread waits, with the owner's close button on its last report, before the supervisor closes it (a number; default 24)"),
-  spec("leadRuntime", "enum", "Terminal runtime the lead's pane opens on: herdr (default) or hc (herdr-core); a running lead moves at its next dori lead-restart", { values: [...RUNTIME_KINDS] }),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
-export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants", "hostCommands", "laneRuntime"];
+export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants", "hostCommands"];
 
 /** One entry per RUNNER_POLICY_KEYS member, same order. */
 export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
@@ -69,7 +67,6 @@ export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
   spec("worktreeRoot", "string", "Where this host's lane worktrees live; absent: <reposRoot>/worktrees"),
   spec("grants", "json", "Named path grants a lane may get with dori launch --grant: name -> {write: [dirs], read: [dirs]}; the owner edits it (set with --set; setup does not ask it)"),
   spec("hostCommands", "json", "Ops this worker runs on its own host for dori host <op>: name -> {argv, lanes, repos, timeoutSec?, cwd?} (no secrets); the owner edits it (set with --set; setup does not ask it)"),
-  spec("laneRuntime", "enum", "Terminal runtime new lanes open on: herdr (default) or hc (herdr-core, installed on the first hc lane); open lanes stay where they are (set with --set; setup does not ask it)", { values: [...RUNTIME_KINDS] }),
 ];
 
 export class ConfigKeyError extends Error {}
@@ -237,7 +234,6 @@ export const runnerConfigDefault = (home?: string, platform?: NodeJS.Platform): 
     case "sandbox": return DEFAULT_POLICY.sandbox;
     case "jobs": return DEFAULT_POLICY.jobs;
     case "detectWorkspaces": return "true";
-    case "laneRuntime": return "herdr";
     case "worktreeRoot": return typeof next.reposRoot === "string" && next.reposRoot ? effectiveWorktreeRoot({ reposRoot: next.reposRoot }, platform) : undefined;
     default: return undefined;
   }

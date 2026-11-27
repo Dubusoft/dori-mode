@@ -10,7 +10,7 @@ export const HC_INSTALL_URL = "https://releases.herdr.dev/core/install.sh";
 const INSTALL_TIMEOUT_MS = 180_000;
 
 /**
- * hc's core autostart on a host whose lanes (or lead) run on hc. On Linux the hc client starts its core in transient
+ * hc's core autostart on every dori host (hc is the only terminal runtime). On Linux the hc client starts its core in transient
  * `systemd-run --user` units that do not come back after a reboot until some hc command runs, so the systemd user unit
  * HC_CORE_UNIT (templates/hc-core.service: oneshot `hc server start`, idempotent while a core runs) starts it at boot.
  * macOS has no user systemd and a core ends with whatever started it, so the launchd agent HC_LAUNCHD_LABEL
@@ -53,7 +53,7 @@ export const hcVersion = async (run: Runner): Promise<string | undefined> => {
 
 /**
  * Makes sure hc is on this host at HC_MIN_VERSION or later: a missing hc is installed with the release installer
- * (into ~/.local/bin, the same place herdr lives), an older one is updated in place (`hc update --version`, which
+ * (into ~/.local/bin), an older one is updated in place (`hc update --version`, which
  * keeps running terminals). Throws `RUNNER_HC_UNAVAILABLE` with the fix when it still is not.
  */
 export const ensureHc = async (run: Runner): Promise<string> => {
@@ -66,7 +66,7 @@ export const ensureHc = async (run: Runner): Promise<string> => {
   version = await hcVersion(run);
   if (version !== undefined && versionAtLeast(version, HC_MIN_VERSION)) return version;
   throw new Error(`RUNNER_HC_UNAVAILABLE hc ${version ?? "is not on the runner's PATH"}${version ? ` is older than ${HC_MIN_VERSION}` : ""}: `
-    + `install it with curl -fsSL ${HC_INSTALL_URL} | sh (or hc update) and make sure ~/.local/bin is on the runner's PATH, or set "laneRuntime": "herdr" in runner-config.json`);
+    + `install it with curl -fsSL ${HC_INSTALL_URL} | sh (or hc update) and make sure ~/.local/bin is on the runner's PATH`);
 };
 
 const hc = async (run: Runner, argv: readonly string[]): Promise<{ readonly ran: Ran; readonly json: Json }> => {
@@ -84,10 +84,10 @@ const getTerminal = async (run: Runner, pane: string): Promise<Terminal | undefi
 };
 
 /**
- * One hc terminal as a herdr pane row. The agent and its status are what the program reported over OSC 7501 (omo
- * does); a terminal that never reported has no agent, like a herdr pane whose agent herdr has not detected.
+ * One hc terminal as a pane row. The agent and its status are what the program reported over OSC 7501 (omo does); a
+ * terminal that never reported has no agent.
  */
-export const paneFromTerminal = (t: Terminal): Pane => ({
+const paneFromTerminal = (t: Terminal): Pane => ({
   pane_id: paneOf(t.address),
   workspace_id: "",
   tab_id: "",
@@ -99,8 +99,8 @@ export const paneFromTerminal = (t: Terminal): Pane => ({
   ...(t.cwd ? { cwd: t.cwd } : {}),
 });
 
-/** hc's one foreground process as herdr's process-info: the terminal's root process is the shell the lane was typed into. */
-export const processInfoOf = (t: Terminal): ProcessInfo => ({
+/** hc's one foreground process as a process-info: the terminal's root process is the shell the lane was typed into. */
+const processInfoOf = (t: Terminal): ProcessInfo => ({
   ...(t.pid !== undefined ? { shell_pid: t.pid } : {}),
   ...(t.foreground?.pid !== undefined ? { foreground_process_group_id: t.foreground.pid } : {}),
   foreground_processes: t.foreground ? [{
@@ -117,15 +117,13 @@ const terminalName = (key: string): string | undefined =>
 /**
  * herdr-core (`hc`) behind the session runtime interface. A lane terminal runs the user's shell with no parent and no
  * notes (`--no-parent --no-notify`: the supervisor is the only thing that types into a lane), and the launch line is
- * typed into that shell the way herdr's `pane run` types it. Nothing but the shell is on the terminal's command line,
- * so `hc get`, `hc ls` and `ps` show no lane variable; the lane's secrets reach it only inside the shell, through
- * `dori secret env` over the lane socket.
+ * typed into that shell. Nothing but the shell is on the terminal's command line, so `hc get`, `hc ls` and `ps` show no
+ * lane variable; the lane's secrets reach it only inside the shell, through `dori secret env` over the lane socket.
  */
 export const hcRuntime = (run: Runner, shell: string = process.env.SHELL || "/bin/sh"): SessionRuntime => {
   let ensured: Promise<string> | undefined;
   const ready = (): Promise<string> => ensured ??= ensureHc(run).catch((e: unknown) => { ensured = undefined; throw e; });
   return {
-    kind: "hc",
     // `server status` starts a stopped core; its id outlives core restarts, as hc terminals do.
     instance: async () => {
       await ready();
@@ -167,8 +165,8 @@ export const hcRuntime = (run: Runner, shell: string = process.env.SHELL || "/bi
       const pane = paneOf(made.json.address);
       const t = await getTerminal(run, pane);
       return {
-        pane, tab: "", shell: "posix",
-        ...(t ? { terminalId: terminalIdOf(t) } : {}), ...(t?.pid !== undefined ? { shellPid: t.pid } : {}), cwd: t?.cwd ?? spec.cwd,
+        pane,
+        ...(t ? { terminalId: terminalIdOf(t) } : {}), ...(t?.pid !== undefined ? { shellPid: t.pid } : {}),
       };
     },
     run: async (pane, command) => (await hc(run, ["send", address(pane), "--", command])).ran,

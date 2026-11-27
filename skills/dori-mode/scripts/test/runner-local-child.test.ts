@@ -48,7 +48,7 @@ test("the child restarts after each exit with backoff from the clock, and is kil
   const logs: string[] = [];
   const controller = new AbortController();
   const child = startLocalRunner({
-    spawn: w.spawn, argv: ["bun", "cli.ts", "runner", "serve"], env: { PATH: "/bin", DORI_LANE_KEY: "lane-x", HERDR_PANE_ID: "p3" },
+    spawn: w.spawn, argv: ["bun", "cli.ts", "runner", "serve"], env: { PATH: "/bin", DORI_LANE_KEY: "lane-x" },
     clock, log: (l) => { logs.push(l); }, random: () => 0.5,
   }, controller.signal);
   expect(w.children).toHaveLength(1);
@@ -147,8 +147,8 @@ test("an already aborted signal spawns nothing; a spawn that throws is retried a
   await child.stop();
 });
 
-test("childEnv drops the lane-mode variables; spawnProcess runs a real process and reports its exit code", async () => {
-  expect(childEnv({ A: "1", DORI_LANE_KEY: "k", HERDR_PANE_ID: "p" })).toEqual({ A: "1" });
+test("childEnv drops the lane-mode variable; spawnProcess runs a real process and reports its exit code", async () => {
+  expect(childEnv({ A: "1", DORI_LANE_KEY: "k" })).toEqual({ A: "1" });
   const proc = spawnProcess(["/bin/sh", "-c", "exit 3"], { PATH: process.env.PATH ?? "/bin" });
   expect(await proc.exited).toBe(3);
 });

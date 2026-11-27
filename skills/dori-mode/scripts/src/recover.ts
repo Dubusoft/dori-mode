@@ -6,13 +6,12 @@ import { fillHook } from "./config.ts";
 import { isLaneOutcomeLine, laneOutcomeEventId } from "./autopilot.ts";
 import { finishedOutcome } from "./task-finish.ts";
 import { closeLane, closeRunning, finishClosedTask, type FlowDeps, finishedReason } from "./done-flow.ts";
-import { LaunchError, laneTabWorkspace, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
+import { LaunchError, launchLane, prepareLeadLaneBrief, recoveryFields, restoreFileProposal, SandboxRefusal, startupLine } from "./launch.ts";
 import { runnerJournalHead } from "./runner/lanes-hub.ts";
 import { resumeArgv } from "./runner/lane-control.ts";
 import { argvModel } from "./runner/lane-launch.ts";
 import { checkLaneFilesBody } from "./lane-file-contract.ts";
 import { LaneOpsError, machineRunner } from "./lane-ops.ts";
-import { herdrDownSince } from "./runner/herdr-down.ts";
 import { ALIVE_STATUSES } from "./pane-state.ts";
 import type { Pane } from "./panes.ts";
 import { STARTUP_GRACE_MS as RUNNER_STARTUP_GRACE_MS } from "./runner/serve.ts";
@@ -120,7 +119,7 @@ const liveModel = (raw: unknown): { readonly omo: boolean; readonly model?: stri
 };
 
 /**
- * The pane is there but its agent is gone (its shell is all that runs): no omo process, no live herdr status, and past
+ * The pane is there but its agent is gone (its shell is all that runs): no omo process, no live hc status, and past
  * the runner's startup window (where its lane.recover leaves the pane alone).
  */
 const agentGoneFrom = (deps: FlowDeps, lane: Lane, pane: Pane, live: { readonly omo: boolean }): boolean =>
@@ -223,16 +222,14 @@ const startAgain = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, sess
 
 /**
  * A lane whose pane or agent is gone: its runner relaunches it from its own record (`lane.recover`, which closes the
- * dead pane's tab and keeps the lane token's brief and profile). A runner that has no record of the lane starts it anew.
+ * dead pane and keeps the lane token's brief and profile). A runner that has no record of the lane starts it anew.
  */
 const runnerRecover = async (deps: FlowDeps, lane: Lane, stored: RecoveryLane, session: string | undefined,
   prepared: Awaited<ReturnType<typeof prepareLeadLaneBrief>>, cmdId: string, prior: Lane): Promise<Relaunched> => {
   let r;
   try {
-    // A local relaunch opens its new tab in the lanes workspace as it is now (herdr may have renumbered it since the start).
-    const tabWorkspace = lane.machine ? undefined : await laneTabWorkspace(deps, (line) => { console.error(line); });
     r = await deps.ops.recover(stored, { briefText: prepared.briefText, files: prepared.files, cmdId,
-      ...(session !== undefined ? { session } : {}), ...(tabWorkspace ? { tabWorkspace } : {}) });
+      ...(session !== undefined ? { session } : {}) });
   } catch (error) {
     if (unknownToRunner(error)) {
       await restoreFileProposal(deps, lane.key, prepared.files.run.id, prior);
@@ -400,22 +397,16 @@ const relaunchLane = async (deps: FlowDeps, lane: Lane, enqueue: RecoveryEnqueue
 
 /**
  * Legacy callers receive lines; supervisors must pass enqueue to durably accept notices before their flags are saved.
- * A lane whose runner's machine has herdr down (herdr-down.ts) is held: nothing is read, relaunched or counted against
- * its recovery attempts until herdr reads again. The sweep holds it silently (HERDR_DOWN already told the lead); a
- * recovery asked for by key says LANE_RECOVERY_HELD. A lane whose runner has no admitted connection (right after a
- * supervisor restart, before the runner's hello) is held the same way: the runner's own liveness reports a runner that
- * stays away, and the first sweep after its hello recovers what is still missing.
+ * A lane whose runner has no admitted connection (right after a supervisor restart, before the runner's hello) is held:
+ * nothing is read, relaunched or counted against its recovery attempts. The sweep holds it silently (the runner's own
+ * liveness reports a runner that stays away); a recovery asked for by key says LANE_RECOVERY_HELD. The first sweep
+ * after its hello recovers what is still missing.
  */
 export const recoverLanes = async (deps: FlowDeps, key?: string, enqueue?: RecoveryEnqueue, view: SweepView = passthroughView(deps.ops)): Promise<string[]> => {
   const lanes = key ? [await deps.registry.read(key)].filter((lane): lane is Lane => lane !== null) : await deps.registry.open();
-  const down = herdrDownSince(deps.config.stateDir);
   const events: string[] = [];
   for (const lane of lanes) {
     const runner = lane.runner ?? machineRunner(lane.machine);
-    if (down.has(runner)) {
-      if (key && statusOf(lane) === "working") events.push(`LANE_RECOVERY_HELD ${lane.key} herdr is down on machine=${runner.replace(/\s/g, "_")}; recovery resumes once it reads again`);
-      continue;
-    }
     if (!deps.ops.connected(lane.machine)) {
       if (key && statusOf(lane) === "working") events.push(runnerHeld(lane, runner));
       continue;

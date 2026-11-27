@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, watch } from "node:fs";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
+import * as memoryCheck from "../src/memory-check.ts";
 import { gatewayStatusPath } from "../src/gateway-status.ts";
 import type { Http } from "../src/messenger/http.ts";
 import { Repos } from "../src/repos.ts";
@@ -46,7 +47,7 @@ const until = (subscribe: (signal: () => void) => () => void, check: () => boole
 
 /**
  * The real supervise(), where the work of `stalled` hangs until the test ends: the inbound Discord
- * catch-up, the delivery task's lead delivery pass, every Discord post (the notices task hangs on its owner delay notice), the machine-guard sweep's `herdr machine list` (the host guard reads the
+ * catch-up, the delivery task's lead delivery pass, every Discord post (the notices task hangs on its owner delay notice), the memory sweep (the host guard reads the
  * local runner's sample and runs nothing), or the GitHub poll's gh api call (a wait check
  * has its own 10 s budget, so it cannot hold the polling task).
  */
@@ -83,7 +84,7 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
   spyOn(quota, "lookupQuotaResults").mockReturnValue(async () => ({ results: [], text: "" }));
   const clock = fakeClock(T0);
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(world, clock, state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: OWNER }, discordChannels: ["11"], defaultModel: "test/model",
   });
@@ -114,17 +115,19 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     changed();
     return pending.call(this);
   });
-  const done = { machines: 0, gh: 0 };
+  const done = { sweeps: 0, gh: 0 };
+  // The memory sweep runs in the sweeps task only: it hangs there when that task is stalled.
+  const memorySweep = memoryCheck.memorySweep;
+  spyOn(memoryCheck, "memorySweep").mockImplementation(async (sweepDeps, sweepHome) => {
+    if (stalled === "sweeps") return hang([]);
+    const lines = await memorySweep(sweepDeps, sweepHome);
+    done.sweeps++;
+    changed();
+    return lines;
+  });
   const deps = {
     ...base,
     run: async (argv: readonly string[]): Promise<Ran> => {
-      if (argv.join(" ") === "herdr machine list --json") {
-        const ran = { code: 0, out: "[]", err: "" };
-        if (stalled === "sweeps") return hang(ran);
-        done.machines++;
-        changed();
-        return ran;
-      }
       if (argv[0] === "gh" && argv[1] === "api") return hang({ code: 1, out: "", err: "released at the end of the test" });
       if (argv[0] === "gh" && argv[1] === "pr" && argv[2] === "view") {
         const ran = await base.run(argv);
@@ -172,7 +175,7 @@ const setup = (stalled: SupervisorTask, before?: (home: string) => void) => {
     inbound: () => existsSync(gatewayStatusPath(state.dir)),
     delivery: () => existsSync(log) && readFileSync(log, "utf8").includes(REPORT),
     notices: () => reportTicks > 0,
-    sweeps: () => done.machines > 0,
+    sweeps: () => done.sweeps > 0,
     polling: () => done.gh > 0,
     reports: () => reportPasses > 0,
   };

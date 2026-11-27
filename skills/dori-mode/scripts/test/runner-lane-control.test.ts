@@ -1,9 +1,8 @@
 import { expect, test } from "bun:test";
 
-import type { Ran, Runner } from "../src/run.ts";
+import type { Runner } from "../src/run.ts";
 import {
-  goalCommand, lastLines, PAUSED_SHOWN, pause, paneShell, resolveTargetPane, resume, RESUME_TEXT, resumeArgv, startupFailure, startupPoll, stopTurn,
-  TargetError,
+  goalCommand, lastLines, PAUSED_SHOWN, pause, resume, RESUME_TEXT, resumeArgv, startupFailure, startupPoll, stopTurn,
 } from "../src/runner/lane-control.ts";
 import { fakeClock, fakeRunner, newWorld, type World } from "./fakes.ts";
 
@@ -11,20 +10,22 @@ const T0 = 1_800_000_000_000;
 
 const world = (status = "working"): World => {
   const w = newWorld();
-  w.panes = [{ pane_id: "p1", workspace_id: "w1", tab_id: "t1", agent: "omo", agent_status: status }];
+  w.panes = [{ pane_id: "hc:t1", workspace_id: "w1", tab_id: "t1", agent: "omo", agent_status: status }];
   return w;
 };
 
 const deps = (w: World) => ({ run: fakeRunner(w), clock: fakeClock(T0) });
-const sentText = (w: World): string[] => w.calls.filter((c) => c[2] === "send-text").map((c) => c[4] ?? "");
-const escapes = (w: World): number => w.calls.filter((c) => c[2] === "send-keys" && c[4] === "escape").length;
+const sentText = (w: World): string[] => w.calls.filter((c) => c[0] === "hc" && c[2] === "send").map((c) => c[5] ?? "");
+const escapes = (w: World): number => w.calls.filter((c) => c[0] === "hc" && c[2] === "keys" && c[4] === "esc").length;
+/** An Enter reached the pane: typed text (hc pastes it and presses Enter in one `send`) or `hc keys <addr> enter`. */
+const isEnter = (argv: readonly string[]): boolean => argv[0] === "hc" && (argv[2] === "send" || (argv[2] === "keys" && argv[4] === "enter"));
 
 test("pause both: goal confirmed from the screen, the running turn stopped by Escape", async () => {
   const w = world("working");
   w.onEscapeStatus = "idle";
   // before the send, the guard's input-box read, then the read-back showing the goal paused
   w.screens = ["❯ ", "❯ ", "Goal paused\n❯ "];
-  expect(await pause(deps(w), "p1", "both")).toEqual({ goal: "confirmed", working: true, stopped: true });
+  expect(await pause(deps(w), "hc:t1", "both")).toEqual({ goal: "confirmed", working: true, stopped: true });
   expect(sentText(w)).toEqual(["/goal pause"]);
   expect(escapes(w)).toBe(1);
 });
@@ -33,60 +34,60 @@ test("pause defaults to both", async () => {
   const w = world("working");
   w.onEscapeStatus = "idle";
   w.screens = ["❯ ", "❯ ", "Goal paused\n❯ "];
-  expect(await pause(deps(w), "p1")).toEqual({ goal: "confirmed", working: true, stopped: true });
+  expect(await pause(deps(w), "hc:t1")).toEqual({ goal: "confirmed", working: true, stopped: true });
 });
 
 test("pause both stops before Escape when the goal is not confirmed", async () => {
   const w = world("working");
   w.onEscapeStatus = "idle";
-  expect(await pause(deps(w), "p1", "both")).toEqual({ goal: "unconfirmed" });
+  expect(await pause(deps(w), "hc:t1", "both")).toEqual({ goal: "unconfirmed" });
   expect(escapes(w)).toBe(0);
 });
 
 test("pause goal only never presses Escape", async () => {
   const w = world("working");
   w.screens = ["❯ ", "❯ ", "Goal paused\n❯ "];
-  expect(await pause(deps(w), "p1", "goal")).toEqual({ goal: "confirmed" });
+  expect(await pause(deps(w), "hc:t1", "goal")).toEqual({ goal: "confirmed" });
   expect(escapes(w)).toBe(0);
 });
 
 test("pause stop on an idle pane sends nothing and counts as stopped", async () => {
   const w = world("idle");
-  expect(await pause(deps(w), "p1", "stop")).toEqual({ working: false, stopped: true });
+  expect(await pause(deps(w), "hc:t1", "stop")).toEqual({ working: false, stopped: true });
   expect(escapes(w)).toBe(0);
   expect(sentText(w)).toEqual([]);
 });
 
 test("stopTurn reports false when the turn keeps running after Escape", async () => {
   const w = world("working");
-  expect(await stopTurn(deps(w), "p1")).toBe(false);
+  expect(await stopTurn(deps(w), "hc:t1")).toBe(false);
 });
 
 test("goalCommand: a pane without a live agent is failed, nothing typed", async () => {
   const w = world("working");
-  w.panes = [{ pane_id: "p1", workspace_id: "w1" }];
-  expect(await goalCommand(deps(w), "p1", "/goal pause", PAUSED_SHOWN)).toBe("failed");
+  w.panes = [{ pane_id: "hc:t1", workspace_id: "w1" }];
+  expect(await goalCommand(deps(w), "hc:t1", "/goal pause", PAUSED_SHOWN)).toBe("failed");
   expect(sentText(w)).toEqual([]);
 });
 
 test("goalCommand counts only new whole lines: an old 'Goal paused' line does not confirm", async () => {
   const w = world("idle");
   w.screen = "Goal paused\n❯ ";
-  expect(await goalCommand(deps(w), "p1", "/goal pause", PAUSED_SHOWN)).toBe("unconfirmed");
+  expect(await goalCommand(deps(w), "hc:t1", "/goal pause", PAUSED_SHOWN)).toBe("unconfirmed");
 });
 
 test("resume confirms 'Goal active' and a running turn, typing nothing more", async () => {
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
   w.onEnterStatus = "working";
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "running" });
+  expect(await resume(deps(w), "hc:t1")).toEqual({ goal: "confirmed", execution: "running" });
   expect(sentText(w)).toEqual(["/goal resume"]);
 });
 
 test("resume: a goal active but a session left held is held, after one message to release it", async () => {
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(await resume(deps(w), "hc:t1")).toEqual({ goal: "confirmed", execution: "held" });
   expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
 });
 
@@ -96,10 +97,10 @@ test("resume: a held session the message releases is running", async () => {
   let enters = 0;
   const run: Runner = async (argv) => {
     // The /goal resume Enter leaves the session idle; the release message's Enter starts a turn.
-    if (argv[2] === "send-keys" && argv[4] !== "escape" && ++enters === 2) w.onEnterStatus = "working";
+    if (isEnter(argv) && ++enters === 2) w.onEnterStatus = "working";
     return fakeRunner(w)(argv);
   };
-  expect(await resume({ run, clock: fakeClock(T0) }, "p1")).toEqual({ goal: "confirmed", execution: "running" });
+  expect(await resume({ run, clock: fakeClock(T0) }, "hc:t1")).toEqual({ goal: "confirmed", execution: "running" });
   expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
 });
 
@@ -112,10 +113,10 @@ test("resume: a turn the pause cut with Escape gets /resume after the goal, and 
   let enters = 0;
   const run: Runner = async (argv) => {
     // /goal resume alone leaves the cut turn paused; the /resume Enter continues it.
-    if (argv[2] === "send-keys" && argv[4] !== "escape" && ++enters === 2) w.onEnterStatus = "working";
+    if (isEnter(argv) && ++enters === 2) w.onEnterStatus = "working";
     return fakeRunner(w)(argv);
   };
-  expect(await resume({ run, clock: fakeClock(T0) }, "p1")).toEqual({ goal: "confirmed", execution: "running" });
+  expect(await resume({ run, clock: fakeClock(T0) }, "hc:t1")).toEqual({ goal: "confirmed", execution: "running" });
   expect(sentText(w)).toEqual(["/goal resume", "/resume"]);
 });
 
@@ -123,83 +124,38 @@ test("resume: an Escape-paused session /resume does not start falls back to the 
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Goal active\n❯ "];
   w.screen = ESC_FOOTER;
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(await resume(deps(w), "hc:t1")).toEqual({ goal: "confirmed", execution: "held" });
   expect(sentText(w)).toEqual(["/goal resume", "/resume", RESUME_TEXT]);
 });
 
 test("resume: a goal not confirmed types no /resume, even under the paused footer", async () => {
   const w = world("idle");
   w.screen = ESC_FOOTER;
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "unconfirmed" });
+  expect(await resume(deps(w), "hc:t1")).toEqual({ goal: "unconfirmed" });
   expect(sentText(w)).toEqual(["/goal resume"]);
 });
 
 test("resume: a session with no goal that stays held is held", async () => {
   const w = world("idle");
   w.screens = ["❯ ", "❯ ", "Error: cannot update goal: no goal exists\n❯ "];
-  expect(await resume(deps(w), "p1")).toEqual({ goal: "confirmed", execution: "held" });
+  expect(await resume(deps(w), "hc:t1")).toEqual({ goal: "confirmed", execution: "held" });
   expect(sentText(w)).toEqual(["/goal resume", RESUME_TEXT]);
 });
 
 // ---------------------------------------------------------------------------------------------------------------
 
-const scripted = (answers: Record<string, unknown>): Runner => async (argv): Promise<Ran> => {
-  const key = argv.slice(0, 4).join(" ");
-  const hit = Object.entries(answers).find(([k]) => key.startsWith(k));
-  if (!hit) return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
-  const v = hit[1];
-  return typeof v === "object" && v !== null && "code" in v ? (v as Ran) : { code: 0, out: JSON.stringify(v), err: "" };
-};
-
-const idleShell = {
-  "herdr pane get p9": { result: { pane: { pane_id: "p9", workspace_id: "w1", tab_id: "t9", cwd: "/repo" } } },
-  "herdr pane process-info --pane": { result: { process_info: { shell_pid: 10, foreground_process_group_id: 10, foreground_processes: [{ pid: 10, name: "bash" }] } } },
-};
-
-test("resolveTargetPane accepts an idle shell pane no lane owns", async () => {
-  const got = await resolveTargetPane(scripted(idleShell), { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: true });
-  expect(got).toEqual({ pane: "p9", tab: "t9", cwd: "/repo", shell: "posix", shellPid: 10 });
-});
-
-test("resolveTargetPane picks the one shell pane of a workspace", async () => {
-  const run = scripted({ ...idleShell, "herdr pane list": { result: { panes: [{ pane_id: "p8", workspace_id: "w1", agent: "omo" }, { pane_id: "p9", workspace_id: "w1" }, { pane_id: "p7", workspace_id: "w2" }] } } });
-  expect((await resolveTargetPane(run, { workspace: "w1" }, { ownerOf: () => undefined, refuseCmd: true })).pane).toBe("p9");
-});
-
-test("resolveTargetPane refuses busy panes with RUNNER_LANE_TARGET_BUSY", async () => {
-  const owned = resolveTargetPane(scripted(idleShell), { pane: "p9" }, { ownerOf: () => "other-lane", refuseCmd: true });
-  await expect(owned).rejects.toThrow("RUNNER_LANE_TARGET_BUSY pane p9 is already registered to lane other-lane");
-  const foreground = scripted({ ...idleShell, "herdr pane process-info --pane": { result: { process_info: { shell_pid: 10, foreground_process_group_id: 11 } } } });
-  const err = await resolveTargetPane(foreground, { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: true }).catch((e: unknown) => e);
-  expect(err).toBeInstanceOf(TargetError);
-  expect((err as TargetError).code).toBe("RUNNER_LANE_TARGET_BUSY");
-});
-
-test("resolveTargetPane refuses a missing pane and a cmd.exe pane when asked", async () => {
-  await expect(resolveTargetPane(scripted({}), { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: true })).rejects.toThrow("RUNNER_LANE_TARGET_INVALID pane p9 does not exist");
-  const cmd = scripted({ ...idleShell, "herdr pane process-info --pane": { result: { process_info: { shell_pid: 10, foreground_processes: [{ pid: 10, name: "cmd.exe" }] } } } });
-  await expect(resolveTargetPane(cmd, { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: true })).rejects.toThrow("runs cmd.exe");
-  expect((await resolveTargetPane(cmd, { pane: "p9" }, { ownerOf: () => undefined, refuseCmd: false })).shell).toBe("cmd");
-});
-
-test("paneShell reads pwsh and a drive-letter cwd as PowerShell", () => {
-  expect(paneShell({ shell_pid: 1, foreground_processes: [{ pid: 1, name: "pwsh.exe" }] })).toBe("pwsh");
-  expect(paneShell({ shell_pid: 1, foreground_processes: [{ pid: 1, name: "powershell.exe" }] })).toBe("powershell");
-  expect(paneShell(undefined, "D:\\work")).toBe("powershell");
-  expect(paneShell(undefined, "/home/x")).toBe("posix");
-});
 
 // ---------------------------------------------------------------------------------------------------------------
 
 test("startupPoll: two ready reads in a row are ok", async () => {
   const w = world("working");
-  expect(await startupPoll(deps(w), "p1")).toEqual({ verdict: "ok", detail: "ready" });
+  expect(await startupPoll(deps(w), "hc:t1")).toEqual({ verdict: "ok", detail: "ready" });
 });
 
 test("startupPoll: a failure word on an idle screen is an error at once", async () => {
   const w = world("idle");
   w.screen = "Error: No API key found for provider\n❯ ";
-  expect(await startupPoll(deps(w), "p1")).toEqual({ verdict: "error", detail: "No API key" });
+  expect(await startupPoll(deps(w), "hc:t1")).toEqual({ verdict: "error", detail: "No API key" });
 });
 
 test.each([false, true])("startupPoll confirms readiness past the old window without resending (worked earlier=%s)", async (workedEarlier) => {
@@ -210,25 +166,25 @@ test.each([false, true])("startupPoll confirms readiness past the old window wit
     w.panes[0]!.agent_status = clock.at > T0 + 20_000 ? (workedEarlier ? "idle" : "working")
       : workedEarlier && clock.at === T0 + 2_000 ? "working" : "unknown";
   };
-  expect(await startupPoll({ run: fakeRunner(w), clock: { ...clock, sleep } }, "p1", async () => false)).toEqual({ verdict: "ok", detail: "ready" });
+  expect(await startupPoll({ run: fakeRunner(w), clock: { ...clock, sleep } }, "hc:t1", async () => false)).toEqual({ verdict: "ok", detail: "ready" });
   expect(clock.at - T0).toBe(24_000);
   expect(sentText(w)).toEqual([]);
 });
 
-test("startupPoll counts slow herdr calls against the budget and leaves permanent unknown unconfirmed", async () => {
+test("startupPoll counts slow hc calls against the budget and leaves permanent unknown unconfirmed", async () => {
   const w = world("unknown");
   w.screen = "loading\nstill loading\n❯ ";
   const clock = fakeClock(T0);
   const sleep = async (ms: number) => { clock.at += ms; };
-  const herdr = fakeRunner(w);
+  const hc = fakeRunner(w);
   const run: Runner = async (argv, opts) => {
     const limit = opts?.timeoutMs ?? Infinity;
     expect(limit).toBeGreaterThan(0);
     expect(clock.at - T0 + limit).toBeLessThanOrEqual(45_000);
     clock.at += Math.min(limit, 3_000);
-    return herdr(argv);
+    return hc(argv);
   };
-  const v = await startupPoll({ run, clock: { ...clock, sleep } }, "p1");
+  const v = await startupPoll({ run, clock: { ...clock, sleep } }, "hc:t1");
   expect(v).toEqual({ verdict: "unconfirmed", detail: "no ready agent status (unknown); last lines: loading / still loading / ❯" });
   expect(clock.at - T0).toBeWithin(40_000, 45_001);
   expect(sentText(w)).toEqual([]);

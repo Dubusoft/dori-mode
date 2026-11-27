@@ -42,8 +42,6 @@ export type LaneCliDeps = {
   readonly readFile?: (path: string) => string;
   /** The runner directory holding `briefs/<key>.token`; default `~/.dori/runner`. */
   readonly runnerDir?: string;
-  /** The lane's own key when it is not in `DORI_LANE_KEY` (a lane found through the socket's whoami). */
-  readonly laneKey?: string;
   /** Defaults to `process.platform`. */
   readonly platform?: string;
   /** Runs the Windows load sampler; default the real runner. */
@@ -172,7 +170,7 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     deps.out(LANE_HELP[sub as (typeof LANE_CLI_COMMANDS)[number]]);
     return 0;
   }
-  const own = deps.laneKey ?? deps.env.DORI_LANE_KEY ?? "";
+  const own = deps.env.DORI_LANE_KEY?.trim() ?? "";
   const clock = deps.clock ?? realClock;
   const withoutOk = ({ ok: _ok, ...others }: Reply): object => others;
   /** One authenticated request for the lane's own key; `done` prints on success. */

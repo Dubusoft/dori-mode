@@ -319,7 +319,7 @@ describe("proto 3 frames", () => {
       .toThrow("RUNNER_FRAME_INVALID field-type body.reason");
     expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 6, "guard.sample", { ...sample, lanes: [{ key: "a", rssKb: 1 } as never] })), "runner"))
       .toThrow("RUNNER_FRAME_INVALID missing-field body.lanes[0].top");
-    // A runner that could not read herdr sends panes -1 (the supervisor's herdr-down signal); nothing lower decodes.
+    // A runner that could not read its pane list sends panes -1; nothing lower decodes.
     expect(roundTrip(runnerEvent(HEAD, 7, "guard.sample", { ...sample, panes: -1 }), "runner").body).toEqual({ ...sample, panes: -1 });
     expect(() => decodeFrame(encodeFrame(runnerEvent(HEAD, 8, "guard.sample", { ...sample, panes: -2 })), "runner"))
       .toThrow("RUNNER_FRAME_INVALID field-type body.panes must be a non-negative integer or -1");
@@ -337,7 +337,7 @@ describe("proto 3 frames", () => {
     expect(() => decodeFrame(encodeFrame(supervisorControl(HEAD, "q.panes", {} as never)), "supervisor")).toThrow("missing-field body.qid");
     const answer = { qid: "q1", ok: true, detail: "ok", result: { panes: [{ pane_id: "w1:p2" }] } };
     expect(roundTrip(runnerControl(HEAD, "q.result", answer), "runner").body).toEqual(answer);
-    expect(roundTrip(runnerControl(HEAD, "q.result", { qid: "q2", ok: false, detail: "herdr down" }), "runner").body).toEqual({ qid: "q2", ok: false, detail: "herdr down" });
+    expect(roundTrip(runnerControl(HEAD, "q.result", { qid: "q2", ok: false, detail: "hc unreachable" }), "runner").body).toEqual({ qid: "q2", ok: false, detail: "hc unreachable" });
     expect(() => decodeFrame(encodeFrame(runnerControl(HEAD, "q.result", answer)), "supervisor")).toThrow("wrong-direction");
   });
 });

@@ -6,37 +6,18 @@ import { CONFIG_SCHEMA_KEY, CONFIG_SCHEMA_VERSION, ConfigSchemaError, migrateCon
 import { defaultConfig, expandHome, type DiscordConfig } from "./config.ts";
 import { envFileValue } from "./credentials.ts";
 import type { Http } from "./messenger/http.ts";
-import { HERDR_UNIT, hostRuntimes, type HostRuntimes, hostServices, localLanePanes, localLaneRuntime, runtimesNote } from "./host-runtimes.ts";
-import { LANES_WORKSPACE, LEAD_WORKSPACE, LEGACY_PANE_KEYS, managedPanesPath, readManagedPanes, resolveManagedPanes, saveManagedPanes } from "./managed-panes.ts";
-import { listPanes } from "./panes.ts";
-import { Registry } from "./registry.ts";
+import { hostServices, pruneLocalRunnerConfig } from "./host-runtimes.ts";
+import { LEGACY_PANE_KEYS, resolveManagedPanes } from "./managed-panes.ts";
 import { Repos } from "./repos.ts";
-import { defaultRunnerDir } from "./runner/fs-safety.ts";
 import { HC_CORE_UNIT, HC_INSTALL_URL } from "./runtime/hc.ts";
 import type { Runner } from "./run.ts";
 
 export class SetupError extends Error {}
 
 export const TOKEN_KEY = "DORI_DISCORD_TOKEN";
-/**
- * The units of a host on herdr alone (the default); hostServices gives a host's own set. A literal: setup.ts is loaded
- * inside an import cycle (runner/fs-safety.ts imports it), so nothing imported may run while it initialises.
- */
-export const UNITS = ["herdr-server.service", "dori-supervisor.service"] as const;
+/** The script the supervisor unit runs first (ExecStartPre), rendered from templates/dori-boot-prep.sh. */
 export const BOOT_PREP = "dori-boot-prep.sh";
-/**
- * The boot prep script of a lead host that does not use herdr: templates/dori-boot-prep.sh waits for the herdr server and
- * fails without one, which would stop the supervisor. On hc there is nothing to wait for: the hc client starts its core
- * itself and hc-core.service starts it at boot.
- */
-export const HC_BOOT_PREP = [
-  "#!/usr/bin/env bash",
-  "# Runs before `dori supervise` (systemd ExecStartPre). Written by `dori setup` on a lead host that does not use herdr",
-  "# (leadRuntime and the local laneRuntime are hc): nothing to wait for, the hc client starts its core itself.",
-  "echo \"BOOT_PREP herdr not used on this host\"",
-  "",
-].join("\n");
-/** Started by OnFailure= of the units above; never enabled itself. */
+/** Started by OnFailure= of the host's units (hostServices); never enabled itself. */
 export const NOTIFY_UNIT = "dori-failure-notify@.service";
 export const FAILURE_NOTIFY = "dori-failure-notify.sh";
 
@@ -60,7 +41,7 @@ export type SetupDeps = {
   readonly envPath: string;
   readonly unitDir: string;
   readonly templatesDir: string;
-  readonly bins: { readonly dori: string; readonly herdr?: string; readonly hc?: string; readonly shell: string };
+  readonly bins: { readonly dori: string; readonly hc?: string; readonly shell: string };
 };
 
 export type SetupInput = {
@@ -71,19 +52,20 @@ export type SetupInput = {
   readonly stateDir?: string;
   /** GitHub logins whose new issues start work (githubIssueAuthors). */
   readonly issueAuthors?: readonly string[];
-  /** Create or reuse the herdr lead pane and lanes workspace (default yes). */
-  readonly herdr?: boolean;
   /** Install and enable the systemd user units (default no). */
   readonly autostart?: boolean;
   /** `--set key=value` values: applied as given, never asked. */
   readonly patch?: Json;
   /** `--unset key` keys: deleted, never asked. */
   readonly unset?: readonly string[];
-  /** Prune obsolete keys and ask only keys never shown before; no token, Discord, herdr or autostart steps. */
+  /**
+   * Prune obsolete keys (config.json, and the local runner's runner-config.json) and ask only keys never shown before;
+   * no token, Discord or autostart steps.
+   */
   readonly migrate?: boolean;
   /**
    * Also ask what the default flow takes from flags, stored values or defaults: models, directories, every other config
-   * key, the herdr step, each autostart step and keeping a channel that failed its check. The default flow asks five
+   * key, each autostart step and keeping a channel that failed its check. The default flow asks five
    * questions: bot token, channels, owner id, issue auto-start and autostart.
    */
   readonly advanced?: boolean;
@@ -271,74 +253,6 @@ export const verifyChannel = async (http: Http, token: string, id: string): Prom
 
 export const parseChannels = (text: string): string[] => [...new Set(text.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
 
-const herdrJson = async (run: Runner, argv: readonly string[]): Promise<Json> => {
-  const r = await run(["herdr", ...argv]);
-  if (r.code !== 0) throw new SetupError(`herdr ${argv.join(" ")} failed: ${r.err || r.out}`);
-  try {
-    return JSON.parse(r.out) as Json;
-  } catch {
-    return {};
-  }
-};
-
-const workspaceByLabel = async (run: Runner, label: string): Promise<string | undefined> => {
-  const list = (await herdrJson(run, ["workspace", "list"])) as { result?: { workspaces?: { label?: string; workspace_id?: string }[] } };
-  return list.result?.workspaces?.find((w) => w.label === label)?.workspace_id;
-};
-
-export const ensureWorkspace = async (run: Runner, label: string): Promise<{ id: string; created: boolean }> => {
-  const found = await workspaceByLabel(run, label);
-  if (found) return { id: found, created: false };
-  await herdrJson(run, ["workspace", "create", "--label", label, "--no-focus"]);
-  const id = await workspaceByLabel(run, label);
-  if (!id) throw new SetupError(`cannot create herdr workspace ${label}`);
-  return { id, created: true };
-};
-
-const exists = async (run: Runner, kind: "pane" | "workspace", id: string): Promise<boolean> => Boolean(id) && (await run(["herdr", kind, "get", id])).code === 0;
-
-export type HerdrResult = { readonly patch: Json; readonly lines: string[] };
-
-/**
- * The supervisor's own steps, run once ahead of it: keep the lead pane and lanes workspace recorded in dori state (or,
- * before the first migration, named by the config) when they still exist, otherwise create them, and record both in
- * `stateDir`. The patch carries only config keys: a new lanes workspace starts with a shell pane that is not a lane, so it
- * goes on ignorePanes.
- */
-export const ensureHerdr = async (run: Runner, current: Json, leadCwd: string, stateDir: string): Promise<HerdrResult> => {
-  const lines: string[] = [];
-  const patch: Json = {};
-  const recorded = resolveManagedPanes(stateDir, current);
-  const lead = recorded.leadPane;
-  let leadPane = lead;
-  if (lead && (await exists(run, "pane", lead))) lines.push(`SETUP herdr lead pane ${lead} reused`);
-  else {
-    const ws = await ensureWorkspace(run, LEAD_WORKSPACE);
-    const tab = (await herdrJson(run, ["tab", "create", "--workspace", ws.id, "--cwd", leadCwd, "--label", "dori-lead", "--no-focus"])) as { result?: { root_pane?: { pane_id?: string } } };
-    const pane = tab.result?.root_pane?.pane_id;
-    if (!pane) throw new SetupError("herdr tab create returned no pane id for the lead");
-    leadPane = pane;
-    lines.push(`SETUP herdr lead pane ${pane} created in workspace ${LEAD_WORKSPACE} (${ws.id})${lead ? `; ${lead} was gone` : ""}`);
-  }
-  const oldLanes = recorded.laneWorkspace;
-  const ignore = strings(current.ignorePanes);
-  let lanes = oldLanes;
-  if (oldLanes && (await exists(run, "workspace", oldLanes))) lines.push(`SETUP herdr lanes workspace ${oldLanes} reused`);
-  else {
-    const ws = await ensureWorkspace(run, LANES_WORKSPACE);
-    lanes = ws.id;
-    if (ws.created) {
-      const shells = (await listPanes(run)).filter((p) => p.workspace_id === lanes).map((p) => p.pane_id);
-      patch.ignorePanes = [...new Set([...ignore, ...shells])];
-    }
-    lines.push(`SETUP herdr lanes workspace ${lanes} ${ws.created ? "created" : "found by label"}${oldLanes ? `; ${oldLanes} was gone` : ""}`);
-  }
-  saveManagedPanes(stateDir, { leadPane, laneWorkspace: lanes, migrated: true });
-  lines.push(`SETUP herdr ids recorded in ${managedPanesPath(stateDir)}`);
-  if (patch.ignorePanes === undefined && !Array.isArray(current.ignorePanes)) patch.ignorePanes = ignore;
-  return { patch, lines };
-};
-
 export const renderTemplate = (text: string, values: Readonly<Record<string, string>>): string =>
   text.replace(/\{\{(\w+)\}\}/g, (_, name: string) => {
     const v = values[name];
@@ -356,15 +270,12 @@ export const fillMarkers = (text: string, values: Readonly<Record<string, string
     return v;
   });
 
-/** The values the unit templates take; the herdr binary is required only while herdr is used, hc's only while hc is. */
-export const templateValues = (d: SetupDeps, workDir: string, rt: Pick<HostRuntimes, "herdr" | "hc"> = { herdr: true, hc: false }): Record<string, string> => {
-  if (rt.herdr && !d.bins.herdr) throw new SetupError("herdr is not on PATH; install it (https://herdr.dev) before turning on autostart");
-  if (rt.hc && !d.bins.hc) throw new SetupError(`hc is not on PATH; install it (curl -fsSL ${HC_INSTALL_URL} | sh) before turning on autostart`);
-  const used = [...(rt.herdr && d.bins.herdr ? [d.bins.herdr] : []), ...(rt.hc && d.bins.hc ? [d.bins.hc] : [])];
-  const bins = [dirname(d.bins.dori), ...used.map((bin) => dirname(bin)), join(d.home, ".bun", "bin"), join(d.home, ".local", "bin"), "/usr/local/bin", "/usr/bin", "/bin"];
+/** The values the unit templates take; hc must be on PATH (hc-core.service runs it). */
+export const templateValues = (d: SetupDeps, workDir: string): Record<string, string> => {
+  if (!d.bins.hc) throw new SetupError(`hc is not on PATH; install it (curl -fsSL ${HC_INSTALL_URL} | sh) before turning on autostart`);
+  const bins = [dirname(d.bins.dori), dirname(d.bins.hc), join(d.home, ".bun", "bin"), join(d.home, ".local", "bin"), "/usr/local/bin", "/usr/bin", "/bin"];
   return {
-    ...(rt.herdr && d.bins.herdr ? { HERDR_BIN: d.bins.herdr } : {}),
-    ...(rt.hc && d.bins.hc ? { HC_BIN: d.bins.hc } : {}),
+    HC_BIN: d.bins.hc,
     HOME: d.home,
     PATH: [...new Set(bins)].join(":"),
     SHELL: d.bins.shell,
@@ -378,18 +289,17 @@ export const templateValues = (d: SetupDeps, workDir: string, rt: Pick<HostRunti
 };
 
 /**
- * The autostart files for this host's units (hostServices): herdr-server.service only while herdr is used, hc-core.service
- * (its `@HC_BIN@` and `@PATH@` filled) while hc is, the supervisor, the failure notifier and the boot prep script, which
- * waits for herdr only on a host that uses it (HC_BOOT_PREP otherwise).
+ * The autostart files for this host's units (hostServices): hc-core.service (its `@HC_BIN@` and `@PATH@` filled), the
+ * supervisor, the failure notifier and the boot prep script.
  */
-export const renderAutostart = (d: SetupDeps, workDir: string, rt: Pick<HostRuntimes, "herdr" | "hc"> = { herdr: true, hc: false }): Map<string, { content: string; mode: number }> => {
-  const values = templateValues(d, workDir, rt);
+export const renderAutostart = (d: SetupDeps, workDir: string): Map<string, { content: string; mode: number }> => {
+  const values = templateValues(d, workDir);
   const out = new Map<string, { content: string; mode: number }>();
-  for (const unit of [...hostServices(rt), NOTIFY_UNIT]) {
+  for (const unit of [...hostServices(), NOTIFY_UNIT]) {
     const text = readFileSync(join(d.templatesDir, unit), "utf8");
     out.set(join(d.unitDir, unit), { content: unit === HC_CORE_UNIT ? fillMarkers(text, values) : renderTemplate(text, values), mode: 0o644 });
   }
-  out.set(values.BOOT_PREP as string, { content: rt.herdr ? renderTemplate(readFileSync(join(d.templatesDir, BOOT_PREP), "utf8"), values) : HC_BOOT_PREP, mode: 0o755 });
+  out.set(values.BOOT_PREP as string, { content: renderTemplate(readFileSync(join(d.templatesDir, BOOT_PREP), "utf8"), values), mode: 0o755 });
   out.set(values.FAILURE_NOTIFY as string, { content: renderTemplate(readFileSync(join(d.templatesDir, FAILURE_NOTIFY), "utf8"), values), mode: 0o755 });
   return out;
 };
@@ -455,7 +365,10 @@ const reportMissing = (d: SetupDeps, missing: readonly string[]): boolean => {
   return missing.length > 0;
 };
 
-/** `dori setup --migrate`: prune obsolete keys and ask only keys never shown before. */
+/**
+ * `dori setup --migrate`: prune obsolete keys (config.json, then the local runner's runner-config.json, e.g. a retired
+ * `laneRuntime`) and ask only keys never shown before.
+ */
 const runMigrate = async (d: SetupDeps, input: SetupInput): Promise<number> => {
   if (!existsSync(d.configPath)) {
     d.log(`SETUP_MIGRATE_SKIPPED no config at ${d.configPath}; run dori setup`);
@@ -470,6 +383,7 @@ const runMigrate = async (d: SetupDeps, input: SetupInput): Promise<number> => {
     prompt: d.prompt, interactive: d.interactive, seen, mode: "new", defaults: doriConfigDefault(d.home), log: d.log,
   });
   d.log(`SETUP config ${saveConfig(d.configPath, raw, configured.next, d.log) ? "written" : "unchanged"}: ${d.configPath}`);
+  await pruneLocalRunnerConfig(d.home, d.log);
   if (d.interactive) writeSeenKeys(seenPath, [...seen, ...configured.shown]);
   if (reportMissing(d, configured.missingRequired)) {
     d.log("SETUP_MIGRATE_DONE with problems: config");
@@ -600,35 +514,8 @@ export const runSetup = async (d: SetupDeps, input: SetupInput = {}): Promise<nu
     ? `SETUP decisionsChannel ${decisionsChannel}: owner decisions open one thread each there`
     : `SETUP decisionsChannel unset: owner decisions go to the requesting channel; optional, add "decisionsChannel": "<channel id>" to ${d.configPath} to open them in one channel`);
 
-  let serverUp = false;
-  const runtimes = await setupRuntimes(d, config, stateAbs);
-  const herdrStep = input.herdr ?? true;
-  if (!runtimes.herdr) d.log(`SETUP herdr skipped: not used on this host (${runtimesNote(runtimes)})`);
-  else if (advanced ? await d.prompt.confirm("Create or reuse the herdr lead pane and lanes workspace?", herdrStep) : herdrStep) {
-    if (!d.bins.herdr) {
-      problems.push("herdr");
-      d.log("SETUP herdr not found on PATH; install it (https://herdr.dev) and run dori setup again");
-    } else if ((await d.run(["herdr", "workspace", "list"])).code !== 0) {
-      problems.push("herdr");
-      d.log("SETUP herdr server not reachable; start `herdr server` (or the herdr-server unit) and run dori setup again");
-    } else {
-      serverUp = true;
-      try {
-        const h = await ensureHerdr(d.run, config, workDir, expandHome(stateDir, d.home));
-        for (const l of h.lines) d.log(l);
-        const before = config;
-        // The herdr ids live in dori state; setup drops the legacy keys from the config.
-        config = Object.fromEntries(Object.entries(mergeConfig(config, h.patch)).filter(([key]) => !(LEGACY_PANE_KEYS as readonly string[]).includes(key)));
-        d.log(`SETUP config ${saveConfig(d.configPath, before, config, d.log) ? "updated" : "unchanged"} for herdr`);
-      } catch (e) {
-        problems.push("herdr");
-        d.log(`SETUP herdr failed: ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-  } else d.log("SETUP herdr skipped");
-
-  if (await d.prompt.confirm(`Start ${runtimes.herdr ? "herdr" : "hc"} and the supervisor automatically at boot (systemd user units)?`, input.autostart ?? false)) {
-    problems.push(...(await autostart(d, workDir, serverUp, advanced, runtimes)));
+  if (await d.prompt.confirm("Start hc and the supervisor automatically at boot (systemd user units)?", input.autostart ?? false)) {
+    problems.push(...(await autostart(d, workDir, advanced)));
   } else d.log("SETUP autostart skipped");
 
   d.log(problems.length ? `SETUP_DONE with problems: ${[...new Set(problems)].join(", ")}` : "SETUP_DONE");
@@ -642,28 +529,14 @@ const ensureDir = (d: SetupDeps, dir: string): void => {
 };
 
 /**
- * host-runtimes.ts for the host setup configures: the config being written (`leadRuntime`), the recorded lead pane, the
- * local runner's runner-config `laneRuntime` and the open local lanes (none when the registry cannot be read).
- */
-const setupRuntimes = async (d: SetupDeps, config: Json, stateDir: string): Promise<HostRuntimes> => {
-  const registry = new Registry(stateDir);
-  let lanes: Awaited<ReturnType<Registry["open"]>> = [];
-  if (existsSync(registry.dir)) try { lanes = await registry.open(); } catch { lanes = []; }
-  return hostRuntimes(
-    { leadRuntime: config.leadRuntime === "hc" ? "hc" : "herdr", leadPane: readManagedPanes(stateDir).leadPane ?? "" },
-    localLaneRuntime(defaultRunnerDir(d.home)), localLanePanes(lanes),
-  );
-};
-
-/**
  * `advanced` asks before each step; otherwise the one autostart answer accepts them all. Writes and enables this host's
- * units (hostServices): herdr-server.service only while herdr is used (an existing one is never removed), and
- * hc-core.service while hc is, started at once (`hc server start` is safe while a core runs).
+ * units (hostServices) and starts hc-core.service at once (`hc server start` is safe while a core runs). Units it
+ * does not write are never touched.
  */
-const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advanced: boolean, rt: HostRuntimes): Promise<string[]> => {
+const autostart = async (d: SetupDeps, workDir: string, advanced: boolean): Promise<string[]> => {
   const problems: string[] = [];
-  const units = hostServices(rt);
-  const files = renderAutostart(d, workDir, rt);
+  const units = hostServices();
+  const files = renderAutostart(d, workDir);
   const confirm = advanced ? d.prompt.confirm : async () => true;
   if (!(await confirm(`Write ${units.join(", ")} to ${d.unitDir} and the boot prep script?`, true))) {
     d.log("SETUP autostart units not written; stopping autostart here");
@@ -702,11 +575,7 @@ const autostart = async (d: SetupDeps, workDir: string, serverUp: boolean, advan
     await step("Disable and stop the legacy presence unit? The supervisor now owns Discord presence and slash commands.", ["systemctl", "--user", "disable", "--now", legacy]);
   }
   await step("Enable the units so they start at boot?", ["systemctl", "--user", "enable", ...units]);
-  if (rt.hc) await step("Start the hc core now?", ["systemctl", "--user", "start", HC_CORE_UNIT]);
-  const rest = units.filter((u) => u !== HC_CORE_UNIT);
-  if (serverUp) {
-    d.log("SETUP herdr server is already running (started by hand?); herdr-server.service is enabled but not started so it does not fight for the socket");
-    d.log(`SETUP start the rest now with: systemctl --user start ${rest.filter((u) => u !== HERDR_UNIT).join(" ")}`);
-  } else d.log(`SETUP start them now with: systemctl --user start ${rest.join(" ")}`);
+  await step("Start the hc core now?", ["systemctl", "--user", "start", HC_CORE_UNIT]);
+  d.log(`SETUP start them now with: systemctl --user start ${units.filter((u) => u !== HC_CORE_UNIT).join(" ")}`);
   return problems;
 };

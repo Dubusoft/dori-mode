@@ -99,7 +99,7 @@ test("never removes open lanes' dirs, git checkouts, secrets, live-session temp,
   const dirtyFile = file(join(dirty, "wip.ts"), "uncommitted");
   const secretsA = file(join(home, ".dori", "secrets", "store.json"));
   const secretsB = file(join(home, ".secrets", "token"));
-  const live = [file(join(tmp, "tmux-1000", "default")), file(join(tmp, "herdr-x", "s")), file(join(tmp, "senpi-abc", "f")), file(join(tmp, "a.lock")), file(join(tmp, "proj", "x.lock"))];
+  const live = [file(join(tmp, "tmux-1000", "default")), file(join(tmp, "senpi-abc", "f")), file(join(tmp, "a.lock")), file(join(tmp, "proj", "x.lock"))];
   const held = file(join(tmp, "held", "open.log"));
   const busyDir = file(join(tmp, "busy", "inner", "f.txt"));
   const outside = file(join(dirname(home), "outside", "keep.txt"));

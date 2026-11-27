@@ -17,7 +17,7 @@ export const SETUP_USAGE = `dori setup [options]
   Enter keeps it and - clears an optional key.
   Asks five questions: bot token, channel ids, owner id, whether new GitHub issues start work (yes: the logins and
   repos to watch), and autostart (yes: every system step runs). Everything else keeps its value or default.
-  --advanced              also ask models, directories, every other config key, the herdr step, each autostart step
+  --advanced              also ask models, directories, every other config key, each autostart step
                           and whether to keep a channel that failed its check; GitHub repos are asked every time
   --yes, -y               non-interactive: take flags, then stored values, then defaults
   --token-file FILE       read the Discord bot token from FILE ("-" for stdin); never pass it as an argument
@@ -27,8 +27,8 @@ export const SETUP_USAGE = `dori setup [options]
   --set KEY=VALUE         set a config.json key as given, without asking (repeatable; an empty VALUE unsets it)
   --unset KEY             delete a config.json key without asking (repeatable)
   --migrate               after an update: migrate the schema, remove keys config.json no longer reads (warned once first)
-                          and ask only keys never shown before; no token, Discord, herdr or autostart steps
-  --no-herdr              skip the herdr lead pane and lanes workspace
+                          and keys the local runner's runner-config.json no longer reads, and ask only keys never shown
+                          before; no token, Discord or autostart steps
   --autostart             install and enable the systemd user units (with --yes: runs every step)
 
   Keys config.json no longer reads are warned about on the first run that finds them and removed on the next;
@@ -107,7 +107,7 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
     options: {
       yes: { type: "boolean", short: "y" }, "token-file": { type: "string" }, channel: { type: "string", multiple: true },
       model: { type: "string" }, cwd: { type: "string" }, "state-dir": { type: "string" }, "issue-author": { type: "string", multiple: true },
-      "no-herdr": { type: "boolean" }, autostart: { type: "boolean" }, help: { type: "boolean", short: "h" },
+      autostart: { type: "boolean" }, help: { type: "boolean", short: "h" },
       set: { type: "string", multiple: true }, unset: { type: "string", multiple: true }, migrate: { type: "boolean" },
       advanced: { type: "boolean" },
     },
@@ -135,7 +135,6 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
     cwd: values.cwd,
     stateDir: values["state-dir"],
     issueAuthors: values["issue-author"]?.flatMap((a) => a.split(",")).map((a) => a.trim()).filter(Boolean),
-    herdr: values["no-herdr"] ? false : undefined,
     autostart: values.autostart,
     patch: keys.patch,
     unset: keys.unset,
@@ -157,7 +156,7 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
         envPath: join(home, ".dori", "env"),
         unitDir: join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user"),
         templatesDir: join(import.meta.dir, "..", "templates"),
-        bins: { dori: Bun.which("dori") ?? join(home, ".bun", "bin", "dori"), herdr: Bun.which("herdr") ?? undefined,
+        bins: { dori: Bun.which("dori") ?? join(home, ".bun", "bin", "dori"),
           // hc's installer puts it in ~/.local/bin, which a login PATH may not hold yet.
           hc: Bun.which("hc") ?? (existsSync(join(home, ".local", "bin", "hc")) ? join(home, ".local", "bin", "hc") : undefined), shell: process.env.SHELL || "/bin/bash" },
       },

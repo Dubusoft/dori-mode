@@ -14,13 +14,13 @@ export type SweepView = {
   readonly panes: (machine?: string) => Promise<Pane[]>;
   /** The pane's row, or undefined when it does not exist; throws when the machine's runner cannot list its panes. */
   readonly find: (ref: PaneRef) => Promise<Pane | undefined>;
-  /** herdr's agent_status for the pane; a failed lookup comes back as its error text. */
+  /** hc's agent_status for the pane; a failed lookup comes back as its error text. */
   readonly status: (ref: PaneRef) => Promise<{ readonly status?: string; readonly error?: string }>;
   readonly screen: (ref: PaneRef, lines: number) => Promise<string>;
   readonly processInfo: (ref: PaneRef) => Promise<Ran>;
 };
 
-/** Concurrent herdr calls per machine in a round. */
+/** Concurrent runtime calls per machine in a round. */
 export const SWEEP_CONCURRENCY = 4;
 /** One screen read per pane serves every sweep: the largest any of them asks for (remote reports, freshness posts). */
 export const SWEEP_SCREEN_LINES = 200;
@@ -85,7 +85,7 @@ const cacheKey = (machine: string | undefined, pane: string): string => `${machi
 
 /**
  * One sweep round: one `ops.panes` per machine, taken now and shared by every sweep. A screen or process-info
- * read is cached by the pane's `revision` (herdr bumps it on prompt and command events, not when a program prints), so
+ * read is cached by the pane's `revision` (hc bumps it on prompt and command events, not when a program prints), so
  * a screen is also keyed by the pane's scrollback extent and re-read once it is older than SWEEP_SCREEN_MAX_AGE_MS;
  * a pane that did not change costs no call at all; a row without a revision is cached for this round only. Reads of open lanes whose pane
  * changed are prefetched with at most `concurrency` calls per machine, each machine within its own deadline.

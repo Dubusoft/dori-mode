@@ -37,8 +37,6 @@ export type QueuedLaunch = {
   /** The launch's `--task` (Toodo task id). */
   readonly task?: number;
   readonly machine?: string;
-  readonly pane?: string;
-  readonly workspace?: string;
   /** The launch's `--grant` names. */
   readonly grants?: readonly string[];
   readonly queuedAt: string;
@@ -85,7 +83,7 @@ const MACHINE_FLAG_FIELDS: Fields = { ...FLAG_FIELDS, blocked: ["boolean", true]
 const LAUNCH_FIELDS: Fields = {
   key: ["string", true], title: ["string", true], done: ["string", true], brief: ["string", true],
   cwd: ["string", false], repos: ["strings", false], thread: ["string", false], model: ["string", false], mode: ["mass-ulw", false],
-  task: ["posint", false], machine: ["string", false], pane: ["string", false], workspace: ["string", false], grants: ["strings", false],
+  task: ["posint", false], machine: ["string", false], grants: ["strings", false],
   queuedAt: ["string", true], reasons: ["strings", true],
 };
 

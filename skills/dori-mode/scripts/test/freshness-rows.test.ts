@@ -44,7 +44,7 @@ test.each(STORES)("%s store: 100 lanes reporting rows cost the freshness sweep n
   // Silent by replies past both nudgeAfterMin (15) and postAfterMin (20), but every lane wrote a row 11 min ago: nothing to read or post.
   expect(await freshnessTick(deps(T0 + 21 * MIN), undefined, store)).toEqual([]);
   expect(world.ops).toEqual([]);
-  expect(world.calls.filter((c) => c[0] === "herdr")).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "hc")).toEqual([]);
   // Without the store the same tick nudges every lane through its runner; no pane's text is read for a report.
   expect((await freshnessTick(deps(T0 + 21 * MIN))).filter((a) => a.kind === "nudged")).toHaveLength(100);
   expect(world.ops.filter((e) => e.op === "screen")).toEqual([]);

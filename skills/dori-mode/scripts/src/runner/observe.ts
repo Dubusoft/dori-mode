@@ -2,7 +2,7 @@ import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { listPanes, type Pane } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
-import { infoOf, paneRuntime } from "../runtime/index.ts";
+import { infoOf, sessionRuntime } from "../runtime/index.ts";
 import type { TurnEvidence, TurnHold, TurnStopCause } from "./protocol.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
 
@@ -10,14 +10,14 @@ import { laneStatus, type ObservedLane } from "./serve.ts";
  * What a runner on a worker machine sees of the lanes on its host, without the supervisor's registry. A pane the runner
  * started a lane on (`owned`: its lane records, each pane checked by `RunnerLanes.currentPane`) is that lane's whatever
  * runs in it, so a lane whose agent exited and left only its shell is still observed (as dead), and a host with no
- * readable process environment (macOS) still sees every lane it owns. Any other pane is a lane's when one of its foreground processes (from `herdr pane process-info`) carries `DORI_LANE_KEY` in its own
+ * readable process environment (macOS) still sees every lane it owns. Any other pane is a lane's when one of its foreground processes (from the pane's process info) carries `DORI_LANE_KEY` in its own
  * environment or inherits it from an ancestor, the same attribution `lane-memory.ts` uses for memory (Linux, where
  * `/proc` is readable). When no process environment is readable (macOS) the attribution falls back to the agent's
  * argv: the launch prompt names the lane brief (`briefs/<key>.md` in the runner directory, or an older launch's
  * `dori-brief-<key>.md`), and a foreground process whose argv carries that path belongs to `<key>`. The owned record
  * wins, then the environment attribution, then the argv. For each such
  * pane the status follows `laneStatus` (agent not alive: dead; alive and working: working; else idle), except that a
- * pane herdr calls dead whose lane agent process still runs there (`laneAgentRunning`) is idle: herdr detects a lane's
+ * pane hc calls dead whose lane agent process still runs there (`laneAgentRunning`) is idle: hc detects a lane's
  * agent from one child process, which a live agent can lack (a sandboxed omo on a non-Anthropic model, after an idle
  * spell or an extension reload). A pane's text is never read here: a lane's reports reach the supervisor only as
  * `lane.report` events.
@@ -91,13 +91,13 @@ export type ObserveHostDeps = {
   readonly owned?: (panes: readonly Pane[]) => Promise<ReadonlyMap<string, string>>;
 };
 
-const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | undefined> => infoOf(await paneRuntime(run, pane).processInfo(pane));
+const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | undefined> => infoOf(await sessionRuntime(run).processInfo(pane));
 
 const agentProcesses = (info: ProcessInfo | undefined) =>
   (info?.foreground_processes ?? []).filter((p): p is typeof p & { readonly pid: number } => typeof p.pid === "number" && p.pid !== info?.shell_pid);
 
 /**
- * Whether lane `key`'s agent process still runs in a pane, from herdr's process-info of it: one of the pane's foreground
+ * Whether lane `key`'s agent process still runs in a pane, from its process info: one of the pane's foreground
  * processes other than its shell belongs to the lane by its environment (`owner`: `procLanes`, `DORI_LANE_KEY` own or
  * inherited; Linux) or names the lane's brief in its argv (`briefLane`: the launch prompt names it; every OS). The
  * launch sets `DORI_LANE_KEY` for the agent's command only, so a shell left after the agent exited never counts.

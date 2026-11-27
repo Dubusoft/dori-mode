@@ -6,10 +6,8 @@ import { join } from "node:path";
 import { defaultConfig } from "../src/config.ts";
 import { runnerChecks } from "../src/doctor.ts";
 import { openOperations, plan } from "../src/operations.ts";
-import { herdrDownSince } from "../src/runner/herdr-down.ts";
 import { HUB_FILE, RunnerHub } from "../src/runner/hub.ts";
 import { writeRunnerEndpoint } from "../src/runner/endpoints.ts";
-import { markHerdr } from "./herdr-world.ts";
 import { withSqliteStore } from "./fakes.ts";
 
 const dirs: string[] = [];
@@ -63,39 +61,4 @@ test("a protocol two versions apart and an open restart circuit warn", () => {
   const row = checks.find((c) => c.id === "runner worker-a");
   expect(row?.level).toBe("WARN");
   expect(row?.detail).toBe("proto 11 is not 10 or 9; restart circuit open (3 restarts in the last hour)");
-});
-
-test("a runner whose machine's herdr is down or hung is FAIL with the herdr command for that machine; up is OK", () => {
-  const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "worker-a", 10);
-  addRunner(s.stateDir, "worker-b", 10);
-  addRunner(s.stateDir, "worker-c", 3);
-  addRunner(s.stateDir, "worker-d", 10);
-  markHerdr(s.stateDir, "worker-a", "down", NOW - 60_000);
-  markHerdr(s.stateDir, "worker-b", "hung", NOW - 60_000);
-  markHerdr(s.stateDir, "worker-c", "down", NOW - 60_000);
-  markHerdr(s.stateDir, "worker-d", "up", NOW - 60_000);
-  const checks = runnerChecks(s.deps);
-  const since = new Date(NOW - 60_000).toISOString();
-  expect(checks.find((c) => c.id === "runner worker-a")).toEqual({
-    id: "runner worker-a", level: "FAIL", detail: `herdr down since ${since} (no server process)`, fix: "dori runner herdr start --machine worker-a",
-  });
-  expect(checks.find((c) => c.id === "runner worker-b")).toMatchObject({
-    level: "FAIL", detail: `herdr hung since ${since} (the server process runs but does not answer)`,
-    fix: "dori runner herdr restart --machine worker-b --yes (ends every lane pane there; without --yes it lists them)",
-  });
-  expect(checks.find((c) => c.id === "runner worker-c")?.fix).toBe("dori runner install --machine worker-c to upgrade (proto 3 has no host.herdr), then dori runner herdr start --machine worker-c");
-  expect(checks.find((c) => c.id === "runner worker-d")).toMatchObject({ level: "OK", detail: "proto 10, gen 4, restarts1h 0, herdr up" });
-});
-
-test("a runner whose herdr server runs elevated is FAIL with the elevated-server fix, never the restart the runner would refuse", () => {
-  const s = setup("100.101.1.2:7411");
-  addRunner(s.stateDir, "windows-pc", 10);
-  markHerdr(s.stateDir, "windows-pc", "elevated", NOW - 60_000);
-  const row = runnerChecks(s.deps).find((c) => c.id === "runner windows-pc");
-  expect(row).toMatchObject({ level: "FAIL", detail: `herdr elevated since ${new Date(NOW - 60_000).toISOString()} (the server runs as administrator and refuses the unelevated runner)` });
-  expect(row?.fix).toContain("allow_unelevated_clients = true");
-  expect(row?.fix).not.toContain("dori runner herdr restart");
-  // Lane recovery and launches on that machine stay held while it is elevated, as for down and hung.
-  expect(herdrDownSince(s.stateDir).has("windows-pc")).toBe(true);
 });

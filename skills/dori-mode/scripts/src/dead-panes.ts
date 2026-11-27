@@ -11,7 +11,7 @@ import { BUILT_IN } from "./tunables.ts";
 /** Unrecognised ticks in a row before one alert names the pane. */
 export const UNRECOGNISED_ALERT_AFTER = 3;
 
-/** Terminal title of the DAG viewer a mass-ulw lane opens next to its agent pane. It runs no agent, so herdr reports no status. */
+/** Terminal title of the DAG viewer a mass-ulw lane opens next to its agent pane. It runs no agent, so hc reports no status. */
 export const DAG_VIEWER_TITLE = "OmO DAG";
 /** Label prefix the DAG extension gives the pane it splits off, set before its viewer runs (and kept when it never does). */
 export const DAG_PANE_LABEL = "DAG · ";
@@ -35,7 +35,7 @@ const laneActivity = (lane: Lane): number => Math.max(
 );
 
 /**
- * A pane is alive when herdr reports a running agent status for it; that wins over any screen text. Otherwise it is
+ * A pane is alive when hc reports a running agent status for it; that wins over any screen text. Otherwise it is
  * dead only when this tick's tail carries a configured dead marker AND equals the previous tick's tail, so the two
  * reads are a full loop interval apart and a screen mid-redraw never counts. A marker seen once is pending. Anything
  * else is unrecognised, counted per pane, with one alert after UNRECOGNISED_ALERT_AFTER ticks in a row.
@@ -45,7 +45,7 @@ const laneActivity = (lane: Lane): number => Math.max(
  * owns raises one `unregistered` line (lead-digest) for the life of the state, however often its count fills again.
  * A dead pane that is a registered lane's pane also leaves a synthetic `blocked` report row under that lane's key (lane-reports.ts appendDeadPaneReport), so the lane's result is not lost.
  * A lane's pane whose lane agent process still runs there (runner/observe.ts `laneAgentRunning`, from the pane's
- * process-info) is alive like one with an alive status: herdr's agent detection can miss a live agent. A lane pane the
+ * process-info) is alive like one with an alive status: hc's agent detection can miss a live agent. A lane pane the
  * lead already heard of as dead (`Lane.deadAlertPane`, from RUNNER_LANE_DEAD) raises no line of its own.
  * Pane lists and tails come from each machine's runner: `view` (the supervisor round's cached reads), else `ops`.
  * A machine that is not `admitted` (its runner has no admitted connection) is skipped without a line.
@@ -69,7 +69,7 @@ export const deadPaneTick = async (ops: LaneOps, config: DoriConfig, seen: Set<s
     // Remote inventories contain other people's panes too: inspect only registered lane panes.
     const owned = new Set(lanes.flatMap((lane) => lane.machine === machine && lane.pane ? [lane.pane] : []));
     try {
-      out.push(...await inspect(view, { ...config, laneWorkspace: "", leadPane: "", ignorePanes: [] }, seen, hourKey, state, ctx, machine, owned));
+      out.push(...await inspect(view, { ...config, leadPane: "", ignorePanes: [] }, seen, hourKey, state, ctx, machine, owned));
     } catch (e) {
       out.push(`DEAD_PANES_WARN machine=${machine} ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -87,7 +87,6 @@ type Ctx = {
 
 const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, hourKey: string, state: DeadPaneState, ctx: Ctx, machine?: string, owned?: ReadonlySet<string>): Promise<string[]> => {
   const out: string[] = [];
-  const watch = new Set([config.laneWorkspace].filter(Boolean));
   const skip = new Set([config.leadPane, ...config.ignorePanes].filter(Boolean));
   const marked = (tail: string) => BUILT_IN.deadPanePatterns.some((p) => tail.includes(p.toLowerCase()));
   const panes = await view.panes(machine);
@@ -97,7 +96,7 @@ const inspect = async (view: LaneReads, config: DoriConfig, seen: Set<string>, h
   }));
   for (const pane of panes) {
     if (owned && !owned.has(pane.pane_id)) continue;
-    if (skip.has(pane.pane_id) || (watch.size > 0 && !watch.has(pane.workspace_id))) continue;
+    if (skip.has(pane.pane_id)) continue;
     const id = machine ? `${machine}/${pane.pane_id}` : pane.pane_id;
     if (pane.agent_status && ALIVE_STATUSES.has(pane.agent_status)) {
       state.unknown.delete(id);

@@ -1,17 +1,15 @@
 import { listPanes, readScreen, sendGuarded, statusLookup } from "../panes.ts";
 import { RUN_KILL_GRACE_MS, RUN_TIMEOUT_CODE, type Clock, type Runner } from "../run.ts";
-import { paneRuntime, runtimeOfPane } from "../runtime/index.ts";
-import type { CommandResults, ExecutionOutcome, GoalOutcome, PauseStep, ProcessInfo, StartupVerdict } from "./protocol.ts";
+import { sessionRuntime } from "../runtime/index.ts";
+import type { CommandResults, ExecutionOutcome, GoalOutcome, PauseStep, StartupVerdict } from "./protocol.ts";
 
 /**
  * Runner-side lane control (design section 2.3, rows A6-A8, A28, A32, A33): the pause and resume sequences behind
- * `lane.pause` / `lane.resume`, the target-pane checks behind `lane.start.target`, the startup poll behind the
+ * `lane.pause` / `lane.resume`, the startup poll behind the
  * `lane.start` / `lane.recover` startup verdict, and the resume argv rule. Every function reads and types into panes of
  * the runner's own host through `run`; nothing here reads the supervisor's registry.
  *
- * Copied from pause.ts (goalCommand, stopTurn, isWorking), launch.ts (resolveTargetPane, inspectCreated, paneShell,
- * startup poll, startupFailure, screenLines, lastLines); the supervisor
- * copies are deleted by later packages. recover.ts imports `resumeArgv` from here.
+ * The lead's recovery path also uses `resumeArgv`.
  */
 
 export type ControlDeps = { readonly run: Runner; readonly clock: Clock };
@@ -45,7 +43,7 @@ export const goalCommand = async (deps: ControlDeps, pane: string, text: string,
  * a monitor event, a queued message), so stopping is confirmed, never assumed; a failed status lookup confirms nothing.
  */
 export const stopTurn = async (deps: ControlDeps, pane: string): Promise<boolean> => {
-  await paneRuntime(deps.run, pane).key(pane, "escape");
+  await sessionRuntime(deps.run).key(pane, "escape");
   for (let attempt = 0; attempt < READ_BACK_TRIES; attempt++) {
     const after = await statusLookup(deps.run, pane);
     if (!after.error && after.status !== "working") return true;
@@ -105,105 +103,6 @@ export const resume = async (deps: ControlDeps, pane: string): Promise<CommandRe
     execution = (await sendGuarded(deps.run, pane, RESUME_TEXT)) === "sent" && (await turnRuns(deps, pane)) ? "running" : "held";
   }
   return { goal, execution };
-};
-
-// ---------------------------------------------------------------------------------------------------------------
-// Target panes (lane.start.target) and freshly created panes
-// ---------------------------------------------------------------------------------------------------------------
-
-export type PaneShell = "posix" | "pwsh" | "powershell" | "cmd";
-
-/**
- * The shell an idle pane runs, from herdr process-info: the foreground process that is the shell (or the only one).
- * Without a readable name, a drive-letter cwd (D:\...) means a Windows pane, whose default shell is PowerShell.
- */
-export const paneShell = (info: ProcessInfo | undefined, cwd?: string): PaneShell => {
-  const procs = info?.foreground_processes ?? [];
-  const proc = procs.find((p) => p.pid !== undefined && p.pid === info?.shell_pid) ?? (procs.length === 1 ? procs[0] : undefined);
-  const name = (proc?.name || proc?.argv?.[0] || "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/^-/, "").replace(/\.exe$/, "") ?? "";
-  if (name === "pwsh" || name === "powershell") return name;
-  if (name === "cmd") return "cmd";
-  if (name) return "posix";
-  return cwd && /^[A-Za-z]:[\\/]/.test(cwd) ? "powershell" : "posix";
-};
-
-type PaneInfo = { readonly pane_id: string; readonly workspace_id: string; readonly tab_id?: string; readonly terminal_id?: string; readonly agent?: string; readonly cwd?: string; readonly foreground_cwd?: string };
-
-export type TargetPane = { readonly pane: string; readonly tab?: string; readonly terminalId?: string; readonly cwd?: string; readonly shell: PaneShell; readonly shellPid?: number };
-
-/** A target pane that cannot take the lane. `code`: `RUNNER_LANE_TARGET_BUSY` (an agent, a foreground process or another lane holds it) or `RUNNER_LANE_TARGET_INVALID`. */
-export class TargetError extends Error {
-  constructor(readonly code: "RUNNER_LANE_TARGET_BUSY" | "RUNNER_LANE_TARGET_INVALID", detail: string) {
-    super(`${code} ${detail}`);
-    this.name = "TargetError";
-  }
-}
-
-const invalid = (detail: string): TargetError => new TargetError("RUNNER_LANE_TARGET_INVALID", detail);
-const busy = (detail: string): TargetError => new TargetError("RUNNER_LANE_TARGET_BUSY", detail);
-
-const parse = <T>(text: string, what: string): T => {
-  try { return JSON.parse(text) as T; } catch { throw invalid(`${what}: unreadable herdr output`); }
-};
-
-export const cmdRefused = (pane: string): string => `pane ${pane} runs cmd.exe; start pwsh or powershell in it (or a POSIX shell) and launch again`;
-
-export type TargetOptions = {
-  /** The lane key that already owns `pane` on this host, if any (the runner's own lane records). */
-  readonly ownerOf: (pane: string) => string | undefined;
-  /** Refuse a cmd.exe pane (no lane footer form exists for it). */
-  readonly refuseCmd: boolean;
-  /** Restored tabs need positive proof that the shell owns the foreground process group. */
-  readonly requireIdleProof?: boolean;
-};
-
-/**
- * The existing pane a lane may start in: `target.pane`, else the one shell pane of `target.workspace`. It must exist,
- * be an idle shell (no agent, no other foreground process) and belong to no lane. Throws `TargetError` before anything
- * is written.
- */
-export const resolveTargetPane = async (run: Runner, target: { readonly pane?: string; readonly workspace?: string }, opts: TargetOptions): Promise<TargetPane> => {
-  let id = target.pane;
-  if (!id) {
-    if (!target.workspace) throw invalid("no target pane or workspace");
-    const list = await run(["herdr", "pane", "list"]);
-    if (list.code !== 0) throw invalid(`herdr pane list failed: ${list.err || list.out}`);
-    const inWs = parse<{ result: { panes: PaneInfo[] } }>(list.out, "herdr pane list").result.panes.filter((p) => p.workspace_id === target.workspace);
-    if (!inWs.length) throw invalid(`workspace ${target.workspace} has no panes (or does not exist)`);
-    const shells = inWs.filter((p) => !p.agent);
-    if (shells.length !== 1) throw invalid(`workspace ${target.workspace} has ${shells.length} shell panes; pass a pane to pick one`);
-    id = shells[0]?.pane_id;
-  }
-  if (!id) throw invalid("no target pane");
-  if (runtimeOfPane(id) !== "herdr") throw invalid(`pane ${id} is an hc terminal; a lane target must be an idle herdr shell pane (an hc lane opens its own terminal)`);
-  const got = await run(["herdr", "pane", "get", id]);
-  if (got.code !== 0) throw invalid(`pane ${id} does not exist on this host: ${got.err || got.out}`);
-  const info = parse<{ result: { pane: PaneInfo } }>(got.out, `herdr pane get ${id}`).result.pane;
-  if (target.workspace && info.workspace_id !== target.workspace) throw invalid(`pane ${id} is in workspace ${info.workspace_id}, not ${target.workspace}`);
-  if (info.agent) throw busy(`pane ${id} runs an agent (${info.agent}); a lane needs an idle shell`);
-  const proc = await run(["herdr", "pane", "process-info", "--pane", id]);
-  if (proc.code !== 0) throw invalid(`cannot read the processes of pane ${id}: ${proc.err || proc.out}`);
-  const p = parse<{ result: { process_info: ProcessInfo } }>(proc.out, `herdr pane process-info ${id}`).result.process_info;
-  if (opts.requireIdleProof && (!p.shell_pid || p.foreground_process_group_id !== p.shell_pid
-    || p.foreground_processes?.some((proc) => proc.pid !== p.shell_pid))) throw busy(`pane ${id} is not a proven idle shell`);
-  if (p.foreground_process_group_id && p.foreground_process_group_id !== p.shell_pid) throw busy(`pane ${id} has a foreground process running; a lane needs an idle shell`);
-  const owner = opts.ownerOf(id);
-  if (owner) throw busy(`pane ${id} is already registered to lane ${owner}`);
-  const cwd = info.foreground_cwd ?? info.cwd;
-  const shell = paneShell(p, cwd);
-  if (opts.refuseCmd && shell === "cmd") throw invalid(cmdRefused(id));
-  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.terminal_id ? { terminalId: info.terminal_id } : {}), ...(cwd ? { cwd } : {}), shell, ...(p.shell_pid ? { shellPid: p.shell_pid } : {}) };
-};
-
-/** A freshly created pane: its shell and directory, read leniently (an unreadable answer means POSIX). */
-export const inspectCreated = async (run: Runner, pane: string): Promise<{ readonly shell: PaneShell; readonly cwd?: string; readonly terminalId?: string; readonly shellPid?: number }> => {
-  const got = await run(["herdr", "pane", "get", pane]);
-  const proc = await run(["herdr", "pane", "process-info", "--pane", pane]);
-  const read = <T>(text: string): T | undefined => { try { return JSON.parse(text) as T; } catch { return undefined; } };
-  const info = got.code === 0 ? read<{ result?: { pane?: PaneInfo } }>(got.out)?.result?.pane : undefined;
-  const p = proc.code === 0 ? read<{ result?: { process_info?: ProcessInfo } }>(proc.out)?.result?.process_info : undefined;
-  const cwd = info?.foreground_cwd ?? info?.cwd;
-  return { shell: paneShell(p, cwd), ...(cwd ? { cwd } : {}), ...(info?.terminal_id ? { terminalId: info.terminal_id } : {}), ...(p?.shell_pid ? { shellPid: p.shell_pid } : {}) };
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -304,7 +203,7 @@ export const startupPoll = async (deps: ControlDeps, pane: string, processAlive?
   return { verdict: "unconfirmed", detail: `${why}; last lines: ${lastLines(screen)}` };
 };
 
-/** Whether `pane` is in herdr's pane list of this host (a list that cannot be read answers false). */
+/** Whether `pane` is in hc's pane list of this host (a list that cannot be read answers false). */
 export const paneListed = async (run: Runner, pane: string): Promise<boolean> => {
   try { return (await listPanes(run)).some((p) => p.pane_id === pane); } catch { return false; }
 };

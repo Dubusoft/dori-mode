@@ -170,13 +170,13 @@ test("planLaunch with --machine or a --cwd that narrows to one runner checks onl
   expect(plan.lines).toEqual(["PLACEMENT machine=mini source=runner rule=acme/app cwd=/mini/app"]);
 });
 
-/** `bun src/cli.ts` with a config saving machine big and fake herdr/ssh on PATH; no supervisor runs, so no runner observes big. */
+/** `bun src/cli.ts` with a config saving machine big and fake hc/ssh on PATH; no supervisor runs, so no runner observes big. */
 const cliWorld = () => {
   const state = withState();
   cleanups.push(state.done);
   const bin = join(state.dir, "bin");
   mkdirSync(bin);
-  for (const [name, body] of [["ssh", "echo 'ssh: connect to host big: No route to host' >&2; exit 255"], ["herdr", "echo '{\"result\":{\"panes\":[]}}'"]] as const) {
+  for (const [name, body] of [["ssh", "echo 'ssh: connect to host big: No route to host' >&2; exit 255"], ["hc", "echo '{\"terminals\":[]}'"]] as const) {
     writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   }

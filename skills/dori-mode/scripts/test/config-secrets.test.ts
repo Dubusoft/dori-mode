@@ -9,7 +9,7 @@ import { withState } from "./fakes.ts";
 test("schema 8 drops the old secrets key and preserves secretCommands", async () => {
   const raw = { schemaVersion: 7, secrets: { TOKEN: { lanes: ["lane-a"] } }, secretCommands: {} };
   const migrated = migrateConfigSchema(raw);
-  expect(CONFIG_SCHEMA_VERSION).toBe(8);
+  expect(CONFIG_SCHEMA_VERSION).toBeGreaterThanOrEqual(8);
   const fresh = migrateConfigSchema({});
   expect(fresh.next).not.toHaveProperty("secrets");
   expect(fresh.filled).not.toContain("secrets");

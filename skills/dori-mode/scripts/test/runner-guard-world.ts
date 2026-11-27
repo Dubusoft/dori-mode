@@ -33,7 +33,6 @@ export const guardWorld = (cleanups: (() => void)[]) => {
   const clock = fakeClock(T0);
   let sshCalls = 0;
   const run: Runner = async (argv) => {
-    if (argv.join(" ") === "herdr machine list --json") return { code: 0, out: JSON.stringify([{ label: "mac", ssh_target: "me@mac" }]), err: "" };
     if (argv[0] === "ssh") sshCalls += 1;
     return { code: 1, out: "", err: "unexpected" };
   };

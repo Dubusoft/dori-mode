@@ -13,7 +13,7 @@ export const LOCAL_MACHINE = "local";
 /** This host holds launches while its 1-minute load exceeds its core count times this. */
 export const LOAD_PER_CORE_MAX = 4;
 
-export type PlacementInput = { readonly machine?: string; readonly cwd?: string; readonly done: string; readonly pane?: string; readonly workspace?: string };
+export type PlacementInput = { readonly machine?: string; readonly cwd?: string; readonly done: string };
 
 export type Placement = {
   /** "local" or a machine label. */
@@ -103,7 +103,7 @@ const filled = (s: string | undefined): s is string => typeof s === "string" && 
 export const resolvePlacement = (input: PlacementInput, placement: PlacementConfig, reports: readonly RunnerPlacement[] = []): Placement => {
   if (filled(input.machine)) return { machine: input.machine.trim(), source: "flag", movable: false };
   const repos = doneRepos(input.done);
-  const workspaceTask = filled(input.cwd) || filled(input.pane) || filled(input.workspace) || repos.length > 0;
+  const workspaceTask = filled(input.cwd) || repos.length > 0;
   if (workspaceTask && declaring(reports)) {
     const owners = declaredOwners(input.cwd, repos, reports);
     if (owners) {

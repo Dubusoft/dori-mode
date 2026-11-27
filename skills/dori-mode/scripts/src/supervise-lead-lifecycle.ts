@@ -14,9 +14,7 @@ import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { completeLeadRestart } from "./lead-restart.ts";
 import { awaitStartupEvidence, confirmLead, hasStartupEvidence, heldSession, killTargets, LEAD_STAYS, leadPermissionArgs, ownedTargets, plainShell, processInfo, stopHung, stopLead, supervisorLaunch, UNCONFIRMED_LIMIT } from "./lead-process.ts";
 import { softCommand, softEvidence, softLive, softSessionStarted, sessionModel } from "./lead-soft-restart.ts";
-import { herdrDownSince } from "./runner/herdr-down.ts";
-import { paneRuntime, runtimeOfPane, sessionRuntime } from "./runtime/index.ts";
-import { LOCAL_RUNNER } from "./runner/serve.ts";
+import { sessionRuntime } from "./runtime/index.ts";
 import { redactSecrets } from "./redact.ts";
 import { launchQueue, launchQueueText } from "./routing.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
@@ -330,14 +328,13 @@ export class LeadLifecycle {
   }
 
   /**
-   * Recreate a vanished lead pane like dori-boot-prep.sh: a tab in the "Dori" workspace at leadCwd.
-   * The runtime leadPane changes and persistLeadPane records it in dori state (managed-panes.ts). Returns the new
-   * pane id, or undefined when the pane exists or cannot be recreated cleanly (retries continue).
+   * Recreate a vanished lead pane: a new hc terminal at leadCwd (createLeadPane). The runtime leadPane changes and
+   * persistLeadPane records it in dori state (managed-panes.ts). Returns the new pane id, or undefined when the pane
+   * exists or cannot be recreated cleanly (retries continue). Throws when hc's terminal list cannot be read.
    */
   async repairLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
-    if (this.herdrHeld()) return undefined;
-    if (config.leadPane && await this.leadPaneListed()) return undefined;
+    if (config.leadPane && (await paneRow(run, config.leadPane)) !== undefined) return undefined;
     const pane = await this.createLeadPane();
     if (!pane) return undefined;
     // A launch submitted into the vanished pane can never confirm there; the same events get a fresh session in the new one.
@@ -345,26 +342,6 @@ export class LeadLifecycle {
     if (pending?.phase === "submitted") this.abandon(pending);
     console.log(`LEAD_PANE_RECREATED ${config.leadPane} -> ${pane}`);
     return pane;
-  }
-
-  /** The lead's pane is on another runtime than config `leadRuntime` names: it moves at its next process restart. */
-  private runtimeMoveDue(): boolean {
-    const { leadPane, leadRuntime } = this.deps.config;
-    return leadPane !== "" && runtimeOfPane(leadPane) !== leadRuntime;
-  }
-
-  /**
-   * Whether the recorded lead pane is still listed by its runtime. When that runtime is not config `leadRuntime` and
-   * cannot be read (herdr down under a lead set to hc), the pane counts as gone, so the lead opens on leadRuntime
-   * instead of waiting for the old runtime to come back.
-   */
-  private async leadPaneListed(): Promise<boolean> {
-    const { run, config } = this.deps;
-    try { return (await paneRow(run, config.leadPane)) !== undefined; } catch (e) {
-      if (runtimeOfPane(config.leadPane) === config.leadRuntime) throw e;
-      console.error(`LEAD_PANE_UNREADABLE ${config.leadPane}: ${e instanceof Error ? e.message : String(e)}; the lead opens on ${config.leadRuntime}`);
-      return false;
-    }
   }
 
   /** Move a restart to a fresh session id (phase starting) with the same events and offset; drops the old prompt file. */
@@ -377,81 +354,23 @@ export class LeadLifecycle {
   }
 
   /**
-   * A new "dori-lead" tab in the Dori workspace at leadCwd, persisted as the lead pane. herdr removes a workspace
-   * together with its last pane, so closing the lead by hand can take the Dori workspace with it: then the workspace is
-   * created again, as dori-boot-prep.sh does, and its root pane becomes the lead. Undefined, with herdr's reason logged,
-   * when herdr refuses.
+   * A new lead terminal, persisted as the lead pane: the user's shell at leadCwd in hc, named dori-lead and labelled
+   * dori.lead=1, with no parent and no notes like a lane's. It runs outside any lane sandbox. Undefined, with hc's reason
+   * logged, when hc refuses.
    */
-  /**
-   * While the local runner reports this host's herdr down or hung (HERDR_DOWN / HERDR_HUNG machine=local, saved on its
-   * hub row) the lead pane is not created again: herdr cannot hold it, and each refused attempt would only add a
-   * failure. Re-creation resumes once the runner reads herdr again (HERDR_UP). Logged once per held state.
-   */
-  private heldSince: number | undefined;
-  private herdrHeld(): boolean {
-    // A lead on hc does not need herdr: its pane is created whatever herdr's state.
-    if (this.deps.config.leadRuntime === "hc") return false;
-    const since = herdrDownSince(this.deps.config.stateDir).get(LOCAL_RUNNER);
-    if (since !== undefined && since !== this.heldSince) {
-      console.log(`LEAD_PANE_HELD herdr on machine=${LOCAL_RUNNER} has been unreadable since ${new Date(since).toISOString()}; the lead pane is created again after HERDR_UP`);
-    }
-    this.heldSince = since;
-    return since !== undefined;
-  }
-
   private async createLeadPane(): Promise<string | undefined> {
     const { run, config } = this.deps;
-    if (this.herdrHeld()) return undefined;
-    const pane = config.leadRuntime === "hc" ? await this.createHcLeadPane() : await this.createHerdrLeadPane();
-    if (!pane) return undefined;
-    this.deps = { ...this.deps, config: { ...config, leadPane: pane } };
-    try { this.hooks.persistLeadPane?.(pane); } catch (e) {
-      console.error(`LEAD_PANE_PERSIST_FAILED ${pane}: ${e instanceof Error ? e.message : String(e)}`);
-    }
-    return pane;
-  }
-
-  /**
-   * The lead's hc terminal (config `leadRuntime: "hc"`): the user's shell at leadCwd, named dori-lead and labelled
-   * dori.lead=1, with no parent and no notes like a lane's. It runs outside any lane sandbox, as the herdr lead pane does.
-   */
-  private async createHcLeadPane(): Promise<string | undefined> {
-    const { run, config } = this.deps;
+    let pane: string;
     try {
-      return (await sessionRuntime(run, "hc").open({ key: LEAD_TERMINAL, label: LEAD_TERMINAL_LABEL, cwd: config.leadCwd })).pane;
+      pane = (await sessionRuntime(run).open({ key: LEAD_TERMINAL, label: LEAD_TERMINAL_LABEL, cwd: config.leadCwd })).pane;
     } catch (e) {
       console.error(`LEAD_PANE_CREATE_FAILED ${e instanceof Error ? e.message : String(e)}`);
       return undefined;
     }
-  }
-
-  /** A "dori-lead" tab in herdr's Dori workspace, or that workspace again with its root pane (see createLeadPane). */
-  private async createHerdrLeadPane(): Promise<string | undefined> {
-    const { run, config } = this.deps;
-    const refused = (what: string, result: { readonly out: string; readonly err: string }): undefined => {
-      console.error(`LEAD_PANE_CREATE_FAILED ${what}: ${result.err || result.out}`);
-      return undefined;
-    };
-    const listed = await run(["herdr", "workspace", "list"]);
-    if (listed.code !== 0) return refused("herdr workspace list", listed);
-    const workspace = (JSON.parse(listed.out) as { result: { workspaces: { label?: string; workspace_id: string }[] } }).result.workspaces.find((w) => w.label === "Dori");
-    let pane: string | undefined;
-    if (workspace) {
-      const made = await run(["herdr", "tab", "create", "--workspace", workspace.workspace_id, "--cwd", config.leadCwd, "--label", "dori-lead"]);
-      if (made.code !== 0) return refused(`herdr tab create in ${workspace.workspace_id}`, made);
-      pane = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string } } }).result.root_pane.pane_id;
-    } else {
-      const made = await run(["herdr", "workspace", "create", "--label", "Dori", "--cwd", config.leadCwd, "--no-focus"]);
-      if (made.code !== 0) return refused("herdr workspace create Dori", made);
-      const root = (JSON.parse(made.out) as { result: { root_pane: { pane_id?: string; tab_id?: string; workspace_id?: string } } }).result.root_pane;
-      pane = root.pane_id;
-      console.log(`LEAD_WORKSPACE_RECREATED ${root.workspace_id ?? "?"}`);
-      if (root.tab_id) {
-        const renamed = await run(["herdr", "tab", "rename", root.tab_id, "dori-lead"]);
-        if (renamed.code !== 0) console.error(`LEAD_TAB_RENAME_FAILED ${root.tab_id}: ${renamed.err || renamed.out}`);
-      }
+    this.deps = { ...this.deps, config: { ...config, leadPane: pane } };
+    try { this.hooks.persistLeadPane?.(pane); } catch (e) {
+      console.error(`LEAD_PANE_PERSIST_FAILED ${pane}: ${e instanceof Error ? e.message : String(e)}`);
     }
-    if (!pane) return refused("herdr returned no pane id", { out: "", err: "" });
     return pane;
   }
 
@@ -492,7 +411,7 @@ export class LeadLifecycle {
     const info = await processInfo({ ...this.deps, config: { ...this.deps.config, leadPane: old } });
     const others = (info?.foreground_processes ?? []).filter((p) => p.pid !== info?.shell_pid);
     if (info && (plainShell(info) || (others.length > 0 && others.every(supervisorLaunch)))) {
-      await paneRuntime(run, old).close(old);
+      await sessionRuntime(run).close(old);
     } else console.log(`LEAD_PANE_LEFT ${old}: its foreground is not the supervisor's; left open, nothing in it stopped`);
     console.log(`LEAD_PANE_RECREATED ${old} -> ${pane}`);
     return pane;
@@ -701,7 +620,7 @@ export class LeadLifecycle {
         return next;
       }
     } else {
-      // this.deps, not deps: stopping may have moved the lead to a new pane (a leadRuntime move).
+      // this.deps, not deps: stopping may have moved the lead to a new pane (replaceLeadPane).
       if (!(await confirmLead(this.deps, restart.session))) return this.unconfirmedStart(restart);
       if (!(await awaitStartupEvidence(this.deps, restart.session))) return this.hungStart(restart, promptPath);
     }
@@ -715,8 +634,6 @@ export class LeadLifecycle {
    */
   private async beginSoft(restart: Restart): Promise<{ readonly restart: Restart; readonly startedAt?: number }> {
     const { deps } = this;
-    // A lead due to move to the other runtime needs a process restart: /new would keep it in its old pane.
-    if (this.runtimeMoveDue()) return { restart };
     const idle = (pane: Pane | undefined): boolean => !!pane?.agent && (pane.agent_status === "idle" || pane.agent_status === "done");
     const pane = await paneRow(deps.run, deps.config.leadPane);
     if (!pane || !idle(pane)) return { restart };
@@ -821,15 +738,6 @@ export class LeadLifecycle {
       this.setRestart(undefined);
       return undefined;
     }
-    // With its process stopped, a lead on another runtime than config leadRuntime moves: a new pane there takes the
-    // launch and the old one is closed (replaceLeadPane). When no new pane can be made it starts again where it was,
-    // and the next restart tries the move again.
-    if (!moved && this.runtimeMoveDue()) {
-      const old = this.deps.config.leadPane;
-      const pane = await this.replaceLeadPane();
-      console.log(pane ? `LEAD_RUNTIME_MOVED ${old} -> ${pane} leadRuntime=${this.deps.config.leadRuntime}`
-        : `LEAD_RUNTIME_MOVE_FAILED ${old}: no ${this.deps.config.leadRuntime} pane could be made; the lead starts again in ${old}`);
-    }
     // The restart cap counts forced restarts once the lead really stopped; an owner's request and a
     // demand-driven cold start never count.
     if (!restart.request && restart.force) this.core.noteForcedRestart("forced");
@@ -885,7 +793,7 @@ export class LeadLifecycle {
       "--session-dir", sessionDirFor(deps.tunables.sessionsDir, deps.config.leadCwd),
       ...deps.config.leadArgs, ...(deps.tunables.leadDiet ? LEAD_DIET_ARGS : []), ...agent.slice(1),
     ];
-    const launched = await paneRuntime(deps.run, deps.config.leadPane).run(deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`);
+    const launched = await sessionRuntime(deps.run).run(deps.config.leadPane, `cd ${quoteForPane(deps.config.leadCwd)} && ${argv.map(quoteForPane).join(" ")}`);
     if (launched.code !== 0) throw new TransientSuperviseError(`lead launch admission unconfirmed: ${launched.err || launched.out}; pending session ${submitted.session}`);
     return submitted;
   }
@@ -917,7 +825,7 @@ export class LeadLifecycle {
   }
 
   /**
-   * The process answered herdr but omo never initialised (no holder file, no session jsonl). Stops exactly that process
+   * The process answered hc but omo never initialised (no holder file, no session jsonl). Stops exactly that process
    * tree and returns a fresh session with the same events and tail offset; a second hung start defers to backoff.
    */
   private async hungStart(restart: Restart, promptPath: string): Promise<Restart> {

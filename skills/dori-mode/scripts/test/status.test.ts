@@ -26,21 +26,28 @@ const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
-const fixture = async (panes: unknown[] = [{ pane_id: "lead:p1", workspace_id: "w" }]) => {
+type FakePane = { readonly pane_id: string; readonly agent?: string; readonly agent_status?: string; readonly cwd?: string };
+/** A pane as hc answers `ls`/`get` for it. */
+const terminal = (p: FakePane) => ({ address: p.pane_id.slice("hc:".length), state: "live", ...(p.cwd ? { cwd: p.cwd } : {}), status: p.agent ? { app: p.agent, state: p.agent_status } : null });
+const fixture = async (panes: FakePane[] = [{ pane_id: "hc:t1" }]) => {
   const state = withState();
   cleanups.push(state.done);
   const calls: string[] = [];
   const run = async (argv: readonly string[]): Promise<Ran> => {
     const line = argv.join(" ");
     calls.push(line);
-    if (line === "herdr pane list") return ok(JSON.stringify({ result: { panes } }));
+    if (line === "hc --json ls") return ok(JSON.stringify({ terminals: panes.map(terminal) }));
+    if (argv[0] === "hc" && argv[2] === "get") {
+      const p = panes.find((x) => x.pane_id === `hc:${argv[3]}`);
+      return p ? ok(JSON.stringify(terminal(p))) : { code: 1, out: "", err: "no such terminal" };
+    }
     if (line.startsWith("systemctl --user is-enabled")) return ok("enabled");
     if (line === "systemctl --user is-active dori-presence.service") return { code: 3, out: "inactive", err: "" };
     if (line.startsWith("systemctl --user is-active")) return ok("active");
     return { code: 127, out: "", err: line };
   };
   const registry = new Registry(state.dir);
-  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "lead:p1", displayTimeZone: "Asia/Seoul" }, tunables: builtInTunables("/home/test") };
+  const deps: StatusDeps = { run, clock: fakeClock(NOW), registry, config: { ...defaultConfig("/home/test"), stateDir: state.dir, leadPane: "hc:t1", displayTimeZone: "Asia/Seoul" }, tunables: builtInTunables("/home/test") };
   return { deps, registry, calls, dir: state.dir };
 };
 const lane = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, thread: "discord:1/2", brief: "/b", done: "d", openedAt: OPENED, ...extra });
@@ -81,18 +88,12 @@ test("status lists working lanes with model, age and last progress; paused and c
   expect(text).not.toContain("beta");
 });
 
-test("status lists hc-core instead of herdr-server on a lead host on hc, and herdr-server again while a local lane sits on herdr", async () => {
+test("status lists hc-core and the supervisor, and never reads a herdr unit", async () => {
   const f = await fixture();
-  const runnerDir = join(f.dir, "runner");
-  mkdirSync(runnerDir, { recursive: true });
-  writeFileSync(join(runnerDir, "runner-config.json"), JSON.stringify({ laneRuntime: "hc" }));
-  const deps: StatusDeps = { ...f.deps, runnerDir, config: { ...f.deps.config, leadRuntime: "hc", leadPane: "hc:t1" } };
-  const s = await collectStatus(deps);
+  const s = await collectStatus(f.deps);
   expect(s.services.map((u) => u.name)).toEqual(["hc-core.service", "dori-supervisor.service", "dori-presence.service"]);
   expect(renderStatus(s)).toContain("\n■ 서비스\n- hc-core: 실행 중\n- dori-supervisor: 실행 중\n");
-  expect(f.calls.some((c) => c.includes("herdr-server"))).toBe(false);
-  await f.registry.write(lane("old", { pane: "w1:p3" }));
-  expect((await collectStatus(deps)).services.map((u) => u.name)).toEqual(["herdr-server.service", "hc-core.service", "dori-supervisor.service", "dori-presence.service"]);
+  expect(f.calls.some((c) => c.includes("herdr"))).toBe(false);
 });
 
 test("status shows services, pending waits, watched repos with poll time and failures, and the gateway", async () => {
@@ -104,7 +105,7 @@ test("status shows services, pending waits, watched repos with poll time and fai
   writeGatewayStatus(f.dir, { pid: 1, at: NOW - 4_000, connected: true, messageContent: true });
   const s = await collectStatus(f.deps);
   const text = renderStatus(s);
-  expect(text).toContain("\n■ 서비스\n- herdr-server: 실행 중\n- dori-supervisor: 실행 중\n");
+  expect(text).toContain("\n■ 서비스\n- hc-core: 실행 중\n- dori-supervisor: 실행 중\n");
   expect(text).toContain("\n- Discord 게이트웨이: 연결됨\n- GitHub: 저장소 1개 감시, 마지막 폴링 2분 전, 1개 실패\n");
   expect(text).toContain("\n■ 대기 (1)\n- ci-pr-7: 신호 대기, 10-19 10:30 KST 시한 (0분 후) - n");
   expect(text).toContain("\n■ 문제\n- GitHub 폴링 실패: o/r 20분 전\n");
@@ -136,11 +137,11 @@ test("status shows open owner decisions and answered decisions awaiting close", 
 
 test("lead state: missing pane, and a pane with no agent is cold; cap and ttl come from config", async () => {
   const missing = await fixture([]);
-  expect((await collectStatus(missing.deps)).lead).toMatchObject({ pane: "lead:p1", state: "missing", cacheTtlMin: 5, capTokens: 250_000 });
+  expect((await collectStatus(missing.deps)).lead).toMatchObject({ pane: "hc:t1", state: "missing", cacheTtlMin: 5, capTokens: 250_000 });
   const bare = await fixture();
   const s = await collectStatus(bare.deps);
   expect(s.lead.state).toBe("cold");
-  expect(renderStatus(s)).toContain("\n■ 리드\n- lead:p1: 멈춤 - 리드 패널에 실행 중인 에이전트 없음\n");
+  expect(renderStatus(s)).toContain("\n■ 리드\n- hc:t1: 멈춤 - 리드 패널에 실행 중인 에이전트 없음\n");
 });
 
 test("status --json shape round-trips and an empty state dir needs no files and creates none", async () => {
@@ -150,7 +151,7 @@ test("status --json shape round-trips and an empty state dir needs no files and 
   expect(s).toMatchObject({ lanes: [], waits: [], github: { repos: [], failures: [] }, gateway: { state: "missing" } });
   expect(s.lead).not.toHaveProperty("pendingRestart");
   expect(await Bun.file(join(f.dir, "lanes")).exists()).toBe(false);
-  expect(f.calls.every((c) => c === "herdr pane list" || c.startsWith("systemctl --user is-"))).toBe(true);
+  expect(f.calls.every((c) => c.startsWith("hc --json ") || c.startsWith("systemctl --user is-"))).toBe(true);
 });
 
 test("status exposes a pending lead restart when requested and leaves it queued", async () => {
@@ -162,7 +163,7 @@ test("status exposes a pending lead restart when requested and leaves it queued"
   expect(JSON.parse(JSON.stringify(s)).lead.pendingRestart).toEqual(request);
   for (const value of [request.id, "qa/lead", "high", "qa/fallback"]) expect(renderStatus(s)).toContain(value);
   expect(pendingLeadRestart(f.dir)).toEqual(request);
-  expect(f.calls.every((c) => c === "herdr pane list" || c.startsWith("systemctl --user is-"))).toBe(true);
+  expect(f.calls.every((c) => c.startsWith("hc --json ") || c.startsWith("systemctl --user is-"))).toBe(true);
 });
 
 test("the /status text stays far under Discord's limit even with many lanes", async () => {
@@ -280,11 +281,11 @@ const base: Status = {
   at: "2026-10-21T00:53:36.000Z",
   timeZone: "Asia/Seoul",
   services: [
-    { name: "herdr-server.service", enabled: "enabled", active: "active" },
+    { name: "hc-core.service", enabled: "enabled", active: "active" },
     { name: "dori-supervisor.service", enabled: "enabled", active: "active" },
     { name: "dori-presence.service", enabled: "disabled", active: "inactive" },
   ],
-  lead: { pane: "wL1:p4", state: "warm", idleMin: 0, tokens: 52_000, cacheTtlMin: 5, capTokens: 150_000, laneWorkspace: "wS" },
+  lead: { pane: "wL1:p4", state: "warm", idleMin: 0, tokens: 52_000, cacheTtlMin: 5, capTokens: 150_000 },
   lanes: [],
   waits: [],
   github: { repos: ["a/b", "c/d", "e/f"], lastPollAt: "2026-10-21T00:52:36.000Z", failures: [], issueAuthors: ["octo-owner"], issueRepos: ["a/b"] },
@@ -306,12 +307,11 @@ test("healthy status reads as titled sections with one line per item, in KST", (
     "✅ 모두 정상 · 작업 중 레인 1개 · 대기 없음",
     "",
     "■ 서비스",
-    "- herdr-server: 실행 중",
+    "- hc-core: 실행 중",
     "- dori-supervisor: 실행 중",
     "",
     "■ 리드",
     "- wL1:p4: 활동 중 (마지막 턴 방금, 프롬프트 캐시 유지) · 컨텍스트 52k/150k 토큰",
-    "- 새 레인 워크스페이스: wS",
     "",
     "■ 레인 (1)",
     "▸ local: 미확인 · 레인 1개",
@@ -335,10 +335,10 @@ test("long progress is cut at a word with ..., never mid-word", () => {
 });
 
 test("a failing service expands on its own line and the legacy unit counts only when it is active", () => {
-  const down = renderStatus({ ...base, services: [{ name: "herdr-server.service", enabled: "enabled", active: "active" }, { name: "dori-supervisor.service", enabled: "enabled", active: "failed" }, base.services[2]!] });
+  const down = renderStatus({ ...base, services: [{ name: "hc-core.service", enabled: "enabled", active: "active" }, { name: "dori-supervisor.service", enabled: "enabled", active: "failed" }, base.services[2]!] });
   expect(down.split("\n")[1]).toBe("⚠️ 확인 필요: dori-supervisor 실패 · 작업 중 레인 0개 · 대기 없음");
   expect(down).toContain("\n■ 문제\n- 서비스 dori-supervisor: 실패\n");
-  expect(down).toContain("\n■ 서비스\n- herdr-server: 실행 중\n- dori-supervisor: 실패\n");
+  expect(down).toContain("\n■ 서비스\n- hc-core: 실행 중\n- dori-supervisor: 실패\n");
   expect(down).not.toContain("dori-presence");
   const legacy = renderStatus({ ...base, services: [base.services[0]!, base.services[1]!, { name: "dori-presence.service", enabled: "enabled", active: "active" }] });
   expect(legacy).toContain("- 서비스 dori-presence: 실행 중 (예전 유닛, 꺼야 함)");
@@ -433,7 +433,7 @@ test("RUNNER lanes= follows the registry's open lanes on each runner's machine, 
   expect(await counts()).toEqual({ local: 1, macbook: 2 });
   await f.registry.update("beta", (l) => (l ? { ...l, closedAt: OPENED } : undefined));
   expect(await counts()).toEqual({ local: 1, macbook: 1 });
-  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^- macbook: 연결됨 · 레인 1개 · herdr 미확인$/m);
+  expect(renderStatus(await collectStatus(f.deps))).toMatch(/^- macbook: 연결됨 · 레인 1개$/m);
 });
 
 test("lanes are grouped by runner: each runner's heading has its state and lane count, a runner with no lanes still shows", async () => {
@@ -469,17 +469,17 @@ test("the local runner row is always shown, with its child's state from the heal
   const f = await fixture();
   // No runners.sqlite and no runners section: still RUNNER local, offline, no child state without a runner dir.
   expect((await collectStatus(f.deps)).runners).toEqual([{ label: "local", state: "offline", gen: 0, cmds: 0, restarts1h: 0, lanes: 0 }]);
-  expect(renderStatus(await collectStatus(f.deps))).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개 · herdr 미확인\n  머신 샘플 없음\n");
+  expect(renderStatus(await collectStatus(f.deps))).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개\n  머신 샘플 없음\n");
   const runnerDir = join(f.dir, "runner");
   expect((await collectStatus({ ...f.deps, runnerDir })).runners?.[0]?.child).toEqual({ verdict: "dead" });
   mkdirSync(runnerDir, { recursive: true });
   writeFileSync(healthPath(runnerDir), `${JSON.stringify({ pid: process.pid, gen: 3, monotonicMs: 1, wallAt: NOW })}\n`);
   utimesSync(healthPath(runnerDir), new Date(NOW - 5_000), new Date(NOW - 5_000));
   const text = renderStatus(await collectStatus({ ...f.deps, runnerDir }));
-  expect(text).toMatch(/^- local: 오프라인 · 레인 0개 · herdr 미확인$/m);
+  expect(text).toMatch(/^- local: 오프라인 · 레인 0개$/m);
   // A local runner child that is not healthy is named on its line.
   const dead = renderStatus(await collectStatus({ ...f.deps, runnerDir: join(f.dir, "no-runner") }));
-  expect(dead).toMatch(/^- local: 오프라인 · 레인 0개 · herdr 미확인 · 러너 프로세스 없음$/m);
+  expect(dead).toMatch(/^- local: 오프라인 · 레인 0개 · 러너 프로세스 없음$/m);
 });
 
 test("a claude-quota.json left by the removed quota gate is ignored", async () => {
@@ -508,11 +508,11 @@ test("each runner's machine shows CPU load, free memory, disk and swap from its 
   const text = renderStatus(s);
   expect(text).toContain([
     "\n■ 머신 (3)",
-    "- local (linux): 연결됨 · 레인 0개 · herdr 미확인",
+    "- local (linux): 연결됨 · 레인 0개",
     "  CPU 부하 1.2 · 메모리 여유 35% · 디스크 여유 120GB · 스왑 여유 2.0/4.0GB · 레인 메모리 3.0GB (40초 전 측정)",
-    "- [경고] macbook (darwin): 연결됨 · 레인 0개 · herdr 미확인",
+    "- [경고] macbook (darwin): 연결됨 · 레인 0개",
     "  CPU 부하 1.2 · 메모리 여유 8% · 디스크 여유 7.3GB · 스왑 없음 · 레인 메모리 3.0GB (40초 전 측정)",
-    "- pi: 연결됨 · 레인 0개 · herdr 미확인",
+    "- pi: 연결됨 · 레인 0개",
     "  머신 샘플 없음\n",
   ].join("\n"));
   expect(text).toContain("\n- 머신 macbook 경고: memory free 8% < 10%\n");
@@ -525,6 +525,6 @@ test("dori status marks a runner whose lanes run without a sandbox: a Windows ma
   expect(views.map((v) => [v.label, v.unsandboxed])).toEqual([
     ["local", undefined], ["win", "is a Windows runner (Windows has no lane sandbox)"], ["mini", "is opted in with runners.mini.allowUnsandboxed"], ["box", undefined],
   ]);
-  expect(machineLines(views[1]!)[0]).toBe("- win (win32): 오프라인 · 샌드박스 없음 · herdr 미확인");
-  expect(machineLines(views[3]!)[0]).toBe("- box (linux): 오프라인 · herdr 미확인");
+  expect(machineLines(views[1]!)[0]).toBe("- win (win32): 오프라인 · 샌드박스 없음");
+  expect(machineLines(views[3]!)[0]).toBe("- box (linux): 오프라인");
 });

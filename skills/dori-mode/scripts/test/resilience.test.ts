@@ -3,7 +3,6 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { Runner } from "../src/run.ts";
 import { BACKOFF_MAX_MS, BACKOFF_MIN_MS, RetryingDelivery, STUCK_AFTER_MS, SuperviseError, Supervisor, TransientSuperviseError } from "../src/supervise.ts";
 import { recordLaunchVerdict } from "../src/routing.ts";
 import { runSweeps, supervise, supervisorSweeps, WARN_REPEAT_MS } from "../src/supervise-loop.ts";
@@ -43,7 +42,7 @@ const scripted = (failWith: () => Error | undefined) => {
 };
 
 test("a transient error retries instead of throwing, and backoff doubles up to the cap", async () => {
-  const s = scripted(() => new TransientSuperviseError("lead pane lead:p1 does not exist"));
+  const s = scripted(() => new TransientSuperviseError("lead pane hc:t1 does not exist"));
   const delays: number[] = [];
   for (let i = 0; i < 8; i++) {
     await s.delivery.tick();
@@ -53,7 +52,7 @@ test("a transient error retries instead of throwing, and backoff doubles up to t
   }
   expect(delays).toEqual([BACKOFF_MIN_MS, 10_000, 20_000, 40_000, BACKOFF_MAX_MS, BACKOFF_MAX_MS, BACKOFF_MAX_MS, BACKOFF_MAX_MS]);
   expect(s.logs).toHaveLength(8);
-  expect(s.logs[0]).toStartWith("SUPERVISOR_RETRY lead pane lead:p1 does not exist");
+  expect(s.logs[0]).toStartWith("SUPERVISOR_RETRY lead pane hc:t1 does not exist");
 });
 
 test("a fatal error is rethrown", async () => {
@@ -212,30 +211,23 @@ test("a missing lead pane keeps events and journal untouched, then delivers once
   await delivery.tick();
   expect(JSON.stringify(readJournal(state.dir))).toBe(journal);
   expect(readFileSync(supervisor.eventLog, "utf8")).toBe("");
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "w", cwd: "/repo", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "w", cwd: "/repo", agent: "omo", agent_status: "working" });
   advanceToDue(clock, delivery);
   await delivery.tick();
   expect(readFileSync(supervisor.eventLog, "utf8")).toContain("INBOUND hello");
 });
 
-test("a vanished lead pane is recreated in the Dori workspace at leadCwd, in memory only", async () => {
+test("a vanished lead pane is recreated as a new hc terminal at leadCwd, in memory only", async () => {
   const state = withState();
   cleanups.push(state.done);
   const world = newWorld();
   const clock = fakeClock(T0);
   const base = depsFor(world, clock, state.dir);
-  const run: Runner = async (argv) => {
-    if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { workspaces: [{ workspace_id: "w7", label: "Dori" }] } }), err: "" };
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") {
-      world.panes.push({ pane_id: "w7:p9", workspace_id: "w7", cwd: "/repo" });
-      return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w7:p9" } } }), err: "" };
-    }
-    return base.run(argv);
-  };
-  const supervisor = new Supervisor({ ...base, run });
-  expect(await supervisor.repairLeadPane()).toBe("w7:p9");
-  expect(world.calls.some((c) => c.join(" ") === "herdr pane list")).toBe(true);
-  expect(base.config.leadPane).toBe("lead:p1");
+  const supervisor = new Supervisor(base);
+  expect(await supervisor.repairLeadPane()).toBe("hc:t101");
+  expect(world.calls.some((c) => c.join(" ") === "hc --json ls")).toBe(true);
+  expect(world.calls.find((c) => c[0] === "hc" && c[2] === "run")).toEqual(expect.arrayContaining(["--cwd", "/repo", "--label", "dori.lead=1"]));
+  expect(base.config.leadPane).toBe("hc:t1");
   expect(await supervisor.repairLeadPane()).toBeUndefined();
 });
 
@@ -268,22 +260,14 @@ test("a recreated lead pane is persisted through the hook, and a failing hook do
   cleanups.push(state.done);
   const world = newWorld();
   const base = depsFor(world, fakeClock(T0), state.dir);
-  const run: Runner = async (argv) => {
-    if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { workspaces: [{ workspace_id: "w7", label: "Dori" }] } }), err: "" };
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") {
-      world.panes.push({ pane_id: "w7:p9", workspace_id: "w7", cwd: "/repo" });
-      return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w7:p9" } } }), err: "" };
-    }
-    return base.run(argv);
-  };
   const saved: string[] = [];
-  expect(await new Supervisor({ ...base, run }, { persistLeadPane: (pane) => { saved.push(pane); } }).repairLeadPane()).toBe("w7:p9");
-  expect(saved).toEqual(["w7:p9"]);
+  expect(await new Supervisor(base, { persistLeadPane: (pane) => { saved.push(pane); } }).repairLeadPane()).toBe("hc:t101");
+  expect(saved).toEqual(["hc:t101"]);
   world.panes.length = 0;
   const original = console.error;
   console.error = () => {};
   try {
-    expect(await new Supervisor({ ...base, run }, { persistLeadPane: () => { throw new Error("read-only fs"); } }).repairLeadPane()).toBe("w7:p9");
+    expect(await new Supervisor(base, { persistLeadPane: () => { throw new Error("read-only fs"); } }).repairLeadPane()).toBe("hc:t102");
   } finally { console.error = original; }
 });
 
@@ -292,18 +276,13 @@ test("a vanished pane with a submitted launch moves the same events to a fresh s
   cleanups.push(state.done);
   const world = newWorld();
   const base = depsFor(world, fakeClock(T0), state.dir);
-  const run: Runner = async (argv) => {
-    if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { workspaces: [{ workspace_id: "w7", label: "Dori" }] } }), err: "" };
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w7:p9" } } }), err: "" };
-    return base.run(argv);
-  };
   const old = "33333333-3333-4333-8333-333333333333";
   const events = [{ id: "x", line: "INBOUND x" }];
   writeJournal(state.dir, ({ events, restart: { session: old, events, offset: 7, phase: "submitted", unconfirmed: 3 } }));
   writeFileSync(join(state.dir, `lead-${old}.md`), "prompt");
   const original = console.log;
   console.log = () => {};
-  try { expect(await new Supervisor({ ...base, run }).repairLeadPane()).toBe("w7:p9"); } finally { console.log = original; }
+  try { expect(await new Supervisor(base).repairLeadPane()).toBe("hc:t101"); } finally { console.log = original; }
   const restart = readJournal(state.dir).restart;
   expect(restart).toMatchObject({ events, offset: 7, phase: "starting", unconfirmed: 0 });
   expect(restart.session).not.toBe(old);

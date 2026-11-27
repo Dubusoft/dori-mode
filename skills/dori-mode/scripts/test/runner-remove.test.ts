@@ -26,10 +26,7 @@ const fakeRun = (result: Partial<Ran> = {}) => {
 };
 const posixKind = async () => ({ ok: true as const, kind: "posix" as const });
 const windowsKind = async () => ({ ok: true as const, kind: "windows" as const });
-/** Every call that could stop or restart a running herdr. */
-const HERDR_DISRUPTION = /systemctl --user (restart|stop|kill|try-restart|reload-or-restart|disable --now)[^\n]*herdr-server|launchctl (bootout|kickstart|kill|stop)[^\n]*com\.dori\.herdr|herdr server stop/;
-
-test("on a POSIX worker the uninstall goes on stdin to the fixed command sh -s and never stops herdr", async () => {
+test("on a POSIX worker the uninstall goes on stdin to the fixed command sh -s and leaves hc alone", async () => {
   const { run, calls } = fakeRun();
   expect(await removeRunner({ run, kind: posixKind }, { machine, label: "worker-a" })).toEqual({ ok: true });
   expect(calls).toHaveLength(1);
@@ -37,13 +34,10 @@ test("on a POSIX worker the uninstall goes on stdin to the fixed command sh -s a
   const script = calls[0]!.opts?.stdin ?? "";
   expect(script).toBe(removeScript());
   expect(script).toContain("systemctl --user disable --now dori-runner.service");
-  expect(script).toContain("systemctl --user disable herdr-server.service");
   expect(script).toContain('rm -rf "$HOME/.dori/runner"');
   expect(script).toContain('launchctl bootout "$D/com.dori.runner"');
-  expect(script).not.toContain("stop herdr-server");
-  expect(script).not.toContain("restart herdr");
-  expect(script).not.toMatch(/bootout[^\n]*com\.dori\.herdr/);
-  expect(script).not.toMatch(HERDR_DISRUPTION);
+  expect(script).not.toContain("hc-core");
+  expect(script).not.toContain("com.dori.hc");
 });
 
 test("on a Windows worker the uninstall is an encoded PowerShell command that purges the runner directory", async () => {
@@ -80,19 +74,18 @@ test("a machine whose kind cannot be found is unreachable or unsupported, and ss
   expect(calls).toHaveLength(0);
 });
 
-test("run by sh on Linux, the script deletes the runner and both unit files, leaves ~/.dori, and only disables herdr", async () => {
+test("run by sh on Linux, the script deletes the runner and its unit file, and leaves ~/.dori and every other unit", async () => {
   const home = tempDir("runner-remove-home-");
   const bin = join(home, "fakebin");
   mkdirSync(bin);
   const log = join(home, "argv.log");
-  for (const [name, body] of [["uname", "echo Linux"], ["systemctl", "exit 0"], ["herdr", "exit 0"]] as const) {
+  for (const [name, body] of [["uname", "echo Linux"], ["systemctl", "exit 0"]] as const) {
     writeFileSync(join(bin, name), `#!/bin/sh\nprintf '%s %s\\n' '${name}' "$*" >> '${log}'\n${body}\n`);
     chmodSync(join(bin, name), 0o755);
   }
   const units = join(home, ".config/systemd/user");
   mkdirSync(units, { recursive: true });
   writeFileSync(join(units, "dori-runner.service"), "unit\n");
-  writeFileSync(join(units, "herdr-server.service"), "unit\n");
   writeFileSync(join(units, "other.service"), "unit\n");
   mkdirSync(join(home, ".dori/runner/keys"), { recursive: true });
   writeFileSync(join(home, ".dori/runner/keys/runner.key"), "secret\n");
@@ -103,13 +96,11 @@ test("run by sh on Linux, the script deletes the runner and both unit files, lea
   expect(existsSync(join(home, ".dori/runner"))).toBe(false);
   expect(existsSync(join(home, ".dori/keep"))).toBe(true);
   expect(existsSync(join(units, "dori-runner.service"))).toBe(false);
-  expect(existsSync(join(units, "herdr-server.service"))).toBe(false);
   expect(existsSync(join(units, "other.service"))).toBe(true);
   const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
   expect(calls).toEqual([
     "uname -s",
     "systemctl --user disable --now dori-runner.service",
-    "systemctl --user disable herdr-server.service",
     "systemctl --user daemon-reload",
   ]);
 });
@@ -161,12 +152,11 @@ test("forgetRunner deletes the runners row and attempts, keeps the revoked key, 
   expect(forgetRunner(stateDir, "worker-a")).toBe(false);
 });
 
-test("an unknown label is local-only with local state, unknown without it, and unknown when the machine list failed", () => {
-  const listed = { ok: true, machines: [machine] };
+test("a known label is removed over ssh; an unknown one is local-only with local state, unknown without it", () => {
+  const listed = [machine];
   expect(planRemove(listed, "worker-a", false)).toEqual({ kind: "remote", machine });
   expect(planRemove(listed, "macbook", true)).toEqual({ kind: "local" });
   expect(planRemove(listed, "macbook", false)).toEqual({ kind: "unknown" });
-  expect(planRemove({ ok: false, detail: "herdr down", machines: [] }, "macbook", true)).toEqual({ kind: "unknown", detail: "herdr down" });
 });
 
 test("local state is a runners or runner_keys row, an endpoint or a recorded machine", () => {

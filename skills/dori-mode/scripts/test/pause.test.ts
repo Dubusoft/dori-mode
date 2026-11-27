@@ -21,13 +21,13 @@ let world: World;
 beforeEach(() => {
   state = withState();
   world = newWorld();
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.panes = [{ pane_id: "hc:t7", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   // Escape stops a running turn, unless a test says otherwise.
   world.onEscapeStatus = "idle";
 });
 afterEach(() => state.done());
 
-const working: Lane = { key: "waiting-lane", title: "wait", thread: "chat:team/9", pane: "w:p7", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
+const working: Lane = { key: "waiting-lane", title: "wait", thread: "chat:team/9", pane: "hc:t7", brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0 };
 const deps = (ms: number) => depsFor(world, fakeClock(ms), state.dir, { hooks: { threadReply: ["notify", "{thread}", "{text}"] } });
 const stored = async (): Promise<Lane | null> => deps(T0).registry.read(working.key);
 const paneStatus = (status: string) => {
@@ -120,14 +120,14 @@ test("resume relaunches a paused lane whose agent is gone (its pane left with on
   await Bun.write(brief, "Execute the task.");
   // Paused from working; the agent exited since, so the pane runs only its shell. Old recoveries do not count against it.
   await deps(T0).registry.write({ ...working, brief, cwd: state.dir, session: "sess-1", status: "paused", pausedFrom: "working", recoveryAttempts: 3 });
-  world.panes = [{ pane_id: "w:p7", tab_id: "w:t7", workspace_id: "w" }];
+  world.panes = [{ pane_id: "hc:t7", tab_id: "w:t7", workspace_id: "w" }];
   world.inspection = { process: { foreground_processes: [{ pid: 42, argv: ["zsh"] }] } };
   const d = deps(T0 + 90 * MIN);
   // The shell refuses the typed `/goal resume`; the relaunched agent confirms it.
   const resumes: string[] = [];
   const ops = {
     ...d.ops,
-    resume: async (lane: LaneRef) => { resumes.push(lane.pane ?? "-"); return lane.pane === "w:p7" ? { goal: "failed" as const } : { goal: "confirmed" as const, execution: "running" as const }; },
+    resume: async (lane: LaneRef) => { resumes.push(lane.pane ?? "-"); return lane.pane === "hc:t7" ? { goal: "failed" as const } : { goal: "confirmed" as const, execution: "running" as const }; },
     recover: async (lane: LaneRef, opts?: { readonly session?: string }) => {
       world.ops.push({ op: "recover", key: lane.key, args: { ...(opts ? { opts } : {}) } });
       world.panes = [{ pane_id: "w:p8", tab_id: "w:t8", workspace_id: "w", agent: "omo", agent_status: "working" }];
@@ -148,7 +148,7 @@ test("resume relaunches a paused lane whose agent is gone (its pane left with on
     "STARTUP_OK waiting-lane w:p8",
   ]);
   expect(world.ops.find((e) => e.op === "recover")?.args).toMatchObject({ opts: { session: "sess-1" } });
-  expect(resumes).toEqual(["w:p7", "w:p8"]);
+  expect(resumes).toEqual(["hc:t7", "w:p8"]);
   const lane = (await stored()) as Lane & { resuming?: string };
   expect(statusOf(lane)).toBe("working");
   expect(lane).toMatchObject({ key: "waiting-lane", pane: "w:p8", brief, cwd: state.dir, recoveryAttempts: 1 });
@@ -388,8 +388,9 @@ const workingOnLookup = (n: number | undefined): Runner => {
   let entered = false;
   let lookups = 0;
   return async (argv) => {
-    if (argv[2] === "send-keys" && argv[4] === "enter") entered = true;
-    if (entered && argv[2] === "list" && ++lookups === n) paneStatus("working");
+    // hc presses Enter with each send (and with keys); a status lookup lists the terminals.
+    if (argv[0] === "hc" && (argv[2] === "send" || argv[2] === "keys")) entered = true;
+    if (entered && argv[0] === "hc" && argv[2] === "ls" && ++lookups === n) paneStatus("working");
     return base(argv);
   };
 };
@@ -400,27 +401,27 @@ const sleepLog = () => {
 
 test("sendVerified confirms with escalating backoff, and the first lookup after Enter has no wait", async () => {
   const { sleeps, clock } = sleepLog();
-  expect(await sendVerified(workingOnLookup(1), clock, "w:p7", "hello")).toBe("delivered");
+  expect(await sendVerified(workingOnLookup(1), clock, "hc:t7", "hello")).toBe("delivered");
   expect(sleeps).toEqual([]);
   paneStatus("idle");
   const third = sleepLog();
-  expect(await sendVerified(workingOnLookup(3), third.clock, "w:p7", "hello")).toBe("delivered");
+  expect(await sendVerified(workingOnLookup(3), third.clock, "hc:t7", "hello")).toBe("delivered");
   expect(third.sleeps).toEqual([150, 300]);
 });
 
 test("sendVerified backs off 150ms growing to 1000ms and reports unconfirmed when the pane never works", async () => {
   const { sleeps, clock } = sleepLog();
-  expect(await sendVerified(workingOnLookup(undefined), clock, "w:p7", "hello")).toBe("unconfirmed");
+  expect(await sendVerified(workingOnLookup(undefined), clock, "hc:t7", "hello")).toBe("unconfirmed");
   expect(sleeps).toEqual([150, 300, 600, 900, 1000, 1000, 1000]);
   expect(sleeps).toEqual([...CONFIRM_BACKOFF_MS]);
   expect(sent(world)).toEqual(["hello"]);
 });
 
 test("sendGuarded types without waiting, and refuses a pane with no running agent", async () => {
-  expect(await sendGuarded(fakeRunner(world), "w:p7", "hi")).toBe("sent");
+  expect(await sendGuarded(fakeRunner(world), "hc:t7", "hi")).toBe("sent");
   expect(sent(world)).toEqual(["hi"]);
-  world.panes = [{ pane_id: "w:p7", workspace_id: "w" }];
-  expect(await sendGuarded(fakeRunner(world), "w:p7", "rm -rf x")).toBe("failed");
-  expect(await sendGuarded(fakeRunner(world), "w:missing", "hi")).toBe("failed");
+  world.panes = [{ pane_id: "hc:t7", workspace_id: "w" }];
+  expect(await sendGuarded(fakeRunner(world), "hc:t7", "rm -rf x")).toBe("failed");
+  expect(await sendGuarded(fakeRunner(world), "hc:missing", "hi")).toBe("failed");
   expect(sent(world)).toEqual(["hi"]);
 });

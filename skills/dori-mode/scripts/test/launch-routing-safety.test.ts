@@ -85,7 +85,7 @@ const brief = () => { const b = join(state.dir, `brief-${Math.random()}.md`); wr
 const input = (key: string, extra: Record<string, unknown> = {}) => ({ key, title: key, brief: brief(), done: "merged acme/app#1", ...extra });
 const tabs = () => world.ops.filter((e) => e.op === "start");
 
-test("attachment preparation refuses before reservation, workspace creation, start or lead brief rewrite", async () => {
+test("attachment preparation refuses before reservation, start or lead brief rewrite", async () => {
   const base = deps();
   const entry = input("bad-files", { cwd: "/scratch" });
   writeFileSync(entry.brief, "x".repeat(70_000));
@@ -93,7 +93,7 @@ test("attachment preparation refuses before reservation, workspace creation, sta
   expect(readFileSync(entry.brief, "utf8")).toBe("x".repeat(70_000));
   expect(await base.registry.open()).toEqual([]);
   expect(tabs()).toEqual([]);
-  expect(world.calls.filter((c) => c.slice(0, 3).join(" ") === "herdr workspace create")).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "hc")).toEqual([]);
 });
 
 test("real RunnerCalls unknown-proto refusal releases the launch reservation with no attempt or send", async () => {
@@ -224,7 +224,7 @@ for (const conflict of ["key", "thread", "checkout"] as const) {
 test("a failed launch releases only its reservation and allows retrying the key", async () => {
   const base = deps();
   const entry = input("retry-lane", { cwd: "/scratch" });
-  const d = { ...base, ops: { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.start herdr tab create failed: create failed"); } } };
+  const d = { ...base, ops: { ...base.ops, start: async () => { throw new LaneOpsError("LANE_OP_FAILED", "local", "lane.start hc run failed: create failed"); } } };
   await expect(launchLane(d, entry)).rejects.toThrow("create failed");
   expect(await d.registry.read(entry.key)).toBeNull();
   await expect(launchLane(base, entry)).resolves.toMatchObject({ lane: { key: entry.key } });

@@ -5,10 +5,10 @@ import { join } from "node:path";
 
 import { defaultConfig } from "../src/config.ts";
 import { LANE_SANDBOX_MACOS_TEMPLATE, LANE_SANDBOX_TEMPLATE } from "../src/lane-sandbox-install.ts";
-import type { Ran } from "../src/run.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import { localPolicy } from "../src/runner/local-policy.ts";
 import { fakeClock } from "./fakes.ts";
+import { hcAnswer, newHcWorld, sentTo } from "./runner-hc-world.ts";
 
 // The review lane profile (LANE_SANDBOX_PROFILE=review): the snapshot worktree, its git common dir, the worktree root
 // and every repo .git are never writable, and no git or gh credential reaches the lane. bwrap cannot create namespaces
@@ -32,10 +32,10 @@ const fixture = () => {
   const root = scratch();
   const home = join(root, "home");
   const repos = join(root, "repos"), worktrees = join(root, "worktrees"), grantRw = join(root, "grant-rw"), grantRo = join(root, "grant-ro");
-  for (const d of [".omo", ".cache", ".npm", ".bun/install/cache", ".cargo/registry", ".cargo/git", ".config/gh", ".config/git", ".config/herdr", ".dori/runner/briefs/lane-a.files"]) {
+  for (const d of [".omo", ".cache", ".npm", ".bun/install/cache", ".cargo/registry", ".cargo/git", ".config/gh", ".config/git", ".config/ssh-agent", ".dori/runner/briefs/lane-a.files"]) {
     mkdirSync(join(home, d), { recursive: true });
   }
-  for (const f of [".gitconfig", ".git-credentials", ".config/herdr/agent"]) writeFileSync(join(home, f), "x");
+  for (const f of [".gitconfig", ".git-credentials", ".config/ssh-agent/socket"]) writeFileSync(join(home, f), "x");
   for (const d of [worktrees, grantRw, grantRo, repos]) mkdirSync(d, { recursive: true });
   const repo = join(repos, "app");
   git("init", "-q", repo);
@@ -44,7 +44,7 @@ const fixture = () => {
   git("-C", repo, "worktree", "add", "-q", "--detach", snap);
   const env = {
     DORI_LANE_KEY: "lane-a", LANE_SANDBOX_WORKTREES: worktrees, LANE_SANDBOX_REPOS: repos, LANE_SANDBOX_RW: grantRw, LANE_SANDBOX_RO: grantRo,
-    SSH_AUTH_SOCK: join(home, ".config", "herdr", "agent"),
+    SSH_AUTH_SOCK: join(home, ".config", "ssh-agent", "socket"),
   };
   return { root, home, repos, worktrees, grantRw, grantRo, repo, gitDir: join(repo, ".git"), snap, env };
 };
@@ -88,7 +88,7 @@ test("review profile: only briefs/<key>.out, ~/.omo, ~/.cache and the private TM
   for (const p of [f.snap, f.gitDir, f.worktrees, f.grantRo]) expect(ro).toContain(p);
   // No credential: gh and git config and the ssh agent socket are not in the argv at all (~/.config is hidden); the git
   // config and git credentials, readable through the read-only $HOME otherwise, only as targets of an empty data bind.
-  for (const p of [".config/gh", ".config/git", ".config/herdr/agent"]) expect(r.argv).not.toContain(join(f.home, p));
+  for (const p of [".config/gh", ".config/git", ".config/ssh-agent/socket"]) expect(r.argv).not.toContain(join(f.home, p));
   for (const p of [join(f.home, ".git-credentials"), join(f.home, ".gitconfig")]) {
     const covers = r.argv.flatMap((a, i) => a === p ? [r.argv.slice(i - 2, i + 1)] : []);
     expect(covers).toHaveLength(1);
@@ -153,8 +153,8 @@ test("macOS: any LANE_SANDBOX_PROFILE is refused with exit 2 and one error line"
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
 
-/** A local RunnerLanes over localPolicy with repos/worktree roots and a write grant; `shell` is what herdr reports. */
-const reviewRunner = (shell: "posix" | "pwsh" = "posix") => {
+/** A local runner with scripted hc, repos/worktree roots and a write grant. */
+const reviewRunner = (sandboxAvailable = true) => {
   const home = scratch();
   const repo = join(home, "repos", "app"), snap = join(home, "worktrees", "snap"), grant = join(home, "grant");
   for (const d of [repo, snap, grant]) mkdirSync(d, { recursive: true });
@@ -165,17 +165,15 @@ const reviewRunner = (shell: "posix" | "pwsh" = "posix") => {
     reposRoot: join(home, "repos"), grants: { notes: { write: [grant], read: [] } },
   };
   const calls: string[][] = [];
+  const hc = newHcWorld();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), policy, token: () => "tok", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     run: async (argv) => {
       calls.push([...argv]);
-      if (argv[0] === "lane-sandbox" && argv.includes("--check")) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" } as Ran;
-      if (shell === "pwsh" && argv.slice(0, 3).join(" ") === "herdr pane process-info") {
-        return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 7, foreground_processes: [{ pid: 7, name: "pwsh.exe" }] } } }), err: "" } as Ran;
-      }
-      return { code: 0, out: "", err: "" } as Ran;
+      if (argv[0] === "lane-sandbox" && argv.includes("--check")) return sandboxAvailable
+        ? { code: 0, out: "DORI_LANE_FILES=1\n", err: "" }
+        : { code: 1, out: "", err: "sandbox unavailable" };
+      return hcAnswer(hc, argv) ?? { code: 1, out: "", err: `unexpected command: ${argv.join(" ")}` };
     },
   });
   const start = {
@@ -194,7 +192,7 @@ test("a review lane.start runs the sandbox check (even with sandbox: false) and 
   const { lanes, calls, start } = reviewRunner();
   await lanes.start(start);
   expect(calls[0]).toEqual(["lane-sandbox", "--check"]);
-  const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
+  const command = sentTo(calls, "hc:t1")[0] ?? "";
   expect(command).toMatch(/LANE_SANDBOX_PROFILE=review(?:[ ;])/);
   expect(command).toContain(" lane-sandbox omo ");
   for (const name of ["LANE_SANDBOX_REPOS", "LANE_SANDBOX_WORKTREES", "LANE_SANDBOX_RW"]) expect(command).not.toContain(name);
@@ -206,15 +204,14 @@ test("a review lane.start runs the sandbox check (even with sandbox: false) and 
   // The same runner's sandboxed lane keeps the roots and grants: only the review profile drops them.
   calls.length = 0;
   await lanes.start({ ...start, cmdId: "lane-start:lane-s:1", key: "lane-s", agentProfile: "sandboxed", sandbox: true });
-  const sandboxed = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
+  const sandboxed = sentTo(calls, "hc:t2")[0] ?? "";
   for (const name of ["LANE_SANDBOX_REPOS=", "LANE_SANDBOX_WORKTREES=", "LANE_SANDBOX_RW="]) expect(sandboxed).toContain(name);
   expect(sandboxed).not.toContain("LANE_SANDBOX_PROFILE");
 });
 
-test("a review lane.start on a PowerShell pane is refused, its tab closed and nothing typed", async () => {
-  const { lanes, calls, start } = reviewRunner("pwsh");
-  await expect(lanes.start(start)).rejects.toThrow("RUNNER_LANE_REVIEW_UNSANDBOXED lane-r");
-  expect(calls.some((a) => a[1] === "pane" && a[2] === "run")).toBe(false);
-  expect(calls).toContainEqual(["herdr", "tab", "close", "t1"]);
+test("a review lane.start refuses an unavailable sandbox before opening a terminal or typing anything", async () => {
+  const { lanes, calls, start } = reviewRunner(false);
+  await expect(lanes.start(start)).rejects.toThrow("sandbox unavailable");
+  expect(calls).toEqual([["lane-sandbox", "--check"]]);
   expect(lanes.records()).toEqual({});
 });

@@ -52,8 +52,6 @@ export const LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export type LaneStatus = "working" | "idle" | "dead" | "missing";
 export type WaitOutcome = "WAIT_DONE" | "WAIT_TIMEOUT" | "WAIT_FAILED";
 export type GuardLevel = "ok" | "alert" | "critical";
-/** `elevated`: the server runs as administrator and refuses this unelevated runner (Windows; herdr-watch.ts herdrElevatedError). */
-export type HerdrHealth = { readonly state: "up" | "down" | "hung" | "elevated"; readonly instance?: string; readonly since: number };
 export type CommandOutcome = "verified" | "failed" | "ambiguous";
 /** What a runner knows of a command when asked (`cmd.status`): `unknown` means it holds no record of it. */
 export type CommandStatusState = "intent" | "running" | "verified" | "failed" | "ambiguous" | "unknown";
@@ -152,8 +150,6 @@ export type SendMode = "verified" | "guarded";
 
 export type SupervisorCommandBodies = { readonly [T in keyof typeof COMMAND_SCHEMAS]: StaticShape<(typeof COMMAND_SCHEMAS)[T]> };
 
-export type HerdrAction = "start" | "restart" | "stop" | "status";
-
 export type RunnerControlBodies = { readonly [T in keyof typeof RUNNER_CONTROL_SCHEMAS]: StaticShape<(typeof RUNNER_CONTROL_SCHEMAS)[T]> };
 
 /** A closed lane in `lanes.closed.result`: its key, when it closed (ms since epoch), its cwd and recorded worktrees. */
@@ -237,18 +233,11 @@ export type CommandResults = {
    * most 4 KiB). The same run also goes out as a `job.result` event.
    */
   readonly "job.run": { readonly exitCode: number; readonly timedOut: boolean; readonly output: string; readonly err: string };
-  /**
-   * herdr as read after the action: `managed` when a herdr unit is installed on the host, `paused` when the watch
-   * pause marker is set (`dori runner herdr stop`).
-   */
-  readonly "host.herdr": {
-    readonly action: HerdrAction; readonly state: HerdrHealth["state"]; readonly instance?: string; readonly managed: boolean; readonly paused: boolean;
-  };
 };
 /** The commands a supervisor awaits a structured result for. */
 export type DurableCommandType = keyof CommandResults;
 
-/** herdr's `pane process-info` result. */
+/** A pane's shell and foreground processes (runtime/hc.ts processInfoOf). */
 export type ProcessInfo = {
   readonly shell_pid?: number;
   readonly foreground_process_group_id?: number;
@@ -258,7 +247,7 @@ export type ProcessInfo = {
 export type LaneInspection = {
   /** `laneStatus(pane)` as serve.ts computes it. */
   readonly status: LaneStatus;
-  /** The record's (or the cwd's) pane row when herdr lists it. */
+  /** The record's (or the cwd's) pane row when hc lists it. */
   readonly pane?: Pane;
   readonly process?: ProcessInfo;
   readonly cwd: string;
@@ -401,7 +390,6 @@ const laneKey = { key: req("string") } satisfies Shape;
 const BODY_REF = { sha256: req("string"), bytes: req("int"), truncated: req("bool") } satisfies Shape;
 const INVENTORY = { key: req("string"), pane: req("string"), tab: req("string"), session: opt("string") } satisfies Shape;
 const WORKSPACE = { repo: req("string"), path: req("string") } satisfies Shape;
-const HERDR = { state: req({ enum: ["up", "down", "hung", "elevated"] }), instance: opt("string") } satisfies Shape;
 // Lane file transfer (since proto 5). Structure only: limits, digests, base64, names and ordering are checked by the
 // producing/consuming endpoint, so a semantically bad snapshot is a refusal there, not an undecodable frame.
 const LANE_FILE = { path: req("string"), bytes: req("int"), sha256: req("string"), base64: req("string") } satisfies Shape;
@@ -416,8 +404,6 @@ const LANE_OUTPUT_FILES = {
 } satisfies Shape;
 
 const EVENT_SCHEMAS = {
-  "herdr.state": { ...HERDR, detail: req("string") },
-  "herdr.start": { ok: req("bool"), detail: req("string") },
   /** `fileRun` (since proto 5): the file run the started pane belongs to; absent from older runners and journals. */
   "lane.started": { key: req("string"), pane: req("string"), tab: req("string"), session: req("string"), fileRun: opt({ object: LANE_FILE_RUN }) },
   /**
@@ -451,10 +437,8 @@ const EVENT_SCHEMAS = {
   "guard.sample": {
     level: req({ enum: ["ok", "alert", "critical"] }), reasons: req("string[]"), sampledAt: req("int"),
     load1: opt("number"), memFreePct: opt("number"), diskFreeGb: opt("number"), swapFreeGb: opt("number"), swapTotalGb: opt("number"), os: opt("string"),
-    // -1 when the runner could not read herdr's pane list (main.ts paneCount): the supervisor's herdr-down signal.
-    /** Since proto 3: herdr's pane count on the host, and per-lane memory. */
+    /** Since proto 3: the host's pane count (hc terminals; -1 when the list could not be read), and per-lane memory. */
     panes: opt("count"),
-    herdr: opt({ object: { ...HERDR, since: req("int") } }),
     lanes: opt({ list: { key: req("string"), rssKb: req("int"), top: req({ list: { comm: req("string"), rssKb: req("int"), count: req("int") } }) } }),
   },
   "guard.alert": { reasons: req("string[]") },
@@ -470,16 +454,14 @@ const EVENT_SCHEMAS = {
 const COMMAND_SCHEMAS = {
   /**
    * Since proto 3, all optional: `keywords` (the opening keywords; absent: the runner's default), `session` (resume
-   * that agent session), `target` (run in this idle shell pane, or the one shell pane of this workspace, instead of a
-   * new tab), `heavySlots`/`heavyMaxLoad` (exported to the lane as DORI_HEAVY_SLOTS / DORI_HEAVY_MAX_LOAD), `tabWorkspace`
-   * (the herdr workspace a new tab opens in; absent on remote runners: find or create `lanes`).
+   * that agent session), `heavySlots`/`heavyMaxLoad` (exported to the lane as DORI_HEAVY_SLOTS / DORI_HEAVY_MAX_LOAD).
+   * The lane opens in a new hc terminal.
    */
   "lane.start": cmd({
     /** `cwd` absent (a `--machine` launch without `--cwd`): the runner fills `<runnerDir>/lanes/<key>`, created by the start. */
     key: req("string"), briefText: req("string"), done: req("string"), thread: req("string"), cwd: opt("string"),
     agentProfile: req("string"), mode: req("string"), model: req("string"), sandbox: req("bool"), expectedLaneGen: req("int"),
-    keywords: opt("string"), session: opt("string"), target: opt({ object: { pane: opt("string"), workspace: opt("string") } }),
-    heavySlots: opt("int"), heavyMaxLoad: opt("number"), tabWorkspace: opt("string"),
+    keywords: opt("string"), session: opt("string"), heavySlots: opt("int"), heavyMaxLoad: opt("number"),
     /** Since proto 5: the input snapshot and its file run (optional only so historical bodies decode). */
     files: opt({ object: LANE_BRIEF_FILES }),
     /**
@@ -495,12 +477,11 @@ const COMMAND_SCHEMAS = {
   "lane.pause": cmd({ key: req("string"), step: opt({ enum: ["goal", "stop", "both"] }) }),
   "lane.resume": cmd(laneKey),
   /**
-   * `session` (since proto 3): resume that agent session when relaunching. `tabWorkspace`: the herdr workspace the
-   * relaunch's new tab opens in (absent: the one the lane was started in).
+   * `session` (since proto 3): resume that agent session when relaunching. `briefText` and `files` (since proto 5) are a
+   * fresh lead brief and input snapshot: both present or both absent.
    */
-  /** `briefText` and `files` (since proto 5) are a fresh lead brief and input snapshot: both present or both absent. */
   "lane.recover": cmd({
-    key: req("string"), session: opt("string"), tabWorkspace: opt("string"), briefText: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
+    key: req("string"), session: opt("string"), briefText: opt("string"), files: opt({ object: LANE_BRIEF_FILES }),
   }),
   /** Since proto 7: add `tree` to the running lane's input directory, in place, under a fresh `a<NNNN>` group. */
   "lane.attach": cmd({ key: req("string"), tree: req({ object: LANE_FILE_TREE }) }),
@@ -529,12 +510,6 @@ const COMMAND_SCHEMAS = {
     opKey: req("string"), name: req("string"), command: req("string[]"), cwd: req("string"), timeoutSec: req("int"), heavy: req("bool"),
   }),
   "guard.kill": cmd({ keys: req("string[]") }),
-  /**
-   * Since proto 4: the host's herdr server. `start` starts the installed unit and clears the watch pause; `restart`
-   * ends the running server (every lane pane on the host with it) and starts the unit; `stop` ends it and leaves the
-   * watch pause marker so HerdrWatch does not start it again; `status` only reads.
-   */
-  "host.herdr": cmd({ action: req({ enum: ["start", "restart", "stop", "status"] }) }),
   "runner.rotate": cmd({}),
 } satisfies Readonly<Record<string, Shape>>;
 
@@ -587,11 +562,11 @@ const SECRET_ANSWER = {
 const query = <const S extends Shape>(shape: S) => ({ qid: req("string"), ...shape });
 
 const QUERY_SCHEMAS = {
-  /** herdr's pane list of the runner's host. */
+  /** The pane list (hc terminals) of the runner's host. */
   "q.panes": query({}),
   /** A pane's screen: the visible screen, or its last `lines` lines of scrollback and screen (`recent`). */
   "q.screen": query({ pane: req("string"), lines: req("int"), source: req({ enum: ["visible", "recent"] }) }),
-  /** herdr's process-info of a pane. */
+  /** A pane's shell and foreground processes. */
   "q.process": query({ pane: req("string") }),
   /** Whether each path exists on the runner's host. */
   "q.stat": query({ paths: req("string[]") }),

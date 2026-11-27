@@ -19,9 +19,9 @@ const doneChild = (pid: number, code: number, out: string): RunChild => ({
 test("on win32 a command is spawned hidden and not detached", async () => {
   const spawned: { argv: string[]; options: RunSpawnOptions }[] = [];
   const run = makeRunner({ os: "win32", spawn: (argv, options) => { spawned.push({ argv, options }); return doneChild(9, 0, "hi\n"); } });
-  expect(await run(["herdr", "workspace", "list"], { cwd: "C:\\work", timeoutMs: 0 })).toEqual({ code: 0, out: "hi", err: "" });
+  expect(await run(["git", "status", "--porcelain"], { cwd: "C:\\work", timeoutMs: 0 })).toEqual({ code: 0, out: "hi", err: "" });
   expect(spawned).toHaveLength(1);
-  expect(spawned[0]?.argv).toEqual(["herdr", "workspace", "list"]);
+  expect(spawned[0]?.argv).toEqual(["git", "status", "--porcelain"]);
   expect(spawned[0]?.options).toEqual({ windowsHide: true, stdout: "pipe", stderr: "pipe", cwd: "C:\\work" });
 });
 

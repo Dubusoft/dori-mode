@@ -8,6 +8,7 @@ import { RunnerLanes, type RunnerLanesDeps } from "../src/runner/lanes.ts";
 import type { RunnerEventType } from "../src/runner/protocol.ts";
 import { memoryNetwork } from "./support/memory-transport.ts";
 import { fakeClock } from "./fakes.ts";
+import { hcAnswer, newHcWorld } from "./runner-hc-world.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -15,22 +16,20 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
 const START = { cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES };
 
-/** A RunnerLanes with lane-a started on pane p1 (token tok-a), served on an in-memory lane socket. */
+/** A RunnerLanes with lane-a started on hc terminal hc:t1 (token tok-a), served on an in-memory lane socket. */
 const setup = async (over: Partial<RunnerLanesDeps> = {}, requiredReport = false) => {
   const root = mkdtempSync(join(tmpdir(), "runner-lane-socket-"));
   dirs.push(root);
   const runnerDir = join(root, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
+  const world = newHcWorld();
   const lanes = new RunnerLanes({
     ...over,
-    instance: async () => "server-1",
     runnerDir, clock: fakeClock(0), token: () => "tok-a", publish: () => {}, startup: async () => ({ verdict: "ok", detail: "ready" }),
     policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
-    run: async (argv) => (argv.slice(0, 3).join(" ") === "herdr tab create"
-      ? { code: 0, out: JSON.stringify({ result: { tab_id: "t1", root_pane: { pane_id: "p1", tab_id: "t1" } } }), err: "" }
-      : { code: 0, out: "", err: "" }) as Ran,
+    run: async (argv) => hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran),
   });
-  await lanes.start({ ...START, tabWorkspace: "w1", files: { ...FILES, run: { ...FILES.run, requiredReport } } });
+  await lanes.start({ ...START, files: { ...FILES, run: { ...FILES.run, requiredReport } } });
   const storage = { fail: false, loseReply: false };
   const net = memoryNetwork({ drop: (_line, direction) => storage.loseReply && direction === "to-runner" });
   const published: [RunnerEventType, unknown][] = [];
@@ -49,13 +48,6 @@ const setup = async (over: Partial<RunnerLanesDeps> = {}, requiredReport = false
   };
   return { lanes, ask, published, logs, runnerDir, storage, net };
 };
-
-test("whoami by pane answers the lane's key without a token; an unknown pane answers no key", async () => {
-  const t = await setup();
-  expect(await t.ask({ kind: "whoami", pane: "p1" })).toEqual({ ok: true, key: "lane-a" });
-  expect(await t.ask({ kind: "whoami", pane: "p9" })).toEqual({ ok: true });
-  expect(await t.ask({ kind: "whoami" })).toMatchObject({ ok: false, code: "RUNNER_LANE_BAD_REQUEST" });
-});
 
 test("authentication precedes capture and only done captures; retries keep bytes and revision", async () => {
   let reads = 0;
@@ -135,7 +127,7 @@ test("status answers the default before any notify, then the notice lane.notify 
   expect(t.lanes.notice("lane-a")?.status).toBe("not-done");
 });
 
-test("ack publishes lane.ack; report publishes lane.report; a wrong token is refused for every verb but whoami", async () => {
+test("ack publishes lane.ack; report publishes lane.report; a wrong token is refused for every verb", async () => {
   const t = await setup();
   expect(await t.ask({ kind: "ack", key: "lane-a", token: "tok-a", id: "msg-7" })).toEqual({ ok: true });
   expect(await t.ask({ kind: "milestone", key: "lane-a", token: "tok-a", text: "PR open" })).toEqual({ ok: true });

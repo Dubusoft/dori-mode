@@ -25,9 +25,9 @@ import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 
 const T0 = Date.parse("2026-01-01T12:00:00.000Z");
 const MIN = 60_000;
-const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222", pane: "w:p1", brief: "/b.md", done: "x", cwd: "/repo", openedAt: new Date(T0).toISOString() };
-const idle = { pane_id: "w:p1", workspace_id: "w", agent: "omo", agent_status: "idle" };
-const REFUSAL = "pane w:p1 input line holds other text (or shows no prompt)";
+const lane: Lane = { key: "demo-lane", title: "demo", thread: "discord:111/222", pane: "hc:t1", brief: "/b.md", done: "x", cwd: "/repo", openedAt: new Date(T0).toISOString() };
+const idle = { pane_id: "hc:t1", workspace_id: "w", agent: "omo", agent_status: "idle" };
+const REFUSAL = "pane hc:t1 input line holds other text (or shows no prompt)";
 const ID = "not-done-demo-lane-1";
 
 const cleanups: (() => void)[] = [];
@@ -114,7 +114,7 @@ test("a steering message refused while the lane's input line is busy stays queue
   const t = await setup();
   queueSteering(t.messages, T0, lane, { id: ID, subject: "demo-lane done status", text: "[LEAD] not done: read dori lane status demo-lane" });
   await t.pass();
-  expect(t.messages.get(ID)).toMatchObject({ state: "queued", blocked: `send failed (pane w:p1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}` });
+  expect(t.messages.get(ID)).toMatchObject({ state: "queued", blocked: `send failed (pane hc:t1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}` });
   expect(t.typed).toEqual([]);
 
   t.control.pane = "take";
@@ -181,7 +181,7 @@ test("a pane that never shows a prompt gets one LANE_MESSAGE_UNCONFIRMED naming 
   expect(t.typed).toEqual([]);
   expect(t.cmdIds.length).toBeGreaterThan(1);
   expect(t.events).toEqual([
-    `LANE_MESSAGE_UNCONFIRMED demo-lane ${ID} not delivered: send failed (pane w:p1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL} after 20 min; about demo-lane done status`,
+    `LANE_MESSAGE_UNCONFIRMED demo-lane ${ID} not delivered: send failed (pane hc:t1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL} after 20 min; about demo-lane done status`,
   ]);
   expect(t.messages.get(ID)).toMatchObject({ state: "queued", escalatedAt: expect.any(Number) });
   expect(t.ops.get(operationId({ lane: lane.key, action: "lane-message", target: ID }))?.state).toBe("failed");
@@ -213,7 +213,7 @@ test("sendVerified names why a pane did not take the text: other text in its inp
   for (const screen of ["\u276f the owner's half-typed line", "vim: some file"]) {
     t.world.screen = screen;
     const why: string[] = [];
-    expect(await sendVerified(t.deps.run, t.clock, "w:p1", "[LEAD] hello", true, (w) => { why.push(w); })).toBe("failed");
+    expect(await sendVerified(t.deps.run, t.clock, "hc:t1", "[LEAD] hello", true, (w) => { why.push(w); })).toBe("failed");
     expect(why).toEqual([REFUSAL]);
   }
   expect(t.world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
@@ -281,7 +281,7 @@ test("dori lane send to a lane showing a question prompt is refused, types nothi
   const sent = await sendToLane(t.deps, lane, "hello");
   const id = `lane-send-demo-lane-${T0}`;
   expect(sent.ok).toBe(false);
-  expect(sent.line).toStartWith(`LANE_SEND_REFUSED demo-lane ${id}: send failed (pane w:p1 idle): `);
+  expect(sent.line).toStartWith(`LANE_SEND_REFUSED demo-lane ${id}: send failed (pane hc:t1 idle): `);
   expect(sent.line).toContain("RUNNER_LANE_ASKING demo-lane shows a question prompt");
   expect(t.messages.get(id)?.state).toBe("superseded");
   queueSteering(t.messages, T0, lane, { id: ID, subject: "demo-lane done status", text: "[LEAD] not done" });
@@ -308,7 +308,7 @@ test("a close text the pane keeps refusing is retried, never typed by the genera
   closedDecision(t.deps.config.stateDir, lane.key);
   const d = await relayDecisionClose(t.deps, readDecisions(t.deps.config.stateDir).decisions[0] as never);
   expect(t.typed).toEqual([]);
-  expect(relayLine(d)).toStartWith(`DECISION_RELAY_RETRYING demo-lane d1: send failed (pane w:p1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}; the supervisor tries again (attempt 1 of 3)`);
+  expect(relayLine(d)).toStartWith(`DECISION_RELAY_RETRYING demo-lane d1: send failed (pane hc:t1 idle): RUNNER_CMD_FAILED RUNNER_LANE_SEND_FAILED demo-lane: ${REFUSAL}; the supervisor tries again (attempt 1 of 3)`);
   expect(t.messages.get("decision-close-d1")?.state).toBe("superseded");
   const enqueued: string[] = [];
   await ownerDecisionTick(tickDeps(t, enqueued));

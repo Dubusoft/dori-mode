@@ -15,7 +15,7 @@ import { errText } from "../line-text.ts";
  * way, with no per-machine cron or tmpfiles rule. Targets and ages:
  * - lane sandbox TMPDIRs (`~/.cache/omo-tmp/lane-sandbox/<key>`) and the rest of the lanes' build temp (`omo-tmp`): 3 days;
  * - the user's own entries in the system temp dirs (`/tmp`, macOS `$TMPDIR`, Windows `%TEMP%`): 2 days; `/var/tmp` on
- *   Linux: 30 days; live-session state (sockets, locks, herdr/tmux/senpi and the like) is never touched;
+ *   Linux: 30 days; live-session state (sockets, locks, tmux/senpi and the like) is never touched;
  * - headless browser profiles (`.<id>.bun-chrome` in a temp dir): 2 hours;
  * - omo sessions (`~/.omo/agent/sessions/<cwd>/*.jsonl` and their `-artifacts` dirs) untouched for 14 days are moved to
  *   `~/.omo/agent/sessions-archive/<cwd>/`, and empty `-artifacts` dirs and empty dirs under the runner's `evidence/` go;
@@ -125,7 +125,7 @@ const IN_USE_TIMEOUT_MS = 60_000;
  * `metro-*` caches, which only metroCache removes.
  */
 export const TEMP_EXCLUDES: readonly string[] = [
-  ".X11-unix", ".ICE-unix", ".XIM-unix", ".font-unix", "systemd-private-*", "snap-private-tmp", "tmux-*", "herdr*", ".*.hm",
+  ".X11-unix", ".ICE-unix", ".XIM-unix", ".font-unix", "systemd-private-*", "snap-private-tmp", "tmux-*", ".*.hm",
   "*.sock", "*.lock", "clr-debug-pipe-*", "dotnet-diagnostic-*", "senpi-*", "event-log-*", "metro-*", "node-compile-cache",
   "com.apple.*", ".com.apple.*", "launchd*", "*.pid",
 ];

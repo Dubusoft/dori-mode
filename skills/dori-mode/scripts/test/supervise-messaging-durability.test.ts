@@ -21,7 +21,7 @@ const fixture = () => {
   cleanups.push(state.done);
   const clock = fakeClock(1_800_000_000_000);
   const world = newWorld();
-  const pane = { pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" };
+  const pane = { pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" };
   world.panes.push(pane);
   const deps = depsFor(world, clock, state.dir);
   const journal = (): {
