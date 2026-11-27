@@ -54,9 +54,9 @@ const KEY_PROBLEM = /^SETUP_KEY_(MISSING|INVALID) (\S+)/;
  * runner upgrade, a refresh, the restart command or pi-quota), else 0. A failed step never blocks the restart.
  */
 export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<number> => {
-  const git = async (args: readonly string[], cwd = root): Promise<string> => {
+  const git = async (args: readonly string[], cwd = root, hint = ""): Promise<string> => {
     const r = await d.run(["git", ...args], { cwd, timeoutMs: 120_000 });
-    if (r.code !== 0) throw new UpdateStop(`UPDATE_FAILED git ${args.join(" ")}: ${(r.err || r.out).split("\n")[0]}`);
+    if (r.code !== 0) throw new UpdateStop(`UPDATE_FAILED git ${args.join(" ")}: ${(r.err || r.out).split("\n")[0]}${hint}`);
     return r.out;
   };
   let root = o.packageDir;
@@ -95,7 +95,7 @@ export const updateInstall = async (d: UpdateDeps, o: UpdateOptions): Promise<nu
   };
   try {
     root = await git(["rev-parse", "--show-toplevel"], o.packageDir);
-    await git(["fetch", "-q", "origin", o.branch]);
+    await git(["fetch", "-q", "origin", o.branch], root, "; the repo is private: git needs a GitHub login with access to it (gh auth login or GH_TOKEN, then gh auth setup-git)");
     const from = await git(["branch", "--show-current"]);
     const old = await git(["rev-parse", "HEAD"]);
     const stash = (await git(["status", "--porcelain", "--untracked-files=no"])) === "" ? undefined

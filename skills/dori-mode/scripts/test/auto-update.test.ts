@@ -33,8 +33,8 @@ const runner: Runner = async (argv): Promise<Ran> => {
 };
 const starts = (): string[][] => calls.filter((c) => c[0] === "systemd-run");
 const emit = async (line: string, id: string): Promise<void> => { events.push([id, line]); };
-const auto = (): AutoUpdate => new AutoUpdate({
-  stateDir: dir, run: runner, now: () => now, env: { PATH: "/usr/bin", HOME: "/home/u" }, log: () => {},
+const auto = (env: Record<string, string> = { PATH: "/usr/bin", HOME: "/home/u" }): AutoUpdate => new AutoUpdate({
+  stateDir: dir, run: runner, now: () => now, env, log: () => {},
   command: ["/bin/bun", "/dori/src/cli.ts", "update", "--dev"], busy: async () => busy, staleAfterMs: STALE_MS,
   staleBlocker: async (key, since) => {
     stale.push(`${key}@${since}`);
@@ -54,6 +54,15 @@ beforeEach(() => {
   calls = []; unit = "inactive"; startCode = 0; busy = []; events = []; now = 1_000; stale = []; staleCloses = false;
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+test("the supervisor's GitHub tokens reach the update unit by name, never by value", async () => {
+  noteDevMerge(dir, "Dubusoft/dori-mode#7");
+  await auto({ PATH: "/usr/bin", HOME: "/home/u", GH_TOKEN: "gho_secret", GITHUB_TOKEN: "" }).tick(emit);
+  expect(starts()).toEqual([[
+    "systemd-run", "--user", "--unit", AUTO_UPDATE_UNIT, "--collect", "--quiet", "--setenv=PATH=/usr/bin", "--setenv=HOME=/home/u", "--setenv=GH_TOKEN",
+    "--", "/bin/bun", "/dori/src/cli.ts", "update", "--dev", "--result", join(dir, AUTO_UPDATE_RESULT),
+  ]]);
+});
 
 test("a dev merge with no busy lane starts one detached update unit; exit 0 is a digest AUTO_UPDATE_DONE", async () => {
   const a = auto();

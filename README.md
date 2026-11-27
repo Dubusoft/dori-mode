@@ -13,12 +13,13 @@ It ships as a skill (`skills/dori-mode/SKILL.md` plus references) and a small bu
 ## Install
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
+gh auth login   # the repo is private; skip when gh is signed in or GH_TOKEN is set
+bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mode/contents/install.sh)"
 ```
 
-This clones the repo to `~/.dori/src`, links the skill into `~/.agents/skills/dori-mode`, puts `dori` on your PATH with `bun link`, and starts `dori setup`. Set `SKILLS_DIR` if your agent loads skills from somewhere else.
+This clones the repo to `~/.dori/src` with your GitHub login (git there keeps taking its credentials from `gh`, so later updates work too), links the skill into `~/.agents/skills/dori-mode`, puts `dori` on your PATH with `bun link`, and starts `dori setup`. Set `SKILLS_DIR` if your agent loads skills from somewhere else.
 
-`dori setup` asks for the Discord bot token (saved to `~/.dori/env`, mode 600, never shown), the main channel ids (checked with the token), the default model, working directory and state directory, then creates or reuses the herdr lead pane and `lanes` workspace and, if you want, installs systemd user units so herdr, the supervisor and presence start at boot. It asks before each system step. Run it again any time: current values are the defaults, and Enter keeps them. With `curl ... | bash` there is no terminal to ask in, so the installer only prints the hint; run `dori setup` yourself. For scripts: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
+`dori setup` asks for the Discord bot token (saved to `~/.dori/env`, mode 600, never shown), the main channel ids (checked with the token), the default model, working directory and state directory, then creates or reuses the herdr lead pane and `lanes` workspace and, if you want, installs systemd user units so herdr, the supervisor and presence start at boot. It asks before each system step. Run it again any time: current values are the defaults, and Enter keeps them. Piped into bash there is no terminal to ask in, so the installer only prints the hint; run `dori setup` yourself. For scripts: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
 
 Then open your agent inside herdr and say "Dori mode".
 
