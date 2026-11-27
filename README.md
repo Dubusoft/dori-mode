@@ -1,3 +1,5 @@
+> **Moved:** Dori now lives in [`dori/` of Dubusoft/toodo](https://github.com/Dubusoft/toodo/tree/dev/dori), together with this repository's history. This repository is archived and read-only; open issues and pull requests in Dubusoft/toodo.
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [한국어](README.ko.md)
 
 <p align="center">
