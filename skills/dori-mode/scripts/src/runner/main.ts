@@ -7,8 +7,8 @@ import { RunnerLanes } from "./lanes.ts";
 import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
-import { laneRepoOf, maskStoreSecrets, secretGranter } from "./secret-grant.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { laneRepoOf, maskStoreSecrets, ruleMatches, secretGranter } from "./secret-grant.ts";
+import { hostCommandRouter, remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
@@ -349,16 +349,34 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {
       const linked = client;
+      const laneRepo = laneRepoOf(run, (key) => runnerLanes.cwdOf(key));
+      const hostCommands = () => policy.hostCommands ?? {};
+      // runner-config hostCommands carry no secrets, so this store is never read.
+      const onHost = secretCommandRunner({
+        store: { read: (name) => Promise.reject(new Error(`hostCommands carry no secrets (${name})`)) },
+        commands: async () => hostCommands(),
+        source: "runner-config hostCommands",
+        laneRepo, log,
+      });
       laneSocketLanes = {
         tokenFor: (key, token) => runnerLanes.tokenFor(key, token),
         notice: (key) => runnerLanes.notice(key),
         keyForPane: (pane) => runnerLanes.keyForPane(pane),
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secrets: remoteSecretGranter({
-          client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log, onGranted: addKnownSecrets,
+          client: linked, laneRepo, log, onGranted: addKnownSecrets,
         }),
-        // Proxy execution runs on the supervisor host: secret.run over the link.
-        secretRun: remoteSecretRunner({ client: linked, laneRepo: laneRepoOf(run, (key) => runnerLanes.cwdOf(key)), log }),
+        // Proxy execution: a hostCommands op runs on this worker host, any other on the supervisor host (secret.run over the link).
+        secretRun: hostCommandRouter({
+          hostCommands,
+          onHost: (key, op) => onHost(key, op),
+          onSupervisor: remoteSecretRunner({ client: linked, laneRepo, log }),
+          allowedOnHost: async (key) => {
+            const allowed: string[] = [];
+            for (const [name, rule] of Object.entries(hostCommands())) if (await ruleMatches(rule, key, () => laneRepo(key).catch(() => undefined))) allowed.push(name);
+            return allowed;
+          },
+        }),
       };
     } else {
       const secretStore = new SecretStore({ log });

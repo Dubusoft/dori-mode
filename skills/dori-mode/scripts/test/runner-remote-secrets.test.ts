@@ -9,7 +9,9 @@ import {
   decodeFrame, encodeFrame, supervisorControl,
   type AnySupervisorControl, type RunnerControl, type RunnerControlBodies, type SupervisorControlBodies, type SupervisorControlType,
 } from "../src/runner/protocol.ts";
-import { remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { hostCommandRouter, remoteSecretGranter, remoteSecretRunner } from "../src/runner/remote-secrets.ts";
+import { secretCommandRunner, type SecretRunResult } from "../src/runner/secret-run.ts";
+import type { SecretCommand } from "../src/config.ts";
 import type { SecretFrame } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import type { Transport } from "../src/runner/transport.ts";
@@ -310,5 +312,54 @@ describe("remote runner secrets over the link", () => {
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
       "RUNNER_SECRET_DENIED lane=lane-a op=deploy code=RUNNER_SECRET_FAILED",
     ]);
+  });
+});
+
+describe("hostCommandRouter (worker runner-config hostCommands)", () => {
+  const hostOp = (argv: readonly string[], lanes: readonly string[]): SecretCommand => ({ argv, secrets: [], lanes, repos: [], timeoutSec: 30 });
+  /** A router over a real secretCommandRunner (real spawn) and a fake supervisor that records each op it is sent. */
+  const router = (table: Record<string, SecretCommand>, supervisorReply: SecretRunResult) => {
+    const sent: string[] = [];
+    const logs: string[] = [];
+    const onHost = secretCommandRunner({
+      store: { read: (name) => Promise.reject(new Error(`no store (${name})`)) },
+      commands: async () => table, source: "runner-config hostCommands", log: (l) => { logs.push(l); }, home: tmp.dir,
+    });
+    const route = hostCommandRouter({
+      hostCommands: () => table,
+      onHost: (key, op) => onHost(key, op),
+      onSupervisor: async (_key, op) => { sent.push(op); return supervisorReply; },
+      allowedOnHost: async (key) => Object.entries(table).filter(([, rule]) => rule.lanes.some((l) => l === key || l === "*")).map(([name]) => name),
+    });
+    return { route, sent, logs };
+  };
+  const denied: SecretRunResult = { ok: false, code: "RUNNER_SECRET_DENIED", detail: "nope is not a configured secret command (config secretCommands); ops this lane may run: probe-sandbox" };
+
+  test("a listed op runs on this host and never reaches the supervisor", async () => {
+    const r = router({ "worker-probe": hostOp(["/bin/sh", "-c", "echo host=worker lane=$DORI_LANE_KEY"], ["lane-a"]) }, denied);
+    const result = await r.route("lane-a", "worker-probe");
+    expect(result).toEqual({ ok: true, exitCode: 0, stdout: "host=worker lane=lane-a\n", stderr: "", truncated: false });
+    expect(r.sent).toEqual([]);
+    expect(r.logs).toEqual(["RUNNER_SECRET_RUN lane=lane-a op=worker-probe exit=0"]);
+  });
+
+  test("a listed op the lane does not match is refused here, naming runner-config hostCommands", async () => {
+    const r = router({ "worker-probe": hostOp(["/bin/true"], ["lane-b"]) }, denied);
+    const result = await r.route("lane-a", "worker-probe");
+    expect(result).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "lane-a may not run worker-probe (runner-config hostCommands); ops this lane may run: none" });
+    expect(r.sent).toEqual([]);
+  });
+
+  test("an unlisted op goes to the supervisor; its refusal lists the supervisor's and this lane's worker ops together", async () => {
+    const r = router({ "worker-probe": hostOp(["/bin/true"], ["*"]), "other-lane": hostOp(["/bin/true"], ["lane-b"]) }, denied);
+    const result = await r.route("lane-a", "nope");
+    expect(r.sent).toEqual(["nope"]);
+    expect(result).toEqual({ ok: false, code: "RUNNER_SECRET_DENIED", detail: "nope is not a configured secret command (config secretCommands); ops this lane may run: probe-sandbox, worker-probe" });
+  });
+
+  test("without hostCommands the supervisor's answer passes through unchanged", async () => {
+    const ran: SecretRunResult = { ok: true, exitCode: 0, stdout: "host=home-server\n", stderr: "", truncated: false };
+    expect(await router({}, ran).route("lane-a", "probe-sandbox")).toEqual(ran);
+    expect(await router({}, denied).route("lane-a", "nope")).toEqual(denied);
   });
 });

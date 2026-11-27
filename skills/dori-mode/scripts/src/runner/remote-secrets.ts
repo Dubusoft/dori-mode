@@ -56,3 +56,41 @@ export const remoteSecretRunner = (deps: RemoteSecretRunDeps) => async (key: str
   deps.log(`RUNNER_SECRET_RUN lane=${key} op=${op} exit=${outcome.exitCode}`);
   return outcome;
 };
+
+export type HostCommandRouterDeps = {
+  /** This runner's live runner-config `hostCommands` (a reload rewrites the policy in place). */
+  readonly hostCommands: () => Readonly<Record<string, unknown>>;
+  /** Runs a hostCommands op on this host (secretCommandRunner over hostCommands). */
+  readonly onHost: (key: string, op: string) => Promise<SecretRunResult>;
+  /** Hands any other op to the supervisor (remoteSecretRunner). */
+  readonly onSupervisor: (key: string, op: string) => Promise<SecretRunResult>;
+  /** The hostCommands ops whose lanes/repos match lane `key`. */
+  readonly allowedOnHost: (key: string) => Promise<readonly string[]>;
+};
+
+const ALLOWED = "; ops this lane may run: ";
+
+/** The op names after ALLOWED in a DENIED detail, and the detail before it; undefined when the detail has no list. */
+const allowedOps = (detail: string): { readonly head: string; readonly ops: string[] } | undefined => {
+  const at = detail.lastIndexOf(ALLOWED);
+  if (at < 0) return undefined;
+  const list = detail.slice(at + ALLOWED.length);
+  return { head: detail.slice(0, at), ops: list === "none" ? [] : list.split(", ") };
+};
+
+/**
+ * The `secretRun` handler of a worker runner: an op in this runner's `hostCommands` runs here, on the worker host and
+ * outside the lane sandbox; any other op goes to the supervisor's `secretCommands` as before. An op is never both: a
+ * hostCommands name shadows the supervisor's. When the supervisor refuses with RUNNER_SECRET_DENIED, the ops this lane
+ * may run on this host join its list, so the lane sees every op it can call in one place.
+ */
+export const hostCommandRouter = (deps: HostCommandRouterDeps) => async (key: string, op: string): Promise<SecretRunResult> => {
+  if (Object.hasOwn(deps.hostCommands(), op)) return deps.onHost(key, op);
+  const result = await deps.onSupervisor(key, op);
+  if (result.ok || result.code !== "RUNNER_SECRET_DENIED") return result;
+  const remote = allowedOps(result.detail);
+  const local = remote ? await deps.allowedOnHost(key) : [];
+  if (!remote || !local.length) return result;
+  const ops = [...new Set([...remote.ops, ...local])].sort();
+  return { ...result, detail: `${remote.head}${ALLOWED}${ops.join(", ")}` };
+};

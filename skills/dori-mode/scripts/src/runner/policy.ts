@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolvePath, sep, win32 } from "node:path";
 import { defaultRunnerDir, RUNNER_PATHS } from "./fs-safety.ts";
+import { hostCommands as parseHostCommands, type SecretCommand } from "../config.ts";
 import { validateFileKey } from "../lane-file-contract.ts";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
@@ -49,6 +50,13 @@ export type RunnerPolicy = {
    * grantPathRefusal; the wrapper's hide list still wins over every grant.
    */
   readonly grants?: Readonly<Record<string, PathGrant>>;
+  /**
+   * Ops a worker runner runs on its own host, outside the lane sandbox, for `dori host <op>` / `dori secret run <op>`
+   * (remote-secrets.ts hostCommandRouter): config secretCommands' shape without `secrets` (each entry's `secrets` is
+   * `[]`). An op not listed here goes to the supervisor as before. The local runner ignores it: config secretCommands
+   * already run on its host.
+   */
+  readonly hostCommands?: Readonly<Record<string, SecretCommand>>;
 };
 
 /** One named entry of runner-config `grants`. */
@@ -78,7 +86,7 @@ export const laneCwd = (runnerDir: string, key: string): string => join(lanesDir
 
 /** The top-level keys runner-config.json may hold; parsePolicy throws on any other (RETIRED_POLICY_KEYS aside). */
 export const RUNNER_POLICY_KEYS = [
-  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot", "grants",
+  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot", "grants", "hostCommands",
 ] as const;
 
 /**
@@ -226,6 +234,10 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
       grants[name] = { write, read };
     }
   }
+  let hostCommands: Readonly<Record<string, SecretCommand>> | undefined;
+  if (value.hostCommands !== undefined) {
+    try { hostCommands = parseHostCommands(value.hostCommands); } catch (e) { throw new Error(`runner-config: ${e instanceof Error ? e.message : String(e)}`); }
+  }
   // Explicit roots stay as written (none listed: derivedRoots); the lanes directory is appended unless a root already
   // holds it, then reposRoot and the effective worktree root unless one already names the same directory.
   const explicit = (value.allowedRoots as string[] | undefined) ?? [];
@@ -255,6 +267,7 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
     ...(reposRoot !== undefined ? { reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     ...(grants ? { grants } : {}),
+    ...(hostCommands ? { hostCommands } : {}),
     agents,
     allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,

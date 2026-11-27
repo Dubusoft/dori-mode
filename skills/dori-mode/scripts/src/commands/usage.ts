@@ -118,7 +118,7 @@ export const USAGE = `dori <command> [options]
   secret list [--json]                 stored secret names and backend (cred or plain); values are never printed
   secret delete NAME                   remove a stored secret
   secret env                          inside a lane: export every stored secret as POSIX shell lines for eval "$(dori secret env)" (loaded at launch; refuses a terminal stdout)
-  secret run <op> | host <op>          inside a lane: the supervisor host runs config secretCommands.<op> and prints its redacted output
+  secret run <op> | host <op>          inside a lane: the supervisor host runs config secretCommands.<op> (a worker runs its runner-config hostCommands.<op> itself) and prints its redacted output
   freshness [--loop MIN]               nudge silent lanes, post their last report via hooks.threadReply
   dead-panes [--loop MIN]              print DEAD_PANE <id> for stopped agent panes
   guard [--loop MIN]                   host load, memory, disk and pane-count alerts
