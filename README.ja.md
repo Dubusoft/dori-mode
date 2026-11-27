@@ -6,7 +6,7 @@
 
 # omo-dori-mode-experimental
 
-Dori モードは、コーディングエージェントのセッションひとつを常駐型のメッセンジャーエージェントに変えます。あなたが話す相手は Discord のボットひとつだけ。Dori は仕事ごとに herdr のタブでエージェントセッションを立ち上げて任せ、自分が立ち上げたセッションをすべて覚えておき、仕事が本当に終わったときだけ閉じます。PR がマージされ、issue が閉じ、バージョンが公開されたあとです。
+Dori モードは、コーディングエージェントのセッションひとつを常駐型のメッセンジャーエージェントに変えます。あなたが話す相手は Discord のボットひとつだけ。Dori は仕事ごとに hc のターミナルでエージェントセッションを立ち上げて任せ、自分が立ち上げたセッションをすべて覚えておき、仕事が本当に終わったときだけ閉じます。PR がマージされ、issue が閉じ、バージョンが公開されたあとです。
 
 中身はスキル(`skills/dori-mode/SKILL.md` と references)と、bun + TypeScript の小さな CLI `dori` です。実験段階なので、粗いところがあります。
 
@@ -19,14 +19,14 @@ bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mo
 
 GitHub のログインでリポジトリを `~/.dori/src` に取得し(そのチェックアウトの git は以後も `gh` から認証情報を受け取るので、更新もそのまま動きます)、スキルを `~/.agents/skills/dori-mode` にリンクし、`bun link` で `dori` を PATH に通してから `dori setup` を起動します。エージェントが別の場所からスキルを読む場合は `SKILLS_DIR` を指定してください。
 
-`dori setup` は Discord ボットのトークン(`~/.dori/env` に権限 600 で保存し、表示しません)、メインチャンネルの ID(トークンで読めるか確認します)、デフォルトのモデル、作業ディレクトリ、状態ディレクトリを尋ね、herdr のリードペインと `lanes` ワークスペースを作成または再利用します。希望すれば、起動時に herdr、スーパーバイザー、プレゼンスが立ち上がるよう systemd ユーザーユニットも入れます。システムに関わる手順はそれぞれ事前に確認します。何度でも実行し直せます。現在の値がデフォルトとして表示され、Enter でそのまま残ります。パイプで bash に渡すと尋ねる端末がないので案内だけを表示します。その場合は `dori setup` を自分で実行してください。スクリプト向け: `dori setup --yes --token-file FILE --channel ID [--autostart]`。
+`dori setup` は Discord ボットのトークン(`~/.dori/env` に権限 600 で保存し、表示しません)、メインチャンネルの ID(トークンで読めるか確認します)、デフォルトのモデル、作業ディレクトリ、状態ディレクトリを尋ねます。希望すれば、起動時に hc コア、スーパーバイザー、プレゼンスが立ち上がるよう systemd ユーザーユニットも入れます。システムに関わる手順はそれぞれ事前に確認します。何度でも実行し直せます。現在の値がデフォルトとして表示され、Enter でそのまま残ります。パイプで bash に渡すと尋ねる端末がないので案内だけを表示します。その場合は `dori setup` を自分で実行してください。スクリプト向け: `dori setup --yes --token-file FILE --channel ID [--autostart]`。
 
-あとは herdr の中でエージェントを開いて「Dori mode」と言うだけです。
+あとはエージェントを開いて「Dori mode」と言うだけです。
 
 ## 必要なもの
 
 - [bun](https://bun.sh) 1.3 以上と git
-- [herdr](https://herdr.dev):レーンが動くターミナルマルチプレクサ
+- hc(herdr-core):リードとレーンが動くヘッドレスのターミナルランタイム(`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`)
 - スキルを読み込むコーディングエージェント([OmO](https://github.com/code-yeongyu/oh-my-openagent) 向けに作っていますが、起動コマンドは設定で変えられます)
 - PR のマージと issue のクローズを確認する `gh`(GitHub CLI)、公開バージョンを確認する `npm`
 - ボット本体のための [agent-messenger](https://github.com/agent-messenger/agent-messenger)
@@ -38,10 +38,10 @@ GitHub のログインでリポジトリを `~/.dori/src` に取得し(そのチ
 ゼロから最初の仕事が終わるまで:
 
 1. **Discord ボットを作る。** [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーションを作り、**Bot** ページで **Message Content Intent** をオンにしてトークンをコピーします。ボットをサーバーに招待し(OAuth2 URL generator、`bot` スコープ)、ボットと話すチャンネルの ID をコピーします(開発者モードをオンにして、チャンネルを右クリック、チャンネル ID をコピー)。
-2. **herdr を起動**(`herdr`)し、その中で上のワンライナーでインストールします。`dori setup` がそのトークンとチャンネル ID、モデルとフォルダーを尋ね、`dori-lead` ペインと `lanes` ワークスペースを作ります。
+2. **hc をインストール**し、上のワンライナーでインストールします。`dori setup` がそのトークンとチャンネル ID、モデルとフォルダーを尋ねます。
 3. **インストールを確認**: `dori doctor` が項目ごとに OK、WARN、FAIL を表示し、失敗した項目には正確な直し方を出します。
 4. **オンにする**: `dori-lead` ペインでコーディングエージェントを開き、「Dori mode」と言います。Dori は自分の名前を尋ね、ボットからあいさつし、オンボーディングを提案します。
-5. **仕事を頼む**: チャンネルでボットに、たとえば「acme/app の README のタイポを直して PR を出して」と書きます。herdr にレーンを開き、スレッドに進捗を投稿し、PR がマージされたらレーンを閉じます。
+5. **仕事を頼む**: チャンネルでボットに、たとえば「acme/app の README のタイポを直して PR を出して」と書きます。hc にレーンを開き、スレッドに進捗を投稿し、PR がマージされたらレーンを閉じます。
 
 スラッシュコマンド、モニター、自動起動を含む設定の全体は [`references/setup.md`](skills/dori-mode/references/setup.md) にあります。
 
@@ -65,7 +65,7 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 
 残り(時間、しきい値、heavy スロット数)は既定値で十分です。全項目の表は [`references/scripts.md`](skills/dori-mode/references/scripts.md) にあります。環境変数 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` はファイルより優先されます。
 
-リードの herdr pane と、新しいレーンのタブを開く workspace は設定しません。スーパーバイザーが見つけ、なければ作り(`Dori` workspace の `dori-lead` タブと `lanes` workspace)、`<stateDir>/herdr-panes.json` に記録します。古い設定の `leadPane`、`laneWorkspace`、`workspaces` は一度だけそこへ移され、以後は無視されます。
+リードの pane は設定しません。スーパーバイザーがなければ hc ターミナル `dori-lead` として開き、`<stateDir>/herdr-panes.json` に記録します。古い設定の `leadPane` は一度だけそこへ移され、以後は無視されます。残った `leadRuntime` キーは無視され、`dori setup --migrate` がそれとローカルランナーの `runner-config.json` の `laneRuntime` を削除します。ターミナルランタイムは hc だけです。
 
 ## オンボーディング
 
@@ -84,7 +84,7 @@ Dori はあなたの話し方に合わせます。短く、くだけた調子で
 
 ## セッションレジストリ
 
-レーンごとに `~/.dori/state/lanes/` の下に JSON ファイルがひとつできます。メッセンジャーのスレッドと herdr の pane、pane とエージェントのセッション id を結びつけ、状態(`working`、`done-claimed`、`verified-done`、`not-done`、`closed`)とその変化の履歴を残します。
+レーンごとに `~/.dori/state/lanes/` の下に JSON ファイルがひとつできます。メッセンジャーのスレッドと hc の pane、pane とエージェントのセッション id を結びつけ、状態(`working`、`done-claimed`、`verified-done`、`not-done`、`closed`)とその変化の履歴を残します。
 
 `dori sync` はこの記録を実際に動いている pane と突き合わせて、ずれを教えてくれます。消えた pane、変わったセッション id、完了を証明する手段がないレーンなどです。何も削除しません。`--write` を付けると、見つけたセッション id を保存します。
 
@@ -159,7 +159,7 @@ CI は型チェックだけを回します。テストはローカルで回し�
 ```sh
 cd skills/dori-mode/scripts
 bun install
-bun test           # 偽の herdr、git、gh で振る舞いを確かめるテスト
+bun test           # 偽の hc、git、gh で振る舞いを確かめるテスト
 bunx tsc --noEmit  # 型チェック
 ```
 

@@ -6,7 +6,7 @@
 
 # omo-dori-mode-experimental
 
-Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只需要在 Discord 上和一个机器人对话。Dori 把每件事交给 herdr 标签页里单独启动的智能体会话，记住自己启动过的每个会话，只有在工作真正完成后才关闭它:PR 已合并、issue 已关闭、版本已发布。
+Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只需要在 Discord 上和一个机器人对话。Dori 把每件事交给 hc 终端里单独启动的智能体会话，记住自己启动过的每个会话，只有在工作真正完成后才关闭它:PR 已合并、issue 已关闭、版本已发布。
 
 它由一个技能(`skills/dori-mode/SKILL.md` 和 references)以及一个用 bun + TypeScript 写的小 CLI `dori` 组成。目前还是实验版本，会有不完善的地方。
 
@@ -19,14 +19,14 @@ bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mo
 
 它会用你的 GitHub 登录把仓库克隆到 `~/.dori/src`(该检出里的 git 之后继续从 `gh` 取凭据，所以更新也能用),把技能链接到 `~/.agents/skills/dori-mode`,用 `bun link` 把 `dori` 放进 PATH,然后启动 `dori setup`。如果你的智能体从别的目录加载技能，请设置 `SKILLS_DIR`。
 
-`dori setup` 会询问 Discord 机器人令牌(保存到 `~/.dori/env`,权限 600,不会显示出来)、主频道 ID(用令牌确认能读取)、默认模型、工作目录和状态目录，然后创建或复用 herdr 的主控窗格和 `lanes` 工作区。需要的话，它还会安装 systemd 用户单元，让 herdr、supervisor 和 presence 开机自启;每个系统级步骤都会先询问。可以随时重新运行：当前值就是默认值，按回车保留。通过管道交给 bash 安装时没有终端可以提问，只会打印提示，请自己运行 `dori setup`。脚本用法:`dori setup --yes --token-file FILE --channel ID [--autostart]`。
+`dori setup` 会询问 Discord 机器人令牌(保存到 `~/.dori/env`,权限 600,不会显示出来)、主频道 ID(用令牌确认能读取)、默认模型、工作目录和状态目录。需要的话，它还会安装 systemd 用户单元，让 hc 核心、supervisor 和 presence 开机自启;每个系统级步骤都会先询问。可以随时重新运行：当前值就是默认值，按回车保留。通过管道交给 bash 安装时没有终端可以提问，只会打印提示，请自己运行 `dori setup`。脚本用法:`dori setup --yes --token-file FILE --channel ID [--autostart]`。
 
-然后在 herdr 里打开智能体，说一句 "Dori mode" 就行。
+然后打开智能体，说一句 "Dori mode" 就行。
 
 ## 依赖
 
 - [bun](https://bun.sh) 1.3 或更新版本，以及 git
-- [herdr](https://herdr.dev):运行各条 lane 的终端复用器
+- hc(herdr-core):主控和各条 lane 运行的无界面终端运行时(`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`)
 - 能加载技能的编程智能体(按 [OmO](https://github.com/code-yeongyu/oh-my-openagent) 设计，启动命令可以在配置里改)
 - 用来确认 PR 合并和 issue 关闭的 `gh`(GitHub CLI),以及确认已发布版本的 `npm`
 - 机器人本身用的 [agent-messenger](https://github.com/agent-messenger/agent-messenger)
@@ -38,10 +38,10 @@ bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mo
 从零到完成第一件工作:
 
 1. **创建 Discord 机器人。** 在 [Discord Developer Portal](https://discord.com/developers/applications) 创建应用，在 **Bot** 页面打开 **Message Content Intent** 并复制令牌。把机器人邀请进你的服务器(OAuth2 URL generator,`bot` scope),再复制你要和它对话的频道 ID(打开开发者模式，右键频道，复制频道 ID)。
-2. **启动 herdr**(`herdr`),在里面运行上面的一行安装命令。`dori setup` 会询问这个令牌和频道 ID、模型和目录，并创建 `dori-lead` 窗格和 `lanes` 工作区。
+2. **安装 hc**,然后运行上面的一行安装命令。`dori setup` 会询问这个令牌和频道 ID、模型和目录。
 3. **检查安装**:`dori doctor` 逐项显示 OK、WARN 或 FAIL,失败的项目会给出具体的修复方法。
 4. **开启**:在 `dori-lead` 窗格里启动编程智能体，说一句 "Dori mode"。Dori 会问你怎么称呼它，通过机器人跟你打招呼，并提议做 onboarding。
-5. **交给它一件工作**:在频道里给机器人写，比如 "修一下 acme/app README 里的错别字并开个 PR"。它会在 herdr 里开一条 lane,在帖子里汇报进度，PR 合并后关闭这条 lane。
+5. **交给它一件工作**:在频道里给机器人写，比如 "修一下 acme/app README 里的错别字并开个 PR"。它会在 hc 里开一条 lane,在帖子里汇报进度，PR 合并后关闭这条 lane。
 
 包括斜杠命令、监控和开机自启在内的完整设置说明见 [`references/setup.md`](skills/dori-mode/references/setup.md)。
 
@@ -65,7 +65,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 其余项(时间、阈值、heavy 槽位数)用默认值就够了。完整表格见 [`references/scripts.md`](skills/dori-mode/references/scripts.md)。环境变量 `DORI_CONFIG`、`DORI_STATE_DIR`、`DORI_LEAD_PANE` 优先于配置文件。
 
-主控的 herdr pane 和新 lane 标签页打开的 workspace 不在配置里设置：由 supervisor 查找，缺失时创建(`Dori` workspace 里的 `dori-lead` 标签页，以及 `lanes` workspace),并记录在 `<stateDir>/herdr-panes.json`。旧配置里的 `leadPane`、`laneWorkspace`、`workspaces` 只会被迁移一次，之后忽略。
+主控的 pane 不在配置里设置：缺失时由 supervisor 打开 hc 终端 `dori-lead`,并记录在 `<stateDir>/herdr-panes.json`。旧配置里的 `leadPane` 只会被迁移一次，之后忽略。残留的 `leadRuntime` 键会被忽略,`dori setup --migrate` 会删除它以及本机 runner 的 `runner-config.json` 里的 `laneRuntime`。终端运行时只有 hc。
 
 ## 初次了解(Onboarding)
 
@@ -84,7 +84,7 @@ Dori 会跟着你的说话方式走。你写得简短、随意、用小写，它
 
 ## 会话登记表
 
-每条 lane 在 `~/.dori/state/lanes/` 下有一个 JSON 文件。它把消息线程对应到 herdr pane,把 pane 对应到智能体自己的会话 id,并记录状态(`working`、`done-claimed`、`verified-done`、`not-done`、`closed`)以及每次变化的历史。
+每条 lane 在 `~/.dori/state/lanes/` 下有一个 JSON 文件。它把消息线程对应到 hc pane,把 pane 对应到智能体自己的会话 id,并记录状态(`working`、`done-claimed`、`verified-done`、`not-done`、`closed`)以及每次变化的历史。
 
 `dori sync` 会把登记表和实际在运行的 pane 对照，告诉你哪里对不上：消失的 pane、变了的会话 id、没有办法证明已完成的 lane。它不会删除任何东西。加上 `--write` 会把找到的会话 id 存下来。
 
@@ -159,7 +159,7 @@ CI 只做类型检查,测试在本地运行:
 ```sh
 cd skills/dori-mode/scripts
 bun install
-bun test           # 用假的 herdr、git、gh 验证行为
+bun test           # 用假的 hc、git、gh 验证行为
 bunx tsc --noEmit  # 类型检查
 ```
 

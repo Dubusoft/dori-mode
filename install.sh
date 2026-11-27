@@ -43,5 +43,5 @@ echo "Installed. Skill: $skills/dori-mode  CLI: $dori"
 if [ -t 0 ]; then
   "$dori" setup
 else
-  echo "Next: run \`dori setup\` in a terminal (bot token, channels, herdr panes, autostart), then tell your agent: Dori mode"
+  echo "Next: run \`dori setup\` in a terminal (bot token, channels, autostart), then tell your agent: Dori mode"
 fi
