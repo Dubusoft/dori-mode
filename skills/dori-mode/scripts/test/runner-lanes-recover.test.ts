@@ -469,7 +469,7 @@ test("the lane token is never on the herdr command line; the lane CLI authentica
   await t.lanes.start(START);
   const run = t.calls.find((a) => a[2] === "run");
   const file = t.lanes.tokenPath("lane-a");
-  expect(run?.[4]).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
+  expect(run?.[4]).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${file} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(t.calls.flat().join("\n")).not.toContain("tok-1");
   expect(readFileSync(file, "utf8")).toBe("tok-1");
   expect(statSync(file).mode & 0o777).toBe(0o600);
@@ -556,7 +556,7 @@ test("lane.start carries keywords and heavy env into the launch line, and a reco
   expect(started.detail).toBe("started pane=p1 tab=t1");
   expect(started.result.startup.verdict).toBe("unconfirmed");
   const first = t.calls.find((a) => a[2] === "run")?.[4] ?? "";
-  expect(first).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute`);
+  expect(first).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${t.lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(t.runnerDir, "briefs", "lane-a.out")} DORI_HEAVY_SLOTS=2 DORI_HEAVY_MAX_LOAD=40; eval "$(dori secret env)"; omo --model m1 --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute`);
   t.world.panes = [];
   const recovered = await t.lanes.recover("lane-a", "ses_123", undefined, "# fresh brief\n", FILES);
   expect(recovered.result).toMatchObject({ pane: "p2", tab: "t2", relaunched: true, resumed: true });

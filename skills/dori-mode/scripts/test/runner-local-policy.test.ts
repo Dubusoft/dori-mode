@@ -79,7 +79,7 @@ test("acceptance: a local RunnerLanes over localPolicy(cfg) starts a lane with t
   const started = await lanes.start(start);
   expect(started.result).toEqual({ pane: "p1", tab: "t1", startup: { verdict: "ok", detail: "ready" }, cwd: start.cwd, model: start.model });
   const command = calls.find((a) => a[1] === "pane" && a[2] === "run")?.[4] ?? "";
-  expect(command).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; lane-sandbox omo --model m1 --thinking medium --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute the lane brief at `);
+  expect(command).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; lane-sandbox omo --model m1 --thinking medium --permission-preset full-access --no-ask-user=true 'ulw set goal and work. Read and execute the lane brief at `);
   expect(lanes.records()["lane-a"]?.profile).toBe("sandboxed");
   // The wrapper's check ran before anything else of the launch.
   expect(calls[0]).toEqual(["lane-sandbox", "--check"]);
