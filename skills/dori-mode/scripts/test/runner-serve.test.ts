@@ -30,7 +30,7 @@ const waiter = <T>() => {
   };
 };
 
-test.each([8, 9])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
+test.each([9, 10])("direct and queued file operations pass admitted proto %i and enforce the frame limits", async (proto) => {
   const tmp = withState(); cleanups.push(tmp.done);
   const hub = new RunnerHub({ stateDir: tmp.dir, now: () => 1000, monotonic: () => 1000, epoch: 1, commit: () => true });
   cleanups.push(() => hub.close());
@@ -79,7 +79,7 @@ const silenceWorld = () => {
     const replies: string[] = [];
     transport.onLine((line) => { replies.push(decodeFrame(line, "supervisor").type); });
     const head = { runner: "box", gen, epoch: 1 };
-    transport.send(encodeFrame(runnerControl(head, "hello", { label: "box", hostId: "host", gen, proto: 9, cmdAck: 0 })));
+    transport.send(encodeFrame(runnerControl(head, "hello", { label: "box", hostId: "host", gen, proto: 10, cmdAck: 0 })));
     pair.pump();
     return { transport, replies, heartbeat: () => { transport.send(encodeFrame(runnerControl(head, "heartbeat", {}))); pair.pump(); } };
   };
@@ -184,7 +184,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
 
   // dori status reads the persisted row.
   const status = await collectStatus(deps);
-  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 9, gen: 1, heartbeatAgeSec: 0 });
+  expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 10, gen: 1, heartbeatAgeSec: 0 });
   // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
   expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 

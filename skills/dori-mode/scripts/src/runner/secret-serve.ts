@@ -3,6 +3,7 @@ import { secretsSupported, SECRET_PROTO } from "./protocol.ts";
 import { secretGranter, type SecretGranterDeps } from "./secret-grant.ts";
 import { secretCommandRunner, type SecretRunnerDeps, type SecretRunResult } from "./secret-run.ts";
 import { SECRET_ANSWER_TYPE, type SecretFrame, type SecretReplyContext } from "./serve.ts";
+import { laneToodoRequest, type LaneToodoReader } from "../toodo-lane-read.ts";
 
 export type LaneGranter = (key: string, names: readonly string[]) => Promise<SecretGrant>;
 export type LaneCommandRunner = (key: string, op: string) => Promise<SecretRunResult>;
@@ -11,10 +12,15 @@ export type SupervisorSecretDeps = {
   readonly runnerUnsandboxed: (label: string) => boolean;
   readonly granter: (label: string, repo: string | undefined) => LaneGranter;
   readonly commandRunner?: (label: string, repo: string | undefined) => LaneCommandRunner;
+  /** Answers a remote lane's `toodo.read` (toodo-lane-read.ts); absent: RUNNER_SECRET_UNSUPPORTED. */
+  readonly toodoReader?: LaneToodoReader;
   readonly log: (line: string) => void;
 };
 
-/** Authenticate the link, lane ownership and sandbox before returning sealed store values or host output. */
+/**
+ * Authenticate the link, lane ownership and sandbox before returning sealed store values or host output. A Toodo read
+ * hands out no secret, so it needs lane ownership but not a sandboxed runner.
+ */
 export const supervisorSecretHandler = (deps: SupervisorSecretDeps) => async (label: string, frame: SecretFrame, ctx: SecretReplyContext): Promise<void> => {
   const type = SECRET_ANSWER_TYPE[frame.type];
   const { rid, key } = frame.body;
@@ -26,6 +32,15 @@ export const supervisorSecretHandler = (deps: SupervisorSecretDeps) => async (la
     if (await deps.laneOwner(key) !== label) {
       deps.log(`RUNNER_FORGED_SECRET runner=${label} key=${key}`);
       refuse("RUNNER_SECRET_DENIED", `${key} is not a lane of runner ${label}`);
+      return;
+    }
+    if (frame.type === "toodo.read") {
+      if (!deps.toodoReader) { refuse("RUNNER_SECRET_UNSUPPORTED", "this supervisor does not serve Toodo reads"); return; }
+      const request = laneToodoRequest(frame.body.op, frame.body.id, frame.body.query);
+      if (!request) { refuse("TOODO_LANE_BAD_REQUEST", "toodo.read needs op get [id], search with a query, or guidelines"); return; }
+      const result = await deps.toodoReader(key, request);
+      if (!result.ok) { refuse(result.code, result.detail); return; }
+      ctx.reply(type, { rid, ok: true, sealed: session.sealSecret("s2r", { ...ctx.head, type, rid }, JSON.stringify({ text: result.text, truncated: result.truncated })) });
       return;
     }
     if (deps.runnerUnsandboxed(label)) {

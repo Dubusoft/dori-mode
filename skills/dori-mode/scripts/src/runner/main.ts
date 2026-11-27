@@ -8,7 +8,10 @@ import { browserWindowCheck } from "./browser-window.ts";
 import { HerdrReportSockets } from "./herdr-report.ts";
 import { connectLaneSocket, LANE_SOCKET_DIR, laneSocketPath, type LaneSocketLanes, serveLaneSocket } from "./lane-socket.ts";
 import { laneRepoOf, maskStoreSecrets, ruleMatches, secretGranter } from "./secret-grant.ts";
-import { hostCommandRouter, remoteSecretGranter, remoteSecretRunner } from "./remote-secrets.ts";
+import { hostCommandRouter, remoteSecretGranter, remoteSecretRunner, remoteToodoReader } from "./remote-secrets.ts";
+import { ToodoClient } from "../toodo-client.ts";
+import { laneToodoReader } from "../toodo-lane-read.ts";
+import { builtInTunables } from "../tunables.ts";
 import { secretCommandRunner } from "./secret-run.ts";
 import { SecretStore } from "../secret-store.ts";
 import { addKnownSecrets, replaceKnownSecrets } from "../redact.ts";
@@ -377,6 +380,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
             return allowed;
           },
         }),
+        // A lane's Toodo read goes to the supervisor (toodo.read over the link), which holds the token and decides the scope.
+        toodoRead: remoteToodoReader({ client: linked }),
       };
     } else {
       const secretStore = new SecretStore({ log });
@@ -393,6 +398,8 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
         reportFiles: (key) => runnerLanes.reportFiles(key),
         secretRun: (key, op) => runOp(key, op),
         secrets: secretGranter({ store: secretStore, onGranted: addKnownSecrets }),
+        // The local runner is on the supervisor host: it reads Toodo itself with the supervisor's token.
+        toodoRead: laneToodoReader({ client: () => new ToodoClient(builtInTunables().toodoEvents), log }),
       };
       // Store values are masked in this runner's output from the start, not only once a lane asked for them.
       void maskStoreSecrets(secretStore, replaceKnownSecrets, log);

@@ -2,6 +2,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { addKnownSecrets } from "./redact.ts";
 import { SecretStore } from "./secret-store.ts";
+import { ToodoClient } from "./toodo-client.ts";
+import { laneToodoReader } from "./toodo-lane-read.ts";
 import { alertsChannelOf, loadConfig } from "./config.ts";
 import { defaultRunnerDir } from "./runner/fs-safety.ts";
 import { readRunnerRows } from "./runner/hub.ts";
@@ -203,6 +205,8 @@ export class SupervisorRunners {
             commands: async () => (await loadConfig()).secretCommands,
             log: (line) => { console.log(line); },
           }),
+          // A remote lane's toodo.read: read here with this host's Toodo token, within the lane's scope (toodo-lane-read.ts).
+          toodoReader: laneToodoReader({ client: () => new ToodoClient(deps.tunables.toodoEvents), log: (line) => { console.log(line); } }),
           log: (line) => { console.log(line); },
         }),
         // A runner-owned wait that the runner saw met ends here (deduped with the check's own result by its event id);

@@ -9,6 +9,7 @@ import type { Connector, Listener, Transport } from "./transport.ts";
 import { LaneFileError } from "../lane-file-contract.ts";
 import type { LaneOutputFiles } from "./protocol.ts";
 import type { SecretRunResult } from "./secret-run.ts";
+import { laneToodoRequest, type LaneToodoReader } from "../toodo-lane-read.ts";
 
 /**
  * The lane socket `<runnerDir>/sock/lane.d/lane` (design 2.5): one JSON request line in, one JSON reply line out, many per
@@ -22,6 +23,8 @@ import type { SecretRunResult } from "./secret-run.ts";
  * - `{kind: "secret", key, token}`: every store value as `{ok, values}`, or `{ok:false, code, detail}`.
  * - `{kind: "secret-run", key, token, op}`: has the host run config `secretCommands.<op>` for the lane (secret-run.ts);
  *   `{ok, exitCode, stdout, stderr, truncated}` or a refusal. The token is checked before `op`; the output is never logged.
+ * - `{kind: "toodo", key, token, op, id?, query?}`: a read-only Toodo read for the lane (toodo-lane-read.ts: op `get`
+ *   [id], `search` query or `guidelines`; nothing else, so no write); `{ok, text, truncated}` or a refusal.
  * Every verb but `whoami` needs the key's own token (`RUNNER_LANE_AUTH_FAILED`). A failure is `{ok:false, code, detail}`.
  */
 
@@ -65,6 +68,8 @@ export type LaneSocketLanes = {
   readonly secrets?: (key: string) => Promise<SecretGrant>;
   /** Runs a configured secret command for a lane; absent on a runner that does not support them. */
   readonly secretRun?: (key: string, op: string) => Promise<SecretRunResult>;
+  /** Reads Toodo for a lane, read-only; absent on a runner that does not support it. */
+  readonly toodoRead?: LaneToodoReader;
 };
 
 /** A `secretCommands` op name. */
@@ -91,8 +96,25 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
         reply({ ok: true, ...(key ? { key } : {}) });
         return;
       }
-      const known = req.kind === "status" || req.kind === "ack" || req.kind === "secret" || req.kind === "secret-run" || isReportKind(req.kind);
-      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run or whoami"); return; }
+      const known = req.kind === "status" || req.kind === "ack" || req.kind === "secret" || req.kind === "secret-run" || req.kind === "toodo" || isReportKind(req.kind);
+      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run, toodo or whoami"); return; }
+      if (req.kind === "toodo") {
+        if (!lanes.tokenFor(req.key, req.token)) {
+          log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=toodo`);
+          reply({ ok: false, code: "RUNNER_LANE_AUTH_FAILED", detail: `not ${req.key}'s lane token` });
+          return;
+        }
+        const request = laneToodoRequest(req.op, req.id, req.query);
+        if (!request) { bad("toodo is read-only: op get [id], search with a query, or guidelines"); return; }
+        if (!lanes.toodoRead) { reply({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "this runner does not read Toodo for lanes" }); return; }
+        const read = lanes.toodoRead;
+        const key = req.key;
+        void Promise.resolve().then(() => read(key, request)).then(
+          (result) => { reply(result.ok ? { ok: true, text: result.text, truncated: result.truncated } : { ok: false, code: result.code, detail: result.detail }); },
+          (error: unknown) => { reply({ ok: false, code: "TOODO_LANE_UNREADABLE", detail: error instanceof Error ? error.message : String(error) }); },
+        );
+        return;
+      }
       if (req.kind === "secret-run") {
         if (!lanes.tokenFor(req.key, req.token)) {
           log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=secret-run`);

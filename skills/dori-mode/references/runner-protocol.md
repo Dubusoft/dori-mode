@@ -37,11 +37,13 @@ Control frames, used in this release:
 - Runner to supervisor: `enroll`, `hello {proto, gen, label, hostId, cmdAck, version?, inventory?, workspaces?, detected?, worktreeRoot?, nonce, dh}`,
   `auth.proof {sig}`, `runner.rotated {cmdId, runnerPubKey, sig}`, `heartbeat {outbox?: {unacked, oldestAgeMs}}`,
   `cmd.status.result {cmdId, state, detail?}`, `q.result {qid, ok, detail, result?}` (protocol 3, see [Queries](#queries)),
-  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)).
+  `secret.get {rid, key, names, repo?}` and `secret.run {rid, key, op, repo?}` (protocol 6, see [Secrets](#secrets-over-the-link)),
+  `toodo.read {rid, key, op, id?, query?}` (protocol 10, see [Toodo reads](#toodo-reads-over-the-link)).
 - Supervisor to runner: `enroll.ok`, `hello.challenge {nonce, dh, sig, keyFp}`, `hello.ok {proto, epoch, eventAck}`,
   `hello.reject {code, detail}`, `rotate.ok`, `ack {eventAck}`, `cmd.status {cmdId}`, and the queries `q.panes`,
   `q.screen`, `q.process`, `q.stat`, `q.lane.inspect`, `q.machine.observe` (protocol 3), and `secret.value` and
-  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6). The secret frames are control frames: no
+  `secret.run.result {rid, ok, code?, detail?, sealed?: {n, c}}` (protocol 6), and `toodo.read.result` shaped like them
+  (protocol 10). The secret frames are control frames: no
   `seq`/`cmdSeq`, never queued, journaled or logged.
 
 `hello` must be the first frame on a connection (after an `enroll` connection has closed). After the handshake
@@ -850,16 +852,17 @@ in the schema and bump `PROTO`. The hub accepts runners at its own protocol vers
 so a supervisor can be upgraded before its runners. An older runner never sends the new field, and code reading it
 must handle its absence. On disk, new hub columns are added with `ALTER TABLE` and read back as optional.
 
-The current protocol is 9, so a supervisor accepts runners at 9 and 8 (`checkProto`). Any other runner is refused at
-hello with `RUNNER_PROTO_MISMATCH`: one at 7 or below as too old (`dori runner update` upgrades it), one at 10 or
-above as newer than the supervisor. Protocol 9 adds `lanes.closed` / `lanes.closed.result`; a proto 8 runner still
-runs lanes and secrets while `dori doctor` warns that its cleanup sweep skips the closed lanes' `node_modules`.
-Protocol 8 added `secret.put` (since removed; the protocol number stays).
+The current protocol is 10, so a supervisor accepts runners at 10 and 9 (`checkProto`). Any other runner is refused at
+hello with `RUNNER_PROTO_MISMATCH`: one at 8 or below as too old (`dori runner update` upgrades it), one at 11 or
+above as newer than the supervisor. Protocol 10 adds `toodo.read` / `toodo.read.result`; a proto 9 runner still
+runs lanes and secrets while `dori doctor` warns that its lanes get no `dori toodo` reads. Protocol 9 added
+`lanes.closed` / `lanes.closed.result` (the cleanup sweep's closed lanes). Protocol 8 added `secret.put` (since
+removed; the protocol number stays).
 
-**Upgrade the supervisor before its runners**: a proto 8 runner still connects to a proto 9 supervisor, but a proto 9
-runner is refused by a proto 8 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). Bring every runner
-to the supervisor's version before the next bump: a supervisor at protocol 10 would accept 10 and 9 and refuse a
-runner still at 8.
+**Upgrade the supervisor before its runners**: a proto 9 runner still connects to a proto 10 supervisor, but a proto 10
+runner is refused by a proto 9 supervisor (`RUNNER_PROTO_MISMATCH`, newer than the supervisor). Bring every runner
+to the supervisor's version before the next bump: a supervisor at protocol 11 would accept 11 and 10 and refuse a
+runner still at 9.
 
 Historical note (runners below protocol 8 can no longer connect): protocol 3 added the queries, the `cmd.result`
 `result` and the other protocol 3 fields above, and the runner's `state.sqlite` gained the nullable
@@ -1053,6 +1056,20 @@ ciphertext with its 16-byte tag `c` (both base64), under a key derived per direc
 associated data, so a box moved to another frame, rid, runner or direction fails to open. The frame also carries the
 normal `mac`. Both sides send secret frames only on an authenticated link whose peer announced protocol >= 6; the
 supervisor must therefore be upgraded before runners, and an older runner is never sent a value.
+
+### Toodo reads over the link
+
+Protocol 10. A lane reads Toodo read-only with `dori toodo get [<id>] | search <query> | guidelines` (lane socket
+verb `toodo {key, token, op, id?, query?}`). Toodo's token lives only on the supervisor host, so the local runner
+reads there itself and a remote runner sends `toodo.read {rid, key, op, id?, query?}`; the supervisor checks the link
+and lane ownership (not `allowUnsandboxed`: no secret is handed out) and answers `toodo.read.result`, shaped like
+`secret.value`, whose sealed box opens to `{text, truncated}`. Both sides check `op` again: only `get`, `search` and
+`guidelines` exist, each mapped to toodo-server's read commands (`get_task`, `list_tasks`, `list_task_relations`,
+`list_guidelines`), so no lane request can reach a Toodo write. The scope is the lane's task (autopilot key
+`ap-<task>-<n>`): that task, the tasks it depends on or is related to, the tasks of its workspace and that workspace's
+guidelines. Anything else is refused with `TOODO_LANE_OUT_OF_SCOPE`; a lane without a task gets `TOODO_LANE_NO_TASK`.
+The text goes through `redactSecrets` and is cut at 256 KiB. A runner whose supervisor is below protocol 10 answers
+`RUNNER_SECRET_OUTDATED`.
 
 **Ownership.** The supervisor takes a lane event only from the runner that `Lane.runner` names, over that runner's
 authenticated connection. Anything else (another runner's lane, a lane no runner owns, a key the registry does not

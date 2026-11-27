@@ -2,6 +2,7 @@ import type { RunnerClient } from "./client.ts";
 import type { SecretGrant } from "./lane-socket.ts";
 import type { SecretRunResult } from "./secret-run.ts";
 import { SECRET_NAME } from "../secret-name.ts";
+import type { LaneToodoReader } from "../toodo-lane-read.ts";
 
 export type RemoteSecretDeps = {
   readonly client: Pick<RunnerClient, "secretRequest">;
@@ -55,6 +56,25 @@ export const remoteSecretRunner = (deps: RemoteSecretRunDeps) => async (key: str
   if (!outcome?.ok) return refuse("RUNNER_SECRET_FAILED", "the supervisor's secret.run.result is not {exitCode, stdout, stderr, truncated}");
   deps.log(`RUNNER_SECRET_RUN lane=${key} op=${op} exit=${outcome.exitCode}`);
   return outcome;
+};
+
+/**
+ * The `toodoRead` handler for a remote runner's lane socket: asks the supervisor with a sealed `toodo.read` (the
+ * supervisor decides the scope and holds the Toodo token) and hands the lane the opened `{text, truncated}`, or a refusal.
+ */
+export const remoteToodoReader = (deps: Pick<RemoteSecretDeps, "client">): LaneToodoReader => async (key, request) => {
+  const reply = await deps.client.secretRequest("toodo.read", {
+    key, op: request.op,
+    ...(request.op === "get" && request.id !== undefined ? { id: request.id } : {}),
+    ...(request.op === "search" ? { query: request.query } : {}),
+  });
+  if (!reply.ok) return reply;
+  let parsed: unknown;
+  try { parsed = JSON.parse(reply.plaintext); } catch { parsed = undefined; }
+  if (!isRecord(parsed) || typeof parsed.text !== "string" || typeof parsed.truncated !== "boolean") {
+    return { ok: false, code: "TOODO_LANE_UNREADABLE", detail: "the supervisor's toodo.read.result is not {text, truncated}" };
+  }
+  return { ok: true, text: parsed.text, truncated: parsed.truncated };
 };
 
 export type HostCommandRouterDeps = {
