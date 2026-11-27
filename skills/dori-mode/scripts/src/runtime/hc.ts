@@ -144,7 +144,7 @@ export const hcRuntime = (run: Runner, shell: string = process.env.SHELL || "/bi
     open: async (spec: OpenSpec): Promise<OpenedSession> => {
       await ready();
       const name = terminalName(spec.key);
-      const argv = (named: boolean) => ["run", "--bg", "--no-parent", "--no-notify", "--cwd", spec.cwd, "--label", `dori.lane=${spec.key}`,
+      const argv = (named: boolean) => ["run", "--bg", "--no-parent", "--no-notify", "--cwd", spec.cwd, "--label", spec.label ?? `dori.lane=${spec.key}`,
         ...(named && name ? ["--name", name] : []), "--", shell];
       let made = await hc(run, argv(true));
       if (made.ran.code !== 0 && name) made = await hc(run, argv(false));

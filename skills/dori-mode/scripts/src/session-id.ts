@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import type { Runner } from "./run.ts";
 import type { Lane } from "./registry.ts";
+import { infoOf, paneRuntime } from "./runtime/index.ts";
 
 export type Proc = { readonly pid: number; readonly ppid: number; readonly cmd: string };
 export type SessionHit = { readonly id: string; readonly via: "argv" | "child-env" | "start-time" | "none"; readonly pid?: number };
@@ -55,12 +56,11 @@ export const sessionDirFor = (sessionsDir: string, cwd: string): string => join(
 export type SessionDeps = { readonly run: Runner; readonly sessionsDir: string; readonly listDir?: (dir: string) => readonly string[] };
 
 export const resolveSession = async (pane: string, cwd: string, table: readonly Proc[], deps: SessionDeps, lane: Pick<Lane, "machine"> = {}): Promise<SessionHit> => {
-  const info = await deps.run(["herdr", "pane", "process-info", "--pane", pane]);
+  // The pane's own runtime answers: a herdr pane through herdr, an hc terminal (the lead's or a lane's) through hc.
+  const info = infoOf(await paneRuntime(deps.run, pane).processInfo(pane));
   if (lane.machine) {
     // Remote PIDs and session files must never be resolved against the lead host.
-    const processes: readonly { readonly argv?: readonly string[]; readonly pid?: number }[] =
-      info.code === 0 ? (JSON.parse(info.out).result?.process_info?.foreground_processes ?? []) : [];
-    for (const process of processes) {
+    for (const process of info?.foreground_processes ?? []) {
       const argv = process.argv ?? [];
       if (!argv.some((arg) => AGENT.test(arg))) continue;
       const id = sessionFlag(argv);
@@ -68,7 +68,7 @@ export const resolveSession = async (pane: string, cwd: string, table: readonly 
     }
     return { id: "", via: "none" };
   }
-  const shellPid = info.code === 0 ? Number((JSON.parse(info.out) as { result?: { process_info?: { shell_pid?: number } } }).result?.process_info?.shell_pid ?? 0) : 0;
+  const shellPid = info?.shell_pid ?? 0;
   const agent = shellPid ? descendants(table, shellPid).find((p) => AGENT.test(p.cmd) && !/\bmcp\b/.test(p.cmd)) : undefined;
   if (!agent) return { id: "", via: "none" };
   const argv = agent.cmd.split(/\s+/);

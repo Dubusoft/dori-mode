@@ -12,7 +12,8 @@ import { gatewayView, readGatewayStatus, type GatewayView } from "./gateway-stat
 import { type LaneReport, latestLaneReports } from "./lane-report-store.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
-import { listPanes } from "./panes.ts";
+import { paneRow } from "./panes.ts";
+import { runtimeOfPane, type RuntimeKind } from "./runtime/index.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { type Lane, type Registry, statusOf } from "./registry.ts";
 import { Repos } from "./repos.ts";
@@ -56,7 +57,11 @@ export type Status = {
   readonly timeZone?: string;
   readonly services: readonly UnitState[];
   /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
-  readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string };
+  readonly lead: LeadState & {
+    readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string;
+    /** config `leadRuntime`: the runtime the lead's pane opens on. Absent in an older status. */
+    readonly leadRuntime?: RuntimeKind;
+  };
   /** Autopilot is always on; `paused` while `dori autopilot pause` is in force. Absent in an older status. */
   readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
@@ -309,8 +314,8 @@ const lastTokens = (file: string): number => {
 const leadState = async (d: StatusDeps): Promise<LeadState> => {
   const pane = d.config.leadPane;
   try {
-    const found = (await listPanes(d.run)).find((p) => p.pane_id === pane);
-    if (!found) return { pane, state: "missing", note: "pane not found in herdr" };
+    const found = await paneRow(d.run, pane);
+    if (!found) return { pane, state: "missing", note: `pane not found in ${runtimeOfPane(pane)}` };
     if (!found.agent) return { pane, state: "cold", note: "no agent running in the lead pane" };
     const cwd = found.cwd ?? d.config.leadCwd;
     const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.tunables.sessionsDir });
@@ -413,7 +418,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     at: new Date(now).toISOString(),
     timeZone: d.config.displayTimeZone,
     services,
-    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, ...(pendingRestart ? { pendingRestart } : {}) },
+    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, leadRuntime: d.config.leadRuntime, ...(pendingRestart ? { pendingRestart } : {}) },
     autopilot: pause ? { paused: true, ...pause } : { paused: false },
     lanes,
     waits: readWaits(d.config.stateDir),
@@ -568,6 +573,7 @@ export const machineLines = (r: RunnerView): string[] => {
 
 const LEAD_NOTES: Readonly<Record<string, string>> = {
   "pane not found in herdr": "herdr에 리드 패널이 없음",
+  "pane not found in hc": "hc에 리드 터미널이 없음",
   "no agent running in the lead pane": "리드 패널에 실행 중인 에이전트 없음",
   "cannot resolve the lead session": "리드 세션을 찾지 못함",
   "lead session file not found": "리드 세션 파일 없음",
@@ -695,6 +701,12 @@ const leadLine = (l: Status["lead"]): string => {
   return `- ${l.pane || "(리드 패널 기록 없음)"}: ${parts.join(" · ")}${note ? ` - ${clip(note, 100)}` : ""}`;
 };
 
+/** "- 리드 런타임: hc", or the runtime the recorded pane is on and where the next lead restart moves it. */
+const leadRuntimeLine = (pane: string, want: RuntimeKind): string => {
+  const have = pane ? runtimeOfPane(pane) : want;
+  return have === want ? `- 리드 런타임: ${want}` : `- 리드 런타임: ${have} (설정은 ${want}, 다음 dori lead-restart 때 옮김)`;
+};
+
 /** The line under page 1's lanes naming how many more there are (and, paged, where). */
 type More = (hidden: number) => string;
 const plainMore: More = (hidden) => `외 ${hidden}개`;
@@ -716,6 +728,7 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const l = s.lead;
   section("리드", [
     leadLine(l),
+    ...(l.leadRuntime ? [leadRuntimeLine(l.pane, l.leadRuntime)] : []),
     `- 새 레인 워크스페이스: ${l.laneWorkspace || "아직 없음 (수퍼바이저가 만듦)"}`,
     ...(s.autopilot ? [s.autopilot.paused
       ? clip(`- 오토파일럿: 일시정지 (${s.autopilot.since}부터${s.autopilot.reason ? `: ${s.autopilot.reason}` : ""}; dori autopilot resume)`, 200)

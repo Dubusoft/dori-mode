@@ -6,7 +6,7 @@ import type { FlowDeps } from "./done-flow.ts";
 import { DEFAULT_EVENT_POLICY, eventClass, type EventPolicy, forLead } from "./event-policy.ts";
 import { scrubForThread } from "./freshness.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
-import { listPanes, type Pane } from "./panes.ts";
+import { paneRow, type Pane } from "./panes.ts";
 import { pendingLeadRestart } from "./lead-restart.ts";
 import { type Event, type Journal, type JournalCore, TransientSuperviseError } from "./supervise-journal.ts";
 import type { LeadLifecycle } from "./supervise-lead-lifecycle.ts";
@@ -45,7 +45,7 @@ export class Delivery {
     this.owners.drainOutbox();
     // Reuse this pass's pane observation for reporting, delivery, and push. A restart invalidates it.
     let paneSample: Promise<Pane | undefined> | undefined;
-    const readPane = () => paneSample ??= listPanes(this.deps.run).then((panes) => panes.find((p) => p.pane_id === this.deps.config.leadPane));
+    const readPane = () => paneSample ??= paneRow(this.deps.run, this.deps.config.leadPane);
     // One pass starts at most one lead turn: a later batch or pointer in it joins the turn the first one started.
     let woke = false;
     this.outcomes.markDelivered();

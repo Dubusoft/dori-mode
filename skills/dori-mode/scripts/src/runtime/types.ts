@@ -4,8 +4,8 @@ import type { ProcessInfo } from "../runner/protocol.ts";
 
 /**
  * The terminal runtimes a lane can live on. `herdr` is the default everywhere; `hc` (herdr-core, the headless runtime
- * from the same project) is chosen per host with runner-config `laneRuntime`. The lead and the supervisor's own panes
- * stay on herdr.
+ * from the same project) is chosen per host with runner-config `laneRuntime`. The lead's pane follows config.json
+ * `leadRuntime` (herdr unless set); the supervisor itself is a service, not a pane.
  */
 export type RuntimeKind = "herdr" | "hc";
 
@@ -35,6 +35,8 @@ export type OpenedSession = {
 export type OpenSpec = {
   /** The lane key: the herdr tab label, the hc `dori.lane` label and terminal name. */
   readonly key: string;
+  /** hc only: the `k=v` label the terminal gets instead of `dori.lane=<key>` (the lead's is `dori.lead=1`). */
+  readonly label?: string;
   readonly cwd: string;
   /** herdr only: the workspace the tab opens in (absent: herdr's focused one). */
   readonly workspace?: string;

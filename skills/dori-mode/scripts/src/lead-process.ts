@@ -2,7 +2,8 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { listPanes, readScreen } from "./panes.ts";
+import { paneRow, readScreen } from "./panes.ts";
+import { infoOf, paneRuntime, runtimeOfPane } from "./runtime/index.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { LANE_PERMISSION_FLAGS } from "./runner/lane-launch.ts";
 import { TransientSuperviseError } from "./supervise-journal.ts";
@@ -29,12 +30,9 @@ type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_gr
 
 export const STARTUP_ERROR = /Cannot find module|All fallback models failed|No API key|model_not_available|No model matching|usage limit|rate limit|quota|Session crashed|unknown provider/i;
 
-export const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> => {
-  const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
-  if (info.code !== 0) return undefined;
-  try { return (JSON.parse(info.out) as { result: { process_info: ProcessInfo } }).result.process_info; }
-  catch (e) { if (e instanceof SyntaxError) return undefined; throw e; }
-};
+/** The lead pane's shell and foreground processes, from the runtime that holds it; undefined when it gave none. */
+export const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> =>
+  infoOf(await paneRuntime(deps.run, deps.config.leadPane).processInfo(deps.config.leadPane));
 
 /** The old lead's tree was killed but is still listed: it is stuck in its pane, not refused. */
 export const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
@@ -76,18 +74,20 @@ export const confirmLead = async (deps: FlowDeps, session: string): Promise<bool
   // the status gate until the bounded startup deadline.
   const deadline = deps.clock.now() + 30_000;
   for (let attempt = 0; attempt < 60 && deps.clock.now() <= deadline; attempt++) {
-    const ready = await deps.run(["herdr", "agent", "wait", deps.config.leadPane, "--until", "idle", "--until", "working", "--until", "done", "--timeout", String(Math.max(1, deadline - deps.clock.now()))]);
-    if (ready.code !== 0) {
-      // During replacement herdr can briefly report agent_not_running before
-      // the new occupant registers. This is not failed admission.
-      await deps.clock.sleep(500);
-      continue;
+    // herdr waits for the agent's status itself; hc has no such wait, so its status is read below every 500 ms.
+    if (runtimeOfPane(deps.config.leadPane) === "herdr") {
+      const ready = await deps.run(["herdr", "agent", "wait", deps.config.leadPane, "--until", "idle", "--until", "working", "--until", "done", "--timeout", String(Math.max(1, deadline - deps.clock.now()))]);
+      if (ready.code !== 0) {
+        // During replacement herdr can briefly report agent_not_running before
+        // the new occupant registers. This is not failed admission.
+        await deps.clock.sleep(500);
+        continue;
+      }
     }
-    const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
-    const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
-    if (info.code !== 0) return false;
-    const processes: readonly ForegroundProcess[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
-    const identity = processes.some((p) => launchedAs(p, session));
+    const pane = await paneRow(deps.run, deps.config.leadPane);
+    const info = await processInfo(deps);
+    if (!info) return false;
+    const identity = (info.foreground_processes ?? []).some((p) => launchedAs(p, session));
     if (identity && pane && (pane.agent_status === "idle" || pane.agent_status === "working" || pane.agent_status === "done")) {
       const screen = await readScreen(deps.run, deps.config.leadPane, 40);
       return !STARTUP_ERROR.test(screenSinceLaunch(screen, session));
@@ -153,19 +153,17 @@ export const killTargets = async (deps: FlowDeps, targets: ReadonlySet<number>):
   // Waiting for the foreground process group to exit is an observable gate, not
   // a fixed delay. The runner is bounded and never sends keys to a shell.
   if (targets.size) {
-    const released = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
-    if (released.code !== 0) throw new TransientSuperviseError("cannot verify lead termination");
-    const live: readonly ForegroundProcess[] = JSON.parse(released.out).result.process_info.foreground_processes ?? [];
-    if (live.some((p) => p.pid !== undefined && targets.has(p.pid))) throw new TransientSuperviseError("old lead has not exited; events retained");
+    const released = await processInfo(deps);
+    if (!released) throw new TransientSuperviseError("cannot verify lead termination");
+    if ((released.foreground_processes ?? []).some((p) => p.pid !== undefined && targets.has(p.pid))) throw new TransientSuperviseError("old lead has not exited; events retained");
   }
 };
 
 /** Kill only the process tree launched with `--session-id <session>`; status gates do not apply to a hung start. */
 export const stopHung = async (deps: FlowDeps, session: string): Promise<void> => {
-  const info = await deps.run(["herdr", "pane", "process-info", "--pane", deps.config.leadPane]);
-  if (info.code !== 0) throw new TransientSuperviseError("cannot identify hung lead process; refusing broad process cleanup");
-  const processes: readonly ForegroundProcess[] = JSON.parse(info.out).result.process_info.foreground_processes ?? [];
-  const hung = processes.find((p) => p.pid && launchedAs(p, session));
+  const info = await processInfo(deps);
+  if (!info) throw new TransientSuperviseError("cannot identify hung lead process; refusing broad process cleanup");
+  const hung = (info.foreground_processes ?? []).find((p) => p.pid && launchedAs(p, session));
   await killTargets(deps, await ownedTargets(deps, await procTable(deps.run), hung?.pid, session));
 };
 
@@ -173,7 +171,7 @@ export const stopHung = async (deps: FlowDeps, session: string): Promise<void> =
 export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> => {
   const { leadPane, leadCwd } = deps.config;
   const { sessionsDir } = deps.tunables;
-  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
+  const pane = await paneRow(deps.run, leadPane);
   if (!pane) throw new TransientSuperviseError(`lead pane ${leadPane} is missing`);
   // `force` (a stuck lead) stops a working/blocked lead too.
   if (!force && pane.agent && pane.agent_status !== "idle" && pane.agent_status !== "done") return false;
@@ -181,14 +179,13 @@ export const stopLead = async (deps: FlowDeps, force = false): Promise<boolean> 
   const hit = await resolveSession(leadPane, pane.cwd ?? leadCwd, table, { run: deps.run, sessionsDir });
   if (pane.agent && !hit.pid) throw new TransientSuperviseError("cannot identify lead process; refusing broad process cleanup");
   if (!pane.agent && !hit.pid) {
-    const info = await deps.run(["herdr", "pane", "process-info", "--pane", leadPane]);
-    if (info.code !== 0) throw new TransientSuperviseError("cannot verify an available shell in the lead pane");
-    const proc: { readonly shell_pid: number; readonly foreground_process_group_id?: number } = JSON.parse(info.out).result.process_info;
+    const proc = await processInfo(deps);
+    if (!proc) throw new TransientSuperviseError("cannot verify an available shell in the lead pane");
     if (proc.foreground_process_group_id && proc.foreground_process_group_id !== proc.shell_pid) throw new TransientSuperviseError("lead pane contains a non-agent foreground process; refusing to type into it");
   }
   const current = heldSession(sessionDirFor(sessionsDir, pane.cwd ?? leadCwd), hit.pid);
   const targets = await ownedTargets(deps, table, hit.pid, current?.id ?? hit.id);
-  const latest = (await listPanes(deps.run)).find((p) => p.pane_id === leadPane);
+  const latest = await paneRow(deps.run, leadPane);
   if (!latest) throw new TransientSuperviseError("lead pane disappeared during process resolution");
   if (!force && latest.agent && latest.agent_status !== "idle" && latest.agent_status !== "done") return false;
   await killTargets(deps, targets);

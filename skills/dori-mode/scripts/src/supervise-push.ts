@@ -4,7 +4,8 @@ import { eventClass, eventKind } from "./event-policy.ts";
 import { completeLines, parseLogLine } from "./inbox.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
 import { dueDecisions, markDecisionsPushed } from "./decision-obligations.ts";
-import { type InputState, inputState as boxState, listPanes, type Pane, PASTE_PLACEHOLDER, readScreen, sendVerified, squash } from "./panes.ts";
+import { type InputState, inputState as boxState, paneRow, type Pane, PASTE_PLACEHOLDER, readScreen, sendVerified, squash } from "./panes.ts";
+import { paneRuntime } from "./runtime/index.ts";
 import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, leadOwes, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
 import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { dueOwners, latest } from "./supervise-owner-tracking.ts";
@@ -127,7 +128,7 @@ export class PushDelivery {
    * already `woke` the lead (the pointer then belongs to that turn).
    */
   async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
-    (await listPanes(this.core.deps.run)).find((p) => p.pane_id === this.core.deps.config.leadPane), woke = false): Promise<boolean> {
+    paneRow(this.core.deps.run, this.core.deps.config.leadPane), woke = false): Promise<boolean> {
     const { config, tunables, clock, run } = this.core.deps;
     const { delivery } = tunables;
     if (this.journal.restart) return false;
@@ -235,7 +236,7 @@ export class PushDelivery {
     if (input === "ours") {
       // Our own pointer still sits unsubmitted: one Enter submits it, nothing is typed again.
       this.savePush(next);
-      await run(["herdr", "pane", "send-keys", config.leadPane, "enter"]);
+      await paneRuntime(run, config.leadPane).key(config.leadPane, "enter");
       console.log(`LEAD_PUSH_ENTER_RETRY ${config.leadPane} ${batch}`);
       return false;
     }
@@ -254,7 +255,7 @@ export class PushDelivery {
     await clock.sleep(delivery.push.pasteCheckMs);
     const after = inputState(await readScreen(run, config.leadPane));
     if (after === "ours") {
-      await run(["herdr", "pane", "send-keys", config.leadPane, "enter"]);
+      await paneRuntime(run, config.leadPane).key(config.leadPane, "enter");
       console.log(`LEAD_PUSH_ENTER_RETRY ${config.leadPane} ${batch}`);
     } else if (after === "busy") this.once("busy", `LEAD_PUSH_INPUT_BUSY ${config.leadPane} ${batch}: its input line holds other text after the push`);
     return false;

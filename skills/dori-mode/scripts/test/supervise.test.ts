@@ -26,6 +26,7 @@ import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCar
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
+import { unlistRuntime } from "../src/runtime/index.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -1764,6 +1765,77 @@ test("a lead pane closed by hand together with its Dori workspace is recreated i
   expect(restartSession(f)).toBeUndefined();
   expect(delivery.due).toBe(true);
   expect(taken(f)).toEqual(["inbound:1\tINBOUND hello"]);
+});
+
+/**
+ * hc over the fixture: terminal t5 (`hc:t5`) answers with the fixture lead's processes, status and screen (its herdr
+ * fakes still drive the fake omo), so a lead moved onto hc runs the same lead. hc calls are recorded in f.calls.
+ */
+const hcLead = (f: ReturnType<typeof fixture>, next: Runner): Runner => {
+  const pane = "hc:t5";
+  let made = false;
+  const ok = (json: unknown) => ({ code: 0, out: JSON.stringify(json), err: "" });
+  return async (argv, options) => {
+    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") {
+      const panes = (JSON.parse((await next(argv, options)).out) as { result: { panes: { pane_id: string }[] } }).result.panes;
+      return ok({ result: { panes: panes.filter((p) => !p.pane_id.startsWith("hc:")) } });
+    }
+    if (argv[0] !== "hc") return next(argv, options);
+    f.calls.push([...argv]);
+    if (argv[1] === "--version") return { code: 0, out: "hc 0.1.22\n", err: "" };
+    const verb = argv[2];
+    if (verb === "run") {
+      // The fixture's pane object (the one its fakes change) becomes the new terminal; the old herdr pane stays a shell.
+      made = true;
+      f.pane.pane_id = pane;
+      f.world.panes.push({ pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "", agent_status: "" });
+      return ok({ address: "t5" });
+    }
+    if (verb === "ls") return ok({ terminals: made ? [{ address: "t5", state: "live" }] : [] });
+    if (verb === "get") {
+      if (!made) return { code: 1, out: "", err: "no such terminal" };
+      const info = (JSON.parse((await next(["herdr", "pane", "process-info", "--pane", pane], options)).out) as { result: { process_info: { shell_pid: number; foreground_processes: { pid: number; argv: string[] }[] } } }).result.process_info;
+      const fg = info.foreground_processes[0];
+      return ok({
+        address: "t5", state: "live", cwd: "/repo", created_ms: 1, pid: info.shell_pid, name: "dori-lead",
+        status: f.pane.agent ? { app: f.pane.agent, state: f.pane.agent_status } : null, foreground: fg ? { pid: fg.pid, argv: fg.argv } : null,
+      });
+    }
+    if (verb === "send") {
+      const text = argv[5] ?? "";
+      if (text.startsWith("cd ")) return next(["herdr", "pane", "run", pane, text], options);
+      await next(["herdr", "pane", "send-text", pane, text], options);
+      return next(["herdr", "pane", "send-keys", pane, "enter"], options);
+    }
+    if (verb === "keys") return next(["herdr", "pane", "send-keys", pane, "enter"], options);
+    if (verb === "read") return ok({ text: f.world.screen });
+    throw new Error(`unexpected ${argv.join(" ")}`);
+  };
+};
+
+test("with leadRuntime hc a herdr lead moves at its next restart: no /new, a dori-lead hc terminal takes the launch and the old pane is closed", async () => {
+  cleanups.push(() => { unlistRuntime("hc"); });
+  const f = fixture({ leadRuntime: "hc" });
+  f.cold();
+  const persisted: string[] = [];
+  const supervisor = new Supervisor({ ...f.deps, run: hcLead(f, recreating(f, f.deps.run)), config: { ...f.deps.config } }, { persistLeadPane: (pane) => { persisted.push(pane); } });
+  supervisor.enqueue("cold", "INBOUND cold");
+  const lines = await quiet(() => supervisor.flush());
+  // An idle lead on the configured runtime would get /new in place; this one is stopped and started on hc instead.
+  expect(f.calls.some((call) => call[2] === "send-text" && call[4] === "/new")).toBe(false);
+  const made = f.calls.find((call) => call[0] === "hc" && call[2] === "run") ?? [];
+  expect(made.slice(0, 8)).toEqual(["hc", "--json", "run", "--bg", "--no-parent", "--no-notify", "--cwd", "/repo"]);
+  expect(made.slice(8)).toEqual(["--label", "dori.lead=1", "--name", "dori-lead", "--", expect.any(String)]);
+  expect(f.calls).toContainEqual(["herdr", "pane", "close", "lead:p1"]);
+  expect(lines).toContain("LEAD_RUNTIME_MOVED lead:p1 -> hc:t5 leadRuntime=hc");
+  const launches = f.calls.filter((call) => call[0] === "herdr" && call[2] === "run");
+  expect(launches.map((call) => call[3])).toEqual(["hc:t5"]);
+  const session = /--session-id ([\w-]+)/.exec(launches[0]?.[4] ?? "")?.[1];
+  expect(lines).toContain(`LEAD_RESTARTED hc:t5 ${session}`);
+  expect(persisted).toEqual(["hc:t5"]);
+  expect(supervisor.leadPane).toBe("hc:t5");
+  expect(restartSession(f)).toBeUndefined();
+  expect(f.log()).toEqual([{ id: "cold", line: "INBOUND cold" }]);
 });
 
 test("a starting restart is never typed into a pane whose foreground is an agent, and launches once a plain shell is back", async () => {
