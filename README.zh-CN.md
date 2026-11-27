@@ -13,12 +13,13 @@ Dori 模式把一个编程智能体会话变成常驻的消息智能体。你只
 ## 安装
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
+gh auth login   # 仓库是私有的;gh 已登录或设置了 GH_TOKEN 时可跳过
+bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mode/contents/install.sh)"
 ```
 
-它会把仓库克隆到 `~/.dori/src`,把技能链接到 `~/.agents/skills/dori-mode`,用 `bun link` 把 `dori` 放进 PATH,然后启动 `dori setup`。如果你的智能体从别的目录加载技能，请设置 `SKILLS_DIR`。
+它会用你的 GitHub 登录把仓库克隆到 `~/.dori/src`(该检出里的 git 之后继续从 `gh` 取凭据，所以更新也能用),把技能链接到 `~/.agents/skills/dori-mode`,用 `bun link` 把 `dori` 放进 PATH,然后启动 `dori setup`。如果你的智能体从别的目录加载技能，请设置 `SKILLS_DIR`。
 
-`dori setup` 会询问 Discord 机器人令牌(保存到 `~/.dori/env`,权限 600,不会显示出来)、主频道 ID(用令牌确认能读取)、默认模型、工作目录和状态目录，然后创建或复用 herdr 的主控窗格和 `lanes` 工作区。需要的话，它还会安装 systemd 用户单元，让 herdr、supervisor 和 presence 开机自启;每个系统级步骤都会先询问。可以随时重新运行：当前值就是默认值，按回车保留。用 `curl ... | bash` 安装时没有终端可以提问，只会打印提示，请自己运行 `dori setup`。脚本用法:`dori setup --yes --token-file FILE --channel ID [--autostart]`。
+`dori setup` 会询问 Discord 机器人令牌(保存到 `~/.dori/env`,权限 600,不会显示出来)、主频道 ID(用令牌确认能读取)、默认模型、工作目录和状态目录，然后创建或复用 herdr 的主控窗格和 `lanes` 工作区。需要的话，它还会安装 systemd 用户单元，让 herdr、supervisor 和 presence 开机自启;每个系统级步骤都会先询问。可以随时重新运行：当前值就是默认值，按回车保留。通过管道交给 bash 安装时没有终端可以提问，只会打印提示，请自己运行 `dori setup`。脚本用法:`dori setup --yes --token-file FILE --channel ID [--autostart]`。
 
 然后在 herdr 里打开智能体，说一句 "Dori mode" 就行。
 

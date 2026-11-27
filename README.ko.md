@@ -13,12 +13,13 @@ Dori 모드는 코딩 에이전트 세션 하나를 늘 켜져 있는 메신저 
 ## 설치
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
+gh auth login   # 비공개 저장소라 필요합니다. gh에 로그인돼 있거나 GH_TOKEN이 있으면 건너뛰세요
+bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mode/contents/install.sh)"
 ```
 
-저장소를 `~/.dori/src`에 받고, 스킬을 `~/.agents/skills/dori-mode`에 링크하고, `bun link`로 `dori`를 PATH에 올린 뒤 `dori setup`을 실행합니다. 에이전트가 다른 곳에서 스킬을 읽는다면 `SKILLS_DIR`를 지정하세요.
+GitHub 로그인으로 저장소를 `~/.dori/src`에 받고(그 체크아웃의 git은 계속 `gh`에서 자격을 받아 이후 업데이트도 됩니다), 스킬을 `~/.agents/skills/dori-mode`에 링크하고, `bun link`로 `dori`를 PATH에 올린 뒤 `dori setup`을 실행합니다. 에이전트가 다른 곳에서 스킬을 읽는다면 `SKILLS_DIR`를 지정하세요.
 
-`dori setup`은 디스코드 봇 토큰(`~/.dori/env`에 권한 600으로 저장하고 화면에 보여 주지 않습니다), 메인 채널 ID(토큰으로 읽기 권한을 확인합니다), 기본 모델, 작업 디렉터리, 상태 디렉터리를 묻고, herdr 리드 패인과 `lanes` 워크스페이스를 만들거나 재사용합니다. 원하면 부팅 때 herdr, 슈퍼바이저, 프레즌스가 뜨도록 systemd 사용자 유닛도 설치하는데, 시스템 단계마다 먼저 묻습니다. 언제든 다시 실행해도 됩니다. 현재 값이 기본값으로 나오고 Enter를 누르면 그대로 둡니다. `curl ... | bash`로 받으면 물어볼 터미널이 없어서 안내만 출력하니 `dori setup`을 직접 실행하세요. 스크립트용: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
+`dori setup`은 디스코드 봇 토큰(`~/.dori/env`에 권한 600으로 저장하고 화면에 보여 주지 않습니다), 메인 채널 ID(토큰으로 읽기 권한을 확인합니다), 기본 모델, 작업 디렉터리, 상태 디렉터리를 묻고, herdr 리드 패인과 `lanes` 워크스페이스를 만들거나 재사용합니다. 원하면 부팅 때 herdr, 슈퍼바이저, 프레즌스가 뜨도록 systemd 사용자 유닛도 설치하는데, 시스템 단계마다 먼저 묻습니다. 언제든 다시 실행해도 됩니다. 현재 값이 기본값으로 나오고 Enter를 누르면 그대로 둡니다. 파이프로 bash에 넘기면 물어볼 터미널이 없어서 안내만 출력하니 `dori setup`을 직접 실행하세요. 스크립트용: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
 
 그다음 herdr 안에서 에이전트를 열고 "Dori mode"라고 말하면 됩니다.
 

@@ -35,10 +35,11 @@ Greet the owner through the bot before doing anything else.
 ## 4. Scripts and `dori setup`
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Dubusoft/dori-mode/main/install.sh)"
+gh auth login   # the repo is private; skip when gh is signed in or GH_TOKEN is set
+bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mode/contents/install.sh)"
 ```
 
-The installer clones the repo, links the skill, runs `bun link` (puts `dori` on PATH) and then `dori setup` when it has a terminal. Otherwise run `dori setup` yourself, or from a checkout: `cd skills/dori-mode/scripts && bun install && bun link && dori setup`.
+The repo is private, so the installer needs gh signed in (or GH_TOKEN); it clones the repo with that login (the checkout keeps using gh for its credentials, so `dori update` authenticates too), links the skill, runs `bun link` (puts `dori` on PATH) and then `dori setup` when it has a terminal. Otherwise run `dori setup` yourself, or from a checkout: `cd skills/dori-mode/scripts && bun install && bun link && dori setup`.
 
 `dori setup` is interactive and safe to rerun: each question shows the current value in brackets, or `(default: ...)` with the value that applies when the key is unset; Enter keeps it and `-` clears an optional key. It asks five questions: the bot token, the channel ids, the owner id, whether new GitHub issues start work, and autostart. Everything else keeps its stored value or default (change it with `--set key=value`). `dori setup --advanced` also asks the steps marked *advanced* below. It does, in order:
 

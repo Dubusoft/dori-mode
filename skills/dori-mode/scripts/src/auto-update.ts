@@ -25,6 +25,12 @@ export const AUTO_UPDATE_STATE = "auto-update.json";
 export const AUTO_UPDATE_RESULT = "auto-update-result.json";
 /** The environment the unit gets from the supervisor (systemd's user manager has its own, which may lack these). */
 export const AUTO_UPDATE_ENV = ["PATH", "HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "DORI_CONFIG", "DORI_STATE_DIR"] as const;
+/**
+ * The GitHub tokens the update's `git fetch` of the private repo authenticates with (through gh's credential helper),
+ * when the supervisor has them. They go to systemd-run by name only, so it copies each value from its own environment
+ * and no token appears in its argv.
+ */
+export const AUTO_UPDATE_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
 const UNIT_RUNNING = new Set(["active", "activating", "deactivating", "reloading"]);
 /** How often a stale blocker is checked again (its close conditions may come true later). */
 export const STALE_RECHECK_MS = 10 * 60_000;
@@ -190,7 +196,10 @@ export class AutoUpdate {
       return;
     }
     this.deferred = "";
-    const env = AUTO_UPDATE_ENV.flatMap((name) => d.env[name] !== undefined ? [`--setenv=${name}=${d.env[name]}`] : []);
+    const env = [
+      ...AUTO_UPDATE_ENV.flatMap((name) => d.env[name] !== undefined ? [`--setenv=${name}=${d.env[name]}`] : []),
+      ...AUTO_UPDATE_TOKEN_ENV.flatMap((name) => d.env[name] ? [`--setenv=${name}`] : []),
+    ];
     const at = d.now();
     const started = await d.run([
       "systemd-run", "--user", "--unit", AUTO_UPDATE_UNIT, "--collect", "--quiet", ...env, "--", ...d.command, "--result", this.resultPath,
