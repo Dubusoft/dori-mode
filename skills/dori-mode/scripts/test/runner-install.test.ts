@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { INSTALL_EXIT, buildBundle, bundleVersion, herdrInstallNote, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
+import { INSTALL_EXIT, buildBundle, bundleVersion, hcInstallNote, installRunner, installScript, remoteUnit } from "../src/runner/install.ts";
 import { run as realRun, type Ran, type RunOptions } from "../src/run.ts";
 import { gitVersion } from "../src/runner/version.ts";
 import { checkRunnerDir } from "../src/runner/fs-safety.ts";
@@ -69,7 +69,7 @@ test("each script exit maps to its result code", async () => {
     [{ code: INSTALL_EXIT.noBun }, "RUNNER_INSTALL_NO_BUN"],
     [{ code: INSTALL_EXIT.notLinux }, "RUNNER_INSTALL_UNSUPPORTED"],
     [{ code: 1, err: "'sh' is not recognized as an internal or external command" }, "RUNNER_INSTALL_UNSUPPORTED"],
-    [{ code: INSTALL_EXIT.noHerdr }, "RUNNER_INSTALL_NO_HERDR"],
+    [{ code: INSTALL_EXIT.noHc }, "RUNNER_INSTALL_NO_HC"],
     [{ code: INSTALL_EXIT.enroll, err: "RUNNER_ENROLL_REFUSED code used" }, "RUNNER_INSTALL_ENROLL_FAILED"],
     [{ code: INSTALL_EXIT.systemd, err: "Failed to connect to bus" }, "RUNNER_INSTALL_FAILED"],
     [{ code: 1, err: "mkdir: cannot create directory" }, "RUNNER_INSTALL_FAILED"],
@@ -105,9 +105,8 @@ const fakeHost = () => {
   tool("uname", "echo Linux");
   tool("bun", `[ "$1" = --version ] && { echo 1.3.0; exit 0; }; [ "$3" = omo-profile ] && exit 0; cat > '${join(home, "enroll-stdin")}'; mkdir -p "$HOME/.dori/runner/keys"; echo pinned > "$HOME/.dori/runner/keys/supervisor.pub"`);
   tool("loginctl", "exit 0");
-  // The herdr unit is inactive and no herdr answers, unless a test says otherwise.
-  tool("systemctl", `[ "$2" = is-active ] && exit 3; exit 0`);
-  tool("herdr", "exit 1");
+  tool("systemctl", "exit 0");
+  tool("hc", "exit 0");
   // The login shell: its profile prints noise and adds a directory to PATH.
   tool("loginsh", `echo 'Welcome to worker-a'; PATH="${LOGIN_DIR}:$PATH" exec /bin/sh -c "$2"`);
   tool("id", "echo dori");
@@ -162,7 +161,7 @@ test("real runner enroll-only completes two SSH stdio passes without a superviso
       ...req, issue: () => ({ code: auth.issueCode(req.label).code, fingerprint: auth.fingerprint }),
       enroll: (body) => auth.enroll(body),
     });
-    expect(result).toEqual({ ok: true, version: bundleVersion(bundle), herdr: "started", hc: "absent" });
+    expect(result).toEqual({ ok: true, version: bundleVersion(bundle), hc: "enabled" });
     expect(calls).toHaveLength(2);
     expect(calls.every((c) => c.argv.at(-1) === "sh -s")).toBe(true);
     expect(calls[0]!.opts!.stdin).not.toContain("reply=");
@@ -172,7 +171,7 @@ test("real runner enroll-only completes two SSH stdio passes without a superviso
     expect(auth.key(req.label)?.pubKey).toBe(worker.keyPair().pub);
     expect(readRunnerEndpoints(req.stateDir)).toEqual({ "worker-a": req.listenAddress });
     const log = readFileSync(host.log, "utf8");
-    expect(log.match(/systemctl --user restart --job-mode=ignore-dependencies dori-runner.service/g)).toHaveLength(1);
+    expect(log.match(/systemctl --user restart dori-runner.service/g)).toHaveLength(1);
   } finally { auth.close(); }
 });
 
@@ -221,7 +220,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   const host = fakeHost();
   const script = installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "100.101.1.2:7411"), "worker-a", "100.101.1.2:7411", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
   const first = await runScript(host, script);
-  expect(first).toEqual({ code: 0, err: "", out: "DORI_HERDR started\nDORI_HC absent\n" });
+  expect(first).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   const policyFile = join(host.home, ".dori/runner/runner-config.json");
   const wrapperPath = join(host.home, ".dori/runner/bin/lane-sandbox");
   expect(JSON.parse(readFileSync(policyFile, "utf8"))).toEqual({
@@ -236,7 +235,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(argvLog).not.toContain(FINGERPRINT);
   expect(argvLog).toContain("bun ");
   expect(argvLog).toContain("runner serve --enroll-only --label worker-a");
-  expect(argvLog).toContain("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service");
+  expect(argvLog).toContain("systemctl --user restart dori-runner.service");
   expect(argvLog).toContain("loginctl enable-linger dori");
   expect(readFileSync(join(host.home, "enroll-stdin"), "utf8")).toBe(`code=${CODE}\nfingerprint=${FINGERPRINT}\n`);
   expect(readFileSync(join(host.home, ".dori/runner/bin/dori.js"), "utf8")).toBe(BUNDLE);
@@ -257,7 +256,7 @@ test("run by sh, the script installs, enrolls through a pipe, and keeps the keys
   expect(again.out).toContain(`RUNNER_CONFIG_SANDBOX_MISSING sandbox:required agents.sandboxed sandboxCheck in ${policyFile}; add them to sandbox lanes on this runner\n`);
   const second = readFileSync(host.log, "utf8");
   expect(second).not.toContain("--enroll-only");
-  expect(second).toContain("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service");
+  expect(second).toContain("systemctl --user restart dori-runner.service");
 });
 
 test("run by sh without bun on PATH, the script exits with the no-bun code", async () => {
@@ -278,7 +277,7 @@ test("on Darwin with bun on PATH, the script writes the launchd agent, boots it 
   expect(script).toContain('sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$(xesc "$(dirname "$BUN"):$LP")|g"');
   expect(script).not.toContain('$(dirname "$BUN"):$PATH');
   const result = await runDarwin(host, script);
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\nDORI_HC absent\n" });
+  expect(result).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   expect(loadPolicy(join(host.home, ".dori/runner")).allowedRoots).toEqual([host.home, "/private/tmp"]);
   const bun = join(host.bin, "bun");
   const plist = readFileSync(plistPath(host.home), "utf8");
@@ -319,7 +318,7 @@ test("on Darwin a reinstall keeps the variables an operator added to the agent's
     "\t</dict>", "\t<key>KeepAlive</key>", "\t<true/>", "</dict>", "</plist>", "",
   ].join("\n"));
   const result = await runDarwin(host, darwinScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\nDORI_HC absent\n" });
+  expect(result).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   const plist = readFileSync(plistPath(host.home), "utf8");
   const env = plist.match(/<key>EnvironmentVariables<\/key>\s*<dict>([\s\S]*?)<\/dict>/)?.[1] ?? "";
   const pairs = [...env.matchAll(/<key>([^<]*)<\/key>\s*<string>([^<]*)<\/string>/g)].map((m) => [m[1], m[2]]);
@@ -430,7 +429,7 @@ test("a Linux reinstall over a complete sandbox policy prints no missing-key lin
   expect(wrapper).toContain('keep --bind "$R/briefs/$key.out"');
   expect(wrapper).toContain('echo "DORI_LANE_FILES=1"');
   const again = await runScript(host, linuxScript());
-  expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR started\nDORI_HC absent\n" });
+  expect(again).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   expect(readFileSync(host.log, "utf8")).not.toContain("omo-profile");
   const p = Bun.spawn(["/bin/sh", "-n"], { stdin: new TextEncoder().encode(linuxScript()), stdout: "pipe", stderr: "pipe" });
   const [code, err] = await Promise.all([p.exited, new Response(p.stderr).text()]);
@@ -515,159 +514,19 @@ test("the runner import graph, dynamic imports included, reaches the runner and 
   expect(reached.filter((file) => FORBIDDEN.test(file))).toEqual([]);
 });
 
-const herdrUnitPath = (home: string) => join(home, ".config/systemd/user/herdr-server.service");
 const linuxScript = () => installScript(BUNDLE, remoteUnit(UNIT, "worker-a", "h:1"), "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, undefined, AGENT);
 const logLines = (log: string) => readFileSync(log, "utf8").split("\n");
-/** Every call that could stop or restart a running herdr. */
-const HERDR_DISRUPTION = /systemctl --user (restart|stop|kill|try-restart|reload-or-restart)[^\n]*herdr-server|launchctl (bootout|kickstart|kill|stop)[^\n]*com\.dori\.herdr|herdr server stop/;
-
-test("the runner unit only Wants= and is After= the herdr unit, and the herdr unit carries no lead-host failure hook", () => {
-  const runnerUnit = readFileSync(join(import.meta.dir, "..", "templates", "dori-runner-remote.service"), "utf8");
-  expect(runnerUnit).toContain("\nWants=herdr-server.service\n");
-  expect(runnerUnit).toContain("\nAfter=herdr-server.service\n");
-  expect(runnerUnit).not.toMatch(/^(Requires|BindsTo|PartOf|Requisite)=/m);
-  const herdrUnit = readFileSync(join(import.meta.dir, "..", "templates", "herdr-runner-remote.service"), "utf8");
-  expect(herdrUnit).not.toContain("OnFailure=");
-  expect(herdrUnit).toContain("ExecStart=@HERDR_BIN@ server\n");
-  expect(herdrUnit).toContain("Restart=on-failure\n");
-});
-
-test("on Linux with no herdr answering, the script writes the herdr unit from the login shell and starts it before the runner", async () => {
-  const host = fakeHost();
-  const result = await runScript(host, linuxScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR started\nDORI_HC absent\n" });
-  const unit = readFileSync(herdrUnitPath(host.home), "utf8");
-  expect(unit).toContain(`ExecStart=${join(host.bin, "herdr")} server\n`);
-  expect(unit).toContain(`Environment=PATH=${LOGIN_DIR}:${host.bin}:/usr/bin:/bin\n`);
-  expect(unit).toContain(`Environment=SHELL=${join(host.bin, "loginsh")}\n`);
-  expect(unit).not.toMatch(/@[A-Z_]+@/);
-  expect(statSync(herdrUnitPath(host.home)).mode & 0o777).toBe(0o644);
-  expect(existsSync(join(host.home, ".dori/runner/herdr-server.service.tmp"))).toBe(false);
-  const lines = logLines(host.log);
-  const start = lines.indexOf("systemctl --user start herdr-server.service");
-  expect(lines).toContain("systemctl --user enable herdr-server.service dori-runner.service");
-  expect(start).toBeGreaterThan(lines.indexOf("systemctl --user daemon-reload"));
-  expect(lines.indexOf("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service")).toBeGreaterThan(start);
-  expect(readFileSync(host.log, "utf8")).not.toMatch(HERDR_DISRUPTION);
-  checkRunnerDir(join(host.home, ".dori/runner"));
-});
-
-test("on Linux a reinstall or upgrade leaves the herdr the unit runs alone and only rewrites the unit file", async () => {
-  const host = fakeHost();
-  expect((await runScript(host, linuxScript())).code).toBe(0);
-  writeFileSync(herdrUnitPath(host.home), "old unit\n");
-  writeFileSync(host.log, "");
-  host.tool("systemctl", "exit 0");
-  host.tool("herdr", `[ "$1" = workspace ] && exit 0; exit 1`);
-  const again = await runScript(host, linuxScript());
-  expect(again).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\nDORI_HC absent\n" });
-  expect(readFileSync(herdrUnitPath(host.home), "utf8")).toContain(`ExecStart=${join(host.bin, "herdr")} server\n`);
-  const log = readFileSync(host.log, "utf8");
-  expect(log).toContain("systemctl --user daemon-reload");
-  expect(log).not.toContain("systemctl --user start herdr-server.service");
-  expect(log).not.toContain("reset-failed");
-  expect(log).not.toMatch(HERDR_DISRUPTION);
-});
-
-test("on Linux a herdr started by hand gets the unit enabled but not started", async () => {
-  const host = fakeHost();
-  host.tool("herdr", `[ "$1" = workspace ] && exit 0; exit 1`);
-  const result = await runScript(host, linuxScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR unmanaged\nDORI_HC absent\n" });
-  const log = readFileSync(host.log, "utf8");
-  expect(log).toContain("systemctl --user enable herdr-server.service dori-runner.service");
-  expect(log).not.toContain("systemctl --user start herdr-server.service");
-  // The runner restart does not pull the herdr unit in beside the hand-started server.
-  expect(log).toContain("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service");
-  expect(log).not.toMatch(HERDR_DISRUPTION);
-});
-
-test("with neither herdr nor hc on the login PATH the script exits with the no-herdr code before writing anything", async () => {
-  for (const [host, runIt] of [[fakeHost(), runScript], [darwinHost(), runDarwin]] as const) {
-    rmSync(join(host.bin, "herdr"));
-    expect((await runIt(host, runIt === runScript ? linuxScript() : darwinScript())).code).toBe(INSTALL_EXIT.noHerdr);
-    expect(existsSync(join(host.home, ".dori"))).toBe(false);
-    expect(existsSync(join(host.home, ".config"))).toBe(false);
-    expect(existsSync(join(host.home, "Library"))).toBe(false);
-  }
-});
-
-test("herdr found only on the login shell's PATH is accepted", async () => {
-  const host = fakeHost();
-  const loginBin = join(host.home, "login-bin");
-  mkdirSync(loginBin);
-  copyFileSync(join(host.bin, "herdr"), join(loginBin, "herdr"));
-  chmodSync(join(loginBin, "herdr"), 0o755);
-  rmSync(join(host.bin, "herdr"));
-  host.tool("loginsh", `PATH="${loginBin}:$PATH" exec /bin/sh -c "$2"`);
-  const result = await runScript(host, linuxScript());
-  expect(result.code).toBe(0);
-  expect(readFileSync(herdrUnitPath(host.home), "utf8")).toContain(`ExecStart=${join(loginBin, "herdr")} server\n`);
-});
-
-const herdrPlistPath = (home: string) => join(home, "Library/LaunchAgents/com.dori.herdr.plist");
-const NOT_LOADED = `[ "$1" = print ] && case "$2" in */com.dori.herdr) exit 113 ;; esac; exit 0`;
 const plistKey = (plist: string, key: string): string => plist.match(new RegExp(`<key>${key}</key>\\s*(<[^>]+>(?:[^<]*</[a-z]+>)?)`))?.[1] ?? "";
-
-test("on Darwin with no herdr agent loaded, the script writes and bootstraps it into the runner's domain without kickstarting it", async () => {
-  const host = darwinHost(NOT_LOADED);
-  const result = await runDarwin(host, darwinScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR started\nDORI_HC absent\n" });
-  const plist = readFileSync(herdrPlistPath(host.home), "utf8");
-  expect(plist).not.toMatch(/@[A-Z_]+@/);
-  expect(programArguments(plist)).toEqual([join(host.bin, "herdr"), "server"]);
-  expect(plistKey(plist, "RunAtLoad")).toBe("<true/>");
-  expect(plistKey(plist, "KeepAlive")).toBe("<true/>");
-  expect(plistKey(plist, "ThrottleInterval")).toBe("<integer>30</integer>");
-  expect(plistKey(plist, "WorkingDirectory")).toBe(`<string>${host.home}</string>`);
-  expect(plist).toContain(`<key>PATH</key>\n    <string>${LOGIN_DIR.replace("&", "&amp;")}:${host.bin}</string>`);
-  expect(plist).toContain(`<key>SHELL</key>\n    <string>${join(host.bin, "loginsh")}</string>`);
-  expect(plist).toContain(`<string>${join(host.home, ".dori/runner/herdr.log")}</string>`);
-  expect(statSync(herdrPlistPath(host.home)).mode & 0o777).toBe(0o644);
-  expect(statSync(join(host.home, ".dori/runner/herdr.log")).mode & 0o777).toBe(0o600);
-  const lines = logLines(host.log);
-  const enable = lines.indexOf("launchctl enable gui/501/com.dori.herdr");
-  expect(enable).toBeGreaterThanOrEqual(0);
-  expect(lines.indexOf(`launchctl bootstrap gui/501 ${herdrPlistPath(host.home)}`)).toBeGreaterThan(enable);
-  expect(readFileSync(host.log, "utf8")).not.toMatch(HERDR_DISRUPTION);
-  checkRunnerDir(join(host.home, ".dori/runner"));
-});
-
-test("on Darwin a herdr started by hand gets the agent with RunAtLoad false", async () => {
-  const host = darwinHost(NOT_LOADED);
-  host.tool("herdr", `[ "$1" = workspace ] && exit 0; exit 1`);
-  const result = await runDarwin(host, darwinScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR unmanaged\nDORI_HC absent\n" });
-  const plist = readFileSync(herdrPlistPath(host.home), "utf8");
-  expect(plistKey(plist, "RunAtLoad")).toBe("<false/>");
-  expect(plistKey(plist, "ThrottleInterval")).toBe("<integer>30</integer>");
-  expect(readFileSync(host.log, "utf8")).not.toMatch(HERDR_DISRUPTION);
-});
-
-test("on Darwin a reinstall or upgrade with the herdr agent loaded only rewrites its plist", async () => {
-  const host = darwinHost();
-  host.tool("herdr", `[ "$1" = workspace ] && exit 0; exit 1`);
-  const result = await runDarwin(host, darwinScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR managed\nDORI_HC absent\n" });
-  expect(plistKey(readFileSync(herdrPlistPath(host.home), "utf8"), "RunAtLoad")).toBe("<true/>");
-  const herdrCalls = logLines(host.log).filter((l) => l.startsWith("launchctl ") && l.includes("com.dori.herdr"));
-  expect(herdrCalls).toEqual(["launchctl print gui/501/com.dori.herdr"]);
-});
-
-test("the script's DORI_HERDR line is the install result's herdr, named on the RUNNER_INSTALLED line", async () => {
-  const { run } = fakeRun({ out: "enrolled\nDORI_HERDR unmanaged\n" });
-  const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, request({ count: 0 }));
-  expect(result).toEqual({ ok: true, version: bundleVersion(BUNDLE), herdr: "unmanaged" });
-  expect(herdrInstallNote("unmanaged")).toBe("herdr=unmanaged (running, not from its unit; the unit takes over when it stops)");
-  expect(herdrInstallNote(undefined)).toBe("herdr=unknown");
-});
-
-test("the herdr templates are checked against the heredoc delimiter too", () => {
-  expect(() => installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, "plist", [], { unit: "a\nDORI_RUNNER_EOF\n", plist: "p" })).toThrow("heredoc delimiter");
-});
-
 const hcUnitPath = (home: string) => join(home, ".config/systemd/user/hc-core.service");
 const hcPlistPath = (home: string) => join(home, "Library/LaunchAgents/com.dori.hc.plist");
+
+test("the runner unit only Wants= and is After= the hc core unit", () => {
+  const runnerUnit = readFileSync(join(import.meta.dir, "..", "templates", "dori-runner-remote.service"), "utf8");
+  expect(runnerUnit).toContain("\nWants=hc-core.service\n");
+  expect(runnerUnit).toContain("\nAfter=hc-core.service\n");
+  expect(runnerUnit).not.toMatch(/^(Requires|BindsTo|PartOf|Requisite)=/m);
+  expect(runnerUnit).not.toContain("herdr");
+});
 
 test("the hc core templates: a oneshot `hc server start` user unit and a KeepAlive `hc serve` launchd agent", () => {
   const unit = readFileSync(join(import.meta.dir, "..", "templates", "hc-core.service"), "utf8");
@@ -684,47 +543,56 @@ test("the hc core templates: a oneshot `hc server start` user unit and a KeepAli
   expect(plistKey(plist, "ThrottleInterval")).toBe("<integer>30</integer>");
 });
 
-test("on a Linux host with hc and no herdr, the script skips every herdr step, writes, enables and starts the hc core unit", async () => {
+test("on Linux the script writes the hc core unit from the login shell, enables it with the runner and starts it before the runner restarts", async () => {
   const host = fakeHost();
-  rmSync(join(host.bin, "herdr"));
-  host.tool("hc", "exit 0");
   const script = linuxScript();
-  expect(script).toContain('[ -n "$HERDR" ] || [ -n "$HC" ] || exit 7');
-  expect(script).toContain('"$HOME/.config/systemd/user/hc-core.service"');
+  expect(script).toContain(`HC=$(PATH="$LP:$PATH"; command -v hc) || exit ${INSTALL_EXIT.noHc}`);
+  // The lane-sandbox payload names hc's own herdr-core directories; nothing else mentions herdr.
+  expect(script.replaceAll("herdr-core", "")).not.toContain("herdr");
   const result = await runScript(host, script);
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR absent\nDORI_HC enabled\n" });
-  expect(existsSync(herdrUnitPath(host.home))).toBe(false);
+  expect(result).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   const unit = readFileSync(hcUnitPath(host.home), "utf8");
   expect(unit).toContain(`ExecStart=${join(host.bin, "hc")} server start\n`);
   expect(unit).toContain(`Environment=PATH=${LOGIN_DIR}:${host.bin}:/usr/bin:/bin\n`);
   expect(unit).not.toMatch(/@[A-Z_]+@/);
   expect(statSync(hcUnitPath(host.home)).mode & 0o777).toBe(0o644);
+  expect(existsSync(join(host.home, ".dori/runner/hc-core.service.tmp"))).toBe(false);
   const lines = logLines(host.log);
-  expect(lines).toContain("systemctl --user enable dori-runner.service");
   const start = lines.indexOf("systemctl --user start hc-core.service");
-  expect(start).toBeGreaterThan(lines.indexOf("systemctl --user enable hc-core.service"));
-  expect(lines.indexOf("systemctl --user restart --job-mode=ignore-dependencies dori-runner.service")).toBeGreaterThan(start);
+  expect(lines).toContain("systemctl --user enable hc-core.service dori-runner.service");
+  expect(start).toBeGreaterThan(lines.indexOf("systemctl --user daemon-reload"));
+  expect(lines.indexOf("systemctl --user restart dori-runner.service")).toBeGreaterThan(start);
   expect(readFileSync(host.log, "utf8")).not.toContain("herdr");
   checkRunnerDir(join(host.home, ".dori/runner"));
 });
 
-test("on a Linux host with both herdr and hc, the herdr unit is kept as before and the hc core unit is added", async () => {
-  const host = fakeHost();
-  host.tool("hc", "exit 0");
-  const result = await runScript(host, linuxScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR started\nDORI_HC enabled\n" });
-  expect(existsSync(herdrUnitPath(host.home))).toBe(true);
-  expect(existsSync(hcUnitPath(host.home))).toBe(true);
-  expect(logLines(host.log)).toContain("systemctl --user enable herdr-server.service dori-runner.service");
+test("without hc on the login PATH the script exits with the no-hc code before writing anything", async () => {
+  for (const [host, runIt] of [[fakeHost(), runScript], [darwinHost(), runDarwin]] as const) {
+    rmSync(join(host.bin, "hc"));
+    expect((await runIt(host, runIt === runScript ? linuxScript() : darwinScript())).code).toBe(INSTALL_EXIT.noHc);
+    expect(existsSync(join(host.home, ".dori"))).toBe(false);
+    expect(existsSync(join(host.home, ".config"))).toBe(false);
+    expect(existsSync(join(host.home, "Library"))).toBe(false);
+  }
 });
 
-test("on Darwin with hc and no herdr, the hc agent is bootstrapped into the runner's domain only when not loaded, never booted out", async () => {
+test("hc found only on the login shell's PATH is accepted", async () => {
+  const host = fakeHost();
+  const loginBin = join(host.home, "login-bin");
+  mkdirSync(loginBin);
+  copyFileSync(join(host.bin, "hc"), join(loginBin, "hc"));
+  chmodSync(join(loginBin, "hc"), 0o755);
+  rmSync(join(host.bin, "hc"));
+  host.tool("loginsh", `PATH="${loginBin}:$PATH" exec /bin/sh -c "$2"`);
+  const result = await runScript(host, linuxScript());
+  expect(result.code).toBe(0);
+  expect(readFileSync(hcUnitPath(host.home), "utf8")).toContain(`ExecStart=${join(loginBin, "hc")} server start\n`);
+});
+
+test("on Darwin the hc agent is bootstrapped into the runner's domain only when not loaded, never booted out", async () => {
   const host = darwinHost(`[ "$1" = print ] && case "$2" in */com.dori.hc) exit 113 ;; esac; exit 0`);
-  rmSync(join(host.bin, "herdr"));
-  host.tool("hc", "exit 0");
   const result = await runDarwin(host, darwinScript());
-  expect(result).toEqual({ code: 0, err: "", out: "DORI_HERDR absent\nDORI_HC enabled\n" });
-  expect(existsSync(herdrPlistPath(host.home))).toBe(false);
+  expect(result).toEqual({ code: 0, err: "", out: "DORI_HC enabled\n" });
   const plist = readFileSync(hcPlistPath(host.home), "utf8");
   expect(plist).not.toMatch(/@[A-Z_]+@/);
   expect(programArguments(plist)).toEqual([join(host.bin, "hc"), "serve"]);
@@ -741,10 +609,14 @@ test("on Darwin with hc and no herdr, the hc agent is bootstrapped into the runn
   checkRunnerDir(join(host.home, ".dori/runner"));
 });
 
-test("the DORI_HERDR absent and DORI_HC lines become the install result and the RUNNER_INSTALLED note", async () => {
-  const { run } = fakeRun({ out: "DORI_HERDR absent\nDORI_HC enabled\n" });
+test("the script's DORI_HC line is the install result's hc, named on the RUNNER_INSTALLED line", async () => {
+  const { run } = fakeRun({ out: "enrolled\nDORI_HC enabled\n" });
   const result = await installRunner({ run, bundle: async () => BUNDLE, unitTemplate: UNIT, kind: posixKind }, request({ count: 0 }));
-  expect(result).toEqual({ ok: true, version: bundleVersion(BUNDLE), herdr: "absent", hc: "enabled" });
-  expect(herdrInstallNote("absent", "enabled")).toBe("herdr=absent (not installed; hc runs this host's lanes) hc=enabled (its core starts at boot)");
-  expect(herdrInstallNote("started", "absent")).toBe("herdr=started (by its unit) hc=absent");
+  expect(result).toEqual({ ok: true, version: bundleVersion(BUNDLE), hc: "enabled" });
+  expect(hcInstallNote("enabled")).toBe("hc=enabled (its core starts at boot)");
+  expect(hcInstallNote(undefined)).toBe("hc=unknown");
+});
+
+test("the hc templates are checked against the heredoc delimiter too", () => {
+  expect(() => installScript(BUNDLE, UNIT, "worker-a", "h:1", { code: CODE, fingerprint: FINGERPRINT }, "plist", [], { unit: "a\nDORI_RUNNER_EOF\n", plist: "p" })).toThrow("heredoc delimiter");
 });

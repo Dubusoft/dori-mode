@@ -45,7 +45,7 @@ export const CALL_TIMEOUT_MS = 30_000;
 export const QUERY_TIMEOUT_MS = 15_000;
 /** Per-type call timeouts; a type not listed waits `CALL_TIMEOUT_MS`. */
 export const COMMAND_TIMEOUTS: Partial<Record<DurableCommandType, number>> = {
-  "lane.start": 90_000, "lane.recover": 90_000, "lane.close": 60_000, "lane.git": 60_000, "lane.pause": 30_000, "host.herdr": 90_000,
+  "lane.start": 90_000, "lane.recover": 90_000, "lane.close": 60_000, "lane.git": 60_000, "lane.pause": 30_000,
 };
 
 export const isFileOperation = (type: string): type is "lane.start" | "lane.recover" | "q.lane.files" =>

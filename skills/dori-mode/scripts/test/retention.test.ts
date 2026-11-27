@@ -8,7 +8,7 @@ import type { Runner } from "../src/run.ts";
 import { RETENTION, SCHEMA_VERSION, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { convertJsonStore } from "../src/store-import.ts";
 import { ACK_KEEP_MS, Supervisor } from "../src/supervise.ts";
-import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { depsFor, fakeClock, fakeRunner, newWorld, withState } from "./fakes.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -23,10 +23,11 @@ const fixture = (gh?: Runner, root?: string) => {
   cleanups.push(state.done);
   const clock = fakeClock(T0);
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.screen = "working";
+  const terminal = fakeRunner(world);
   const run: Runner = async (argv, opts) => {
-    if (argv[0] === "herdr" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { panes: world.panes } }), err: "" };
-    if (argv[0] === "herdr" && argv[2] === "read") return { code: 0, out: "working", err: "" };
+    if (argv[0] === "hc") return terminal(argv, opts);
     if (argv[0] === "gh" && gh) return gh(argv, opts);
     throw new Error(`unexpected ${argv.join(" ")}`);
   };

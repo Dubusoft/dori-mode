@@ -4,7 +4,7 @@ export const USAGE = `dori <command> [options]
   doctor                                                         read-only health check: OK/WARN/FAIL with the exact fix; exit 1 on any FAIL
   status [--json | --page N]                                     one-screen summary: services, lead, lanes, waits, repos, gateway (also /status in Discord); --page N lists more lanes, --json every lane with its latest report
   setup  [--yes] [--token-file F] [--channel ID] [--autostart] [--set KEY=VALUE ...] [--unset KEY ...] [--migrate]
-                                       interactive install: token, channels, herdr, autostart; --set/--unset set or delete config.json
+                                       interactive install: token, channels, autostart; --set/--unset set or delete config.json
                                        keys as given without asking; keys config.json no longer reads are warned about once, then removed (backup config.json.<time>.bak);
                                        --migrate only removes those and asks keys never shown before (dori setup --help)
   quota [--json]                                                 Claude 5h/7d usage of every account with reset times
@@ -19,13 +19,13 @@ export const USAGE = `dori <command> [options]
                 [--share-thread] [--allow-repo-mismatch]   refused when another open lane has the thread or the git checkout, or cwd's repo is not in Done
                 [--grant NAME]   repeatable: a named path grant from the lane's runner's runner-config.json grants table (write/read paths the sandbox opens
                                        for this lane only; the hide list still wins); an unknown name, an unsandboxed lane or an older runner refuses the launch
-                [--sandbox]   every lane runs in the sandbox (--sandbox is accepted and changes nothing): a local one (--pane too) in laneSandbox.command after a --check preflight, a --machine one under its runner's sandboxed profile; a missing or broken sandbox refuses the launch (SANDBOX_MISSING / SANDBOX_BROKEN / SANDBOX_UNAVAILABLE) and warns on Discord; only Windows runners (no lane sandbox exists there) and machines opted in with runners.<label>.allowUnsandboxed run unsandboxed, with SANDBOX_SKIPPED and a Discord warning each time
+                [--sandbox]   every lane runs in the sandbox (--sandbox is accepted and changes nothing): a local one in laneSandbox.command after a --check preflight, a --machine one under its runner's sandboxed profile; a missing or broken sandbox refuses the launch (SANDBOX_MISSING / SANDBOX_BROKEN / SANDBOX_UNAVAILABLE) and warns on Discord; only Windows runners (no lane sandbox exists there) and machines opted in with runners.<label>.allowUnsandboxed run unsandboxed, with SANDBOX_SKIPPED and a Discord warning each time
                 HOLD (exit 4) on host limits queues the launch in launch-hold.json until it launches or is dropped
-                [--machine LABEL-OR-ID] [--pane ID | --workspace ID]   target a saved machine; run in an existing idle shell pane instead of a new tab; cwd defaults to the pane's
+                [--machine LABEL]   target a saved machine
                 [--worktree REPO [--base REMOTE/BRANCH]]   instead of --cwd: create <worktree root>/<repo name>-<key> on the placed machine, detached at the
                                        fetched base (default origin/dev), from the checkout of REPO (owner/repo or name) its runner declares or detects;
                                        an existing path refuses the launch (LAUNCH_WORKTREE_EXISTS); removed again when the launch registers no lane
-  adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL-OR-ID] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
+  adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF] [--cwd DIR] [--machine LABEL] [--share-thread] [--allow-repo-mismatch]   with --machine, --cwd is the remote directory
   hold list | hold drop <key>          the launches waiting after a HOLD (JSON), or drop one
   autopilot candidates [--tasks 12,13] [--json]
                                        lead-only, read-only: judge every planned toodo task marked for autopilot, plus --tasks
@@ -90,10 +90,6 @@ export const USAGE = `dori <command> [options]
   runner revoke LABEL                  delete the runner's key, close its connection, refuse its hellos (RUNNER_REVOKED)
   runner rotate LABEL                  have the connected runner switch to a new key; prints the new key fingerprint
   runner reset-gen LABEL               forget the runner's highest gen (after restoring its state from a backup)
-  runner herdr start|restart|stop|status --machine LABEL [--yes]
-                                       the machine's herdr through its runner (proto 4; LABEL local is the lead host);
-                                       restart and stop end every lane pane there: they list the open lanes and need --yes;
-                                       stop keeps herdr down (the runner does not start it again) until start
   lead-restart [--model ID] [--thinking LEVEL]   request a cold start at the next idle moment
   update [--dev] [--force]             fast-forward this install's checkout to origin/main (--dev: origin/dev), keep local changes,
                                        bun install on a lockfile change, restart dori-supervisor when HEAD moved (--force: always);

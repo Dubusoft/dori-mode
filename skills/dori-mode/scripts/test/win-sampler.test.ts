@@ -14,7 +14,7 @@ const RECORDED = "\uFEFF" + JSON.stringify({
   procs: [
     { pid: 0, ppid: 0, rss: 8, name: "System Idle Process", cmd: "", created: 0 },
     { pid: 4, ppid: 0, rss: 140, name: "System", cmd: "", created: T0 - 86_400_000 },
-    { pid: 400, ppid: 4, rss: 20_000, name: "herdr.exe", cmd: "herdr.exe server", created: T0 - 3_600_000 },
+    { pid: 400, ppid: 4, rss: 20_000, name: "explorer.exe", cmd: "explorer.exe", created: T0 - 3_600_000 },
     { pid: 500, ppid: 400, rss: 60_000, name: "pwsh.exe", cmd: "pwsh.exe -NoLogo", created: T0 - 600_000 },
     { pid: 510, ppid: 500, rss: 300_000, name: "omo.exe", cmd: "omo.exe --lane", created: T0 - 500_000 },
     { pid: 520, ppid: 510, rss: 1_200_000, name: "node.exe", cmd: "node.exe expo start", created: T0 - 400_000 },

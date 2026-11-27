@@ -121,7 +121,7 @@ const parseMemInfo = (text: string): Pick<HostSample, "memFreePct" | "swapFreeGb
 export const diskGuardPath = (config: Pick<DoriConfig, "stateDir">): string => config.stateDir;
 
 /**
- * One host sample. `paneCount` (-1 when unreadable) is the caller's: a runner counts its own herdr panes, the
+ * One host sample. `paneCount` (-1 when unreadable) is the caller's: a runner counts its own hc terminals, the
  * supervisor (which reaches no pane) passes `async () => -1` when it needs only the load. On win32 every metric comes
  * from one `winSample` run (default: the sampler in the default runner directory); an unreadable metric falls back as
  * the POSIX path does (memory 100%, disk and swap free 0, swap total -1), load to -1.

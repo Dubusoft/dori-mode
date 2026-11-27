@@ -1,19 +1,20 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listPanes, readScreen } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { ensureHc, HC_MIN_VERSION, hcRuntime } from "../src/runtime/hc.ts";
-import { setListedRuntimes } from "../src/runtime/index.ts";
-import { LANES_FILE, RunnerLanes } from "../src/runner/lanes.ts";
-import { parsePolicy } from "../src/runner/policy.ts";
+import { sessionRuntime } from "../src/runtime/index.ts";
+import { RunnerLanes } from "../src/runner/lanes.ts";
+import { localPolicy, localRunnerPolicy } from "../src/runner/local-policy.ts";
+import { parsePolicy, POLICY_FILE } from "../src/runner/policy.ts";
 import { resolveSession } from "../src/session-id.ts";
 import { fakeClock } from "./fakes.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
-  setListedRuntimes({ herdr: true, hc: false });
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -48,7 +49,7 @@ const fakeHc = (version = HC_MIN_VERSION) => {
   return { terminals, calls, run };
 };
 
-test("an hc terminal reads as a herdr pane: its reported agent and status, an hc: id and a terminal id that a reused address never matches", async () => {
+test("an hc terminal reads as a pane row: its reported agent and status, an hc: id and a terminal id that a reused address never matches", async () => {
   const hc = fakeHc();
   hc.terminals.set("t3", {
     address: "t3", state: "live", cwd: "/w", title: "OmO", pid: 41, created_ms: 99,
@@ -64,7 +65,7 @@ test("an hc terminal reads as a herdr pane: its reported agent and status, an hc
   expect(await rt.read("hc:t3", 2)).toBe("two\nthree");
 });
 
-test("resolveSession finds the agent under an hc terminal's shell, as under a herdr pane's", async () => {
+test("resolveSession finds the agent under an hc terminal's shell", async () => {
   const hc = fakeHc();
   const id = "44444444-4444-4444-8444-444444444444";
   hc.terminals.set("t2", { address: "t2", state: "live", pid: 41, created_ms: 1, foreground: { pid: 42, name: "omo", argv: ["omo"] } });
@@ -73,41 +74,16 @@ test("resolveSession finds the agent under an hc terminal's shell, as under a he
   expect(hc.calls).toContainEqual(["hc", "--json", "get", "t2"]);
 });
 
-test("with herdr unlisted and hc listed, listPanes never invokes the herdr binary", async () => {
+test("listPanes and readScreen use the cached hc adapter", async () => {
   const hc = fakeHc();
-  const calls: string[][] = [];
-  const run = async (argv: readonly string[]): Promise<Ran> => {
-    calls.push([...argv]);
-    return argv[0] === "herdr" ? fail("herdr: command not found", 127) : hc.run(argv);
-  };
+  const { run } = hc;
   hc.terminals.set("t1", { address: "t1", state: "live", created_ms: 1 });
-  setListedRuntimes({ herdr: false, hc: true });
-  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["hc:t1"]);
-  setListedRuntimes({ herdr: false, hc: false });
-  expect(await listPanes(run)).toEqual([]);
-  expect(calls.some((argv) => argv[0] === "herdr")).toBe(false);
-});
-
-test("listPanes gathers hc terminals only once hc is listed, and a pane id picks the runtime that reads it", async () => {
-  const hc = fakeHc();
-  const run = async (argv: readonly string[]): Promise<Ran> =>
-    argv[0] === "herdr" ? ok({ result: { panes: [{ pane_id: "w1:p1", workspace_id: "w1" }] } }) : hc.run(argv);
-  hc.terminals.set("t1", { address: "t1", state: "live", created_ms: 1 });
-  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["w1:p1"]);
-  expect(hc.calls).toEqual([]);
-  const runnerDir = mkdtempSync(join(tmpdir(), "runtime-hc-"));
-  dirs.push(runnerDir);
-  const lanes = new RunnerLanes({
-    runnerDir, run, clock: fakeClock(0), publish: () => {},
-    policy: { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow", laneRuntime: "hc" },
-  });
-  expect(lanes.records()).toEqual({});
-  // laneRuntime hc with no herdr lane: herdr is not in use (herdrInUse), so its panes are no longer listed.
+  expect(sessionRuntime(run)).toBe(sessionRuntime(run));
   expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["hc:t1"]);
   expect(await readScreen(run, "hc:t1", 1)).toBe("three");
-  // A lane still on a herdr pane keeps herdr listed, read at the next listing with no sync call.
-  writeFileSync(join(runnerDir, LANES_FILE), JSON.stringify({ k: { key: "k", pane: "w1:p1" } }));
-  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["w1:p1", "hc:t1"]);
+  expect(hc.calls).toEqual([
+    ["hc", "--json", "ls"], ["hc", "--json", "get", "t1"], ["hc", "--json", "read", "t1", "--lines", "1"],
+  ]);
 });
 
 test("ensureHc installs a missing hc, updates an old one in place, and refuses with the fix when neither works", async () => {
@@ -127,7 +103,7 @@ test("ensureHc installs a missing hc, updates an old one in place, and refuses w
   expect(await ensureHc(run)).toBe(HC_MIN_VERSION);
   expect(seen[1]).toEqual(["hc", "update", "--version", HC_MIN_VERSION]);
   const never = async (argv: readonly string[]): Promise<Ran> => (argv[1] === "--version" ? fail("not found", 127) : { code: 0, out: "", err: "" });
-  expect(ensureHc(never)).rejects.toThrow(/^RUNNER_HC_UNAVAILABLE .*laneRuntime/);
+  expect(ensureHc(never)).rejects.toThrow(/^RUNNER_HC_UNAVAILABLE hc is not on the runner's PATH: install it with curl -fsSL /);
 });
 
 test("an hc lane opens a terminal running only the shell, types the launch line into it, and is killed and removed on close", async () => {
@@ -138,7 +114,7 @@ test("an hc lane opens a terminal running only the shell, types the launch line 
   const lanes = new RunnerLanes({
     runnerDir, run: hc.run, clock: fakeClock(0), publish: () => {}, token: () => "secret-token", realpath: (p) => p,
     startup: async () => ({ verdict: "ok", detail: "ready" }), legacyMcp: async () => false,
-    policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", laneRuntime: "hc" },
+    policy: { agents: { omo: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
   });
   const files = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
   const started = await lanes.start({
@@ -156,15 +132,29 @@ test("an hc lane opens a terminal running only the shell, types the launch line 
   expect(typed[5]).toContain("DORI_LANE_TOKEN_FILE=");
   expect(typed[5]).toContain('eval "$(dori secret env)"');
   expect(hc.calls.flat().join(" ")).not.toContain("secret-token");
-  expect(lanes.records()["lane-a"]).toMatchObject({ pane: "hc:t1", tab: "", herdrInstance: "hc:core-1", terminalId: "hc:t1@5" });
+  expect(lanes.records()["lane-a"]).toMatchObject({ pane: "hc:t1", tab: "", hcInstance: "hc:core-1", terminalId: "hc:t1@5" });
   const closed = await lanes.close("lane-a");
   expect(closed.result).toEqual({ closed: "pane", gone: true });
   expect(hc.calls.filter((c) => c[2] === "kill" || c[2] === "rm").map((c) => c[2])).toEqual(["kill", "rm"]);
   expect(lanes.records()).toEqual({});
 });
 
-test("runner-config laneRuntime takes herdr or hc and refuses anything else", () => {
-  expect(parsePolicy({ laneRuntime: "hc" }, "/h", "/t").laneRuntime).toBe("hc");
-  expect(parsePolicy({}, "/h", "/t").laneRuntime).toBeUndefined();
-  expect(() => parsePolicy({ laneRuntime: "tmux" }, "/h", "/t")).toThrow("laneRuntime must be herdr|hc");
+test("a retired runner-config laneRuntime is ignored with one RUNNER_CONFIG_KEY_IGNORED warning, whatever its value", () => {
+  for (const value of ["hc", "herdr", "tmux"]) {
+    const warnings: string[] = [];
+    const policy = parsePolicy({ laneRuntime: value }, "/h", "/t", { warn: (line) => { warnings.push(line); } });
+    expect(policy).not.toHaveProperty("laneRuntime");
+    expect(warnings).toEqual(["RUNNER_CONFIG_KEY_IGNORED laneRuntime: hc is the only terminal runtime; every lane opens on hc; remove it from runner-config.json (dori runner setup does)"]);
+  }
+});
+
+test("a local runner-config holding only a retired laneRuntime keeps the policy derived from config.json", () => {
+  const runnerDir = mkdtempSync(join(tmpdir(), "runtime-hc-"));
+  dirs.push(runnerDir);
+  writeFileSync(join(runnerDir, POLICY_FILE), JSON.stringify({ laneRuntime: "hc" }));
+  const cfg = { agentCommand: ["omo", "{prompt}"], leadCwd: "/work/lead", worktreeRoot: "" };
+  const warnings: string[] = [];
+  const env = { home: homedir(), tmp: tmpdir() };
+  expect(localRunnerPolicy(runnerDir, cfg, { ...env, warn: (line) => { warnings.push(line); } })).toEqual(localPolicy(cfg, env));
+  expect(warnings).toHaveLength(1);
 });

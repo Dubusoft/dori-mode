@@ -11,6 +11,8 @@ import { Database } from "bun:sqlite";
 import { loadGithub } from "../src/github-events.ts";
 import { LaneOpsError, type Delivery, type LaneOps, type LaneRef, runnerOf, machineRunner } from "../src/lane-ops.ts";
 import type { Pane } from "../src/panes.ts";
+import { HC_PANE_PREFIX } from "../src/runtime/types.ts";
+import { HC_MIN_VERSION } from "../src/runtime/hc.ts";
 import type { CommandResults, LaneInspection, TurnEvidence, LaneOutputFiles } from "../src/runner/protocol.ts";
 import { laneStatus } from "../src/runner/serve.ts";
 import { checkDone } from "../src/signals.ts";
@@ -92,43 +94,56 @@ export type World = {
   sandboxCheck?: Ran;
   /** Every runner is down: reads and effects throw RUNNER_UNAVAILABLE, send answers "failed", status an error. */
   runnerDown?: boolean;
-  /** The herdr workspaces `herdr workspace list` answers; `workspace create` adds one (`w<n>`). */
-  workspaces: { label?: string; workspace_id: string }[];
 };
 
 export type OpsEntry = { readonly op: keyof LaneOps; readonly key?: string; readonly args: unknown };
 
 export const WT = "/repo/.wt/demo-lane";
 
-export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [], ops: [], workspaces: [{ label: "lanes", workspace_id: "wL" }] });
+export const newWorld = (): World => ({ prState: "MERGED", issueState: "CLOSED", aheadCount: "0", dirty: "", screen: "❯ ", panes: [], removed: [], calls: [], ops: [] });
+
+/**
+ * The hc CLI over `w.panes` (runtime/hc.ts calls it as `hc --json <verb> ...`): `ls` lists every `hc:` pane as a live
+ * terminal and `get` answers its row (agent and status as the OSC status, label as the name); `read` answers the next
+ * screen; `keys` moves the pane to onEnterStatus / onEscapeStatus; `run` opens `hc:t<n>`; `kill` removes the pane.
+ */
+const fakeHc = (w: World, argv: readonly string[]): Ran => {
+  const ok = (out: unknown = {}): Ran => ({ code: 0, out: typeof out === "string" ? out : JSON.stringify(out), err: "" });
+  if (argv[0] === "--version") return ok(`hc ${HC_MIN_VERSION}`);
+  const [verb, addr] = argv.slice(1);
+  const pane = w.panes.find((p) => p.pane_id === `${HC_PANE_PREFIX}${addr}`);
+  const terminal = (p: World["panes"][number]) => ({
+    address: p.pane_id.slice(HC_PANE_PREFIX.length), state: "live", created_ms: 1, pid: 10,
+    ...(p.cwd ? { cwd: p.cwd } : {}), ...(p.title ? { title: p.title } : {}), ...(p.label ? { name: p.label } : {}),
+    status: p.agent ? { app: p.agent, ...(p.agent_status ? { state: p.agent_status } : {}) } : null,
+  });
+  if (verb === "ls") return ok({ terminals: w.panes.filter((p) => p.pane_id.startsWith(HC_PANE_PREFIX)).map(terminal) });
+  if (verb === "get") return pane ? ok(terminal(pane)) : { code: 1, out: "", err: `no terminal ${addr}` };
+  if (verb === "read") return ok({ text: w.screens?.length ? (w.screens.shift() ?? w.screen) : w.screen });
+  // `send` pastes the text and presses Enter; `keys` presses Enter or Escape.
+  if (verb === "keys" || verb === "send") {
+    const status = argv[3] === "esc" ? w.onEscapeStatus : w.onEnterStatus;
+    if (pane && status) pane.agent_status = status;
+    return ok();
+  }
+  if (verb === "run") {
+    // Numbered apart from the panes a test lists itself (hc:t1 ...), so a new terminal never reuses a vanished one's id.
+    const made = `t${100 + w.calls.filter((c) => c[0] === "hc" && c[2] === "run").length}`;
+    const cwd = argv[argv.indexOf("--cwd") + 1];
+    w.panes.push({ pane_id: `${HC_PANE_PREFIX}${made}`, workspace_id: "", ...(cwd ? { cwd } : {}) });
+    return ok({ address: made });
+  }
+  // A killed terminal leaves the list, so a close's read-back sees it gone.
+  if (verb === "kill") w.panes = w.panes.filter((p) => p !== pane);
+  if (verb === "server") return ok({ core: { id: "core-1" } });
+  return ok();
+};
 
 export const fakeRunner = (w: World): Runner => async (argv) => {
   w.calls.push([...argv]);
   const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
   const [cmd, a1, a2] = argv;
-  if (cmd === "herdr" && a1 === "pane" && a2 === "read") {
-    return ok(w.screens?.length ? (w.screens.shift() ?? w.screen) : w.screen);
-  }
-  if (cmd === "herdr" && a1 === "pane" && a2 === "send-keys" && argv[4] === "escape" && w.onEscapeStatus) {
-    const p = w.panes.find((x) => x.pane_id === argv[3]);
-    if (p) p.agent_status = w.onEscapeStatus;
-    return ok();
-  }
-  if (cmd === "herdr" && a1 === "pane" && a2 === "send-keys" && w.onEnterStatus) {
-    const p = w.panes.find((x) => x.pane_id === argv[3]);
-    if (p) p.agent_status = w.onEnterStatus;
-    return ok();
-  }
-  if (cmd === "herdr" && a1 === "pane" && a2 === "list") return ok(JSON.stringify({ result: { panes: w.panes } }));
-  if (cmd === "herdr" && a1 === "workspace" && a2 === "list") return ok(JSON.stringify({ result: { workspaces: w.workspaces } }));
-  if (cmd === "herdr" && a1 === "workspace" && a2 === "create") {
-    const label = argv[argv.indexOf("--label") + 1];
-    w.workspaces.push({ ...(label ? { label } : {}), workspace_id: `w${w.workspaces.length + 1}` });
-    return ok();
-  }
-  // A closed pane leaves the pane list, so a close's read-back sees it gone.
-  if (cmd === "herdr" && a1 === "pane" && a2 === "close") w.panes = w.panes.filter((p) => p.pane_id !== argv[3]);
-  if (cmd === "herdr") return ok();
+  if (cmd === "hc") return fakeHc(w, argv.slice(1));
   if (cmd === "git" && argv.includes("worktree") && argv.includes("remove")) {
     const wt = argv.at(-1) ?? "";
     if (!w.removed.includes(wt)) w.removed.push(wt);
@@ -320,7 +335,7 @@ export const splitTunables = (patch: Partial<DoriConfig & Tunables>): { readonly
 
 export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial<DoriConfig & Tunables> = {}): FlowDeps & { readonly ops: LaneOps } => {
   const split = splitTunables(patch);
-  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "lead:p1", ...split.config };
+  const config: DoriConfig = { ...defaultConfig("/home/test"), stateDir, leadCwd: "/repo", worktreeRoot: "/data/repos/worktrees", leadPane: "hc:t1", ...split.config };
   const tunables = testTunables(split.tunables);
   // The local sandbox wrapper is installed unless a test says otherwise (override `which`).
   return { run: fakeRunner(w), clock, registry: new Registry(stateDir), config, tunables, exists: (path) => !w.removed.includes(path), ops: fakeLaneOps(w),
@@ -331,8 +346,8 @@ export const depsFor = (w: World, clock: Clock, stateDir: string, patch: Partial
     which: (cmd) => (cmd === "lane-sandbox" ? "/usr/local/bin/lane-sandbox" : null) };
 };
 
-/** The texts sent to lanes: through the facade (`w.ops` sends), and through herdr `send-text` by modules not yet moved onto it. */
+/** The texts sent to panes: through the facade (`w.ops` sends), and typed into an hc terminal (`hc send`, the lead's). */
 export const sent = (w: World): string[] => [
-  ...w.calls.filter((c) => c[0] === "herdr" && c[2] === "send-text").map((c) => c[4] ?? ""),
+  ...w.calls.filter((c) => c[0] === "hc" && c[2] === "send").map((c) => c[5] ?? ""),
   ...w.ops.filter((e) => e.op === "send").map((e) => (e.args as { text: string }).text),
 ];

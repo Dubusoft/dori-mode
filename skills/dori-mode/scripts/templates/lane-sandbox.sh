@@ -32,8 +32,7 @@
 # bound read-only right after the top-level binds; the read-write binds after it (caches,
 # grants, the cwd, worktrees, repos' .git) sit outside that list and stay writable, and each writable
 # .git's hooks are bound read-only again. What no lane may read is hidden after every read-write bind, so neither the
-# cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh, ~/.dori/state and ~/.config/herdr (herdr's control socket
-# drives the lead's panes), each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
+# cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh and ~/.dori/state, each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
 # config, state/review-inputs and the ssh agent socket bound back; herdr-core's (hc) runtime and state dirs and any other
 # hc control socket (HC_SOCKET, the hc config's socket), as hc runs commands on the host for whoever reaches it; the credential stores below (~/.dori/env, secrets
 # and gh's hosts.yml login among them: a lane gets GH_TOKEN only through its environment at launch (dori secret env)), each hidden file an empty
@@ -207,7 +206,6 @@ fi
 # connect needs no write mount; a lane cannot rewrite daemon.json or bsk's state.
 bsk_home=${BSK_HOME:-$H/.bsk}
 opts+=(--ro-bind-try "$bsk_home" "$bsk_home")
-opts+=(--setenv HERDR_SOCKET_PATH "$H/.dori/runner/sock/herdr.d/$key/herdr")
 
 # ssh rejects root-owned include files inside the user namespace (root shows as
 # nobody): re-provide each /etc/ssh/ssh_config.d file as a user-owned ro copy.
@@ -346,7 +344,7 @@ keep() {
   case "$1" in *-try) [ -e "$2" ] || return 0 ;; esac
   kept+=("$(readlink -m "$2")")
 }
-# The ssh agent socket may live in a hidden subtree (herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent).
+# The ssh agent socket may live in a hidden subtree (~/.ssh).
 keep_agent() {
   [ "$review" = 0 ] || return 0
   case "${SSH_AUTH_SOCK:-}" in "$1"/*) keep --ro-bind-try "$SSH_AUTH_SOCK" ;; esac
@@ -354,13 +352,10 @@ keep_agent() {
 # The runner dir: only this lane's entries. The control and cli sockets (sock/control, sock/cli), the runner's keys and
 # state, and other lanes' briefs and tokens are not a lane's to read. The lane socket's own directory is bound, not the
 # socket file: a restarted runner unlinks the socket and binds a new one at the same path, which a bind of the old file
-# would never show (the lane would dial the dead inode). The lane's own herdr report socket (sock/herdr.d/<key>) is
-# bound the same way: omo's herdr extension reports the agent state through it, and the runner forwards only reports
-# for this lane's own pane to herdr. A worker runner host's dori (the lane's `dori report`) lives in bin.
+# would never show (the lane would dial the dead inode). A worker runner host's dori (the lane's `dori report`) lives in bin.
 R="$H/.dori/runner"
 opts+=(--tmpfs "$R" --dir "$R/sock")
 keep --ro-bind-try "$R/sock/lane.d"
-keep --ro-bind-try "$R/sock/herdr.d/$key"
 keep --ro-bind-try "$R/bin"
 keep --ro-bind-try "$R/briefs/$key.md"
 keep --ro-bind "$R/briefs/$key.files"
@@ -387,12 +382,6 @@ fi
 if [ "$review" = 1 ] && [ -d "$H/.config" ]; then
   opts+=(--tmpfs "$H/.config" --remount-ro "$H/.config")
   trees+=("$(readlink -f "$H/.config")")
-elif [ -d "$H/.config/herdr" ]; then
-  # herdr's control socket drives the lead's panes.
-  opts+=(--tmpfs "$H/.config/herdr")
-  keep_agent "$H/.config/herdr"
-  opts+=(--remount-ro "$H/.config/herdr")
-  trees+=("$(readlink -f "$H/.config/herdr")")
 fi
 if [ -d "$H/.dori/state" ]; then
   # The state dir may hold tokens; a lane reads only the review inputs the lead hands it.

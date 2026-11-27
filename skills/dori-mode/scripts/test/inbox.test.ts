@@ -76,7 +76,7 @@ test("the supervisor consumes take receipts in every mode: cursor file first, th
   const s = withState();
   cleanups.push(s.done);
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "w", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "w", agent: "omo", agent_status: "working" });
   const supervisor = new Supervisor(depsFor(world, fakeClock(NOW), s.dir));
   cleanups.push(() => { supervisor.close(); });
   supervisor.enqueue("wait:1", "WAIT_DONE ci green");

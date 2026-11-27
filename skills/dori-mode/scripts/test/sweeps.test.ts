@@ -39,7 +39,7 @@ test("a lane silent past the nudge time is nudged once, and a [REPORT] line on i
 });
 
 test("a stopped agent pane is reported once per hour and the lead pane is never reported", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w" }, { pane_id: "lead:p1", workspace_id: "lead" }];
+  world.panes = [{ pane_id: "w:p1", workspace_id: "w" }, { pane_id: "hc:t1", workspace_id: "lead" }];
   world.screen = "omo has stopped\n$ ";
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const seen = new Set<string>();
@@ -103,10 +103,10 @@ test("a lane pane's count starts over on each report, claim or status change, an
 
 const agentOf = (key: string) => ({ shell_pid: 10, foreground_processes: [{ pid: 11, name: "omo", argv: ["omo", `Read and execute the lane brief at /home/u/.dori/runner/briefs/${key}.md in full.`] }] });
 
-test("a lane pane herdr misses while its lane agent process still runs raises nothing; once only the shell is left it is dead", async () => {
+test("a lane with no reported agent status raises nothing while its agent process still runs; once it leaves the pane is dead", async () => {
   world.panes = [{ pane_id: "w:p7", workspace_id: "w", tab_id: "w:t2", agent_status: "unknown" }];
   world.screen = "omo has stopped\n$ ";
-  // The agent's argv names the lane's brief (every OS); herdr's agent detection lost it.
+  // hc has no usable reported status, but the agent's argv names the lane's brief.
   world.inspection = { process: agentOf("quiet-lane") };
   const deps = depsFor(world, fakeClock(T0), state.dir);
   const st = newDeadPaneState();
@@ -264,18 +264,18 @@ test("adopting a lane refuses a Done line the watcher could never check", async 
 });
 
 test("the session id is read from --session, then a child's environment, then the session file made at start", async () => {
-  const info = JSON.stringify({ result: { process_info: { shell_pid: 10 } } });
+  const info = JSON.stringify({ address: "t1", state: "live", pid: 10 });
   const fake = (extra: Record<string, string>) => async (argv: readonly string[]) => {
     const line = argv.join(" ");
-    if (line.startsWith("herdr pane process-info")) return { code: 0, out: info, err: "" };
+    if (line.startsWith("hc --json get")) return { code: 0, out: info, err: "" };
     const hit = Object.entries(extra).find(([k]) => line.startsWith(k));
     return { code: hit ? 0 : 1, out: hit?.[1] ?? "", err: "" };
   };
   const table = [{ pid: 10, ppid: 1, cmd: "zsh" }, { pid: 11, ppid: 10, cmd: "/bin/bun /x/senpi/dist/bundle/cli.js --extension /x/plugin" }, { pid: 12, ppid: 11, cmd: "bun /x/mcp/cli.js mcp" }];
   const flagged = [{ pid: 10, ppid: 1, cmd: "zsh" }, { pid: 11, ppid: 10, cmd: "omo --session 01a0e129-23ce-7329-bbd1-fc0c1e7a6b8b" }];
-  expect((await resolveSession("w:p1", "/repo", flagged, { run: fake({}), sessionsDir: "/s" })).via).toBe("argv");
-  expect((await resolveSession("w:p1", "/repo", table, { run: fake({ "ps eww -o pid=,command= -p 12": "12 bun mcp PI_SESSION_ID=01a11440-ee81-7f90-b2ed-dcc7d51a0adf X=1" }), sessionsDir: "/s" })).id).toBe("01a11440-ee81-7f90-b2ed-dcc7d51a0adf");
+  expect((await resolveSession("hc:t1", "/repo", flagged, { run: fake({}), sessionsDir: "/s" })).via).toBe("argv");
+  expect((await resolveSession("hc:t1", "/repo", table, { run: fake({ "ps eww -o pid=,command= -p 12": "12 bun mcp PI_SESSION_ID=01a11440-ee81-7f90-b2ed-dcc7d51a0adf X=1" }), sessionsDir: "/s" })).id).toBe("01a11440-ee81-7f90-b2ed-dcc7d51a0adf");
   const listDir = () => ["2026-01-01T09-00-00-000Z_01a10000-0000-7000-8000-000000000000.jsonl", "2026-01-01T12-00-02-113Z_01a11440-ee81-7f90-b2ed-dcc7d51a0adf.jsonl"];
-  const byStart = await resolveSession("w:p1", "/repo", table, { run: fake({ "ps eww": "bun mcp X=1", "ps -o lstart=": "Thu Jan  1 12:00:01 2026 GMT" }), sessionsDir: "/s", listDir });
+  const byStart = await resolveSession("hc:t1", "/repo", table, { run: fake({ "ps eww": "bun mcp X=1", "ps -o lstart=": "Thu Jan  1 12:00:01 2026 GMT" }), sessionsDir: "/s", listDir });
   expect(byStart).toEqual({ id: "01a11440-ee81-7f90-b2ed-dcc7d51a0adf", via: "start-time", pid: 11 });
 });

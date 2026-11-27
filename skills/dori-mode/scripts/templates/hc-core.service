@@ -8,7 +8,7 @@ Description=herdr-core (hc) core autostart (the lanes of this host live in it)
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=%h
-# PATH comes from the user's login shell, as the herdr unit's does.
+# PATH comes from the user's login shell.
 Environment=PATH=@PATH@
 ExecStart=@HC_BIN@ server start
 

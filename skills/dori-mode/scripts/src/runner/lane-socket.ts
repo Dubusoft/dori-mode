@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import { RUNNER_PATHS } from "./fs-safety.ts";
@@ -18,14 +17,12 @@ import { laneToodoRequest, type LaneToodoReader } from "../toodo-lane-read.ts";
  * - `{kind: "status", key, token}`: the lane's status as the supervisor last pushed it with `lane.notify`
  *   (`{ok, status, objection, claim}`; before any notify `working` with no objection and no claim).
  * - `{kind: "ack", key, token, id}`: publishes `lane.ack {key, id}`; `{ok}`.
- * - `{kind: "whoami", pane}`: the key of the lane whose record holds `pane` (`{ok, key?}`), no token needed. The CLI
- *   uses it only to tell lane mode from lead mode.
  * - `{kind: "secret", key, token}`: every store value as `{ok, values}`, or `{ok:false, code, detail}`.
  * - `{kind: "secret-run", key, token, op}`: has the host run config `secretCommands.<op>` for the lane (secret-run.ts);
  *   `{ok, exitCode, stdout, stderr, truncated}` or a refusal. The token is checked before `op`; the output is never logged.
  * - `{kind: "toodo", key, token, op, id?, query?}`: a read-only Toodo read for the lane (toodo-lane-read.ts: op `get`
  *   [id], `search` query or `guidelines`; nothing else, so no write); `{ok, text, truncated}` or a refusal.
- * Every verb but `whoami` needs the key's own token (`RUNNER_LANE_AUTH_FAILED`). A failure is `{ok:false, code, detail}`.
+ * Every verb needs the key's own token (`RUNNER_LANE_AUTH_FAILED`). A failure is `{ok:false, code, detail}`.
  */
 
 export const LANE_SOCKET = "lane";
@@ -40,9 +37,6 @@ export const LANE_SOCKET_DIR = "lane.d";
 /** `<runnerDir>/sock/lane.d/lane`, where the runner serves the lane socket. */
 export const laneSocketPath = (runnerDir: string): string => join(runnerDir, RUNNER_PATHS.sock, LANE_SOCKET_DIR, LANE_SOCKET);
 
-/** Whether the lane socket path exists as seen from here (inside a lane: through its sandbox). */
-export const laneSocketExists = (runnerDir: string): boolean => existsSync(laneSocketPath(runnerDir));
-
 /** How a lane's `dori` dials the lane socket: the `lane.d` path. */
 export const connectLaneSocket = (runnerDir: string, connect: (path: string) => Connector): Connector => connect(laneSocketPath(runnerDir));
 
@@ -56,14 +50,13 @@ export type SecretGrant =
 export type LaneRequest = { readonly key: string; readonly token: string; readonly kind: string; readonly text: string; readonly evidence?: string };
 
 /**
- * What the socket needs of the runner's lanes. `notice` and `keyForPane` are optional so a token-only fake still serves
- * reports; without them `status` answers the default and `whoami` answers no key.
+ * What the socket needs of the runner's lanes. `notice` is optional so a token-only fake still serves reports; without
+ * it `status` answers the default.
  */
 export type LaneSocketLanes = {
   readonly reportFiles?: (key: string) => LaneOutputFiles | undefined;
   readonly tokenFor: (key: string, token: string) => boolean;
   readonly notice?: (key: string) => LaneNotice | undefined;
-  readonly keyForPane?: (pane: string) => string | undefined;
   /** Hands out secret values to a lane; absent on a runner that does not support them. */
   readonly secrets?: (key: string) => Promise<SecretGrant>;
   /** Runs a configured secret command for a lane; absent on a runner that does not support them. */
@@ -90,14 +83,8 @@ export const serveLaneSocket = (listener: Listener, lanes: LaneSocketLanes, publ
       let req: unknown;
       try { req = JSON.parse(line); } catch { bad("not JSON"); return; }
       if (!isRecord(req)) { bad("not a JSON object"); return; }
-      if (req.kind === "whoami") {
-        if (!str(req.pane) || !req.pane) { bad("whoami needs a pane"); return; }
-        const key = lanes.keyForPane?.(req.pane);
-        reply({ ok: true, ...(key ? { key } : {}) });
-        return;
-      }
       const known = req.kind === "status" || req.kind === "ack" || req.kind === "secret" || req.kind === "secret-run" || req.kind === "toodo" || isReportKind(req.kind);
-      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run, toodo or whoami"); return; }
+      if (!str(req.key) || !str(req.token) || !known) { bad("needs key, token, and a report kind, status, ack, secret, secret-run or toodo"); return; }
       if (req.kind === "toodo") {
         if (!lanes.tokenFor(req.key, req.token)) {
           log(`RUNNER_LANE_AUTH_FAILED key=${req.key} verb=toodo`);

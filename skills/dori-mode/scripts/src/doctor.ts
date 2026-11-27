@@ -13,17 +13,15 @@ import { readWakes } from "./store.ts";
 import { legacyPaneKeys, managedPanesPath } from "./managed-panes.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
-import { paneRow } from "./panes.ts";
-import { runtimeOfPane } from "./runtime/index.ts";
+import { listPanes, paneRow } from "./panes.ts";
 import { HC_CORE_UNIT, HC_INSTALL_URL, HC_MIN_VERSION, hcVersion, versionAtLeast } from "./runtime/hc.ts";
-import { hostServices, type HostRuntimes, listHostRuntimes, runtimesNote } from "./host-runtimes.ts";
+import { hostServices } from "./host-runtimes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { Registry, statusOf } from "./registry.ts";
 import { type Clock, realClock, type Runner, run } from "./run.ts";
 import { LEGACY_PRESENCE, unitState } from "./status.ts";
 import { openOperations } from "./operations.ts";
 import { checkRunnerDir, defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
-import { HERDR_ELEVATED_FIX, herdrUnitInstalled } from "./runner/herdr-watch.ts";
 import { LOCAL_RUNNER } from "./runner/serve.ts";
 import { readRunnerRows } from "./runner/hub.ts";
 import { readRunnerEndpoints } from "./runner/endpoints.ts";
@@ -72,12 +70,12 @@ const RESTART = "systemctl --user restart dori-supervisor.service";
 const LEAD_WAKE_WARNING_THRESHOLD = 20;
 
 /**
- * The lead host's units (host-runtimes.ts hostServices): herdr-server only while herdr is used here, hc-core while hc is. hc-core
- * is a oneshot that hands the core to hc's own transient units, so enabled is OK whatever its active state.
+ * The lead host's units (host-runtimes.ts hostServices): hc-core and the supervisor. hc-core is a oneshot that hands the
+ * core to hc's own transient units, so enabled is OK whatever its active state.
  */
-const units = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
+const units = async (d: DoctorDeps): Promise<Check[]> => {
   const checks: Check[] = [];
-  const states = await Promise.all(hostServices(rt).map((name) => unitState(d.run, name)));
+  const states = await Promise.all(hostServices().map((name) => unitState(d.run, name)));
   const [legacy, procs] = await Promise.all([unitState(d.run, LEGACY_PRESENCE), d.run(["pgrep", "-f", "(dori|cli\\.ts) presence"], T)]);
   for (const u of states) {
     const id = `unit ${u.name.replace(/\.service$/, "")}`;
@@ -319,27 +317,20 @@ const workerLabel = (d: Pick<DoctorDeps, "home">): string | undefined => {
 };
 
 /**
- * The repair for an unreachable herdr on this host: the lead host's own unit (dori setup), or on a worker machine the
- * lead host's `dori runner herdr start` (herdr unit installed) or `dori runner install` (none yet).
+ * hc on this host: the binary at HC_MIN_VERSION or later (row `hc`) and its core answering a terminal list (row
+ * `hc core`; the hc client starts the core on demand, hc-core.service at boot).
  */
-export const herdrFix = (d: Pick<DoctorDeps, "home" | "exists">): string => {
-  const label = workerLabel(d);
-  if (!label) return "systemctl --user start herdr-server.service";
-  return herdrUnitInstalled({ home: d.home, exists: d.exists })
-    ? `on the lead host: dori runner herdr start --machine ${label}`
-    : `on the lead host: dori runner install --machine ${label} (installs the herdr unit)`;
-};
-
-/** This host's herdr server, only while herdr is used here (host-runtimes.ts); otherwise one OK row saying why not. */
-const herdr = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
-  if (!rt.herdr) return [ok("herdr", `not used on this host (${runtimesNote(rt)})`)];
-  const up = await d.run(["herdr", "workspace", "list"], T);
-  if (up.code !== 0) return [fail("herdr", "server not reachable", herdrFix(d))];
-  const procs = await d.run(["pgrep", "-f", "herdr server"], T);
-  const n = procs.code === 0 ? procs.out.split("\n").filter(Boolean).length : 0;
-  return [n > 1
-    ? fail("herdr", `${n} herdr server processes`, "keep the unit's server and stop the others: pgrep -af 'herdr server'")
-    : ok("herdr", "reachable, one server")];
+const hc = async (d: DoctorDeps): Promise<Check[]> => {
+  const version = await hcVersion(d.run);
+  if (!version || !versionAtLeast(version, HC_MIN_VERSION)) {
+    return [fail("hc", version ? `hc ${version} is older than ${HC_MIN_VERSION}` : "hc is not on PATH", `curl -fsSL ${HC_INSTALL_URL} | sh (or hc update)`)];
+  }
+  try {
+    const terminals = await listPanes(d.run);
+    return [ok("hc", `hc ${version}`), ok("hc core", `reachable, ${terminals.length} terminal${terminals.length === 1 ? "" : "s"}`)];
+  } catch (e) {
+    return [ok("hc", `hc ${version}`), fail("hc core", `not reachable: ${(e instanceof Error ? e.message : String(e)).slice(0, 200)}`, `systemctl --user start ${HC_CORE_UNIT} (or hc server start)`)];
+  }
 };
 
 const paths = async (d: DoctorDeps): Promise<Check[]> => {
@@ -355,12 +346,10 @@ const paths = async (d: DoctorDeps): Promise<Check[]> => {
 };
 
 /**
- * The lead pane and lanes workspace the supervisor manages (dori state, not the config): the pane must exist in its
- * runtime and, while herdr is used on this host, the lanes workspace in herdr (a host without herdr has none). One that
- * is missing is a WARN, since the supervisor creates it at start and a launch re-creates the lanes workspace.
- * Legacy config keys naming them are reported as ignored.
+ * The lead pane the supervisor manages (dori state, not the config): an hc terminal that must still exist. None recorded
+ * is a WARN: the supervisor opens a new hc terminal at start. Legacy config keys naming panes are reported as ignored.
  */
-const managedPanes = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
+const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
   const c = d.config;
   const where = managedPanesPath(c.stateDir);
   const checks: Check[] = [];
@@ -369,52 +358,18 @@ const managedPanes = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> =
     const legacy = raw && typeof raw === "object" && !Array.isArray(raw) ? legacyPaneKeys(raw as Record<string, unknown>) : [];
     if (legacy.length) checks.push(warn("config pane keys", `${legacy.join(", ")} in ${d.configPath} are ignored; the supervisor manages them in ${where}`, `delete ${legacy.join(", ")} from ${d.configPath}`));
   } catch { /* the config check above already reports an unreadable config */ }
-  checks.push(...await leadRuntime(d));
-  const restart = "systemctl --user restart dori-supervisor.service";
-  if (!c.leadPane) checks.push(warn("leadPane", `no lead pane recorded in ${where}`, restart));
-  const laneWorkspace = rt.herdr ? c.laneWorkspace : "";
-  if (rt.herdr && !laneWorkspace) checks.push(warn("lanes workspace", `no lanes workspace recorded in ${where}`, restart));
-  if (!c.leadPane && !laneWorkspace) return checks;
-  const leadRuntimeKind = c.leadPane ? runtimeOfPane(c.leadPane) : "herdr";
+  if (!c.leadPane) return [...checks, warn("leadPane", `no lead pane recorded in ${where}`, RESTART)];
   try {
-    if (c.leadPane) {
-      const found = (await paneRow(d.run, c.leadPane)) !== undefined;
-      const runtime = runtimeOfPane(c.leadPane);
-      checks.push(found ? ok("leadPane", `${c.leadPane} exists in ${runtime}`) : fail("leadPane", `${c.leadPane} is not a ${runtime} pane`, "dori lead-restart"));
-    }
-    if (laneWorkspace) {
-      const listed = await d.run(["herdr", "workspace", "list"], T);
-      let found = false;
-      try { found = listed.code === 0 && (JSON.parse(listed.out) as { result?: { workspaces?: { workspace_id?: string }[] } }).result?.workspaces?.some((w) => w.workspace_id === c.laneWorkspace) === true; } catch { found = false; }
-      checks.push(found ? ok("lanes workspace", `${c.laneWorkspace} exists in herdr`) : warn("lanes workspace", `${c.laneWorkspace} is not a herdr workspace; the next launch or supervisor start finds or creates one`, restart));
-    }
+    checks.push((await paneRow(d.run, c.leadPane)) !== undefined ? ok("leadPane", `${c.leadPane} exists in hc`) : fail("leadPane", `${c.leadPane} is not an hc terminal any more`, "dori lead-restart"));
   } catch {
-    checks.push(fail("leadPane", `cannot list ${leadRuntimeKind} panes`, leadRuntimeKind === "hc" ? "hc server start" : "systemctl --user start herdr-server.service"));
+    checks.push(fail("leadPane", "cannot list hc terminals", `systemctl --user start ${HC_CORE_UNIT} (or hc server start)`));
   }
-  return checks;
-};
-
-/**
- * config `leadRuntime`: the runtime the lead's pane is on now (a WARN while it is on the other one, until the next lead
- * restart moves it), and with hc, that hc is on this host at HC_MIN_VERSION or later.
- */
-const leadRuntime = async (d: DoctorDeps): Promise<Check[]> => {
-  const { leadRuntime: want, leadPane } = d.config;
-  const checks: Check[] = [];
-  if (want === "hc") {
-    const version = await hcVersion(d.run);
-    checks.push(version && versionAtLeast(version, HC_MIN_VERSION) ? ok("lead hc", `hc ${version}`)
-      : fail("lead hc", version ? `hc ${version} is older than ${HC_MIN_VERSION}` : "hc is not on PATH", `curl -fsSL ${HC_INSTALL_URL} | sh (or hc update), or set "leadRuntime": "herdr" in ${d.configPath}`));
-  }
-  const have = leadPane ? runtimeOfPane(leadPane) : want;
-  checks.push(have === want ? ok("leadRuntime", want)
-    : warn("leadRuntime", `config leadRuntime is ${want} but the lead pane ${leadPane} is on ${have}; it moves at the next lead restart`, "dori lead-restart"));
   return checks;
 };
 
 const isDiscord = (d: DoctorDeps): boolean => Boolean(d.config.discord) || d.config.discordChannels.length > 0 || d.token !== undefined;
 
-const config = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
+const config = async (d: DoctorDeps): Promise<Check[]> => {
   if (d.configError) return [fail("config", `${d.configPath} does not load: ${d.configError}`, "fix the JSON, or dori setup")];
   if (!d.exists(d.configPath)) return [fail("config", `${d.configPath} is missing`, "dori setup")];
   const c = d.config;
@@ -434,7 +389,7 @@ const config = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
   if (blank.length) checks.push(warn("lead command", `${blank.join(", ")} set but blank; the lead uses the lane default`, `set a value or remove ${blank.join(", ")} from ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
-  checks.push(...await managedPanes(d, rt));
+  checks.push(...await managedPanes(d));
   return checks;
 };
 
@@ -474,7 +429,6 @@ export const configSources = (d: Pick<DoctorDeps, "config" | "configPath" | "con
   checks.push(
     line("autopilot.threadChannel", c.autopilot.threadChannel ? "file" : "derived from discordChannels[0]", autopilotThreadChannelOf(c)),
     line("leadPane", env.DORI_LEAD_PANE ? "env DORI_LEAD_PANE" : "derived from the managed panes state", c.leadPane),
-    line("laneWorkspace", "derived from the managed panes state", c.laneWorkspace),
   );
   const kept = CONFIG_FILE_KEYS as readonly string[];
   const ignored = Object.keys(raw).filter((key) => !kept.includes(key) && !legacyPaneKeys(raw).includes(key));
@@ -655,25 +609,9 @@ export const runnerChecks = (d: Pick<DoctorDeps, "config" | "clock" | "home" | "
     else if (row.proto === MIN_PROTO) problems.push(`proto ${row.proto} gives its lanes no dori toodo reads (they need proto ${PROTO})`);
     if (row.outbox && (row.outbox.unacked >= OUTBOX_LARGE_ROWS || row.outbox.oldestAgeMs >= OUTBOX_LARGE_AGE_MS)) problems.push(`outbox ${row.outbox.unacked} unacked, oldest ${Math.floor(row.outbox.oldestAgeMs / 3_600_000)} h`);
     if (restarts(row.label) >= RESTART_CIRCUIT_MAX) problems.push(`restart circuit open (${restarts(row.label)} restarts in the last hour)`);
-    if (row.herdr === "down" || row.herdr === "hung" || row.herdr === "elevated") {
-      // The runner saw its machine's herdr stop answering: its lanes cannot run there and their recovery is held.
-      const since = row.herdrSince ? ` since ${new Date(row.herdrSince).toISOString()}` : "";
-      const herdrProblem = row.herdr === "down" ? `herdr down${since} (no server process)`
-        : row.herdr === "hung" ? `herdr hung${since} (the server process runs but does not answer)`
-          : `herdr elevated${since} (the server runs as administrator and refuses the unelevated runner)`;
-      // An elevated server cannot be ended by the unelevated runner, so dori runner herdr restart would be refused too.
-      const command = row.herdr === "down"
-        ? `dori runner herdr start --machine ${row.label}`
-        : row.herdr === "hung"
-          ? `dori runner herdr restart --machine ${row.label} --yes (ends every lane pane there; without --yes it lists them)`
-          : HERDR_ELEVATED_FIX;
-      const upgrade = row.proto !== undefined && row.proto < 4 ? `dori runner install --machine ${row.label} to upgrade (proto ${row.proto} has no host.herdr), then ` : "";
-      checks.push(fail(id, [herdrProblem, ...problems].join("; "), `${upgrade}${command}`));
-      continue;
-    }
     checks.push(problems.length
       ? warn(id, problems.join("; "), `dori runner probe on that host; dori runner install --machine ${row.label} to upgrade`)
-      : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}${row.herdr ? `, herdr ${row.herdr}` : ""}`));
+      : ok(id, `proto ${row.proto ?? "-"}, gen ${row.maxGen}, restarts1h ${restarts(row.label)}`));
   }
   // Runners whose lanes run without a sandbox (launch-sandbox.ts sandboxChoice): Windows by design, others by opt-in.
   for (const label of new Set([...rows.map((row) => row.label), ...Object.keys(d.config.runners ?? {})])) {
@@ -720,21 +658,8 @@ export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | 
   return [ok(id, entries.length ? `${entries.length} secrets` : "no secrets stored")];
 };
 
-/**
- * host-runtimes.ts for this host: config leadRuntime and leadPane, the local runner-config and the open local lanes (none
- * when unreadable). Also the runtimes this run's pane lists ask (listHostRuntimes), so a host without herdr lists no herdr.
- */
-const doctorRuntimes = async (d: DoctorDeps): Promise<HostRuntimes> => {
-  const registry = new Registry(d.config.stateDir);
-  let lanes: Awaited<ReturnType<Registry["open"]>> = [];
-  // An unreadable registry is the lane recovery check's report; the runtimes then follow config and runner-config alone.
-  if (d.exists(registry.dir)) try { lanes = await registry.open(); } catch { lanes = []; }
-  return listHostRuntimes(d.config, d.home, lanes);
-};
-
 export const runDoctor = async (d: DoctorDeps): Promise<Check[]> => {
-  const rt = await doctorRuntimes(d);
-  return (await Promise.all([units(d, rt), herdr(d, rt), paths(d), config(d, rt), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), Promise.resolve(homeEntries(d)), secretStoreChecks(d)])).flat();
+  return (await Promise.all([units(d), hc(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), Promise.resolve(homeEntries(d)), secretStoreChecks(d)])).flat();
 };
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);

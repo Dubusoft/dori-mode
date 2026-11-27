@@ -370,10 +370,6 @@ export class Registry {
     this.migrateLegacy();
     return [this.legacyDir, this.oldClosedDir].flatMap((dir) => existsSync(dir) ? readdirSync(dir).map((f): [string, string] => [join(dir, f), f]) : []);
   }
-
-  async byPane(pane: string, machine?: string): Promise<Lane | null> {
-    return (await this.open()).find((l) => l.pane === pane && l.machine === machine) ?? null;
-  }
 }
 
 /** Lock, fresh load, mutate, save: a stale copy can never overwrite newer state (objection, pause). */

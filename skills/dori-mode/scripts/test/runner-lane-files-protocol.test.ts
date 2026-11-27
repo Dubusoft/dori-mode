@@ -64,7 +64,7 @@ describe("lane file wire types: round trips", () => {
   });
 
   test("lane.recover carries a fresh brief/files pair, and its legacy form without them still decodes", () => {
-    const fresh = { cmdId: "op-2", key: "lane-a", session: "s", tabWorkspace: "lanes", briefText: BRIEF, files: briefFiles(BINARY_TREE) };
+    const fresh = { cmdId: "op-2", key: "lane-a", session: "s", briefText: BRIEF, files: briefFiles(BINARY_TREE) };
     expect(viaSupervisor(supervisorCommand(HEAD, 3, "lane.recover", fresh)).body).toEqual(fresh);
     const legacy = { cmdId: "op-3", key: "lane-a" };
     expect(viaSupervisor(supervisorCommand(HEAD, 4, "lane.recover", legacy)).body).toEqual(legacy);
@@ -207,7 +207,7 @@ describe("historical proto 4 frames still decode without the new fields", () => 
       proto: 4, gen: 2, label: "r1", hostId: "h", cmdAck: 9, version: "0.9", inventory: [{ key: "lane-a", pane: "p", tab: "t", session: "s" }, { key: "lane-b", pane: "q", tab: "u" }],
     };
     expect(viaRunner(runnerControl(HEAD, "hello", hello)).body).toEqual(hello);
-    const legacyStart = startBody({ keywords: "go", session: "s", target: { workspace: "w" }, heavySlots: 1, heavyMaxLoad: 2.5, tabWorkspace: "lanes" });
+    const legacyStart = startBody({ keywords: "go", session: "s", heavySlots: 1, heavyMaxLoad: 2.5 });
     expect(viaSupervisor(supervisorCommand(HEAD, 5, "lane.start", legacyStart)).body).toEqual(legacyStart);
     const queryAnswer = { qid: "q", ok: true, detail: "ok", result: { exists: [true, false] } };
     expect(viaRunner(runnerControl(HEAD, "q.result", queryAnswer)).body).toEqual(queryAnswer);

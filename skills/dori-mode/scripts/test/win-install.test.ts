@@ -285,7 +285,6 @@ test("each Windows script exit maps to its result code", async () => {
     [{ code: 124, timedOut: true }, "RUNNER_INSTALL_UNREACHABLE"],
     [{ code: INSTALL_EXIT.notLinux, err: "unsupported Windows host: ARM64 build 22631" }, "RUNNER_INSTALL_UNSUPPORTED", "x64 Windows 10 1809"],
     [{ code: INSTALL_EXIT.noBun, err: "bun checksum mismatch" }, "RUNNER_INSTALL_NO_BUN", "pinned Windows build"],
-    [{ code: INSTALL_EXIT.noHerdr }, "RUNNER_INSTALL_NO_HERDR"],
     [{ code: INSTALL_EXIT.enroll, err: "enrollment failed with exit 1" }, "RUNNER_INSTALL_ENROLL_FAILED"],
     // PowerShell's CLIXML progress records after the real error line are skipped.
     [{ code: INSTALL_EXIT.enroll, err: "RUNNER_DIR_UNSAFE bin\\dori owner\nenrollment failed with exit 1\n#< CLIXML\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"></Obj></Objs>" }, "RUNNER_INSTALL_ENROLL_FAILED", "enrollment failed with exit 1"],

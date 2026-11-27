@@ -6,7 +6,7 @@
 
 # omo-dori-mode-experimental
 
-Dori 모드는 코딩 에이전트 세션 하나를 늘 켜져 있는 메신저 에이전트로 바꿉니다. 사용자는 디스코드에서 봇 하나와 이야기합니다. Dori는 일마다 herdr 탭에 에이전트 세션을 따로 띄워 맡기고, 자기가 띄운 세션을 모두 기억하며, 일이 정말 끝났을 때만 닫습니다. PR이 머지되고, 이슈가 닫히고, 버전이 배포된 다음에요.
+Dori 모드는 코딩 에이전트 세션 하나를 늘 켜져 있는 메신저 에이전트로 바꿉니다. 사용자는 디스코드에서 봇 하나와 이야기합니다. Dori는 일마다 hc 터미널에 에이전트 세션을 따로 띄워 맡기고, 자기가 띄운 세션을 모두 기억하며, 일이 정말 끝났을 때만 닫습니다. PR이 머지되고, 이슈가 닫히고, 버전이 배포된 다음에요.
 
 스킬(`skills/dori-mode/SKILL.md`와 references)과 bun + TypeScript로 만든 작은 CLI `dori`로 구성됩니다. 아직 실험 단계라 거친 부분이 남아 있어요.
 
@@ -19,14 +19,14 @@ bash -c "$(gh api -H 'Accept: application/vnd.github.raw' repos/Dubusoft/dori-mo
 
 GitHub 로그인으로 저장소를 `~/.dori/src`에 받고(그 체크아웃의 git은 계속 `gh`에서 자격을 받아 이후 업데이트도 됩니다), 스킬을 `~/.agents/skills/dori-mode`에 링크하고, `bun link`로 `dori`를 PATH에 올린 뒤 `dori setup`을 실행합니다. 에이전트가 다른 곳에서 스킬을 읽는다면 `SKILLS_DIR`를 지정하세요.
 
-`dori setup`은 디스코드 봇 토큰(`~/.dori/env`에 권한 600으로 저장하고 화면에 보여 주지 않습니다), 메인 채널 ID(토큰으로 읽기 권한을 확인합니다), 기본 모델, 작업 디렉터리, 상태 디렉터리를 묻고, herdr 리드 패인과 `lanes` 워크스페이스를 만들거나 재사용합니다. 원하면 부팅 때 herdr, 슈퍼바이저, 프레즌스가 뜨도록 systemd 사용자 유닛도 설치하는데, 시스템 단계마다 먼저 묻습니다. 언제든 다시 실행해도 됩니다. 현재 값이 기본값으로 나오고 Enter를 누르면 그대로 둡니다. 파이프로 bash에 넘기면 물어볼 터미널이 없어서 안내만 출력하니 `dori setup`을 직접 실행하세요. 스크립트용: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
+`dori setup`은 디스코드 봇 토큰(`~/.dori/env`에 권한 600으로 저장하고 화면에 보여 주지 않습니다), 메인 채널 ID(토큰으로 읽기 권한을 확인합니다), 기본 모델, 작업 디렉터리, 상태 디렉터리를 묻고니다. 원하면 부팅 때 hc 코어, 슈퍼바이저, 프레즌스가 뜨도록 systemd 사용자 유닛도 설치하는데, 시스템 단계마다 먼저 묻습니다. 언제든 다시 실행해도 됩니다. 현재 값이 기본값으로 나오고 Enter를 누르면 그대로 둡니다. 파이프로 bash에 넘기면 물어볼 터미널이 없어서 안내만 출력하니 `dori setup`을 직접 실행하세요. 스크립트용: `dori setup --yes --token-file FILE --channel ID [--autostart]`.
 
-그다음 herdr 안에서 에이전트를 열고 "Dori mode"라고 말하면 됩니다.
+그다음 에이전트를 열고 "Dori mode"라고 말하면 됩니다.
 
 ## 필요한 것
 
 - [bun](https://bun.sh) 1.3 이상, git
-- [herdr](https://herdr.dev): 레인이 돌아가는 터미널 멀티플렉서 (`leadRuntime`과 `laneRuntime`이 `hc`(herdr-core)인 호스트에서는 없어도 됩니다)
+- hc(herdr-core): 리드와 레인이 돌아가는 헤드리스 터미널 런타임 (`curl -fsSL https://releases.herdr.dev/core/install.sh | sh`)
 - 스킬을 읽는 코딩 에이전트 ([OmO](https://github.com/code-yeongyu/oh-my-openagent) 기준으로 만들었고, 에이전트 실행 명령은 설정으로 바꿀 수 있습니다)
 - PR 머지와 이슈 종료 확인용 `gh`(GitHub CLI), 배포 버전 확인용 `npm`
 - 봇 자체를 위한 [agent-messenger](https://github.com/agent-messenger/agent-messenger)
@@ -38,10 +38,10 @@ GitHub 로그인으로 저장소를 `~/.dori/src`에 받고(그 체크아웃의 
 아무것도 없는 상태에서 첫 작업이 끝날 때까지:
 
 1. **디스코드 봇 만들기.** [Discord Developer Portal](https://discord.com/developers/applications)에서 애플리케이션을 만들고, **Bot** 페이지에서 **Message Content Intent**를 켜고 토큰을 복사합니다. 봇을 서버에 초대하고(OAuth2 URL generator, `bot` scope), 봇과 대화할 채널의 ID를 복사합니다(개발자 모드를 켠 뒤 채널 우클릭, 채널 ID 복사).
-2. **herdr를 실행**(`herdr`)하고 그 안에서 위의 한 줄 설치를 실행합니다. `dori setup`이 그 토큰과 채널 ID, 모델과 폴더를 묻고 `dori-lead` 패인과 `lanes` 워크스페이스를 만듭니다.
+2. **hc를 설치**하고 위의 한 줄 설치를 실행합니다. `dori setup`이 그 토큰과 채널 ID, 모델과 폴더를 묻습니다.
 3. **설치 확인**: `dori doctor`가 항목마다 OK, WARN, FAIL을 보여 주고, 실패한 항목에는 정확한 해결 방법을 알려 줍니다.
 4. **켜기**: `dori-lead` 패인에서 코딩 에이전트를 열고 "Dori mode"라고 말합니다. Dori가 자기 이름을 묻고, 봇으로 인사한 뒤 온보딩을 제안합니다.
-5. **일 맡기기**: 채널에서 봇에게 예를 들어 "acme/app README 오타 고치고 PR 올려 줘"라고 씁니다. herdr에 레인을 열고, 스레드에 진행 상황을 올리고, PR이 머지되면 레인을 닫습니다.
+5. **일 맡기기**: 채널에서 봇에게 예를 들어 "acme/app README 오타 고치고 PR 올려 줘"라고 씁니다. hc에 레인을 열고, 스레드에 진행 상황을 올리고, PR이 머지되면 레인을 닫습니다.
 
 슬래시 명령, 모니터, 자동 시작까지 포함한 전체 설정 안내는 [`references/setup.md`](skills/dori-mode/references/setup.md)에 있습니다.
 
@@ -65,7 +65,7 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 나머지(시간, 임계값, heavy 슬롯 수)는 기본값으로 충분합니다. 전체 표는 [`references/scripts.md`](skills/dori-mode/references/scripts.md)에 있습니다. `DORI_CONFIG`, `DORI_STATE_DIR`, `DORI_LEAD_PANE` 환경변수를 주면 파일 값 대신 그 값을 씁니다.
 
-리드의 herdr pane과 새 레인 탭이 열리는 workspace는 설정하지 않습니다. 수퍼바이저가 찾아 쓰고, 없으면 만들어서(`Dori` workspace의 `dori-lead` 탭, `lanes` workspace) `<stateDir>/herdr-panes.json`에 기록합니다. 예전 설정의 `leadPane`, `laneWorkspace`, `workspaces`는 한 번 그곳으로 옮겨지고 그 뒤로는 무시됩니다.
+리드의 pane은 설정하지 않습니다. 수퍼바이저가 없으면 hc 터미널 `dori-lead`로 열고 `<stateDir>/herdr-panes.json`에 기록합니다. 예전 설정의 `leadPane`은 한 번 그곳으로 옮겨지고 그 뒤로는 무시됩니다. 남아 있는 `leadRuntime` 키는 무시되고, `dori setup --migrate`가 그것과 로컬 러너 `runner-config.json`의 `laneRuntime`을 지웁니다. 터미널 런타임은 hc 하나뿐입니다.
 
 ## 온보딩
 
@@ -84,7 +84,7 @@ Dori는 사용자의 말투를 따라갑니다. 짧고 편하게, 소문자로 �
 
 ## 세션 레지스트리
 
-레인마다 `~/.dori/state/lanes/` 아래에 JSON 파일이 하나씩 생깁니다. 메신저 스레드와 herdr pane, pane과 에이전트 세션 id를 연결하고, 상태(`working`, `done-claimed`, `verified-done`, `not-done`, `closed`)와 그 변화 이력을 남깁니다.
+레인마다 `~/.dori/state/lanes/` 아래에 JSON 파일이 하나씩 생깁니다. 메신저 스레드와 hc pane, pane과 에이전트 세션 id를 연결하고, 상태(`working`, `done-claimed`, `verified-done`, `not-done`, `closed`)와 그 변화 이력을 남깁니다.
 
 `dori sync`는 이 기록을 실제로 떠 있는 pane과 비교해서 어긋난 곳을 알려 줍니다. 사라진 pane, 바뀐 세션 id, 끝났다는 걸 증명할 방법이 없는 레인 같은 것들입니다. 아무것도 지우지 않습니다. `--write`를 붙이면 찾은 세션 id를 저장합니다.
 
@@ -159,7 +159,7 @@ CI는 타입 검사만 돌립니다. 테스트는 로컬에서 돌립니다.
 ```sh
 cd skills/dori-mode/scripts
 bun install
-bun test           # 가짜 herdr, git, gh로 동작을 확인하는 테스트
+bun test           # 가짜 hc, git, gh로 동작을 확인하는 테스트
 bunx tsc --noEmit  # 타입 검사
 ```
 

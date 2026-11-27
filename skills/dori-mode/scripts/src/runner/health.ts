@@ -1,8 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type { Runner } from "../run.ts";
 import { RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { herdrElevatedError, winHerdrServers } from "./herdr-watch.ts";
 
 /**
  * The runner's health file and the probe that reads it. The runner rewrites `<runnerDir>/health` every 15 s with
@@ -10,8 +8,6 @@ import { herdrElevatedError, winHerdrServers } from "./herdr-watch.ts";
  * probe --json` runs on the runner's host (over ssh from the supervisor) and decides from the file's age and whether
  * its pid is alive: healthy (alive, younger than 60 s), stalled (alive, 60 to 120 s) or dead (no file, no such
  * process, or older than 120 s). The age is taken from the file's mtime, so it uses the host's own clock both ways.
- * The probe also reads the host's herdr once (`probeHerdr`), so an ssh diagnosis shows it; the verdict and exit code
- * stay the runner's alone.
  */
 
 export const HEALTH_WRITE_MS = 15_000;
@@ -94,27 +90,4 @@ export const probe = (deps: ProbeDeps): ProbeResult => {
   if (!alive) return { process: "dead", verdict: "dead", ...base };
   const verdict: Verdict = healthAgeMs > HEALTH_DEAD_MS ? "dead" : healthAgeMs > HEALTH_FRESH_MS ? "stalled" : "healthy";
   return { process: "alive", verdict, ...base };
-};
-
-/**
- * herdr on this host: answering, no `herdr server` process, a server process that does not answer, a server that runs
- * elevated and refuses this unelevated client (Windows), or unknown (pgrep failed).
- */
-export type HerdrProbe = "up" | "down" | "hung" | "elevated" | "unknown";
-export const HERDR_PROBE_TIMEOUT_MS = 5_000;
-
-/**
- * One reading of the host's herdr, as `dori doctor` reads it: `herdr workspace list` answering is up; otherwise a
- * `herdr server` process (pgrep) means hung and none means down. A single reading, with no retry or debounce.
- */
-export const probeHerdr = async (run: Runner, opts: { platform?: string; user?: string } = {}): Promise<HerdrProbe> => {
-  const list = await run(["herdr", "workspace", "list"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS });
-  if (list.code === 0) return "up";
-  if ((opts.platform ?? process.platform) === "win32") {
-    if (herdrElevatedError(`${list.err}\n${list.out}`, "win32")) return "elevated";
-    const ids = await winHerdrServers(run, opts.user);
-    return ids ? (ids.length ? "hung" : "down") : "unknown";
-  }
-  const procs = await run(["pgrep", "-f", "herdr server"], { timeoutMs: HERDR_PROBE_TIMEOUT_MS });
-  return procs.code === 0 ? "hung" : procs.code === 1 ? "down" : "unknown";
 };

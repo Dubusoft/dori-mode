@@ -1,17 +1,7 @@
-import type { FlowDeps } from "./done-flow.ts";
+import { resolveLaneContext } from "./runner/lane-identity.ts";
 
-/**
- * The lane this process runs inside, or undefined for the lead. `dori launch` sets DORI_LANE_KEY in a local lane's
- * pane; a pane registered to an open lane (HERDR_PANE_ID) counts as that lane too, so unsetting the variable is not
- * enough. The lead pane (config.leadPane) is never a lane.
- */
-export const callerLane = async (deps: Pick<FlowDeps, "registry" | "config">, env: Readonly<Record<string, string | undefined>> = process.env): Promise<string | undefined> => {
-  const key = env.DORI_LANE_KEY?.trim();
-  if (key) return key;
-  const pane = env.HERDR_PANE_ID?.trim();
-  if (!pane || pane === deps.config.leadPane) return undefined;
-  return (await deps.registry.byPane(pane))?.key;
-};
+/** The lane this process runs inside (`DORI_LANE_KEY`, lane-identity.ts), or undefined for the lead. */
+export const callerLane = (env: Readonly<Record<string, string | undefined>> = process.env): string | undefined => resolveLaneContext(env);
 
 /** Why a lane may not run `command` on lane `target`, or undefined when it may (the lead always may). */
 export const laneActRefusal = (caller: string | undefined, command: string, target: string): string | undefined =>

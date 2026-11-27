@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -8,7 +8,8 @@ import {
   pruneDoriConfig, pruneRunnerConfig, readSeenKeys, RUNNER_CONFIG_KEYS, writeSeenKeys,
 } from "../src/config-keys.ts";
 import { CONFIG_FILE_KEYS } from "../src/config.ts";
-import { RUNNER_POLICY_KEYS } from "../src/runner/policy.ts";
+import { pruneLocalRunnerConfig } from "../src/host-runtimes.ts";
+import { POLICY_FILE, RUNNER_POLICY_KEYS } from "../src/runner/policy.ts";
 
 const specOf = (specs: readonly KeySpec[], key: string): KeySpec => specs.find((s) => s.key === key)!;
 const dori = (key: string) => specOf(DORI_CONFIG_KEYS, key);
@@ -40,6 +41,32 @@ test("pruneRunnerConfig drops unknown top keys and guard subkeys", () => {
   const { next, removed } = pruneRunnerConfig({ agents: {}, bogus: 1, guard: { loadAlert: 4, foo: 2 } });
   expect(next).toEqual({ agents: {}, guard: { loadAlert: 4 } });
   expect(removed).toEqual(["bogus", "guard.foo"]);
+});
+
+test("pruneLocalRunnerConfig removes a retired laneRuntime from the local runner-config with a backup and one line; nothing else is touched", async () => {
+  const home = mkdtempSync(join(tmpdir(), "dori-prune-"));
+  try {
+    const log: string[] = [];
+    expect(await pruneLocalRunnerConfig(home, (line) => { log.push(line); })).toEqual([]);
+    const dir = join(home, ".dori", "runner");
+    const path = join(dir, POLICY_FILE);
+    const old = `${JSON.stringify({ agents: { omo: ["omo"] }, laneRuntime: "hc" })}\n`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, old);
+    expect(await pruneLocalRunnerConfig(home, (line) => { log.push(line); })).toEqual(["laneRuntime"]);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ agents: { omo: ["omo"] } });
+    expect(readFileSync(`${path}.bak`, "utf8")).toBe(old);
+    expect(log).toEqual([`SETUP_RUNNER_KEY_REMOVED laneRuntime (hc is the only terminal runtime; every lane opens on hc) from ${path}`]);
+    expect(await pruneLocalRunnerConfig(home, (line) => { log.push(line); })).toEqual([]);
+    expect(log).toHaveLength(1);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("the retired runtime keys are in neither spec list", () => {
+  expect(DORI_CONFIG_KEYS.map((s) => s.key)).not.toContain("leadRuntime");
+  expect(RUNNER_CONFIG_KEYS.map((s) => s.key)).not.toContain("laneRuntime");
 });
 
 test("parseValue reads each kind and names the key on bad input", () => {

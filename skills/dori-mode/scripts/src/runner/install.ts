@@ -39,29 +39,21 @@ import { HC_CORE_UNIT, HC_CORE_UNIT_TEMPLATE, HC_INSTALL_URL, HC_LAUNCHD_LABEL, 
  * when no GUI session exists), kickstarts it, and records that domain in `~/.dori/runner/launchd-domain`. Nothing
  * outside `~/.dori` and that plist is touched.
  *
- * Both systems also get a herdr unit (design: runner host herdr lifecycle, section 5.3): `herdr` must be found on the
- * user's login-shell PATH, which together with the login shell becomes the unit's PATH and SHELL (every lane shell
- * herdr opens inherits them). Linux writes `~/.config/systemd/user/herdr-server.service`, which the runner unit only
- * Wants= and is After=; macOS writes the launchd agent `~/Library/LaunchAgents/com.dori.herdr.plist` (KeepAlive,
- * ThrottleInterval 30: a second `herdr server` on a taken socket exits 1 at once, so the retries are spaced out). The
- * script never stops or restarts a running herdr, since that ends every lane on the host: a herdr the unit already runs
- * is left alone (a reinstall or upgrade only rewrites the unit file), a herdr started by hand gets the unit enabled but
- * not started (macOS: `RunAtLoad` false), and only when no herdr answers is the unit started. It prints
- * `DORI_HERDR started|managed|unmanaged` on success. herdr is optional on a host that has hc (herdr-core) on the login
- * PATH instead: every herdr unit and plist step is skipped and the script prints `DORI_HERDR absent`.
- *
- * hc found on the login PATH gets its core autostart (runtime/hc.ts HC_CORE_UNIT, HC_LAUNCHD_LABEL): Linux writes
- * `~/.config/systemd/user/hc-core.service`, enables it and starts it (`hc server start` is a no-op while a core runs);
+ * hc (herdr-core), the only terminal runtime, must be found on the user's login-shell PATH, which becomes its core's
+ * PATH (every lane shell hc opens inherits it); without it the script exits 7 before writing anything. Its core gets an
+ * autostart (runtime/hc.ts HC_CORE_UNIT, HC_LAUNCHD_LABEL): Linux writes `~/.config/systemd/user/hc-core.service`, which
+ * the runner unit only Wants= and is After=, enables it and starts it (`hc server start` is a no-op while a core runs);
  * macOS writes `~/Library/LaunchAgents/com.dori.hc.plist` (`hc serve`) into the runner's launchd domain and bootstraps
  * it only when it is not loaded yet (a loaded agent is never booted out: that would end the core and its lanes). It
- * prints `DORI_HC enabled`, or `DORI_HC absent` without hc.
+ * prints `DORI_HC enabled` on success.
  *
  * Script exit codes: 0 installed; 3 no usable `bun`; 4 unsupported OS; 5 enrollment refused or failed; 6 service
- * manager (systemd, linger or launchd) failed; 7 neither `herdr` nor `hc` on the login PATH; 8 a POSIX shell on Windows (Git Bash,
+ * manager (systemd, linger or launchd) failed; 7 no `hc` on the login PATH; 8 a POSIX shell on Windows (Git Bash,
  * MSYS, Cygwin), which `installRunner` retries as a Windows install; 9 enrollment response needed; anything else is a generic failure.
  * ssh's own 255 or a timeout is unreachable.
  *
- * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead, with the same exit code meanings.
+ * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead, with the same exit code meanings
+ * (hc has no Windows build, so a Windows install never exits 7).
  * Nothing travels on ssh's stdin there (a large script streamed into a PowerShell console host's stdin does not reliably
  * finish): each pass uploads the script with scp as `.dori-runner-install-<random>.ps1` into the user's profile directory
  * (the scp start directory on Windows OpenSSH), then runs the short `winRun` encoded command over ssh, which reads that
@@ -71,10 +63,6 @@ import { HC_CORE_UNIT, HC_CORE_UNIT_TEMPLATE, HC_INSTALL_URL, HC_LAUNCHD_LABEL, 
 export const RUNNER_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-remote.service");
 export const RUNNER_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-runner-launchd.plist");
 export const RUNNER_LAUNCHD_LABEL = "com.dori.runner";
-export const HERDR_REMOTE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "herdr-runner-remote.service");
-export const HERDR_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-herdr-launchd.plist");
-export const HERDR_LAUNCHD_LABEL = "com.dori.herdr";
-export const HERDR_UNIT = "herdr-server.service";
 export const RUNNER_CLI_ENTRY = join(import.meta.dir, "bin.ts");
 export const INSTALL_TIMEOUT_MS = 180_000;
 /** The ssh step of a Windows pass: a first install downloads and expands the pinned Bun zip, perhaps twice. */
@@ -83,42 +71,28 @@ const HEREDOC = "DORI_RUNNER_EOF";
 const LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ENROLL_VALUE = /^[A-Za-z0-9_:=+/.-]+$/;
 
-export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6, noHerdr: 7, windowsShell: 8, enrollPending: 9 } as const;
+export const INSTALL_EXIT = { noBun: 3, notLinux: 4, enroll: 5, systemd: 6, noHc: 7, windowsShell: 8, enrollPending: 9 } as const;
 
 export type InstallFailure =
   | "RUNNER_INSTALL_UNREACHABLE"
   | "RUNNER_INSTALL_UNSUPPORTED"
   | "RUNNER_INSTALL_NO_BUN"
-  | "RUNNER_INSTALL_NO_HERDR"
+  | "RUNNER_INSTALL_NO_HC"
   | "RUNNER_INSTALL_ENROLL_FAILED"
   | "RUNNER_LISTEN_REFUSED"
   | "RUNNER_INSTALL_FAILED";
-/**
- * What the install did with herdr: started its unit, found the unit already running it, found a herdr started by hand,
- * or found no herdr (an hc host: no herdr unit at all).
- */
-export type HerdrInstall = "started" | "managed" | "unmanaged" | "absent";
-/** What the install did with hc: wrote and enabled its core autostart unit (or launchd agent), or found no hc. */
-export type HcInstall = "enabled" | "absent";
+/** What the install did with hc: wrote and enabled its core autostart unit (or launchd agent); `DORI_HC enabled`. */
+export type HcInstall = "enabled";
 export type InstallResult =
-  | { readonly ok: true; readonly version: string; readonly herdr?: HerdrInstall; readonly hc?: HcInstall }
+  | { readonly ok: true; readonly version: string; readonly hc?: HcInstall }
   | { readonly ok: false; readonly code: InstallFailure; readonly detail: string };
 
-/** The herdr part of the `RUNNER_INSTALLED` line, followed by the hc part when the script reported one. */
-export const herdrInstallNote = (herdr: HerdrInstall | undefined, hc?: HcInstall): string =>
-  (herdr === "started" ? "herdr=started (by its unit)"
-    : herdr === "managed" ? "herdr=managed (its unit was already running it; left alone)"
-      : herdr === "unmanaged" ? "herdr=unmanaged (running, not from its unit; the unit takes over when it stops)"
-        : herdr === "absent" ? "herdr=absent (not installed; hc runs this host's lanes)"
-          : "herdr=unknown")
-  + (hc === "enabled" ? " hc=enabled (its core starts at boot)" : hc === "absent" ? " hc=absent" : "");
+/** The hc part of the `RUNNER_INSTALLED` line: `hc=enabled ...` when the script reported it (a POSIX host), else `hc=unknown`. */
+export const hcInstallNote = (hc: HcInstall | undefined): string => (hc === "enabled" ? "hc=enabled (its core starts at boot)" : "hc=unknown");
 
-/**
- * The herdr unit and launchd plist texts, and hc's (`hcUnit`, `hcPlist`, defaulting to runtime/hc.ts
- * HC_CORE_UNIT_TEMPLATE and HC_LAUNCHD_PLIST_TEMPLATE); their `@NAME@` markers are filled on the remote host.
- */
-export type HerdrTemplates = { readonly unit: string; readonly plist: string; readonly hcUnit?: string; readonly hcPlist?: string };
-const herdrTemplates = (): HerdrTemplates => ({ unit: readFileSync(HERDR_REMOTE_UNIT_TEMPLATE, "utf8"), plist: readFileSync(HERDR_LAUNCHD_PLIST_TEMPLATE, "utf8") });
+/** hc's core unit and launchd plist texts (default: runtime/hc.ts HC_CORE_UNIT_TEMPLATE, HC_LAUNCHD_PLIST_TEMPLATE); their `@NAME@` markers are filled on the remote host. */
+export type HcTemplates = { readonly unit: string; readonly plist: string };
+const hcTemplates = (): HcTemplates => ({ unit: readFileSync(HC_CORE_UNIT_TEMPLATE, "utf8"), plist: readFileSync(HC_LAUNCHD_PLIST_TEMPLATE, "utf8") });
 
 export type EnrollIssue = { readonly code: string; readonly fingerprint: string; readonly reply?: string };
 
@@ -129,8 +103,8 @@ export type InstallDeps = {
   readonly unitTemplate?: string;
   /** The remote launchd plist template text; defaults to templates/dori-runner-launchd.plist. */
   readonly plistTemplate?: string;
-  /** The herdr unit and plist texts; default to templates/herdr-runner-remote.service and templates/dori-herdr-launchd.plist. */
-  readonly herdrTemplates?: HerdrTemplates;
+  /** hc's core unit and plist texts; default to templates/hc-core.service and templates/dori-hc-launchd.plist. */
+  readonly hcTemplates?: HcTemplates;
   /** The Windows payload templates; default to the files under templates/. */
   readonly windowsTemplates?: WindowsTemplates;
   /** The lane-sandbox wrapper a Linux host gets as `~/.dori/runner/bin/lane-sandbox`; defaults to templates/lane-sandbox.sh. */
@@ -204,13 +178,11 @@ export const installScript = (
   issue: EnrollIssue,
   plist: string = remoteUnit(readFileSync(RUNNER_LAUNCHD_PLIST_TEMPLATE, "utf8"), label, listenAddress),
   agentCommand: readonly string[] = [],
-  herdr: HerdrTemplates = herdrTemplates(),
+  hc: HcTemplates = hcTemplates(),
   laneSandbox: string = laneSandboxScript(LANE_SANDBOX_TEMPLATE),
   laneSandboxMacos: string = laneSandboxScript(LANE_SANDBOX_MACOS_TEMPLATE),
 ): string => {
-  const hcUnit = herdr.hcUnit ?? readFileSync(HC_CORE_UNIT_TEMPLATE, "utf8");
-  const hcPlist = herdr.hcPlist ?? readFileSync(HC_LAUNCHD_PLIST_TEMPLATE, "utf8");
-  for (const text of [bundle, unit, plist, herdr.unit, herdr.plist, hcUnit, hcPlist, laneSandbox, laneSandboxMacos]) {
+  for (const text of [bundle, unit, plist, hc.unit, hc.plist, laneSandbox, laneSandboxMacos]) {
     if (text.split("\n").some((line) => line.replace(/\r$/, "") === HEREDOC)) throw new Error(`install payload contains the heredoc delimiter ${HEREDOC}`);
   }
   const body = (text: string): string => (text.endsWith("\n") ? text : `${text}\n`);
@@ -220,16 +192,12 @@ export const installScript = (
     "OS=$(uname -s)",
     `case "$OS" in Linux|Darwin) ;; MINGW*|MSYS*|CYGWIN*) exit ${INSTALL_EXIT.windowsShell} ;; *) exit ${INSTALL_EXIT.notLinux} ;; esac`,
     // The login shell's PATH (an ssh command gets a non-login one, without what the user's profile adds), read past
-    // whatever the profile prints. herdr and hc are looked up on it before anything is written, and it becomes their
-    // units' PATH, which the lane shells inherit. A host needs at least one of them; an empty HERDR or HC skips its steps.
+    // whatever the profile prints. hc is looked up on it before anything is written, and it becomes its core unit's
+    // PATH, which the lane shells inherit.
     'SH=${SHELL:-/bin/sh}',
     String.raw`LP=$("$SH" -lc 'printf "\nDORI_LOGIN_PATH=%s\n" "$PATH"' </dev/null 2>/dev/null | sed -n 's/^DORI_LOGIN_PATH=//p' | tail -n 1)`,
     '[ -n "$LP" ] || LP=$PATH',
-    'HERDR=$(PATH="$LP:$PATH"; command -v herdr) || HERDR=',
-    'HC=$(PATH="$LP:$PATH"; command -v hc) || HC=',
-    `[ -n "$HERDR" ] || [ -n "$HC" ] || exit ${INSTALL_EXIT.noHerdr}`,
-    // A herdr already answering is never stopped or restarted here: that would end every lane on the host.
-    'if [ -n "$HERDR" ] && "$HERDR" workspace list </dev/null >/dev/null 2>&1; then HUP=1; else HUP=0; fi',
+    `HC=$(PATH="$LP:$PATH"; command -v hc) || exit ${INSTALL_EXIT.noHc}`,
     String.raw`esc() { printf '%s' "$1" | sed -e 's/[\|&]/\\&/g'; }`,
     // A plist value is XML text as well.
     String.raw`xesc() { esc "$(printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"; }`,
@@ -311,20 +279,11 @@ export const installScript = (
     `sed -e "s|@BUN@|$BUN|g" -e "s|@PATH@|$PATH|g" "$R/dori-runner.service.tmp" > "$HOME/.config/systemd/user/dori-runner.service" || exit 1`,
     'rm -f "$R/dori-runner.service.tmp"',
     'chmod 644 "$HOME/.config/systemd/user/dori-runner.service"',
-    'if [ -n "$HERDR" ]; then',
-    `cat > "$R/${HERDR_UNIT}.tmp" <<'${HEREDOC}' || exit 1`,
-    `${body(herdr.unit)}${HEREDOC}`,
-    `sed -e "s|@HERDR_BIN@|$(esc "$HERDR")|g" -e "s|@PATH@|$(esc "$LP")|g" -e "s|@SHELL@|$(esc "$SH")|g" "$R/${HERDR_UNIT}.tmp" > "$HOME/.config/systemd/user/${HERDR_UNIT}" || exit 1`,
-    `rm -f "$R/${HERDR_UNIT}.tmp"`,
-    `chmod 644 "$HOME/.config/systemd/user/${HERDR_UNIT}"`,
-    "fi",
-    'if [ -n "$HC" ]; then',
     `cat > "$R/${HC_CORE_UNIT}.tmp" <<'${HEREDOC}' || exit 1`,
-    `${body(hcUnit)}${HEREDOC}`,
+    `${body(hc.unit)}${HEREDOC}`,
     `sed -e "s|@HC_BIN@|$(esc "$HC")|g" -e "s|@PATH@|$(esc "$LP")|g" "$R/${HC_CORE_UNIT}.tmp" > "$HOME/.config/systemd/user/${HC_CORE_UNIT}" || exit 1`,
     `rm -f "$R/${HC_CORE_UNIT}.tmp"`,
     `chmod 644 "$HOME/.config/systemd/user/${HC_CORE_UNIT}"`,
-    "fi",
     "else",
     `PL="$HOME/Library/LaunchAgents/${RUNNER_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${RUNNER_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
@@ -354,20 +313,11 @@ export const installScript = (
     'if [ "$OS" = Linux ]; then',
     `loginctl enable-linger "$(id -un)" || exit ${INSTALL_EXIT.systemd}`,
     `systemctl --user daemon-reload || exit ${INSTALL_EXIT.systemd}`,
-    `if [ -n "$HERDR" ]; then U="${HERDR_UNIT} dori-runner.service"; else U=dori-runner.service; fi`,
-    `systemctl --user enable $U || exit ${INSTALL_EXIT.systemd}`,
+    `systemctl --user enable ${HC_CORE_UNIT} dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
     // hc's core: `hc server start` is a no-op while a core runs, so starting the oneshot unit never disturbs its lanes.
-    `if [ -n "$HC" ]; then systemctl --user enable ${HC_CORE_UNIT} && systemctl --user start ${HC_CORE_UNIT} || exit ${INSTALL_EXIT.systemd}; CS=enabled; else CS=absent; fi`,
-    // The unit's own herdr is left running (a changed unit file waits for herdr's next start); a herdr started by
-    // hand keeps the socket, and the unit takes over once it stops; with none answering, the unit starts it.
-    'if [ -z "$HERDR" ]; then HS=absent',
-    `elif systemctl --user is-active --quiet ${HERDR_UNIT}; then HS=managed`,
-    'elif [ "$HUP" = 1 ]; then HS=unmanaged',
-    `else systemctl --user reset-failed ${HERDR_UNIT} >/dev/null 2>&1 || :; systemctl --user start ${HERDR_UNIT} || exit ${INSTALL_EXIT.systemd}; HS=started`,
-    "fi",
-    // ignore-dependencies: the runner's Wants= would otherwise start the herdr unit beside a herdr started by hand.
-    `systemctl --user restart --job-mode=ignore-dependencies dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
-    `printf 'DORI_HERDR %s\\nDORI_HC %s\\n' "$HS" "$CS"`,
+    `systemctl --user start ${HC_CORE_UNIT} || exit ${INSTALL_EXIT.systemd}`,
+    `systemctl --user restart dori-runner.service || exit ${INSTALL_EXIT.systemd}`,
+    "printf 'DORI_HC enabled\\n'",
     "exit 0",
     "fi",
     // Enabled before bootstrap: an evacuated runner was disabled, and launchd refuses to bootstrap a disabled service.
@@ -384,42 +334,20 @@ export const installScript = (
     "}",
     'D="gui/$(id -u)"',
     `if ! { launchctl print "$D" >/dev/null 2>&1 && boot "$D"; }; then D="user/$(id -u)"; boot "$D" || exit ${INSTALL_EXIT.systemd}; fi`,
-    // herdr's agent goes into the runner's domain. Loaded already: only the plist file is rewritten (no bootout, which
-    // would stop herdr; launchd reads the file at the next load). A herdr started by hand: RunAtLoad false, and the
-    // KeepAlive retries of a second server (it exits 1 on the taken socket) are spaced by ThrottleInterval.
-    'if [ -n "$HERDR" ]; then',
-    `HP="$HOME/Library/LaunchAgents/${HERDR_LAUNCHD_LABEL}.plist"`,
-    `if launchctl print "$D/${HERDR_LAUNCHD_LABEL}" >/dev/null 2>&1; then HS=managed; RAL=true`,
-    'elif [ "$HUP" = 1 ]; then HS=unmanaged; RAL=false',
-    "else HS=started; RAL=true",
-    "fi",
-    `cat > "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
-    `${body(herdr.plist)}${HEREDOC}`,
-    `sed -e "s|@HERDR_BIN@|$(xesc "$HERDR")|g" -e "s|@PATH@|$(xesc "$LP")|g" -e "s|@SHELL@|$(xesc "$SH")|g" -e "s|@HOME@|$(xesc "$HOME")|g" -e "s|@RUN_AT_LOAD@|$RAL|g" "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp" > "$HP" || exit 1`,
-    `rm -f "$R/${HERDR_LAUNCHD_LABEL}.plist.tmp"`,
-    'chmod 644 "$HP"',
-    ': >> "$R/herdr.log" && chmod 600 "$R/herdr.log" || exit 1',
-    `if [ "$HS" != managed ]; then launchctl enable "$D/${HERDR_LAUNCHD_LABEL}" || exit ${INSTALL_EXIT.systemd}; launchctl bootstrap "$D" "$HP" || exit ${INSTALL_EXIT.systemd}; fi`,
-    "else HS=absent",
-    "fi",
     // hc's agent owns the foreground core (`hc serve`) in the runner's domain. Loaded already: only the plist file is
     // rewritten, never booted out (that would end the core and every hc lane); launchd reads the file at the next load.
-    'if [ -n "$HC" ]; then',
     `CP="$HOME/Library/LaunchAgents/${HC_LAUNCHD_LABEL}.plist"`,
     `cat > "$R/${HC_LAUNCHD_LABEL}.plist.tmp" <<'${HEREDOC}' || exit 1`,
-    `${body(hcPlist)}${HEREDOC}`,
+    `${body(hc.plist)}${HEREDOC}`,
     `sed -e "s|@HC_BIN@|$(xesc "$HC")|g" -e "s|@PATH@|$(xesc "$LP")|g" -e "s|@HOME@|$(xesc "$HOME")|g" "$R/${HC_LAUNCHD_LABEL}.plist.tmp" > "$CP" || exit 1`,
     `rm -f "$R/${HC_LAUNCHD_LABEL}.plist.tmp"`,
     'chmod 644 "$CP"',
     ': >> "$R/hc.log" && chmod 600 "$R/hc.log" || exit 1',
     `if ! launchctl print "$D/${HC_LAUNCHD_LABEL}" >/dev/null 2>&1; then launchctl enable "$D/${HC_LAUNCHD_LABEL}" || exit ${INSTALL_EXIT.systemd}; launchctl bootstrap "$D" "$CP" || exit ${INSTALL_EXIT.systemd}; fi`,
-    "CS=enabled",
-    "else CS=absent",
-    "fi",
     `launchctl kickstart -k "$D/${RUNNER_LAUNCHD_LABEL}" || exit ${INSTALL_EXIT.systemd}`,
     `printf '%s\\n' "$D" > "$R/launchd-domain" || exit ${INSTALL_EXIT.systemd}`,
     `chmod 600 "$R/launchd-domain" || exit ${INSTALL_EXIT.systemd}`,
-    `printf 'DORI_HERDR %s\\nDORI_HC %s\\n' "$HS" "$CS"`,
+    "printf 'DORI_HC enabled\\n'",
     "exit 0",
     "",
   ].join("\n");
@@ -488,7 +416,7 @@ const TASK = `-TaskPath '${WIN_TASK_PATH}' -TaskName '${WIN_TASK_NAME}'`;
  * stopped. It is pure ASCII: the bundle and every template travel as base64 literals written byte-exact with `[IO.File]::WriteAllBytes`, so no code
  * page, BOM or line-ending conversion can touch them. In order it:
  *
- * - refuses anything but x64 Windows 10 1809+ (exit 4) and a host without `herdr` on PATH (exit 7);
+ * - refuses anything but x64 Windows 10 1809+ (exit 4);
  * - creates `%USERPROFILE%\.dori\runner` with a protected DACL (the user, SYSTEM and Administrators) and the user as
  *   owner, through icacls;
  * - installs the pinned Bun into `bun\<dir>\` after checking the zip's SHA-256, and falls back to the baseline build
@@ -537,7 +465,6 @@ export const windowsInstallScript = (
     "if (-not $Arch) { $Arch = $env:PROCESSOR_ARCHITECTURE }",
     "$Build = [Environment]::OSVersion.Version.Build",
     `if ($Arch -ne 'AMD64' -or $Build -lt 17763) { Exit-Dori ${INSTALL_EXIT.notLinux} ('unsupported Windows host: ' + $Arch + ' build ' + $Build + '; a runner needs x64 Windows 10 1809 or later') }`,
-    `if (-not (Get-Command herdr -ErrorAction SilentlyContinue)) { Exit-Dori ${INSTALL_EXIT.noHerdr} 'no herdr on PATH' }`,
     "Step 'acl'",
     "$Sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
     "$R = Join-Path $env:USERPROFILE '.dori\\runner'",
@@ -686,9 +613,8 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
   const detail = r.err.trim().split("\n").filter((line) => !/^(#< CLIXML|<Objs )/.test(line.trim())).at(-1) || `exit ${r.code}`;
   const windows = kind === "windows";
   if (r.code === 0) {
-    const herdr = [...r.out.matchAll(/^DORI_HERDR (started|managed|unmanaged|absent)$/gm)].at(-1)?.[1] as HerdrInstall | undefined;
-    const hc = [...r.out.matchAll(/^DORI_HC (enabled|absent)$/gm)].at(-1)?.[1] as HcInstall | undefined;
-    return { ok: true, version: bundleVersion(bundle), ...(herdr ? { herdr } : {}), ...(hc ? { hc } : {}) };
+    const hc = /^DORI_HC enabled$/m.test(r.out) ? "enabled" as const : undefined;
+    return { ok: true, version: bundleVersion(bundle), ...(hc ? { hc } : {}) };
   }
   if (r.timedOut || r.code === RUN_TIMEOUT_CODE || r.code === 255) {
     return { ok: false, code: "RUNNER_INSTALL_UNREACHABLE", detail: windows ? `${detail} (progress: %USERPROFILE%\\.dori\\runner-install.log on the host)` : detail };
@@ -698,7 +624,7 @@ const installResult = (kind: InstallKind, r: Ran, bundle: string): InstallResult
   if (r.code === INSTALL_EXIT.noBun) {
     return { ok: false, code: "RUNNER_INSTALL_NO_BUN", detail: windows ? `no usable bun: the pinned Windows build could not be downloaded, verified or run (${detail})` : "no usable bun on the remote host (Linux needs it on PATH; on macOS it could not be found or downloaded)" };
   }
-  if (r.code === INSTALL_EXIT.noHerdr) return { ok: false, code: "RUNNER_INSTALL_NO_HERDR", detail: windows ? "no herdr on the remote host's PATH: install herdr (https://herdr.dev) there first" : `neither herdr nor hc on the remote host's login PATH: install herdr (https://herdr.dev) or hc (curl -fsSL ${HC_INSTALL_URL} | sh) there first` };
+  if (!windows && r.code === INSTALL_EXIT.noHc) return { ok: false, code: "RUNNER_INSTALL_NO_HC", detail: `no hc on the remote host's login PATH: install hc (curl -fsSL ${HC_INSTALL_URL} | sh) there first` };
   if (r.code === INSTALL_EXIT.enroll) return { ok: false, code: "RUNNER_INSTALL_ENROLL_FAILED", detail };
   return { ok: false, code: "RUNNER_INSTALL_FAILED", detail: r.code === INSTALL_EXIT.systemd ? `${windows ? "task scheduler" : "service manager"}: ${detail}` : detail };
 };
@@ -752,7 +678,7 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
   };
   const install = (enrollment: EnrollIssue): Promise<Ran | InstallResult> => {
     if (kind === "windows") return installWindows(windowsInstallScript(bundle, req.label, req.listenAddress, enrollment, req.agentCommand, deps.windowsTemplates ?? windowsTemplates()));
-    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.herdrTemplates, deps.laneSandbox, deps.laneSandboxMacos);
+    const script = installScript(bundle, unit, req.label, req.listenAddress, enrollment, plist, req.agentCommand, deps.hcTemplates, deps.laneSandbox, deps.laneSandboxMacos);
     return deps.run(sshArgv(target, "sh -s"), { stdin: script, timeoutMs: INSTALL_TIMEOUT_MS });
   };
   const failed = (result: InstallResult): InstallResult => {
@@ -803,7 +729,7 @@ export const installRunner = async (deps: InstallDeps, req: InstallRequest): Pro
     return result;
   }
   step("install", "done");
-  step("service", "done", kind === "windows" ? "scheduled task registered and started" : `runner service registered and started; ${herdrInstallNote(result.herdr, result.hc)}`);
+  step("service", "done", kind === "windows" ? "scheduled task registered and started" : `runner service registered and started; ${hcInstallNote(result.hc)}`);
   if (kind === "windows") {
     // Windows has no lane sandbox; a policy that still requires one refuses this host's lanes (the install went through).
     const refused = [...r.out.matchAll(/^RUNNER_CONFIG_SANDBOX_REQUIRED .*$/gm)].map((m) => m[0].trim());

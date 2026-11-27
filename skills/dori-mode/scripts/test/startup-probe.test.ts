@@ -20,10 +20,10 @@ const idleRunner: Spawn = () => {
   return { pid: 4242, exited, kill: () => { exit(0); } };
 };
 
-/** The real supervise() with fake herdr, Discord and gateway (as fixtures/startup-supervise.ts) and an injected local runner spawn. */
+/** The real supervise() with fake hc, Discord and gateway (as fixtures/startup-supervise.ts) and an injected local runner spawn. */
 const superviseWith = (stateDir: string, probe: StartupProbe, signal: AbortSignal, notify: (state: string) => Promise<boolean>, spawnRunner: Spawn = idleRunner): Promise<void> => {
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(world, fakeClock(1_800_000_000_000), stateDir, {
     discord: { applicationId: "100", guildId: "200", ownerId: "123456789012345" }, discordChannels: ["11"], defaultModel: "test/model",
   });

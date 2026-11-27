@@ -32,13 +32,13 @@ export const LOCAL_RUNNER = "local";
 /** How often a runner reads its host's lanes (serveRunner's default observe period). */
 export const OBSERVE_MS = 30_000;
 /**
- * How long a lane's pane may read `dead` before its agent was ever seen alive on it. herdr names the agent of a fresh
- * pane `unknown` until the agent's integration first reports, so a just-launched lane reads dead for its first seconds.
+ * How long a lane's pane may read `dead` before its agent was ever seen alive on it. hc names the agent of a fresh
+ * pane `unknown` until the agent first reports its state, so a just-launched lane reads dead for its first seconds.
  */
 export const STARTUP_GRACE_MS = 120_000;
 /**
  * How long a lane whose agent was seen alive must read `dead` without a break before the runner publishes it. Any alive
- * read inside the window ends it, so a lane that only blinks out of herdr's agent detection raises nothing.
+ * read inside the window ends it, so a lane that only blinks out of hc's agent detection raises nothing.
  */
 export const LANE_DEAD_GRACE_MS = 90_000;
 /** Committed runner events are kept this long in the hub's journal table. */
@@ -581,7 +581,7 @@ export const drainRunnerAdmin = (stateDir: string, accept: Pick<RunnerAccept, "r
 export type ObservedLane = InventoryLane & { readonly status: LaneStatus };
 
 /**
- * A lane's status from its herdr pane, by panes.ts `paneAlive`: no pane: `missing`; a pane whose agent is not alive:
+ * A lane's status from its hc pane, by panes.ts `paneAlive`: no pane: `missing`; a pane whose agent is not alive:
  * `dead`; alive and working: `working`; alive otherwise: `idle`.
  */
 export const laneStatus = (pane: Pane | undefined): LaneStatus =>

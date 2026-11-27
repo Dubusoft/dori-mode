@@ -22,30 +22,17 @@ import { defaultRunnerDir } from "./runner/fs-safety.ts";
 import { laneCliMain } from "./runner/lane-cli.ts";
 import { resolveLaneContext } from "./runner/lane-identity.ts";
 import { connectLaneSocket } from "./runner/lane-socket.ts";
-import type { Connector } from "./runner/transport.ts";
 import { connectUnix } from "./runner/unix-transport.ts";
 import { StoreError } from "./store.ts";
 import { convertJsonState } from "./store-convert.ts";
-
-/** The lane-mode gate's answer: a pane whose lane cannot be told (resolveLaneContext) exits 2 LANE_IDENTITY_UNKNOWN. */
-const laneContext = async (env: Readonly<Record<string, string | undefined>>, runnerDir: string, connect: Connector): Promise<string | undefined> => {
-  const resolved = await resolveLaneContext(env, runnerDir, connect);
-  if (typeof resolved !== "object") return resolved;
-  const { pane, recorded } = resolved;
-  console.error(`LANE_IDENTITY_UNKNOWN pane ${pane}: the runner's lane socket did not answer and its lane record cannot be read (${recorded.detail}); dori will not run as the lead from a pane that may be a lane. Bring the runner back (its lane socket answers whoami) or repair the lane record.`);
-  process.exit(2);
-};
 
 // The lane-mode gate runs before anything else (help, setup, runner *, loadConfig): inside a lane dori takes only
 // report, claim-done, report ack, lane status, heavy and secret env, all over the runner's lane socket, and opens no registry,
 // store, journal, inbox or state-dir file.
 {
-  const laneRunnerDir = defaultRunnerDir();
-  const connectLane = connectLaneSocket(laneRunnerDir, (path) => connectUnix(path));
-  const laneKey = await laneContext(process.env, laneRunnerDir, connectLane);
-  if (laneKey !== undefined) {
+  if (resolveLaneContext(process.env) !== undefined) {
     process.exit(await laneCliMain(process.argv.slice(2), {
-      env: process.env, laneKey, connect: connectLane, stdoutIsTTY: process.stdout.isTTY === true,
+      env: process.env, connect: connectLaneSocket(defaultRunnerDir(), (path) => connectUnix(path)), stdoutIsTTY: process.stdout.isTTY === true,
       out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
     }));
   }

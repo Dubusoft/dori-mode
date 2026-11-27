@@ -4,14 +4,10 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { LaneOpsError, machineRunner, type StartInput } from "./lane-ops.ts";
-import { localLanesOnHerdr } from "./host-runtimes.ts";
-import { ensureLaneWorkspace, ManagedPanesError } from "./managed-panes.ts";
 import { LANE_KEY, type Lane, type LaneMode } from "./registry.ts";
 import { iso } from "./run.ts";
-import { herdrDownSince } from "./runner/herdr-down.ts";
 import { runnerWorktreeRoot } from "./runner/hub.ts";
 import { runnerOs } from "./runner-sandbox.ts";
-import { cmdRefused, paneShell } from "./runner/lane-control.ts";
 import type { StartupVerdict } from "./runner/protocol.ts";
 import { doneRepos, doneSyntaxErrors } from "./signals.ts";
 import { normalizeThreadRef } from "./messenger/target.ts";
@@ -26,8 +22,8 @@ import type { RecoveryLane } from "./recover.ts";
 import { footer } from "./launch-footer.ts";
 import { checkLocalSandbox, runnerSandboxRefusal, sandboxChoice } from "./launch-sandbox.ts";
 
-// The startup check and the pane-shell reader run inside the runner's lane.start now; re-exported for their callers.
-export { paneShell, type PaneShell, screenLines, startupFailure, STARTUP_POLL_MS, STARTUP_POLLS, STARTUP_READY_READS } from "./runner/lane-control.ts";
+// The startup check runs inside the runner's lane.start; re-exported for its callers.
+export { screenLines, startupFailure, STARTUP_POLL_MS, STARTUP_POLLS, STARTUP_READY_READS } from "./runner/lane-control.ts";
 
 /** Return the follow-up instruction when startup did not succeed. */
 export function launchNextLine(key: string, startup: string): string | undefined {
@@ -48,10 +44,6 @@ export type LaunchInput = {
   /** Opening keywords: `ulw` (default, `launchKeywords`) or `mass-ulw` (`massLaunchKeywords`). */
   readonly mode?: LaneMode;
   readonly cwd?: string;
-  /** Run the lane in this existing idle shell pane instead of creating a tab. */
-  readonly pane?: string;
-  /** Run the lane in this workspace's idle shell pane (the only one without an agent). */
-  readonly workspace?: string;
   readonly machine?: string;
   /** Allow a second open lane on the same messenger thread (`--share-thread`); the lanes are recorded in `threadSharedWith`. */
   readonly shareThread?: boolean;
@@ -88,11 +80,6 @@ export class SandboxRefusal extends LaunchError {
 
 export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
   if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
-  // Refused before any placement check or runner call: the runner could not open a tab there anyway.
-  const herdrDown = input.machine ? herdrDownSince(deps.config.stateDir).get(machineRunner(input.machine)) : undefined;
-  if (input.machine && herdrDown !== undefined) {
-    throw new LaunchError(`HERDR_DOWN machine=${input.machine.replace(/\s/g, "_")} herdr there has been unreadable since ${new Date(herdrDown).toISOString()}; launch there once it reads again (HERDR_UP), or pick another machine`);
-  }
   if (input.task !== undefined && !(Number.isSafeInteger(input.task) && input.task > 0)) throw new LaunchError(`--task must be a positive integer (a Toodo task id), got ${input.task}`);
   if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} is already registered`);
   const errors = doneSyntaxErrors(input.done);
@@ -285,7 +272,7 @@ const baseDraft = (deps: FlowDeps, input: LaunchInput, dir: string | undefined, 
   brief: input.brief, done: input.done, ...laneDirs(input.machine, dir, deps.config.leadCwd), openedAt: existing?.openedAt ?? iso(deps.clock),
 });
 
-/** The hint for a pane id this host's herdr does not list: lanes without --machine are local lanes. */
+/** The hint for a pane id this host's runner does not hold: lanes without --machine are local lanes. */
 const REMOTE_PANE_HINT = "a pane on another machine needs --machine LABEL";
 
 /** A runner failure that leaves nothing started (refused, failed, or a runner that was never reached): the reservation can go. */
@@ -337,60 +324,6 @@ const reserveLane = async (deps: FlowDeps, input: LaunchInput, lane: Lane, token
     });
     return draft;
   } finally { release(); }
-};
-
-type TargetPane = { readonly pane: string; readonly tab?: string; readonly cwd?: string };
-
-type ProcessInfo = { readonly shell_pid?: number; readonly foreground_process_group_id?: number };
-
-const parse = <T>(text: string, what: string): T => {
-  try { return JSON.parse(text) as T; } catch { throw new LaunchError(`${what}: unreadable process info`); }
-};
-
-/**
- * The existing pane a lane may start in, checked before anything is written: it exists on the lane's host, is an idle
- * shell (no agent, no other foreground process) and no lane owns it. The pane list and process info come from the
- * lane's runner, which checks the pane again when it starts the lane (`lane.start` target).
- */
-const resolveTargetPane = async (deps: FlowDeps, input: LaunchInput): Promise<TargetPane> => {
-  const panes = await deps.ops.panes(input.machine);
-  let id = input.pane;
-  if (!id) {
-    const inWs = panes.filter((p) => p.workspace_id === input.workspace);
-    if (!inWs.length) throw new LaunchError(`workspace ${input.workspace} has no panes (or does not exist)`);
-    const shells = inWs.filter((p) => !p.agent);
-    if (shells.length !== 1) throw new LaunchError(`workspace ${input.workspace} has ${shells.length} shell panes; pass --pane to pick one`);
-    id = shells[0]?.pane_id;
-  }
-  if (!id) throw new LaunchError("no target pane");
-  const info = panes.find((p) => p.pane_id === id);
-  if (!info) throw new LaunchError(`pane ${id} does not exist on ${input.machine ?? "this host"}${input.machine ? "" : `; ${REMOTE_PANE_HINT}`}`);
-  if (input.workspace && info.workspace_id !== input.workspace) throw new LaunchError(`pane ${id} is in workspace ${info.workspace_id}, not ${input.workspace}`);
-  if (info.agent) throw new LaunchError(`pane ${id} runs an agent (${info.agent}); a lane needs an idle shell`);
-  const proc = await deps.ops.processInfo({ ...(input.machine ? { machine: input.machine } : {}), pane: id });
-  if (proc.code !== 0) throw new LaunchError(`cannot read the processes of pane ${id}: ${proc.err || proc.out}`);
-  const p = parse<{ result: { process_info: ProcessInfo } }>(proc.out, `process info of pane ${id}`).result.process_info;
-  if (p.foreground_process_group_id && p.foreground_process_group_id !== p.shell_pid) throw new LaunchError(`pane ${id} has a foreground process running; a lane needs an idle shell`);
-  const owner = (await deps.registry.open()).find((l) => l.pane === id && l.machine === input.machine);
-  if (owner) throw new LaunchError(`pane ${id} is already registered to lane ${owner.key}`);
-  // The runner refuses a cmd.exe pane (no launch line exists for it); say so before anything is written.
-  if (paneShell(p, info.cwd) === "cmd") throw new LaunchError(cmdRefused(id));
-  return { pane: id, ...(info.tab_id ? { tab: info.tab_id } : {}), ...(info.cwd ? { cwd: info.cwd } : {}) };
-};
-
-/**
- * The herdr workspace a local lane's new tab opens in: the supervisor-managed lanes workspace, found again or created and
- * recorded when herdr lost it. A launch never falls back to herdr's focused workspace, so a herdr failure refuses it.
- * Undefined, with no herdr call, when the local runner opens its lanes on hc (runner-config `laneRuntime`).
- */
-export const laneTabWorkspace = async (deps: Pick<FlowDeps, "run" | "config">, log: (line: string) => void): Promise<string | undefined> => {
-  if (!localLanesOnHerdr()) return undefined;
-  try {
-    return await ensureLaneWorkspace(deps.run, deps.config.stateDir, deps.config.leadCwd, log);
-  } catch (error) {
-    if (error instanceof ManagedPanesError) throw new LaunchError(`no lanes workspace: ${error.message}`);
-    throw error;
-  }
 };
 
 /** The STARTUP_OK / STARTUP_ERROR / STARTUP_UNCONFIRMED line of a runner's startup verdict for `pane`. */
@@ -472,17 +405,15 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
   const choice = sandboxChoice(deps.config, input, deps.which ?? Bun.which, existing, os);
   const sandbox = choice.on;
   if (input.grants?.length && !sandbox) throw new LaunchError(`LAUNCH_GRANT_REFUSED ${input.key}: --grant needs a sandboxed lane (${choice.skipped ?? "no sandbox"})`);
-  // All attachment reads and declaration validation precede reservations, workspace creation and brief writes.
+  // All attachment reads and declaration validation precede reservations and brief writes.
   const prepared = await prepareLeadLaneBrief(deps, {
     ...(existing ?? {}), key: input.key, title: input.title, thread: normalizeThreadRef(input.thread ?? "none"),
     brief: input.brief, done: input.done, openedAt: existing?.openedAt ?? iso(deps.clock), ...(input.machine ? { machine: input.machine } : {}),
     ...(sandbox ? { sandbox: true as const } : {}), ...(input.grants?.length ? { grants: input.grants } : {}),
   }, undefined, Boolean(existing));
   if (sandbox && !input.machine) await checkLocalSandbox(deps, input.key);
-  const target = input.pane || input.workspace ? await resolveTargetPane(deps, input) : undefined;
   const notes = [...prepared.notes, ...(choice.skipped ? [`SANDBOX_SKIPPED ${input.key}: ${choice.skipped}`] : [])];
-  const tabWorkspace = target || input.machine ? undefined : await laneTabWorkspace(deps, (line) => { notes.push(line); });
-  const dir = input.cwd ?? target?.cwd;
+  const dir = input.cwd;
   // The lead's leadCwd (a local directory) means nothing on another machine: without --cwd the start names none and that machine's
   // runner starts the lane in its own directory (~/.dori/runner/lanes/<key>), reporting the directory back in the result.
   const cwd = dir ?? (input.machine ? undefined : deps.config.leadCwd);
@@ -513,8 +444,6 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
       keywords: mode === "mass-ulw" ? deps.tunables.massLaunchKeywords : deps.tunables.launchKeywords,
       ...(input.machine ? { machine: input.machine } : { heavySlots: deps.config.heavySlots, heavyMaxLoad: deps.config.heavyMaxLoad }),
       ...(input.session !== undefined ? { session: input.session } : {}),
-      ...(target ? { target: { pane: target.pane } } : {}),
-      ...(tabWorkspace ? { tabWorkspace } : {}),
       ...(input.grants?.length ? { grants: input.grants } : {}),
     };
     let result;
@@ -525,7 +454,7 @@ export const launchLane = async (deps: FlowDeps, input: LaunchInput, existing?: 
     }
     progress.started = true;
     // A runner profile that pins its own model runs that one instead of `model`: recovery judges the lane against it.
-    const lane: Lane = { ...draft, ...(result.model ? { model: result.model } : {}), ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : target?.tab ? { tab: target.tab } : {}) };
+    const lane: Lane = { ...draft, ...(result.model ? { model: result.model } : {}), ...(input.machine && !dir && result.cwd ? { remoteCwd: result.cwd } : {}), fileRun: prepared.files.run, pendingFileRun: undefined, pane: result.pane, ...(result.tab ? { tab: result.tab } : {}) };
     return { lane: await commitLaunched(deps, lane, existing, token, prepared), notes, startup: startupLine(input.key, result.pane, result.startup) };
   } catch (error) {
     if (token && !progress.started) await deps.registry.releaseReservation(input.key, token);

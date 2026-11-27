@@ -4,67 +4,25 @@ import { dirname } from "node:path";
 import type { GuardThresholds } from "./config.ts";
 import { replaceFileAtomic } from "./durable-write.ts";
 import { alertReasons } from "./host-guard.ts";
-import { herdrMachineList } from "./herdr-machines.ts";
 import { type Ran, RUN_TIMEOUT_CODE, type Runner } from "./run.ts";
 import { readRunnerMachines } from "./runner/machines.ts";
 
 const SAMPLE_TIMEOUT_MS = 20_000;
 
-/** `id` is herdr's machine id when the list has one; a lane may name its machine by label or by id. */
-export type GuardMachine = { readonly label: string; readonly target: string; readonly id?: string };
+/** A remote machine the guard and the runner admin commands reach over ssh; a lane names its machine by `label`. */
+export type GuardMachine = { readonly label: string; readonly target: string };
 
-const str = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v.trim() : typeof v === "number" ? String(v) : undefined);
-
-const machineEntries = (data: unknown): unknown[] => {
-  if (Array.isArray(data)) return data;
-  if (!data || typeof data !== "object") return [];
-  const o = data as Record<string, unknown>;
-  const result = o.result && typeof o.result === "object" ? o.result as Record<string, unknown> : undefined;
-  for (const v of [o.machines, result?.machines, o.profiles, result?.profiles, o.result]) if (Array.isArray(v)) return v;
-  return [];
-};
-
-/** Parses `herdr machine list --json`, tolerating a bare array or one under machines/result.machines/profiles. Throws on invalid JSON. */
-export const parseMachineList = (json: string): GuardMachine[] => {
-  const out: GuardMachine[] = [];
-  for (const e of machineEntries(JSON.parse(json))) {
-    if (!e || typeof e !== "object") continue;
-    const o = e as Record<string, unknown>;
-    if (o.enabled === false) continue;
-    const id = str(o.id);
-    const label = str(o.label) ?? id;
-    if (!label) continue;
-    out.push({ label, target: str(o.ssh_target) ?? str(o.target) ?? str(o.ssh) ?? str(o.host) ?? label, ...(id ? { id } : {}) });
-  }
-  return out;
-};
-
-/** A machine list read; on failure `machines` holds only the overrides and `detail` says why herdr's list is missing. */
-export type MachineListResult = { ok: true; machines: GuardMachine[] } | { ok: false; detail: string; machines: GuardMachine[] };
-
-/** `stateMachines` (label -> target from `dori runner install <target>`) rank lowest: herdr's list and `overrides` replace them by label. */
-const withOverrides = (listed: readonly GuardMachine[], overrides: Readonly<Record<string, string>>, stateMachines: Readonly<Record<string, string>> = {}): GuardMachine[] => {
-  const byLabel = new Map<string, GuardMachine>(Object.entries(stateMachines).map(([label, target]) => [label, { label, target }]));
-  for (const m of listed) byLabel.set(m.label, m);
-  for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { ...byLabel.get(label), label, target });
+/**
+ * The known remote machines, sorted by label: the runner-machines state under `stateDir` (label -> target, written by
+ * `dori runner install <target>`; not read without a `stateDir`), with config `guardMachines` (`overrides`, label -> ssh
+ * target) replacing or adding by label. Reads only local files, so it cannot fail.
+ */
+export const listGuardMachines = (overrides: Readonly<Record<string, string>>, stateDir?: string): GuardMachine[] => {
+  const byLabel = new Map<string, GuardMachine>();
+  for (const [label, target] of Object.entries(stateDir === undefined ? {} : readRunnerMachines(stateDir))) byLabel.set(label, { label, target });
+  for (const [label, target] of Object.entries(overrides)) byLabel.set(label, { label, target });
   return [...byLabel.values()].sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 };
-
-/** herdr's saved machines with `overrides` (label -> ssh target) replacing or adding by label; a herdr failure or invalid JSON is not ok. */
-export const readGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<MachineListResult> => {
-  const state = stateDir === undefined ? {} : readRunnerMachines(stateDir);
-  const r = await herdrMachineList(run);
-  if (r.code !== 0) return { ok: false, detail: firstLine(r.err) || firstLine(r.out) || `exit ${r.code}`, machines: withOverrides([], overrides, state) };
-  try {
-    return { ok: true, machines: withOverrides(parseMachineList(r.out), overrides, state) };
-  } catch (e) {
-    return { ok: false, detail: `invalid JSON: ${e instanceof Error ? e.message : String(e)}`, machines: withOverrides([], overrides, state) };
-  }
-};
-
-/** readGuardMachines' machines, failure or not (only the overrides when herdr fails). */
-export const listGuardMachines = async (run: Runner, overrides: Readonly<Record<string, string>>, stateDir?: string): Promise<GuardMachine[]> =>
-  (await readGuardMachines(run, overrides, stateDir)).machines;
 
 export const sshArgv = (target: string, command: string): string[] => ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "--", target, command];
 

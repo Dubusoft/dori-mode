@@ -82,9 +82,9 @@ describe("runner command policy", () => {
     expect(rule(job(), { ...policy, jobs: "deny" })).toBe("jobs-denied");
   });
 
-  test("proto 3 fields of lane.start pass; an unknown field inside target is refused", () => {
-    expect(checkCommand(policy, start({ keywords: "ulw", session: "s1", target: { pane: "w1:p2" }, heavySlots: 2, heavyMaxLoad: 7.5 }), realpath).ok).toBe(true);
-    expect(rule(start({ target: { pane: "w1:p2", tab: "x" } }))).toBe("unknown-field");
+  test("proto 3 fields of lane.start pass; the retired target pane is refused as an unknown field", () => {
+    expect(checkCommand(policy, start({ keywords: "ulw", session: "s1", heavySlots: 2, heavyMaxLoad: 7.5 }), realpath).ok).toBe(true);
+    expect(rule(start({ target: { pane: "w1:p2" } }))).toBe("unknown-field");
     expect(rule(start({ heavySlots: 1.5 }))).toBe("field-type");
   });
 

@@ -3,6 +3,7 @@ import { existsSync, readFileSync, watch } from "node:fs";
 import { join } from "node:path";
 
 import * as quota from "../src/claude-quota.ts";
+import * as memoryCheck from "../src/memory-check.ts";
 import type { Http } from "../src/messenger/http.ts";
 import { supervise, WATCHDOG_STALL_MS } from "../src/supervise-loop.ts";
 import { depsFor, fakeClock, manualPause, newWorld, withState } from "./fakes.ts";
@@ -57,29 +58,24 @@ const setup = () => {
   spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => new Response(JSON.stringify({ id: "33" }), { status: 200 }), { preconnect: fetch.preconnect }));
   const clock = fakeClock(T0);
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(world, clock, state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: OWNER }, discordChannels: ["11"], defaultModel: "test/model",
   });
-  // The machine-guard sweep's `herdr machine list` (only that sweep reads it) hangs for STALL_MS: the injected sweep stall.
+  // The memory sweep (only the sweeps task runs it) hangs for STALL_MS: the injected sweep stall.
   const stall: { at?: number; release: () => void } = { release: () => {} };
   const stallListeners = new Set<() => void>();
   let ownerPosted = false;
-  const deps = {
-    ...base,
-    run: async (argv: readonly string[]) => {
-      if (argv.join(" ") !== "herdr machine list --json") return base.run(argv);
-      return new Promise<{ code: number; out: string; err: string }>((resolve) => {
-        const timer = setTimeout(() => { stall.release(); }, STALL_MS);
-        stall.release = () => { clearTimeout(timer); resolve({ code: 0, out: "[]", err: "" }); };
-        stall.at = performance.now();
-        // The owner writes while the sweep is stuck; the REST catch-up is due again on the next pass.
-        ownerPosted = true;
-        clock.at += 6_000;
-        for (const listener of stallListeners) listener();
-      });
-    },
-  };
+  const deps = base;
+  spyOn(memoryCheck, "memorySweep").mockImplementation(() => new Promise<string[]>((resolve) => {
+    const timer = setTimeout(() => { stall.release(); }, STALL_MS);
+    stall.release = () => { clearTimeout(timer); resolve([]); };
+    stall.at = performance.now();
+    // The owner writes while the sweep is stuck; the REST catch-up is due again on the next pass.
+    ownerPosted = true;
+    clock.at += 6_000;
+    for (const listener of stallListeners) listener();
+  }));
   cleanups.push(() => { stall.release(); });
   const http: Http = async (request) => {
     if (request.url.endsWith("/threads/active")) return { status: 200, headers: {}, body: JSON.stringify({ threads: [] }) };

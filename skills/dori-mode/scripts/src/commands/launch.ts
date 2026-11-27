@@ -22,8 +22,6 @@ export const launchCommand: CliCommand = {
     mode: { type: "string" },
     task: { type: "string" },
     cwd: { type: "string" },
-    pane: { type: "string" },
-    workspace: { type: "string" },
     machine: { type: "string" },
     note: { type: "string" },
     grant: { type: "string", multiple: true },
@@ -66,10 +64,10 @@ export const launchCommand: CliCommand = {
         return { path: generatedBriefPath(config.stateDir, key ?? ""), text: assembleBrief(title, fromArgs.refs.map((ref) => ownerMessageText(config.stateDir, ref)), fromArgs.notes) };
       } catch (e) { return die(e instanceof Error ? e.message : String(e)); }
     })() : undefined;
-    const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), ...(task !== undefined ? { task } : {}), cwd: opt("cwd"), pane: opt("pane"), workspace: opt("workspace"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }), ...(grants.length ? { grants } : {}) };
+    const input: LaunchInput = { key: key ?? "", title, brief: generated ? generated.path : need("brief"), done: need("done"), thread: await laneThreadRef(opt("thread"), config.discordChannels), model: opt("model"), ...(mode ? { mode: mode as LaneMode } : {}), ...(task !== undefined ? { task } : {}), cwd: opt("cwd"), machine: opt("machine"), shareThread: Boolean(flags.values["share-thread"]), allowRepoMismatch: Boolean(flags.values["allow-repo-mismatch"]), ...(sandbox === undefined ? {} : { sandbox }), ...(grants.length ? { grants } : {}) };
     const worktree = opt("worktree");
     if (worktree === undefined && opt("base") !== undefined) die("--base goes with --worktree");
-    if (worktree !== undefined && (input.cwd || input.pane || input.workspace)) die("--worktree creates the lane's directory; drop --cwd, --pane and --workspace");
+    if (worktree !== undefined && input.cwd) die("--worktree creates the lane's directory; drop --cwd");
     await validateLaunch(deps, input);
     if (generated) writeGeneratedBrief(generated.path, generated.text);
     const placement = await placeLaunch(deps, input);

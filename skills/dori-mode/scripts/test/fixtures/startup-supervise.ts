@@ -6,10 +6,10 @@ import { depsFor, fakeClock, newWorld } from "../fakes.ts";
 
 export const TEN_MINUTES_MS = 10 * 60_000;
 
-/** The real supervise() with fake herdr, Discord and gateway; only the probe and notify transport are the caller's. */
+/** The real supervise() with fake hc, Discord and gateway; only the probe and notify transport are the caller's. */
 export const superviseWith = (stateDir: string, probe: StartupProbe, signal: AbortSignal, notify: (state: string) => Promise<boolean>): Promise<void> => {
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(world, fakeClock(1_800_000_000_000), stateDir, {
     discord: { applicationId: "100", guildId: "200", ownerId: "123456789012345" }, discordChannels: ["11"], defaultModel: "test/model",
   });

@@ -10,30 +10,19 @@ import { Outbox } from "../src/runner/outbox.ts";
 import { LANE_DEAD_GRACE_MS, serveRunner, STARTUP_GRACE_MS, type ObservedLane } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import { fakeClock } from "./fakes.ts";
+import { hcAnswer, type HcPane, type HcProc, newHcWorld } from "./runner-hc-world.ts";
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const stateDir = (): string => { const d = mkdtempSync(join(tmpdir(), "runner-observe-")); dirs.push(d); return d; };
 
-const REPORT_A = "[REPORT] lane-a | milestone | PR #12 open, CI green";
-const REPORT_B_OLD = "[REPORT] lane-b | question | which base branch?";
-const REPORT_B = "[REPORT] lane-b | milestone | tests pass";
-
-const panes = [
-  { pane_id: "p1", workspace_id: "w", tab_id: "t1", agent: "omo", agent_status: "working" },
-  { pane_id: "p2", workspace_id: "w", tab_id: "t2", agent: "omo", agent_status: "idle" },
-  { pane_id: "p3", workspace_id: "w", tab_id: "t3" },
+const panes: HcPane[] = [
+  { pane_id: "hc:t1", agent: "omo", agent_status: "working", shellPid: 100 },
+  { pane_id: "hc:t2", agent: "omo", agent_status: "idle", shellPid: 200 },
+  { pane_id: "hc:t3", shellPid: 300 },
 ];
-const screens: Record<string, string> = {
-  p1: `some output\n${REPORT_A}\nmore output`,
-  p2: `${REPORT_B_OLD}\nwork\n${REPORT_B}`,
-  p3: "$ ls\n",
-};
-const info: Record<string, object> = {
-  p1: { shell_pid: 100, foreground_processes: [{ pid: 101 }] },
-  p2: { shell_pid: 200, foreground_processes: [{ pid: 201 }] },
-  p3: { shell_pid: 300, foreground_processes: [] },
-};
+/** Each terminal's foreground process (hc reports one); t3 runs only its shell. */
+const info: Record<string, HcProc> = { t1: { pid: 101 }, t2: { pid: 201 } };
 // The agents (101, 201) carry DORI_LANE_KEY; their shells (100, 200) and the plain pane's shell (300) carry none.
 const procs: Proc[] = [
   { pid: 100, ppid: 1, rssKb: 1, comm: "sh" },
@@ -42,52 +31,49 @@ const procs: Proc[] = [
   { pid: 201, ppid: 200, rssKb: 1, comm: "omo", lane: "lane-b" },
   { pid: 300, ppid: 1, rssKb: 1, comm: "sh" },
 ];
-const ok = (out: string): Ran => ({ code: 0, out, err: "" } as Ran);
-const herdrCalls: string[][] = [];
-const herdrWith = (list: readonly object[]) => async (argv: readonly string[]): Promise<Ran> => {
-  herdrCalls.push([...argv]);
-  const [, noun, verb, ...rest] = argv;
-  if (noun === "pane" && verb === "list") return ok(JSON.stringify({ result: { panes: list } }));
-  if (noun === "pane" && verb === "process-info") return ok(JSON.stringify({ result: { process_info: info[rest[1] as string] } }));
-  if (noun === "pane" && verb === "read") return ok(screens[rest[0] as string] ?? "");
-  return { code: 1, out: "", err: `unexpected ${argv.join(" ")}` } as Ran;
+const hcCalls: string[][] = [];
+/** A scripted hc listing `list`, whose terminals run the foreground processes `fg`. */
+const hcWith = (list: readonly HcPane[], fg: Record<string, HcProc> = info) => {
+  const world = newHcWorld();
+  world.panes = [...list];
+  world.proc = { ...fg };
+  return async (argv: readonly string[]): Promise<Ran> => {
+    hcCalls.push([...argv]);
+    return hcAnswer(world, argv) ?? ({ code: 1, out: "", err: `unexpected ${argv.join(" ")}` } as Ran);
+  };
 };
-const fakeHerdr = herdrWith(panes);
 
 test("observeHost finds lanes by DORI_LANE_KEY without a registry and never reads a pane's screen for a report", async () => {
-  herdrCalls.length = 0;
-  const observed = await observeHost({ run: fakeHerdr, procs: async () => procs });
+  hcCalls.length = 0;
+  const observed = await observeHost({ run: hcWith(panes), procs: async () => procs });
   expect(observed).toEqual([
-    { key: "lane-a", pane: "p1", tab: "t1", status: "working" },
-    { key: "lane-b", pane: "p2", tab: "t2", status: "idle" },
+    { key: "lane-a", pane: "hc:t1", tab: "", status: "working" },
+    { key: "lane-b", pane: "hc:t2", tab: "", status: "idle" },
   ]);
-  expect(herdrCalls.filter((argv) => argv[1] === "pane" && argv[2] === "process-info").map((argv) => argv[4])).toEqual(["p1", "p2", "p3"]);
-  expect(herdrCalls.filter((argv) => argv[1] === "pane" && argv[2] === "read")).toEqual([]);
+  expect(new Set(hcCalls.filter((argv) => argv[2] === "get").map((argv) => argv[3]))).toEqual(new Set(["t1", "t2", "t3"]));
+  expect(hcCalls.filter((argv) => argv[2] === "read")).toEqual([]);
 });
 
-const withInfo = (override: Record<string, object>) => async (argv: readonly string[]): Promise<Ran> => {
-  if (argv[1] === "pane" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: override[argv[4] as string] } }));
-  return fakeHerdr(argv);
-};
+const withInfo = (override: Record<string, HcProc>) => hcWith(panes, override);
 const agentArgv = (path: string): string[] => ["omo", `Read and execute the lane brief at ${path} in full. You are the lane; report as usual.`];
-const argvInfo = (path: string): Record<string, object> => ({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, name: "omo", argv: agentArgv(path) }] } });
+const argvInfo = (path: string): Record<string, HcProc> => ({ t1: { pid: 101, name: "omo", argv: agentArgv(path) } });
 
 test("observeHost attributes a pane from the brief path in the agent argv when no process environment is readable", async () => {
   const observed = await observeHost({ run: withInfo(argvInfo("/tmp/dori-brief-mac-lane.md")), procs: async () => [] });
-  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "p1"]]);
+  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "hc:t1"]]);
 });
 
 test("observeHost attributes a pane from the runner's own briefs/<key>.md path in the agent argv", async () => {
   const observed = await observeHost({ run: withInfo(argvInfo("/Users/x/.dori/runner/briefs/mac-lane.md")), procs: async () => [] });
-  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "p1"]]);
+  expect(observed.map((l) => [l.key, l.pane])).toEqual([["mac-lane", "hc:t1"]]);
 });
 
 test("observeHost observes the runner's owned panes with no process environment, a shell-only one as dead", async () => {
-  // macOS: no environment is readable and no argv names a brief; p3's agent exited and left only its shell.
-  const run = withInfo({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: ["omo"] }] }, p3: { shell_pid: 300, foreground_processes: [] } });
-  const owned = async () => new Map([["p1", "own-a"], ["p3", "own-b"]]);
+  // macOS: no environment is readable and no argv names a brief; t3's agent exited and left only its shell.
+  const run = withInfo({ t1: { pid: 101, argv: ["omo"] } });
+  const owned = async () => new Map([["hc:t1", "own-a"], ["hc:t3", "own-b"]]);
   const observed = await observeHost({ run, procs: async () => [], owned });
-  expect(observed.map((l) => [l.key, l.pane, l.status])).toEqual([["own-a", "p1", "working"], ["own-b", "p3", "dead"]]);
+  expect(observed.map((l) => [l.key, l.pane, l.status])).toEqual([["own-a", "hc:t1", "working"], ["own-b", "hc:t3", "dead"]]);
 });
 
 test("observeHost attributes a Windows-style brief path in the agent argv", async () => {
@@ -96,7 +82,7 @@ test("observeHost attributes a Windows-style brief path in the agent argv", asyn
 });
 
 test("observeHost does not observe a pane whose argv names no dori-brief path", async () => {
-  const run = withInfo({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: ["vim", "/tmp/notes.md", "/tmp/dori-brief-x.txt"] }] } });
+  const run = withInfo({ t1: { pid: 101, argv: ["vim", "/tmp/notes.md", "/tmp/dori-brief-x.txt"] } });
   expect(await observeHost({ run, procs: async () => [] })).toEqual([]);
   expect(briefLane(undefined)).toBeUndefined();
   expect(briefLane(["/tmp/dori-brief-Bad_Key.md"])).toBeUndefined();
@@ -107,21 +93,20 @@ test("observeHost prefers the environment attribution over a different key in th
   expect(observed.map((l) => l.key)).toEqual(["lane-a"]);
 });
 
-test("observeHost reports a lane as dead only when herdr misses its agent and no lane agent process runs in its pane", async () => {
-  const unknown = panes.map((p) => (p.pane_id === "p1" ? { ...p, agent_status: "unknown" } : p));
-  const runWith = (override: Record<string, object>) => async (argv: readonly string[]): Promise<Ran> =>
-    argv[1] === "pane" && argv[2] === "process-info" ? ok(JSON.stringify({ result: { process_info: override[argv[4] as string] } })) : herdrWith(unknown)(argv);
+test("observeHost reports a lane as dead only when hc misses its agent and no lane agent process runs in its pane", async () => {
+  const unknown = panes.map((p) => (p.pane_id === "hc:t1" ? { ...p, agent_status: "unknown" } : p));
+  const runWith = (override: Record<string, HcProc>) => hcWith(unknown, override);
   const status = (observed: readonly ObservedLane[]) => observed.map((l) => [l.key, l.status]);
-  // Linux: lane-a's agent (DORI_LANE_KEY in its environment) still runs though herdr lost it: idle.
-  expect(status(await observeHost({ run: herdrWith(unknown), procs: async () => procs }))).toEqual([["lane-a", "idle"], ["lane-b", "idle"]]);
+  // Linux: lane-a's agent (DORI_LANE_KEY in its environment) still runs though hc lost it: idle.
+  expect(status(await observeHost({ run: hcWith(unknown), procs: async () => procs }))).toEqual([["lane-a", "idle"], ["lane-b", "idle"]]);
   // macOS: no environment is readable; the agent's argv names lane-a's brief.
-  const mac = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-a.md") }] } });
+  const mac = runWith({ t1: { pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-a.md") } });
   expect(status(await observeHost({ run: mac, procs: async () => [] }))).toEqual([["lane-a", "idle"]]);
-  const owned = async () => new Map([["p1", "lane-a"]]);
+  const owned = async () => new Map([["hc:t1", "lane-a"]]);
   // The agent exited and left only its shell, or the pane runs another lane's agent: dead.
-  const exited = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 100, argv: ["sh"] }] } });
+  const exited = runWith({ t1: { pid: 100, argv: ["sh"] } });
   expect(status(await observeHost({ run: exited, procs: async () => procs, owned }))).toEqual([["lane-a", "dead"]]);
-  const other = runWith({ p1: { shell_pid: 100, foreground_processes: [{ pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-z.md") }] } });
+  const other = runWith({ t1: { pid: 101, argv: agentArgv("/Users/x/.dori/runner/briefs/lane-z.md") } });
   expect(status(await observeHost({ run: other, procs: async () => [], owned }))).toEqual([["lane-a", "dead"]]);
 });
 
@@ -162,7 +147,7 @@ test("serveRunner holds back dead for a starting lane until its agent was seen a
   state.boot();
   const outbox = new Outbox(dir, { now: clock.now });
   const client = new RunnerClient({ label: "worker-a", hostId: "h" }, { connect: async () => { throw new Error("offline"); }, outbox, state, clock });
-  // lane-a: herdr names its fresh agent unknown (dead), then working, then the agent really stops.
+  // lane-a: hc names its fresh agent unknown (dead), then working, then the agent really stops.
   // lane-b: its agent never comes up.
   const steps: { readonly at: number; readonly view: ObservedLane[] }[] = [
     { at: 1_000, view: [{ key: "lane-a", pane: "p1", tab: "t1", status: "dead" }, { key: "lane-b", pane: "p2", tab: "t2", status: "dead" }] },

@@ -47,7 +47,7 @@ const localTip = async (): Promise<string | undefined> => {
 };
 const remoteTip = async (): Promise<string> => (await git("-C", repo, "ls-remote", "origin", "refs/heads/feat-x")).split(/\s+/)[0] ?? "";
 
-/** git runs for real; gh answers that acme/app#7 merged feat-x at `mergedHead` into main; herdr is the fake. */
+/** git runs for real; gh answers that acme/app#7 merged feat-x at `mergedHead` into main; hc is faked. */
 const runner = (): Runner => {
   const fake = depsFor(world, fakeClock(T0), state.dir).run;
   return async (argv, opts) => {

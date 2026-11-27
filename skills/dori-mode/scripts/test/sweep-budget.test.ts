@@ -22,7 +22,7 @@ type Row = { pane_id: string; workspace_id: string; agent: string; agent_status:
 const yieldTurns = async (): Promise<void> => { for (let i = 0; i < 5; i++) await Promise.resolve(); };
 
 /** The runners of two machines ("" is this host) behind a LaneOps: counts calls and in-flight calls per machine. */
-const herdr = () => {
+const fakeRunners = () => {
   const panes = new Map<string, Row[]>([["", []], ["box2", []]]);
   const calls: { readonly op: string; readonly machine: string; readonly pane?: string }[] = [];
   const inFlight = new Map<string, number>();
@@ -49,9 +49,9 @@ const herdr = () => {
 };
 
 const setup = async () => {
-  const h = herdr();
+  const h = fakeRunners();
   const clock = fakeClock(T0);
-  const config = { ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: "/repo", leadPane: "lead:p1", laneWorkspace: "none" };
+  const config = { ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: "/repo", leadPane: "hc:t1" };
   const deps: FlowDeps = { run: async (): Promise<Ran> => ({ code: 1, out: "", err: "no lane access outside the facade" }), clock, registry: new Registry(state.dir), config, tunables: testTunables(), exists: () => true, ops: h.ops };
   for (let i = 0; i < 100; i++) {
     const machine = i % 2 ? "box2" : "";
@@ -186,7 +186,7 @@ test("a bounded gate never runs more than its limit at once and starts nothing p
 });
 
 test("sweepRound issues one pane list per machine and re-reads only the screens whose pane changed", async () => {
-  const h = herdr();
+  const h = fakeRunners();
   const lanes: Lane[] = [];
   for (let i = 0; i < 40; i++) {
     const machine = i % 2 ? "box2" : "";

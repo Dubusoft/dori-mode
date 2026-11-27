@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import type { Lane } from "../src/registry.ts";
 import { clearShellModes } from "../src/remote-guard.ts";
-import type { Ran, Runner } from "../src/run.ts";
+import type { Runner } from "../src/run.ts";
 import { MACHINE_GUARD_STATE_FILE } from "../src/supervise-guard.ts";
 import { supervisorSweeps } from "../src/supervise-loop.ts";
 import { RunnerGuardBoard } from "../src/runner/guard.ts";
@@ -18,20 +18,21 @@ afterEach(() => { for (const done of cleanups.splice(0)) done(); });
 
 const reading = (load1 = 1) => ({ load1, memFreePct: 50, diskFreeGb: 100, swapFreeGb: 2 });
 
-/** The machine-guard sweep over a scripted `herdr machine list` and a runner board; ssh is counted, never answered. */
-const world = () => {
+/**
+ * The machine-guard sweep over config `guardMachines` (label -> ssh target) and a runner board; every command is recorded
+ * and refused (the machine list is read from local files, and ssh is counted, never answered).
+ */
+const world = (guardMachines: Record<string, string> = { mac: "me@mac" }) => {
   const s = withState();
   cleanups.push(s.done);
   clearShellModes();
   const clock = fakeClock(T0);
-  let list: () => Ran = () => ({ code: 0, out: JSON.stringify([{ label: "mac", ssh_target: "me@mac" }]), err: "" });
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
     calls.push([...argv]);
-    if (argv.join(" ") === "herdr machine list --json") return list();
     return { code: 1, out: "", err: "unexpected" };
   };
-  const deps = { ...depsFor(newWorld(), clock, s.dir), run };
+  const deps = { ...depsFor(newWorld(), clock, s.dir, { guardMachines }), run };
   const board = new RunnerGuardBoard(clock.now);
   const sweeps = supervisorSweeps(deps, s.dir, undefined, undefined, undefined, () => board);
   const tick = async (): Promise<string[]> => {
@@ -46,9 +47,7 @@ const world = () => {
     sweeps: () => sweeps,
     /** The runner `label` reports `load1` now. */
     report: (label: string, load1 = 1) => board.event(label, runnerSample(reading(load1), clock.now(), label)),
-    setList: (f: () => Ran) => { list = f; },
     sshCalls: () => calls.filter((c) => c[0] === "ssh").length,
-    listCalls: () => calls.filter((c) => c[0] === "herdr" && c[1] === "machine").length,
   };
 };
 
@@ -58,15 +57,13 @@ test("the machine guard is its own last sweep; the host guard sweep reaches no w
   expect(names.at(-1)).toBe("machine-guard");
   expect(names.filter((n) => n === "guard")).toHaveLength(1);
   await w.sweeps().find(([name]) => name === "guard")?.[1](async () => {}).catch(() => []);
-  expect(w.sshCalls()).toBe(0);
-  expect(w.listCalls()).toBe(0);
+  expect(w.calls).toEqual([]);
 });
 
 test("only machines with an enrolled runner and a fresh sample are judged, never over ssh", async () => {
-  // Given "mac" (listed) and "box" (enrolled but not in herdr's list) with runners, "bare" listed without one, and
+  // Given "mac" (in guardMachines) and "box" (enrolled but not listed) with runners, "bare" listed without one, and
   // the local runner enrolled too.
-  const w = world();
-  w.setList(() => ({ code: 0, out: JSON.stringify([{ label: "mac", ssh_target: "me@mac" }, { label: "bare", ssh_target: "me@bare" }]), err: "" }));
+  const w = world({ mac: "me@mac", bare: "me@bare" });
   enrollRunners(w.dir, "local", "mac", "box");
   w.report("box", 999);
   w.report("bare", 999);
@@ -79,41 +76,21 @@ test("only machines with an enrolled runner and a fresh sample are judged, never
   expect(w.sshCalls()).toBe(0);
 });
 
-test("a failed herdr machine list keeps the previous list, warns, and is retried within a minute", async () => {
+test("a machine ALERT names the lanes on that machine by its label, reading the machine list without any command", async () => {
   const w = world();
-  expect(await w.tick()).toEqual([]);
-  expect(w.listCalls()).toBe(1);
-  w.setList(() => ({ code: 1, out: "", err: "herdr: server unreachable" }));
-  w.clock.at += 10 * 60_000;
-  expect(await w.tick()).toEqual(["SWEEP_WARN machine-guard herdr machine list failed: herdr: server unreachable"]);
-  w.clock.at += 30_000;
-  await w.tick();
-  expect(w.listCalls()).toBe(2);
-  w.clock.at += 30_000;
-  w.setList(() => ({ code: 0, out: "not json", err: "" }));
-  const lines = await w.tick();
-  expect(w.listCalls()).toBe(3);
-  expect(lines).toHaveLength(1);
-  expect(lines[0]).toStartWith("SWEEP_WARN machine-guard herdr machine list failed: invalid JSON: ");
-  expect(w.sshCalls()).toBe(0);
-});
-
-test("a machine ALERT names lanes whose machine is the herdr machine id as well as the label", async () => {
-  const w = world();
-  w.setList(() => ({ code: 0, out: JSON.stringify([{ id: "m-7", label: "mac", ssh_target: "me@mac" }]), err: "" }));
   enrollRunners(w.dir, "mac");
   w.report("mac", 999);
   const lane = (key: string, machine: string): Lane => ({
     key, title: key, thread: "none", pane: `${key}:p1`, machine, brief: "/b.md", done: "merged acme/app#1", openedAt: new Date(T0).toISOString(), lastReplyAt: T0,
   });
-  await w.deps.registry.write(lane("by-id", "m-7"));
   await w.deps.registry.write(lane("by-label", "mac"));
   await w.deps.registry.write(lane("elsewhere", "box"));
   const lines = await w.tick();
   expect(lines).toHaveLength(1);
   expect(lines[0]).toStartWith("HOST_GUARD ALERT machine=mac load 999 > ");
   const lanes = lines[0]?.split("; lanes on this machine: ")[1]?.split(", ").sort();
-  expect(lanes).toEqual(["by-id", "by-label"]);
+  expect(lanes).toEqual(["by-label"]);
+  expect(w.calls).toEqual([]);
 });
 
 const guardEvent = (runner: string, type: "guard.sample" | "guard.critical", body: Record<string, unknown>): AnyRunnerEvent =>

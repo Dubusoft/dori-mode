@@ -8,6 +8,7 @@ import {
   answerQuery,
 } from "../src/runner/queries.ts";
 import { fakeClock, fakeRunner, newWorld, WT } from "./fakes.ts";
+import { hcAnswer, newHcWorld } from "./runner-hc-world.ts";
 
 const T0 = 1_800_000_000_000;
 
@@ -43,14 +44,14 @@ test("q.lane.files preserves complete typed errors and sizes the complete succes
 
 const inspectWorld = () => {
   const w = newWorld();
-  w.panes = [{ pane_id: "p1", workspace_id: "w1", tab_id: "t1", agent: "omo", agent_status: "working", cwd: "/repo" }];
+  w.panes = [{ pane_id: "hc:t1", workspace_id: "", agent: "omo", agent_status: "working", cwd: "/repo" }];
   w.dirty = " M src/a.ts\n";
   w.aheadCount = "3";
   return w;
 };
 
 const depsOf = (run: Runner, over: Partial<QueryDeps> = {}): QueryDeps => ({
-  run, clock: fakeClock(T0), lane: (key) => (key === "demo-lane" ? { pane: "p1", cwd: "/repo" } : undefined), exists: () => true, ...over,
+  run, clock: fakeClock(T0), lane: (key) => (key === "demo-lane" ? { pane: "hc:t1", cwd: "/repo" } : undefined), exists: () => true, ...over,
 });
 
 test("laneInspect uses the lane identity guard before reading processes or resolving sessions", async () => {
@@ -60,14 +61,14 @@ test("laneInspect uses the lane identity guard before reading processes or resol
   expect(got.pane).toBeUndefined();
   expect(got.process).toBeUndefined();
   expect(got.session).toEqual({ id: "", via: "none" });
-  expect(w.calls.some((a) => a[2] === "process-info" || a[0] === "ps")).toBe(false);
+  expect(w.calls.some((a) => a[0] === "ps")).toBe(false);
 });
 
 test("laneInspect({git:true, done}) returns the worktrees with dirty/ahead and the Done checks", async () => {
   const w = inspectWorld();
   const got = await laneInspect(depsOf(fakeRunner(w)), { key: "demo-lane", git: true, roots: ["/repo"], done: "merged o/r#1; closed o/r#2" });
   expect(got.status).toBe("working");
-  expect(got.pane?.pane_id).toBe("p1");
+  expect(got.pane?.pane_id).toBe("hc:t1");
   expect(got.cwd).toBe("/repo");
   expect(got.cwdExists).toBe(true);
   expect(got.git?.worktrees).toEqual([{ path: WT, branch: "demo-lane", exists: true, dirty: true, ahead: 3 }]);
@@ -98,45 +99,45 @@ test("laneInspect runs Done checks in doneCwd when the lane cwd is gone (fallbac
 });
 
 test("laneInspect session: resolveSession on this host from the pane's shell", async () => {
+  const world = newHcWorld();
+  world.panes = [{ pane_id: "hc:t1", agent: "omo", agent_status: "idle", shellPid: 10 }];
   const run: Runner = async (argv): Promise<Ran> => {
-    const a = argv.join(" ");
-    if (a === "herdr pane list") return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "p1", workspace_id: "w1", agent: "omo", agent_status: "idle" }] } }), err: "" };
-    if (a.startsWith("herdr pane process-info")) return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 10 } } }), err: "" };
-    if (a === "ps -A -o pid=,ppid=,command=") return { code: 0, out: "10 1 bash\n11 10 node senpi/dist/bundle/cli.js --session 11111111-2222-3333-4444-555555555555\n", err: "" };
-    return { code: 1, out: "", err: `unexpected ${a}` };
+    if (argv.join(" ") === "ps -A -o pid=,ppid=,command=") return { code: 0, out: "10 1 bash\n11 10 node senpi/dist/bundle/cli.js --session 11111111-2222-3333-4444-555555555555\n", err: "" };
+    return hcAnswer(world, argv) ?? { code: 1, out: "", err: `unexpected ${argv.join(" ")}` };
   };
   const got = await laneInspect(depsOf(run), { key: "demo-lane", session: true, sessionsDir: "/s" });
   expect(got.status).toBe("idle");
-  expect(got.process).toEqual({ shell_pid: 10 });
+  expect(got.process).toEqual({ shell_pid: 10, foreground_processes: [] });
   expect(got.session).toEqual({ id: "11111111-2222-3333-4444-555555555555", via: "argv" });
 });
 
 test("q.screen caps lines and picks the source; q.process and q.stat", async () => {
-  const w = newWorld();
-  w.screen = "hello";
-  const run = fakeRunner(w);
-  expect(await queryScreen({ run }, { pane: "p1", lines: 5000, source: "recent" })).toEqual({ text: "hello" });
-  expect(w.calls.at(-1)).toEqual(["herdr", "pane", "read", "p1", "--source", "recent", "--lines", String(SCREEN_MAX_LINES)]);
-  await queryScreen({ run }, { pane: "p1", lines: 10, source: "visible" });
-  expect(w.calls.at(-1)).toEqual(["herdr", "pane", "read", "p1", "--source", "visible"]);
+  const world = newHcWorld();
+  world.screen = "hello";
+  const calls: string[][] = [];
+  const run: Runner = async (argv) => { calls.push([...argv]); return hcAnswer(world, argv) ?? { code: 1, out: "", err: "unexpected" }; };
+  expect(await queryScreen({ run }, { pane: "hc:t1", lines: 5000, source: "recent" })).toEqual({ text: "hello" });
+  expect(calls.at(-1)).toEqual(["hc", "--json", "read", "t1", "--lines", String(SCREEN_MAX_LINES)]);
+  await queryScreen({ run }, { pane: "hc:t1", lines: 10, source: "visible" });
+  expect(calls.at(-1)).toEqual(["hc", "--json", "read", "t1"]);
   const failing: Runner = async () => ({ code: 1, out: "", err: "no such pane" });
-  expect(await queryProcess({ run: failing }, { pane: "p1" })).toEqual({ error: "no such pane" });
+  expect(await queryProcess({ run: failing }, { pane: "hc:t1" })).toEqual({ error: "no such pane" });
   expect(queryStat({ exists: (p) => p === "/a" }, { paths: ["/a", "/b"] })).toEqual({ exists: [true, false] });
 });
 
 test("observeMachine fills the pane count from the pane list, -1 when it is unreadable", async () => {
-  const w = newWorld();
-  w.panes = [{ pane_id: "p1", workspace_id: "w1" }, { pane_id: "p2", workspace_id: "w1" }];
-  const run: Runner = async (argv, opts) => (argv[0] === "df" ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 100 50 10485760", err: "" } : fakeRunner(w)(argv, opts));
+  const world = newHcWorld();
+  world.panes = [{ pane_id: "hc:t1" }, { pane_id: "hc:t2" }];
+  const run: Runner = async (argv) => (argv[0] === "df" ? { code: 0, out: "Filesystem 1K-blocks Used Available\n/dev/x 100 50 10485760", err: "" } : hcAnswer(world, argv) ?? { code: 1, out: "", err: "unexpected" });
   const mem = async () => "MemTotal: 1000 kB\nMemAvailable: 250 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n";
   const got = await observeMachine(depsOf(run, { os: "linux", readMemInfo: mem }));
   expect(got.os).toBe("linux");
   expect(got.sampledAt).toBe(T0);
-  expect(got.panes.map((p) => p.pane_id)).toEqual(["p1", "p2"]);
+  expect(got.panes.map((p) => p.pane_id)).toEqual(["hc:t1", "hc:t2"]);
   expect(got.sample.panes).toBe(2);
   expect(got.sample.diskFreeGb).toBe(10);
   if (process.platform === "linux") expect(got.sample.memFreePct).toBe(25);
-  const down: Runner = async (argv, opts) => (argv[0] === "herdr" ? { code: 1, out: "", err: "herdr down" } : run(argv, opts));
+  const down: Runner = async (argv, opts) => (argv[0] === "hc" ? { code: 1, out: "", err: "hc down" } : run(argv, opts));
   const blind = await observeMachine(depsOf(down, { os: "linux", readMemInfo: mem }));
   expect(blind.panes).toEqual([]);
   expect(blind.sample.panes).toBe(-1);
@@ -191,16 +192,16 @@ test("queryDispatcher answers each query with one q.result carrying its qid", as
   expect(t.replies).toHaveLength(1);
   expect(t.replies[0]?.qid).toBe("q1");
   expect(t.replies[0]?.ok).toBe(true);
-  expect((t.replies[0]?.result as { panes: { pane_id: string }[] }).panes[0]?.pane_id).toBe("p1");
+  expect((t.replies[0]?.result as { panes: { pane_id: string }[] }).panes[0]?.pane_id).toBe("hc:t1");
 });
 
 test("queryDispatcher: a failed read is ok:false with its error; jobs deny refuses an inspect with done; no qid is dropped", async () => {
-  const down: Runner = async () => ({ code: 1, out: "", err: "herdr down" });
+  const down: Runner = async () => ({ code: 1, out: "", err: "hc down" });
   const t = dispatch(down, "deny");
   const failed = t.answered();
   t.d(frame("q.panes", { qid: "q2" }));
   await failed;
-  expect(t.replies[0]).toEqual({ qid: "q2", ok: false, detail: "RUNNER_QUERY_FAILED q.panes herdr pane list failed: herdr down" });
+  expect(t.replies[0]).toEqual({ qid: "q2", ok: false, detail: "RUNNER_QUERY_FAILED q.panes hc ls failed: hc down" });
   t.d(frame("q.lane.inspect", { qid: "q3", key: "demo-lane", done: "closed o/r#1" }));
   expect(t.replies[1]).toEqual({ qid: "q3", ok: false, detail: "RUNNER_CMD_REJECTED jobs-denied" });
   t.d(frame("q.screen", { qid: "q4", pane: "p1", lines: 5, source: "sideways" }));

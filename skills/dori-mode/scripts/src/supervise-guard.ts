@@ -118,10 +118,10 @@ const machineTag = (label: string): string => `machine=${label.replace(/\s/g, "_
 /** Whose critical stage: this host (its local runner) or one worker machine. */
 export type CriticalScope = { readonly kind: "local" } | { readonly kind: "machine"; readonly machine: GuardMachine };
 
-/** The open lanes with a pane in `scope`: local lanes, or lanes naming the machine by label or herdr id. */
+/** The open lanes with a pane in `scope`: local lanes, or lanes naming the machine by label. */
 const lanesIn = (scope: CriticalScope, open: readonly Lane[]): Lane[] => open.filter((l) => l.pane && (scope.kind === "local"
   ? !l.machine
-  : l.machine !== undefined && (l.machine === scope.machine.label || l.machine === scope.machine.id)));
+  : l.machine === scope.machine.label));
 
 /**
  * The critical stage of one host, once per guard sweep: this host (`scope.kind` "local", the local runner's sample) or

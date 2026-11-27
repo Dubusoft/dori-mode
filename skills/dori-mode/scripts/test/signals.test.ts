@@ -99,7 +99,7 @@ test("a QA-only lane's claim is re-checked at close time: the lane says done, bu
     }),
   };
   const deps = { ...fake, run, ops };
-  // Adoption goes to the lane's runner (the fake facade), so the test never reaches the host's herdr.
+  // Adoption goes to the lane's runner (the fake facade), so the test never reaches the host's hc.
   const lane = await adoptLane(fake, { key: "local-setup", title: "setup", brief: "/b.md", done: `command ["test","-f","${flag}"]`, pane: "w:p3", cwd: state.dir });
   await claimDone(deps, lane, "I ran the setup and it works");
   // The first pass hands the claim over; its window runs from there.

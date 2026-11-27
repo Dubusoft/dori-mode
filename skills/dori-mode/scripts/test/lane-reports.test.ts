@@ -279,7 +279,7 @@ test("dori report: a lane sends a report for its own key only, through its runne
   expect(new SqliteLaneReports(storePath(dir)).list()).toHaveLength(0);
 });
 
-/** Launches a local lane through the fakes (herdr tab create answers with pane w:p9). */
+/** Launches a local lane through the fake runner. */
 const launchLocal = async (dir: string, key = "cli-lane") => {
   const world = newWorld();
   const deps = depsFor(world, fakeClock(T0), dir, { leadPane: "w:lead" });

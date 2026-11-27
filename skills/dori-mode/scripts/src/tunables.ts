@@ -76,7 +76,7 @@ export type Tunables = {
   readonly deadPanePatterns: readonly string[];
   /** A wait without --timeout whose check errors or times out this many times in a row ends as WAIT_FAILED. */
   readonly waitMaxFailures: number;
-  /** Per machine, no herdr call of a sweep round starts later than this many ms after the round began. */
+  /** Per machine, no runtime call of a sweep round starts later than this many ms after the round began. */
   readonly sweepMachineDeadlineMs: number;
   /** How each event kind is delivered (event-policy.ts); a config's `kinds` are laid over the default table. */
   readonly eventPolicy: EventPolicy;

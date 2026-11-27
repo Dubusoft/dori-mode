@@ -9,6 +9,7 @@ import { DEFAULT_POLICY } from "../src/runner/policy.ts";
 import type { CommandStatusState, RunnerEventBodies } from "../src/runner/protocol.ts";
 import { commandDispatcher } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
+import { hcAnswer, newHcWorld } from "./runner-hc-world.ts";
 import { fakeClock } from "./fakes.ts";
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
@@ -25,35 +26,30 @@ const runnerDir = (): string => {
 
 const START = { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES };
 
-const fakeHerdr = () => {
-  const tabs: string[] = [];
-  const run = async (argv: readonly string[]): Promise<Ran> => {
-    if (argv.slice(0, 3).join(" ") === "herdr tab create") {
-      tabs.push(`t${tabs.length + 1}`);
-      return { code: 0, out: JSON.stringify({ result: { tab_id: tabs.at(-1), root_pane: { pane_id: `p${tabs.length}` } } }), err: "" } as Ran;
-    }
-    return { code: 0, out: "", err: "" } as Ran;
-  };
-  return { tabs, run };
+/** A scripted hc; `opened` lists the terminals the runner opened. */
+const fakeHc = () => {
+  const world = newHcWorld();
+  const run = async (argv: readonly string[]): Promise<Ran> => hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
+  return { opened: () => [...world.opened.keys()], run };
 };
 
-test("a runner that crashed after lane.start's effect and before its result settles it as verified on restart, with one tab", async () => {
+test("a runner that crashed after lane.start's effect and before its result settles it as verified on restart, with one terminal", async () => {
   const dir = runnerDir();
-  const herdr = fakeHerdr();
+  const hc = fakeHc();
   const clock = fakeClock(1_000);
   const before = new RunnerState(dir, { now: clock.now });
   before.boot();
   expect(before.recordIntent({ cmdId: START.cmdId, cmdSeq: 1, type: "lane.start", epoch: 1, key: "lane-a" }).fresh).toBe(true);
-  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir: dir, run: herdr.run, clock, publish: () => {}, policy: { agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" } });
+  const lanes = new RunnerLanes({ runnerDir: dir, run: hc.run, clock, publish: () => {}, policy: { agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" } });
   await lanes.start(START);
   before.close();
 
   const after = new RunnerState(dir, { now: clock.now });
   after.boot();
   const published: unknown[] = [];
-  const observeLane = async (key: string): Promise<Observation> => (Object.keys(lanes.records()).includes(key) && herdr.tabs.length ? "present" : "absent");
+  const observeLane = async (key: string): Promise<Observation> => (Object.keys(lanes.records()).includes(key) && hc.opened().length ? "present" : "absent");
   const lines = await resolveInterrupted({ state: after, observeLane, publish: (body) => { published.push(body); } });
-  expect(herdr.tabs).toEqual(["t1"]);
+  expect(hc.opened()).toEqual(["t1"]);
   expect(after.command(START.cmdId)?.state).toBe("verified");
   expect(after.pendingIntents()).toEqual([]);
   expect(published).toEqual([{ cmdId: START.cmdId, cmdSeq: 1, state: "verified", detail: "interrupted lane.start; observed present" }]);
@@ -171,7 +167,7 @@ test("final command records past the 30-day retention are pruned; intent rows an
   state.close();
 });
 
-test("with the runner's command records gone, the supervisor observes instead of resending: present is verified, herdr silent is one OPERATION_AMBIGUOUS", async () => {
+test("with the runner's command records gone, the supervisor observes instead of resending: present is verified, hc silent is one OPERATION_AMBIGUOUS", async () => {
   const dir = runnerDir();
   const state = new RunnerState(dir, { now: () => 1_000 });
   state.boot();
@@ -183,7 +179,7 @@ test("with the runner's command records gone, the supervisor observes instead of
 
   expect(await settle(async () => "present")).toBe("verified");
   expect(resent).toBe(0);
-  expect(await settle(async () => { throw new Error("herdr: connection refused"); })).toBe("ambiguous");
+  expect(await settle(async () => { throw new Error("hc: connection refused"); })).toBe("ambiguous");
   expect(resent).toBe(0);
   expect(emitted.filter((l) => l.startsWith("OPERATION_AMBIGUOUS"))).toHaveLength(1);
   expect(await settle(async () => "absent")).toBe("retry");

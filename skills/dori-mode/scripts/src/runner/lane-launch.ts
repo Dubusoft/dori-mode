@@ -3,31 +3,6 @@ import { resumeArgv } from "./lane-control.ts";
 import type { RunnerPolicy } from "./policy.ts";
 
 export const quote = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);
-const psQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
-
-/**
- * The line typed into a PowerShell pane: a nested `<shell> -NoLogo -EncodedCommand <base64(utf16le(script))>`, so the
- * variables live only in the nested process and the typed text is plain base64. Windows PowerShell 5.1 mangles native
- * arguments containing a double quote, so it is refused there (`RUNNER_LANE_ARGV_UNSAFE`); pwsh passes them intact.
- * With `cwd` the nested shell enters it before the agent starts: the nested shell loads the user's profile, and a profile
- * that changes directory would otherwise start the agent outside the lane's directory.
- */
-export const powershellLaunchLine = (
-  shell: "pwsh" | "powershell", env: readonly (readonly [string, string])[], argv: readonly string[], cwd?: string,
-): string => {
-  if (shell === "powershell" && argv.some((arg) => arg.includes('"'))) {
-    throw new Error("RUNNER_LANE_ARGV_UNSAFE Windows PowerShell 5.1 cannot pass an argument containing a double quote; use pwsh");
-  }
-  const [program, ...args] = argv;
-  const script = [
-    ...env.map(([name, value]) => `$env:${name}=${psQuote(value)}`),
-    "$env:PSExecutionPolicyPreference='Bypass'",
-    ...(cwd !== undefined ? [`Set-Location -LiteralPath ${psQuote(cwd)}`] : []),
-    `& ${[program ?? "", ...args].map(psQuote).join(" ")}`,
-    "exit $LASTEXITCODE",
-  ].join("; ");
-  return `${shell} -NoLogo -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
-};
 
 /** The old lane `.omo/mcp.json` (figma disabled) that launch.ts used to write; the same bytes as `LEGACY_LANE_MCP` there. */
 export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
@@ -61,7 +36,7 @@ export const LANE_PERMISSION_FLAGS: readonly string[] = ["--permission-preset", 
 export const LANE_NO_ASK_FLAG = "--no-ask-user=true";
 
 /**
- * The omo `--permission` value for a lane with no sandbox (a Windows runner, a machine opted in to run unsandboxed), where
+ * The omo `--permission` value for a lane whose machine opted in to run unsandboxed, where
  * full-access alone would leave nothing in place: every path outside the lane's cwd is refused without a prompt, except
  * each `allowed` directory and everything under it. A directory whose path holds `,` or `=` cannot be written as an omo
  * rule, so it stays refused.

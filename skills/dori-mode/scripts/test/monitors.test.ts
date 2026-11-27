@@ -21,7 +21,7 @@ const wakes = (name: string, lines: string[]): string[] => {
 };
 
 test("the done-flow filter wakes on every lane event, never on the ready line", () => {
-  const events = ["LANE_DONE_CLAIMED a w:p1 merged", "LANE_NOT_DONE a dirty", "LANE_CLOSED a {}", "LANE_AUTO_CLOSED a", "LANE_REPORT a", "LANE_WATCH_WARN Error: herdr down"];
+  const events = ["LANE_DONE_CLAIMED a hc:t1 merged", "LANE_NOT_DONE a dirty", "LANE_CLOSED a {}", "LANE_AUTO_CLOSED a", "LANE_REPORT a", "LANE_WATCH_WARN Error: hc unreachable"];
   expect(wakes("done flow", ["LANE_WATCH_READY", ...events])).toEqual(events);
 });
 

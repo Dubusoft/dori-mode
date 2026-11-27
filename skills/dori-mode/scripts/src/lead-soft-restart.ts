@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { ALIVE_STATUSES, paneRow, readScreen, sendGuarded } from "./panes.ts";
-import { paneRuntime } from "./runtime/index.ts";
+import { sessionRuntime } from "./runtime/index.ts";
 import { sessionDirFor } from "./session-id.ts";
 import { plainShell, processInfo, STARTUP_ERROR, STARTUP_EVIDENCE_MS } from "./lead-process.ts";
 import { TransientSuperviseError } from "./supervise-journal.ts";
@@ -23,13 +23,7 @@ export const softCommand = async (deps: FlowDeps, command: string, prompt = fals
   if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
   const before = await readScreen(deps.run, deps.config.leadPane);
   const previous = new Set(before.split("\n"));
-  let enterFailed = false;
-  const run: FlowDeps["run"] = async (argv, options) => {
-    const result = await deps.run(argv, options);
-    if (argv[2] === "send-keys" && result.code !== 0) enterFailed = true;
-    return result;
-  };
-  if (await sendGuarded(run, deps.config.leadPane, command) === "failed" || enterFailed) throw new TransientSuperviseError("soft command send failed");
+  if (await sendGuarded(deps.run, deps.config.leadPane, command) === "failed") throw new TransientSuperviseError("soft command send failed");
   if (prompt) return;
   const deadline = deps.clock.now() + 5_000;
   let enters = 1;
@@ -37,13 +31,13 @@ export const softCommand = async (deps: FlowDeps, command: string, prompt = fals
     const after = await paneRow(deps.run, deps.config.leadPane);
     const screen = await readScreen(deps.run, deps.config.leadPane);
     const addedLines = screen.split("\n").filter((line) => !previous.has(line));
-    // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
+    // omo's terminal integration can release the pane's agent once /new has shut the old session down; that is /new
     // taking effect, and softSessionStarted waits for the agent to come back.
     if (command === "/new" && !after?.agent) return;
     if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
     if (addedLines.some((line) => line.includes(command))) {
       if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
-      if (!(await paneRuntime(deps.run, deps.config.leadPane).key(deps.config.leadPane, "enter"))) throw new TransientSuperviseError("soft command send failed");
+      if (!(await sessionRuntime(deps.run).key(deps.config.leadPane, "enter"))) throw new TransientSuperviseError("soft command send failed");
       enters++;
     } else if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
     if (deps.clock.now() >= deadline) break;
@@ -73,7 +67,7 @@ export const sessionModel = (file: string): { model?: string; thinking?: string 
 };
 
 /**
- * After /new omo's herdr integration can release the pane's agent while the old session shuts down and report it again
+ * After /new omo's terminal integration can release the pane's agent while the old session shuts down and report it again
  * once the new one has started (about two seconds). For this long a missing agent whose process still holds the pane's
  * foreground is that switch, not a dead lead.
  */

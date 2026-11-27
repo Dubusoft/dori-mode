@@ -21,7 +21,7 @@
 # reads almost everywhere and refuses writes outside $HOME and /opt/homebrew, which are writable but for what the host
 # later runs or trusts outside the sandbox: what dori runs or trusts in ~/.dori (its runner dir, dori itself, its config,
 # the scripts its secret commands run, the lead's cwd and the attachment pins), ~/.ssh, ~/Library/LaunchAgents, ~/Library/Keychains, the shell
-# startup files, ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, ~/.gitconfig and ~/.config/git, gh and herdr (HOST_RUN below),
+# startup files, ~/.local/bin, ~/.bun/bin, ~/.cargo/bin, ~/.gitconfig and ~/.config/git and gh (HOST_RUN below),
 # and the directories holding them (~, ~/.dori, ~/.config, ~/.local, ~/.bun, ~/.cargo, ~/Library) themselves, so none of them
 # can be renamed away and replaced by a symlink. Writable again after those refusals: the cwd (worktree) and its git
 # common dir, the runner's worktree root and the .git directories of the repos under its repos root, the lane's own
@@ -37,8 +37,7 @@
 # gh runs with GH_CONFIG_DIR in the lane's TMPDIR, holding a copy of ~/.config/gh/config.yml. /bin/ps and /usr/bin/log
 # refuse to run sandboxed and run outside the profile. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
-# but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
-# HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there. herdr-core's (hc)
+# but the lane socket (sock/lane.d/lane), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there. herdr-core's (hc)
 # state and runtime dirs and any other hc control socket (HC_SOCKET, the hc config's socket) are refused outright like
 # the hide list below, as hc runs commands on the host for whoever reaches it.
 # Host paths listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file), ~/.dori's
@@ -86,7 +85,7 @@ MAC_CREDENTIALS=(
 HOST_RUN=".dori/runner .dori/bin .dori/src .dori/dori-boot-prep.sh .dori/config.json* .dori/ops .dori/lead
   .dori/lane-attachments .dori/worktrees .ssh Library/LaunchAgents Library/Keychains .bashrc .bash_profile .bash_login .bash_logout .profile
   .zshrc .zprofile .zshenv .zlogin .zlogout .local/bin .bun/bin .cargo/bin .gitconfig .config/git .config/gh
-  .config/herdr .config/herdr-core"
+  .config/herdr-core"
 # The directories holding HOST_RUN entries, refused as themselves only: renaming one away would leave its old path free
 # for a symlink into a writable directory.
 HOST_RUN_PARENTS=". .dori .config .local .bun .cargo Library"
@@ -191,7 +190,7 @@ case "$key" in . | ..) key="_$key" ;; esac
 # The profile and its -D parameters for the lane in $key with working directory $C and TMPDIR $LT (set by the caller).
 # Fills the globals PROFILE and PARAMS.
 build_profile() {
-  local n=0 p w_rules="" r_rules="" o_rules="" d_rules="" g_rules="" h_rules="" a_rules="" k_rules="" gcd broad kc rr
+  local n=0 p w_rules="" r_rules="" o_rules="" d_rules="" g_rules="" h_rules="" a_rules="" gcd broad kc rr
   local u_rules="" l_rules=""
   PARAMS=()
   # param NAME PATH: adds -D NAME=<real path of PATH>.
@@ -306,14 +305,10 @@ build_profile() {
   param DOCKER_VAR /var/run/docker.sock
   param_raw DOCKER_VAR_LINK "$(canon_parent /var/run/docker.sock)"
   param LANE_SOCK "$H/.dori/runner/sock/lane.d/lane"
-  if [ -n "$key" ]; then
-    param HERDR_SOCK "$H/.dori/runner/sock/herdr.d/$key/herdr"
-    k_rules="(allow network-outbound (remote unix-socket (path-literal (param \"HERDR_SOCK\"))))"
-  fi
   param CONFIG "$H/.config"
   param REVIEW_INPUTS "$H/.dori/state/review-inputs"
   XREVIEW_INPUTS=$LAST
-  # herdr points SSH_AUTH_SOCK at ~/.config/herdr/herdr.sock.agent, a symlink to the agent's socket: both names stay usable.
+  # SSH_AUTH_SOCK may name a symlink under ~/.config to the agent's socket: both names stay usable.
   case "${SSH_AUTH_SOCK:-}" in
     "$H"/.config/*)
       param AGENT_SOCK "$SSH_AUTH_SOCK"
@@ -416,7 +411,6 @@ $d_rules
 (allow file-read* (subpath (param \"REVIEW_INPUTS\")))
 (deny network-outbound (remote unix-socket (subpath (param \"DORI\"))) (remote unix-socket (subpath (param \"CONFIG\"))))
 (allow network-outbound (remote unix-socket (path-literal (param \"LANE_SOCK\"))))
-$k_rules
 $a_rules
 (deny network-outbound (remote unix-socket (path-literal (param \"DOCKER_HOME\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR\"))) (remote unix-socket (path-literal (param \"DOCKER_VAR_LINK\"))))
 $h_rules
@@ -519,7 +513,7 @@ fi
 C=$(pwd -P)
 build_profile
 
-export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT" HERDR_SOCKET_PATH="$H/.dori/runner/sock/herdr.d/$key/herdr"
+export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT"
 # Nor does a lane learn where herdr-core's (hc) control socket is (the profile refuses its sockets above).
 unset HC_SOCKET HC_SESSION HC_TERMINAL_SOCKET HC_TERMINAL_ID HC_SCOPE
 # omo starts its engine with an empty OpenSSL bundle (SSL_CERT_FILE/SSL_CERT_DIR under ~/.omo/engine-trust/defaults)

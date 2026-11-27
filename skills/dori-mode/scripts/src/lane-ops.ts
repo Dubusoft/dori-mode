@@ -38,9 +38,7 @@ export type StartInput = {
   readonly files?: LaneBriefFiles;
   readonly key: string; readonly machine?: string; readonly briefText: string; readonly done: string; readonly thread: string; readonly cwd?: string;
   readonly sandbox: boolean; readonly mode: string; readonly model: string; readonly keywords: string; readonly session?: string;
-  readonly target?: { pane?: string; workspace?: string }; readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
-  /** The herdr workspace a new tab opens in (the supervisor-managed lanes workspace of a local lane). */
-  readonly tabWorkspace?: string;
+  readonly heavySlots?: number; readonly heavyMaxLoad?: number; readonly cmdId?: string;
   /** Names in the runner's runner-config `grants` (`dori launch --grant`); sent only when non-empty. */
   readonly grants?: readonly string[];
 };
@@ -79,7 +77,7 @@ export type LaneOps = {
   readonly panes: (machine?: string) => Promise<Pane[]>;
   /** `lines` undefined: the visible screen; n: the last n lines of scrollback and screen ("recent"). */
   readonly screen: (ref: PaneRef, lines?: number) => Promise<string>;
-  /** herdr's JSON in `out` (`{result:{process_info}}`), code 1 and `err` when the runner could not read it: keeps the existing parsers. */
+  /** The pane's process info as JSON in `out` (`{result:{process_info}}`), code 1 and `err` when the runner could not read it: keeps the existing parsers. */
   readonly processInfo: (ref: PaneRef) => Promise<Ran>;
   /** From `panes()`; never throws. */
   readonly status: (ref: PaneRef) => Promise<{ readonly status?: string; readonly error?: string }>;
@@ -94,7 +92,7 @@ export type LaneOps = {
   /** Throws LaneOpsError LANE_OP_FAILED with the runner's detail (RUNNER_CMD_REJECTED cwd-outside-roots, RUNNER_LANE_TARGET_BUSY, ...). */
   readonly start: (input: StartInput) => Promise<CommandResults["lane.start"]>;
   readonly adopt: (input: AdoptInput) => Promise<CommandResults["lane.adopt"]>;
-  readonly recover: (lane: LaneRef, opts?: { readonly session?: string; readonly tabWorkspace?: string; readonly briefText?: string; readonly files?: LaneBriefFiles; readonly cmdId?: string }) => Promise<CommandResults["lane.recover"]>;
+  readonly recover: (lane: LaneRef, opts?: { readonly session?: string; readonly briefText?: string; readonly files?: LaneBriefFiles; readonly cmdId?: string }) => Promise<CommandResults["lane.recover"]>;
   /** An ambiguous close throws LANE_OP_AMBIGUOUS (closeSequence maps it to its ambiguous step). */
   readonly close: (lane: LaneRef, opts?: { readonly cmdId?: string }) => Promise<CommandResults["lane.close"]>;
   /** failed → {code: 1, err: detail}; ambiguous → {code: 2, err: "ambiguous: ..."} (the operation's read-back decides). */
@@ -173,8 +171,6 @@ export const RESULT_GUARDS: { readonly [T in DurableCommandType]: (v: unknown) =
   "lane.git": (v) => isObj(v) && isNum(v.code) && isStr(v.out) && isStr(v.err),
   "lane.observe": (v) => isObj(v) && LANE_STATUSES(v.status) && (v.turn === undefined || isTurn(v.turn)),
   "guard.kill": (v) => isObj(v) && listOf(v.killed, (k) => isObj(k) && isNum(k.pid) && isStr(k.comm) && isNum(k.rssKb) && optStr(k.lane)),
-  "host.herdr": (v) => isObj(v) && oneOf(["start", "restart", "stop", "status"])(v.action) && oneOf(["up", "down", "hung", "elevated"])(v.state)
-    && optStr(v.instance) && isBool(v.managed) && isBool(v.paused),
   "wait.check": (v) => isObj(v) && isBool(v.met) && optStr(v.error),
   "job.run": (v) => isObj(v) && isNum(v.exitCode) && isBool(v.timedOut) && isStr(v.output) && isStr(v.err),
 };
@@ -324,17 +320,15 @@ export const laneOps = (call: RunnerCall, deps: { readonly now: () => number; re
       expectedLaneGen: 0, keywords: input.keywords,
       ...(input.files !== undefined ? { files: input.files } : {}),
       ...(input.session !== undefined ? { session: input.session } : {}),
-      ...(input.target ? { target: input.target } : {}),
       ...(input.heavySlots !== undefined ? { heavySlots: input.heavySlots } : {}),
       ...(input.heavyMaxLoad !== undefined ? { heavyMaxLoad: input.heavyMaxLoad } : {}),
-      ...(input.tabWorkspace !== undefined ? { tabWorkspace: input.tabWorkspace } : {}),
       ...(input.grants?.length ? { grants: input.grants } : {}),
     }, input.cmdId),
     adopt: (input) => effect(machineRunner(input.machine), "lane.adopt", {
       key: input.key, pane: input.pane, mode: input.mode, model: input.model, ...(input.cwd !== undefined ? { cwd: input.cwd } : {}),
     }),
     recover: (lane, opts = {}) => effect(runnerOf(lane), "lane.recover", {
-      key: lane.key, ...(opts.session !== undefined ? { session: opts.session } : {}), ...(opts.tabWorkspace !== undefined ? { tabWorkspace: opts.tabWorkspace } : {}),
+      key: lane.key, ...(opts.session !== undefined ? { session: opts.session } : {}),
       ...(opts.briefText !== undefined ? { briefText: opts.briefText } : {}), ...(opts.files !== undefined ? { files: opts.files } : {}),
     }, opts.cmdId),
     // Worktree checks are the supervisor's (q.lane.inspect before the close, D10), never the runner's.

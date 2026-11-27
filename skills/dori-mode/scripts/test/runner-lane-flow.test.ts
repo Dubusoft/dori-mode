@@ -17,6 +17,10 @@ import { commandDispatcher } from "../src/runner/serve.ts";
 import { RunnerState } from "../src/runner/state.ts";
 import type { AnyRunnerEvent, RunnerEventBodies, RunnerEventType } from "../src/runner/protocol.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
+import { hcAnswer, launchLines, newHcWorld, sentTo } from "./runner-hc-world.ts";
+
+/** A scripted hc whose first terminal is t7 (pane hc:t7). */
+const worldAt7 = () => { const world = newHcWorld(); world.next = 7; return world; };
 
 const FILES = { run: { id: "00000000-0000-4000-8000-000000000001", requiredReport: false }, tree: { directories: [], files: [] }, references: [] };
 
@@ -48,28 +52,26 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   const runnerDir = join(t.s.dir, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
   const published: [string, unknown][] = [];
-  const herdr: [string, ...string[]][] = [];
+  const calls: string[][] = [];
+  const world = worldAt7();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1",
     runnerDir, clock: fakeClock(T0), token: () => "lane-token-1",
     policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: ["lane-sandbox", "--check"] },
     publish: (type, body) => { published.push([type, body]); },
     run: async (argv) => {
-      herdr.push(argv as [string, ...string[]]);
+      calls.push([...argv]);
       if (argv[0] === "lane-sandbox") return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
-      return { code: 0, out: "", err: "" } as Ran;
+      return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
     },
   });
   await t.deps.registry.patch("lane-a", { fileRun: FILES.run });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES });
-  const run = herdr.find((a) => a[2] === "run");
-  expect(run?.[4]).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
+  expect(launchLines(calls)[0]).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(lanes.tokenFor("lane-a", "lane-token-1")).toBe(true);
   expect(lanes.tokenFor("lane-a", "other")).toBe(false);
   const [type, started] = published[0] as [RunnerEventType, object];
   await acceptLaneEvent(t.hub, "worker-a", t.event(type, started));
-  expect((await t.deps.registry.read("lane-a"))?.pane).toBe("p7");
+  expect((await t.deps.registry.read("lane-a"))?.pane).toBe("hc:t7");
 
   const binary = Buffer.from([0, 255, 128, 1]);
   writeFileSync(join(runnerDir, "briefs/lane-a.out/report.bin"), binary);
@@ -185,19 +187,19 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe, 
   const state = new RunnerState(runnerDir, { now: () => T0 });
   cleanups.push(() => { state.close(); });
   const policy = { ...DEFAULT_POLICY, sandboxCheck: ["lane-sandbox", "--check"], agents: { sandboxed: ["lane-sandbox", "omo", "{prompt}"] }, allowedRoots: ["/repo"] };
-  const herdr = async (argv: readonly string[]): Promise<Ran> => {
+  const world = worldAt7();
+  world.panes = [{ pane_id: "hc:t7", agent: "omo", agent_status: "working" }];
+  const hc = async (argv: readonly string[]): Promise<Ran> => {
     if (argv[0] === "lane-sandbox") return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
-    if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
-    if (argv.slice(0, 3).join(" ") === "herdr pane list") return { code: 0, out: JSON.stringify({ result: { panes: [{ pane_id: "p7", workspace_id: "w", tab_id: "t7", agent: "omo", agent_status: "working" }] } }), err: "" } as Ran;
-    return { code: 0, out: "", err: "" } as Ran;
+    return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
   };
-  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir, run: herdr, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
+  const lanes = new RunnerLanes({ runnerDir, run: hc, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
   const published: RunnerEventBodies["cmd.result"][] = [];
   let waiting: { n: number; resolve: () => void } | undefined;
   const dispatch = commandDispatcher({
     state, policy, realpath: (p) => p, log: () => {},
     publish: (body) => { published.push(body); if (waiting && published.length >= waiting.n) waiting.resolve(); },
-    effects: runnerEffects({ lanes, guard: { killLanes: async (keys) => keys.map((k, i) => ({ pid: 40 + i, lane: k, comm: "qemu", rssKb: 9 })) }, run: herdr }),
+    effects: runnerEffects({ lanes, guard: { killLanes: async (keys) => keys.map((k, i) => ({ pid: 40 + i, lane: k, comm: "qemu", rssKb: 9 })) }, run: hc }),
   });
   const send = async (cmdSeq: number, type: string, body: object): Promise<void> => {
     const done = new Promise<void>((resolve) => { waiting = { n: cmdSeq, resolve }; });
@@ -211,7 +213,7 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe, 
   const added = Buffer.from("added later");
   await send(5, "lane.attach", { cmdId: "lane.attach:lane-a:5:1", key: "lane-a", tree: { directories: ["r0000"], files: [{ path: "r0000/more.md", bytes: added.length, sha256: createHash("sha256").update(added).digest("hex"), base64: added.toString("base64") }] } });
   expect(published.map(({ state: s, detail, result }) => ({ s, detail, result }))).toEqual([
-    { s: "verified", detail: "started pane=p7 tab=t7", result: { pane: "p7", tab: "t7", startup: { verdict: "ok", detail: "ready" }, cwd: "/repo" } },
+    { s: "verified", detail: "started pane=hc:t7", result: { pane: "hc:t7", tab: "", startup: { verdict: "ok", detail: "ready" }, cwd: "/repo" } },
     { s: "verified", detail: "noted done-claimed", result: {} },
     { s: "verified", detail: "observed working", result: { status: "working" } },
     { s: "verified", detail: "killed 1", result: { killed: [{ pid: 40, comm: "qemu", rssKb: 9, lane: "lane-a" }] } },
@@ -221,7 +223,7 @@ test("the runner's effects table answers lane.start, lane.notify, lane.observe, 
   expect(lanes.notice("lane-a")).toEqual({ status: "done-claimed", claim: { at: "2026-11-06T00:00:00Z", evidence: "abc" } });
 });
 
-test("a lane.start without cwd creates <runnerDir>/lanes/<key>, opens its tab there and reports that directory", async () => {
+test("a lane.start without cwd creates <runnerDir>/lanes/<key>, opens its terminal there and reports that directory", async () => {
   const t = await setup();
   const runnerDir = join(realpathSync(t.s.dir), "runner");
   mkdirSync(join(runnerDir, "lanes"), { recursive: true, mode: 0o700 });
@@ -231,22 +233,22 @@ test("a lane.start without cwd creates <runnerDir>/lanes/<key>, opens its tab th
   const policy = parsePolicy({ agents: { default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], defaultCwd: "/repo/work" }, "/home/u", "/tmp", { runnerDir });
   const laneDir = join(runnerDir, "lanes", "lane-a");
   const calls: string[][] = [];
-  const herdr = async (argv: readonly string[]): Promise<Ran> => {
+  const world = worldAt7();
+  const hc = async (argv: readonly string[]): Promise<Ran> => {
     calls.push([...argv]);
-    if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
-    return { code: 0, out: "", err: "" } as Ran;
+    return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
   };
-  const lanes = new RunnerLanes({ instance: async () => "server-1", runnerDir, run: herdr, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
+  const lanes = new RunnerLanes({ runnerDir, run: hc, clock: fakeClock(T0), policy, publish: () => {}, token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }) });
   const published: RunnerEventBodies["cmd.result"][] = [];
   const done = new Promise<void>((resolve) => {
-    const dispatch = commandDispatcher({ state, policy, realpath: realpathSync, runnerDir, log: () => {}, publish: (body) => { published.push(body); resolve(); }, effects: runnerEffects({ lanes, guard: { killLanes: async () => [] }, run: herdr }) });
+    const dispatch = commandDispatcher({ state, policy, realpath: realpathSync, runnerDir, log: () => {}, publish: (body) => { published.push(body); resolve(); }, effects: runnerEffects({ lanes, guard: { killLanes: async () => [] }, run: hc }) });
     dispatch({ v: 1, runner: "local", gen: 1, epoch: 1, cmdSeq: 1, type: "lane.start", body: { cmdId: "lane-start:lane-a:1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES } });
   });
   await done;
-  expect(published[0]).toMatchObject({ state: "verified", result: { pane: "p7", cwd: laneDir } });
+  expect(published[0]).toMatchObject({ state: "verified", result: { pane: "hc:t7", cwd: laneDir } });
   expect(statSync(laneDir).isDirectory()).toBe(true);
   expect(statSync(laneDir).mode & 0o777).toBe(0o700);
-  expect(calls.find((a) => a.slice(0, 3).join(" ") === "herdr tab create")).toContain(laneDir);
+  expect(calls.find((a) => a[0] === "hc" && a[2] === "run")).toContain(laneDir);
 });
 
 test.each(["idle", "unknown"])("a live fresh launch never seen working is unconfirmed without typing (%s)", async (status) => {
@@ -258,30 +260,29 @@ test.each(["idle", "unknown"])("a live fresh launch never seen working is unconf
   const calls: string[][] = [];
   const brief = join(runnerDir, "briefs", "lane-a.md");
   const prompt = `ulw. Read and execute the lane brief at ${brief} in full. You are the lane-a lane; report as the brief's footer says.`;
-  const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
+  const world = worldAt7();
+  world.panes = [{ pane_id: "hc:t7", agent: "omo", agent_status: status, shellPid: 1 }];
+  world.screen = "❯ ";
   const lanes = new RunnerLanes({
-    instance: async () => "server-1", runnerDir, clock: { ...clock, sleep }, publish: () => {},
+    runnerDir, clock: { ...clock, sleep }, publish: () => {},
     policy: { agents: { omo: ["omo", "--model", "{model}", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     run: async (argv) => {
       calls.push([...argv]);
-      const verb = argv.slice(0, 3).join(" ");
-      if (verb === "herdr tab create") return ok(JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7" } } }));
-      if (verb === "herdr pane list") return ok(JSON.stringify({ result: { panes: [{ pane_id: "p7", agent: "omo", agent_status: status }] } }));
-      if (verb === "herdr pane process-info" && clock.at > T0) {
-        return ok(JSON.stringify({ result: { process_info: { shell_pid: 1, foreground_processes: [{ pid: 2, argv: ["omo", prompt] }] } } }));
-      }
-      if (verb === "herdr pane read") return ok("❯ ");
-      return ok();
+      // The agent process shows up once the launch line has been typed and time has passed.
+      if (clock.at > T0) world.proc.t7 = { pid: 2, argv: ["omo", prompt] };
+      return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
     },
   });
   const { result } = await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES });
-  expect(calls.find((a) => a[2] === "run")?.[4]).toContain(prompt.replace("'", "'\\''"));
+  expect(launchLines(calls)[0]).toContain(prompt.replace("'", "'\\''"));
   expect(result.startup).toEqual({
     verdict: "unconfirmed",
     detail: `agent process is alive but was never observed working (${status}); inspect the pane before sending the start prompt manually; last lines: ❯`,
   });
   expect(clock.at - T0).toBeWithin(38_000, 45_001);
-  expect(calls.filter((a) => a[2] === "send-text" || a[2] === "send-keys")).toEqual([]);
+  // Only the launch line was ever typed: no text, no key.
+  expect(sentTo(calls)).toHaveLength(1);
+  expect(calls.filter((a) => a[2] === "keys")).toEqual([]);
 });
 
 test.each([false, true])("POSIX launch selects its CLI, inherits secrets in shells, and continues after refusal (remote=%s)", async (remote) => {
@@ -297,17 +298,17 @@ printf "export SHARED='%s'\\n" "$PULL_VALUE"
 `);
   chmodSync(cli, 0o700);
   let command = "";
+  const world = worldAt7();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1", runnerDir, remote, clock: fakeClock(T0), token: () => "test-lane-token",
+    runnerDir, remote, clock: fakeClock(T0), token: () => "test-lane-token",
     policy: { agents: { omo: ["sh", "-c", `sh -c 'printf "%s" "\${SHARED-unset}"'`] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow" },
     publish: () => {},
     run: async (argv) => {
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" };
-      if (argv.slice(0, 3).join(" ") === "herdr pane run") command = argv[4]!;
-      return { code: 0, out: "", err: "" };
+      if (argv[0] === "hc" && argv[2] === "send") command = argv[5]!;
+      return hcAnswer(world, argv) ?? { code: 0, out: "", err: "" };
     },
   });
-  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES, tabWorkspace: "w1" });
+  await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES });
   expect(command).toStartWith("export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a ");
   expect(command).toContain(`eval "$(${remote ? cli : "dori"} secret env)";`);
   if (!remote) expect(command).not.toContain(cli);
@@ -326,14 +327,14 @@ test("a sandboxed lane records the checked wrapper as its split-pane prefix even
   const runnerDir = join(t.s.dir, "runner");
   mkdirSync(runnerDir, { mode: 0o700 });
   const wrapper = "/h/.dori/runner/bin/lane-sandbox";
+  const world = worldAt7();
   const lanes = new RunnerLanes({
-    instance: async () => "server-1", runnerDir, clock: fakeClock(T0), token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }),
+    runnerDir, clock: fakeClock(T0), token: () => "tok", startup: async () => ({ verdict: "ok", detail: "ready" }),
     policy: { agents: { sandboxed: ["lane-sandbox", "omo", "{prompt}"], default: ["omo", "{prompt}"] }, allowedRoots: ["/repo"], sandbox: "optional", jobs: "allow", sandboxCheck: [wrapper, "--check"] },
     publish: () => {},
     run: async (argv) => {
       if (argv[0] === wrapper) return { code: 0, out: "DORI_LANE_FILES=1\n", err: "" } as Ran;
-      if (argv.slice(0, 3).join(" ") === "herdr tab create") return { code: 0, out: JSON.stringify({ result: { tab_id: "t7", root_pane: { pane_id: "p7", tab_id: "t7" } } }), err: "" } as Ran;
-      return { code: 0, out: "", err: "" } as Ran;
+      return hcAnswer(world, argv) ?? ({ code: 0, out: "", err: "" } as Ran);
     },
   });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0, files: FILES });

@@ -17,7 +17,7 @@ afterEach(() => state.done());
 const ok = (out: string) => ({ code: 0, out, err: "" });
 
 const syncDeps = (paneIds: readonly string[], inspect?: LaneOps["inspect"]) => {
-  const base = depsFor(world, fakeClock(T0), state.dir, { sessionsDir: "/sessions", laneWorkspace: "w" });
+  const base = depsFor(world, fakeClock(T0), state.dir, { sessionsDir: "/sessions" });
   world.panes = paneIds.map((pane_id) => ({ pane_id, workspace_id: "w", agent: "pi", cwd: "/repo", title: pane_id }));
   const ops = fakeLaneOps(world);
   return { ...base, ops: inspect ? { ...ops, inspect } : ops };
@@ -109,9 +109,9 @@ test("one batched ps eww attributes the session to the first child in tree order
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
     calls.push([...argv]);
-    if (argv[0] === "herdr") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10 } } }));
+    if (argv[0] === "hc") return ok(JSON.stringify({ address: "t1", state: "live", pid: 10 }));
     return { code: 1, out: `14 bun c PI_SESSION_ID=${B}\n13 bun b PI_SESSION_ID=${A}\n`, err: "" };
   };
-  expect(await resolveSession("w:p1", "/repo", table, { run, sessionsDir: "/s" })).toEqual({ id: A, via: "child-env", pid: 11 });
+  expect(await resolveSession("hc:t1", "/repo", table, { run, sessionsDir: "/s" })).toEqual({ id: A, via: "child-env", pid: 11 });
   expect(calls.filter((argv) => argv[0] === "ps")).toEqual([["ps", "eww", "-o", "pid=,command=", "-p", "13,14"]]);
 });

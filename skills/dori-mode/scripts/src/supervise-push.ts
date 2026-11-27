@@ -5,7 +5,7 @@ import { completeLines, parseLogLine } from "./inbox.ts";
 import type { OutcomeTracking } from "./lane-outcomes.ts";
 import { dueDecisions, markDecisionsPushed } from "./decision-obligations.ts";
 import { type InputState, inputState as boxState, paneRow, type Pane, PASTE_PLACEHOLDER, readScreen, sendVerified, squash } from "./panes.ts";
-import { paneRuntime } from "./runtime/index.ts";
+import { sessionRuntime } from "./runtime/index.ts";
 import { type AwaitingAck, type Event, type InboxPush, type Journal, type JournalCore, type LaneOutcome, leadOwes, type Obligation, TransientSuperviseError } from "./supervise-journal.ts";
 import { type LeadLifecycle, PAUSED } from "./supervise-lead-lifecycle.ts";
 import { dueOwners, latest } from "./supervise-owner-tracking.ts";
@@ -124,7 +124,7 @@ export class PushDelivery {
 
   /**
    * The push step of one delivery pass. Returns true when it set a restart (the caller's loop carries it out). Makes no
-   * herdr call while nothing untaken is due. A pointer that starts an idle lead's turn is a lead wake, unless this pass
+   * runtime call while nothing untaken is due. A pointer that starts an idle lead's turn is a lead wake, unless this pass
    * already `woke` the lead (the pointer then belongs to that turn).
    */
   async tick(pending: readonly Event[], readPane = async (): Promise<Pane | undefined> =>
@@ -236,7 +236,7 @@ export class PushDelivery {
     if (input === "ours") {
       // Our own pointer still sits unsubmitted: one Enter submits it, nothing is typed again.
       this.savePush(next);
-      await paneRuntime(run, config.leadPane).key(config.leadPane, "enter");
+      await sessionRuntime(run).key(config.leadPane, "enter");
       console.log(`LEAD_PUSH_ENTER_RETRY ${config.leadPane} ${batch}`);
       return false;
     }
@@ -255,7 +255,7 @@ export class PushDelivery {
     await clock.sleep(delivery.push.pasteCheckMs);
     const after = inputState(await readScreen(run, config.leadPane));
     if (after === "ours") {
-      await paneRuntime(run, config.leadPane).key(config.leadPane, "enter");
+      await sessionRuntime(run).key(config.leadPane, "enter");
       console.log(`LEAD_PUSH_ENTER_RETRY ${config.leadPane} ${batch}`);
     } else if (after === "busy") this.once("busy", `LEAD_PUSH_INPUT_BUSY ${config.leadPane} ${batch}: its input line holds other text after the push`);
     return false;

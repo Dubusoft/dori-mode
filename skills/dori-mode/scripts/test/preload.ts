@@ -2,11 +2,11 @@ import { afterAll } from "bun:test";
 import { accessSync, constants, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-// Hermetic test env: drop ambient dori-lane / herdr host variables so tests never
-// inherit the identity, permissions, or live herdr pane of the lane running them.
+// Hermetic test env: drop ambient dori-lane and terminal variables so tests never
+// inherit the identity, permissions, or terminal of the lane running them.
 // Tests that need these vars set them explicitly themselves.
 for (const key of Object.keys(process.env)) {
-  if (key.startsWith("HERDR_") || key.startsWith("DORI_")) delete process.env[key];
+  if (key.startsWith("HC_") || key.startsWith("DORI_")) delete process.env[key];
 }
 
 // Fake-clock tests keep their durable state in memory: each store save fsyncs a file and its

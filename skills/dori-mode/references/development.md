@@ -8,11 +8,11 @@ For working on the `dori` package itself. Using the CLI needs none of this; see 
 cd skills/dori-mode/scripts
 bun install          # runtime dependencies plus types and tsc
 bun link             # puts `dori` on your PATH
-bun test             # behavior tests with fake herdr/git/gh; nothing real is touched
+bun test             # behavior tests with fake hc/git/gh; nothing real is touched
 bunx tsc --noEmit    # typecheck
 ```
 
-Needs: bun 1.3+, herdr, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in [sessions.md](sessions.md). The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads the load average, `/proc/meminfo` (memory and swap) and `df`. Each worker's runner reads the same sources on its own host: `sysctl`, `memory_pressure` and `df` on macOS, `/proc/loadavg`, `/proc/meminfo` and `df` on Linux. On a Windows worker the runner's `runner-sample.ps1` reads CIM: `Win32_Processor`, `Win32_OperatingSystem`, `Win32_PageFileUsage`, plus `DriveInfo` for disk.
+Needs: bun 1.3+, hc, git, and the GitHub CLI (`gh`) for `merged`/`closed` signals (npm for `published`). The `command`, `file` and `url` signals need nothing extra. The full list of signal kinds is in [sessions.md](sessions.md). The host guard reads `sysctl`, `memory_pressure` and `df` on macOS; on Linux it reads the load average, `/proc/meminfo` (memory and swap) and `df`. Each worker's runner reads the same sources on its own host: `sysctl`, `memory_pressure` and `df` on macOS, `/proc/loadavg`, `/proc/meminfo` and `df` on Linux. On a Windows worker the runner's `runner-sample.ps1` reads CIM: `Win32_Processor`, `Win32_OperatingSystem`, `Win32_PageFileUsage`, plus `DriveInfo` for disk.
 
 ## Library modules
 
@@ -27,7 +27,7 @@ The CLI is a thin layer over typed modules you can import in your own scripts:
 | `src/messenger/discord-lock.ts` | the token-scoped lock that keeps one gateway per user and machine |
 | `src/messenger/typing.ts` | `Timers`: the interval timers seam (`realTimers` in production) |
 | `src/messenger/voice.ts` | `transcribe`: voice note to text through your hook |
-| `src/doctor.ts` | `runDoctor`: read-only checks (units, herdr, paths, config, Discord, gateway, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
+| `src/doctor.ts` | `runDoctor`: read-only checks (units, hc, paths, config, Discord, gateway, tools, disk) as OK/WARN/FAIL with the fix; `doctorMain` prints it and returns the exit code |
 | `src/status.ts` | `collectStatus` / `renderStatus`: the no-LLM one-screen summary behind `dori status` and `/status` |
 | `src/gateway-status.ts` | the supervisor's `gateway-status.json` heartbeat in stateDir (written every loop, about 5 s); doctor and status read it |
 | `src/quota-cache.ts` | `sharedQuotaLookup(config)`: the quota read every caller shares; `cachedQuotaLookup` keeps it in `<stateDir>/quota-cache.json` for `autopilot.quotaCacheSec`, refreshes it once under a state lock, backs an account off after a 429 (Retry-After) and serves its last good read for up to 30 minutes; `cacheNoteLines` says so in `dori quota` and `/quota` |

@@ -13,9 +13,8 @@ import { type LaneReport, latestLaneReports } from "./lane-report-store.ts";
 import { pendingLeadRestart, type LeadRestartRequest } from "./lead-restart.ts";
 import { WAKE_SOURCES, wakeSource, type WakeSource } from "./lead-wakes.ts";
 import { paneRow } from "./panes.ts";
-import { runtimeOfPane, type RuntimeKind } from "./runtime/index.ts";
 import { HC_CORE_UNIT } from "./runtime/hc.ts";
-import { hostRuntimes, hostServices, localLanePanes, localLaneRuntime } from "./host-runtimes.ts";
+import { hostServices } from "./host-runtimes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { type Lane, type Registry, statusOf } from "./registry.ts";
 import { Repos } from "./repos.ts";
@@ -57,12 +56,7 @@ export type Status = {
   /** The config's displayTimeZone: every time in the report is shown in it; absent (an older status) reads as UTC. */
   readonly timeZone?: string;
   readonly services: readonly UnitState[];
-  /** `laneWorkspace`: the supervisor-managed herdr workspace new local lane tabs open in ("" when none is recorded yet). */
-  readonly lead: LeadState & {
-    readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest; readonly laneWorkspace: string;
-    /** config `leadRuntime`: the runtime the lead's pane opens on. Absent in an older status. */
-    readonly leadRuntime?: RuntimeKind;
-  };
+  readonly lead: LeadState & { readonly cacheTtlMin: number; readonly capTokens: number; readonly pendingRestart?: LeadRestartRequest };
   /** Autopilot is always on; `paused` while `dori autopilot pause` is in force. Absent in an older status. */
   readonly autopilot?: { readonly paused: false } | { readonly paused: true; readonly since: string; readonly reason: string | null };
   readonly lanes: readonly {
@@ -147,9 +141,6 @@ export type RunnerView = {
   readonly restarts1h?: number;
   /** Open registry lanes on the runner's machine (see runnerLaneCount). */
   readonly lanes?: number;
-  /** The machine's herdr as the runner's guard samples showed it, and since when (wall ms); absent: unknown. */
-  readonly herdr?: "up" | "down" | "hung" | "elevated";
-  readonly herdrSince?: number;
   /** The machine's readings from the runner's last guard sample (CPU load, free memory, disk, swap), and how old they are. */
   readonly machine?: Omit<RunnerMachine, "at"> & { readonly sampledAt: string; readonly ageSec: number };
   /** Why its lanes run without a sandbox (runner-sandbox.ts: a Windows runner, or allowUnsandboxed); absent: sandboxed. */
@@ -216,8 +207,6 @@ export const runnerView = (row: RunnerRow, now: number, restarts1h?: number, lan
     ...(row.outbox ? { outbox: { unacked: row.outbox.unacked, oldestAgeSec: Math.floor(row.outbox.oldestAgeMs / 1000) } } : {}),
     ...(lanes !== undefined ? { lanes } : {}),
     ...(restarts1h !== undefined ? { restarts1h } : {}),
-    ...(row.herdr ? { herdr: row.herdr } : {}),
-    ...(row.herdrSince !== undefined ? { herdrSince: row.herdrSince } : {}),
     ...(row.machine ? { machine: machineView(row.machine, now) } : {}),
   };
 };
@@ -316,7 +305,7 @@ const leadState = async (d: StatusDeps): Promise<LeadState> => {
   const pane = d.config.leadPane;
   try {
     const found = await paneRow(d.run, pane);
-    if (!found) return { pane, state: "missing", note: `pane not found in ${runtimeOfPane(pane)}` };
+    if (!found) return { pane, state: "missing", note: "pane not found in hc" };
     if (!found.agent) return { pane, state: "cold", note: "no agent running in the lead pane" };
     const cwd = found.cwd ?? d.config.leadCwd;
     const hit = await resolveSession(pane, cwd, await procTable(d.run), { run: d.run, sessionsDir: d.tunables.sessionsDir });
@@ -380,16 +369,14 @@ const laneRepoPr = (l: Lane): { repo?: string; pr?: number } => {
   return { ...(repo ? { repo } : {}), ...(pr !== undefined ? { pr } : {}) };
 };
 
-/** Read-only and no LLM: unit states, files under stateDir, one herdr pane list. */
+/** Read-only and no LLM: unit states, files under stateDir, one hc terminal list. */
 export const collectStatus = async (d: StatusDeps): Promise<Status> => {
   const now = d.clock.now();
   const [lead, open] = await Promise.all([
     leadState(d),
     existsSync(d.registry.dir) ? d.registry.open() : Promise.resolve([]),
   ]);
-  // Without a runner dir the local laneRuntime is unknown and reads as herdr, the default.
-  const runtimes = hostRuntimes(d.config, d.runnerDir ? localLaneRuntime(d.runnerDir) : undefined, localLanePanes(open));
-  const services = await Promise.all([...hostServices(runtimes), LEGACY_PRESENCE].map((name) => unitState(d.run, name)));
+  const services = await Promise.all([...hostServices(), LEGACY_PRESENCE].map((name) => unitState(d.run, name)));
   const gh = githubSummary(d.config.stateDir);
   const pendingRestart = pendingLeadRestart(d.config.stateDir);
   const pause = readPause(autopilotPausePath(d.config.stateDir));
@@ -421,7 +408,7 @@ export const collectStatus = async (d: StatusDeps): Promise<Status> => {
     at: new Date(now).toISOString(),
     timeZone: d.config.displayTimeZone,
     services,
-    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, laneWorkspace: d.config.laneWorkspace, leadRuntime: d.config.leadRuntime, ...(pendingRestart ? { pendingRestart } : {}) },
+    lead: { ...lead, cacheTtlMin: d.tunables.cacheTtlMin, capTokens: d.tunables.leadContextCapTokens, ...(pendingRestart ? { pendingRestart } : {}) },
     autopilot: pause ? { paused: true, ...pause } : { paused: false },
     lanes,
     waits: readWaits(d.config.stateDir),
@@ -532,7 +519,6 @@ const gatewayDetail = (g: GatewayView): string => {
 };
 
 const RUNNER_WORDS: Readonly<Record<RunnerView["state"], string>> = { connected: "연결됨", stale: "응답 늦음", offline: "오프라인", lost: "끊김", revoked: "해지됨" };
-const HERDR_WORDS: Readonly<Record<NonNullable<RunnerView["herdr"]>, string>> = { up: "정상", down: "다운", hung: "멈춤", elevated: "관리자 권한 서버" };
 const CHILD_WORDS: Readonly<Record<Verdict, string>> = { healthy: "정상", stalled: "멈춤", dead: "없음" };
 const LEVEL_WORDS: Readonly<Record<RunnerMachine["level"], string>> = { ok: "정상", alert: "경고", critical: "위험" };
 
@@ -541,7 +527,7 @@ const gb = (n: number): string => `${n < 10 ? n.toFixed(1) : Math.round(n)}GB`;
 
 /**
  * One runner's machine as two lines:
- * "- local (linux): 연결됨 · 레인 3개 · herdr 정상" and
+ * "- local (linux): 연결됨 · 레인 3개" and
  * "  CPU 부하 1.2 · 메모리 여유 35% · 디스크 여유 120GB · 스왑 여유 2.0/4.0GB (1분 전 측정)".
  * The first line adds only what needs a look (an old heartbeat, a backlog, restarts, a local child that is not healthy).
  */
@@ -553,7 +539,6 @@ export const machineLines = (r: RunnerView): string[] => {
     ...(r.unsandboxed ? ["샌드박스 없음"] : []),
     ...(r.state !== "connected" && r.heartbeatAgeSec !== undefined ? [`마지막 응답 ${agoSec(r.heartbeatAgeSec)}`] : []),
     ...(r.lanes !== undefined ? [count(r.lanes, "레인")] : []),
-    `herdr ${r.herdr ? HERDR_WORDS[r.herdr] : "미확인"}`,
     ...(r.outbox && r.outbox.unacked > 0 ? [`미전달 이벤트 ${r.outbox.unacked}개 (가장 오래된 것 ${agoSec(r.outbox.oldestAgeSec)})`] : []),
     ...(r.cmds > 0 ? [`응답 대기 명령 ${r.cmds}개`] : []),
     ...(r.restarts1h ? [`최근 1시간 재시작 ${r.restarts1h}회`] : []),
@@ -575,7 +560,6 @@ export const machineLines = (r: RunnerView): string[] => {
 };
 
 const LEAD_NOTES: Readonly<Record<string, string>> = {
-  "pane not found in herdr": "herdr에 리드 패널이 없음",
   "pane not found in hc": "hc에 리드 터미널이 없음",
   "no agent running in the lead pane": "리드 패널에 실행 중인 에이전트 없음",
   "cannot resolve the lead session": "리드 세션을 찾지 못함",
@@ -705,12 +689,6 @@ const leadLine = (l: Status["lead"]): string => {
   return `- ${l.pane || "(리드 패널 기록 없음)"}: ${parts.join(" · ")}${note ? ` - ${clip(note, 100)}` : ""}`;
 };
 
-/** "- 리드 런타임: hc", or the runtime the recorded pane is on and where the next lead restart moves it. */
-const leadRuntimeLine = (pane: string, want: RuntimeKind): string => {
-  const have = pane ? runtimeOfPane(pane) : want;
-  return have === want ? `- 리드 런타임: ${want}` : `- 리드 런타임: ${have} (설정은 ${want}, 다음 dori lead-restart 때 옮김)`;
-};
-
 /** The line under page 1's lanes naming how many more there are (and, paged, where). */
 type More = (hidden: number) => string;
 const plainMore: More = (hidden) => `외 ${hidden}개`;
@@ -732,8 +710,6 @@ const build = (s: Status, lim: Limits, more: More = plainMore): string => {
   const l = s.lead;
   section("리드", [
     leadLine(l),
-    ...(l.leadRuntime ? [leadRuntimeLine(l.pane, l.leadRuntime)] : []),
-    `- 새 레인 워크스페이스: ${l.laneWorkspace || "아직 없음 (수퍼바이저가 만듦)"}`,
     ...(s.autopilot ? [s.autopilot.paused
       ? clip(`- 오토파일럿: 일시정지 (${s.autopilot.since}부터${s.autopilot.reason ? `: ${s.autopilot.reason}` : ""}; dori autopilot resume)`, 200)
       : "- 오토파일럿: 켜짐 (autopilot 표시된 작업만 실행)"] : []),

@@ -1,7 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { alertsChannelOf, defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
+import { alertsChannelOf, CONFIG_FILE_KEYS, defaultConfig, fill, leadCommand, leadModels, loadConfig, providerOf } from "../src/config.ts";
+import { CONFIG_SCHEMA_VERSION, migrateConfigSchema } from "../src/config-schema.ts";
 import { reviewEnabledFor } from "../src/review-gate.ts";
 import { withState } from "./fakes.ts";
 import { BUILT_IN } from "../src/tunables.ts";
@@ -147,6 +148,20 @@ test("only user and environment keys are read: unknown, removed and malformed tu
   });
   const ignored = "store, futureKey, operations, quotaGate, toodo, laneFinishNotice, drift, eventPolicy, resolveKinds, delivery, guard, heavyKill, closeAfterMin, memoryCheck, sessionsDir, diskGuardPath, laneThinking, toodoEvents, hooks.threadDone, laneSandbox.default, placement.workspaces, runners.listen, runners.mode";
   expect(err.split("\n").filter((line) => line.startsWith("CONFIG_"))).toEqual([`CONFIG_KEYS_IGNORED ${ignored} in ${path}: these keys are no longer read from config.json; they can be deleted`]);
+});
+
+test("a retired leadRuntime loads without error and is not read; schema 9 drops it once", async () => {
+  const path = join(state.dir, "lead-runtime.json");
+  await Bun.write(path, JSON.stringify({ schemaVersion: 8, leadRuntime: "herdr", defaultModel: "a/b" }));
+  const loaded = await loadConfig(path, "/home/ana");
+  expect(loaded.defaultModel).toBe("a/b");
+  expect(loaded).not.toHaveProperty("leadRuntime");
+  expect(CONFIG_FILE_KEYS as readonly string[]).not.toContain("leadRuntime");
+  expect(CONFIG_SCHEMA_VERSION).toBe(9);
+  const migrated = migrateConfigSchema({ schemaVersion: 8, leadRuntime: "hc", defaultModel: "a/b" });
+  expect(migrated.next).toEqual({ defaultModel: "a/b" });
+  expect(migrated.dropped).toEqual([["leadRuntime", "hc is the only terminal runtime; the lead's pane always opens on hc"]]);
+  expect(migrateConfigSchema({ schemaVersion: 9, defaultModel: "a/b" }).dropped).toEqual([]);
 });
 
 test("an old config's task-tracker keys (memoryCheck.toodoMcp/toodoTokenFile, ciToodoWorkspaces) load without error", async () => {

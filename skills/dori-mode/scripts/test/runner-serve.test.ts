@@ -186,7 +186,7 @@ test("a local runner over the real unix socket says hello, replays its outbox, h
   const status = await collectStatus(deps);
   expect(status.runners?.[0]).toMatchObject({ label: "local", state: "connected", proto: 10, gen: 1, heartbeatAgeSec: 0 });
   // The lane count is the registry's open lanes on the machine, not the hello inventory ("demo" is not in the registry).
-  expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · herdr 미확인 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
+  expect(renderStatus(status)).toMatch(/^- local: 연결됨 · 레인 0개 · 미전달 이벤트 1개 \(가장 오래된 것 \d+초 전\)$/m);
 
   // The handle's RunnerCalls: a label with no connection fails closed at once; a query pending on the live connection
   // (this client has no query dispatcher, so it stays unanswered) is rejected when the connection closes.
@@ -214,5 +214,5 @@ test("without a runners section dori status still shows the local runner, offlin
   const clock = fakeClock(Date.parse("2026-11-05T00:00:00Z"));
   const status = await collectStatus(depsFor(newWorld(), clock, state.dir));
   expect(status.runners?.map((r) => [r.label, r.state])).toEqual([["local", "offline"]]);
-  expect(renderStatus(status)).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개 · herdr 미확인\n  머신 샘플 없음\n");
+  expect(renderStatus(status)).toContain("\n■ 머신 (1)\n- local: 오프라인 · 레인 0개\n  머신 샘플 없음\n");
 });

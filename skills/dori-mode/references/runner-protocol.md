@@ -51,10 +51,10 @@ Control frames, used in this release:
 fencing rules in [Fencing](#fencing).
 
 Runner events are defined for `lane.started`, `lane.state`, `lane.report`, `lane.asking`, `lane.progress`,
-`lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `herdr.state`, `herdr.start`, `heavy.state` and `cmd.result`. Today
+`lane.ack`, `wait.result`, `job.result`, `guard.sample`, `guard.alert`, `guard.critical`, `heavy.state` and `cmd.result`. Today
 a runner publishes `lane.state`, `lane.progress`, `cmd.result`, `wait.result` and `job.result` and, on a worker, `lane.started`, `lane.report` and
 the three `guard.*` events. Supervisor commands (`lane.start`, `lane.stop`, `lane.pause`, `lane.resume`,
-`lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `host.herdr`, `runner.rotate`)
+`lane.recover`, `lane.send`, `lane.close`, `lane.observe`, `wait.check`, `job.run`, `guard.kill`, `runner.rotate`)
 are part of the schema. A worker's runner carries out `lane.start`, `lane.stop`, `lane.close`, `lane.send`,
 `lane.recover`, `lane.observe` and `guard.kill` (see [Runner-owned lanes](#runner-owned-lanes)); every runner, the local one
 included, carries out `wait.check` and `job.run` (see [Runner-owned waits and jobs](#runner-owned-waits-and-jobs)); `runner.rotate` is
@@ -70,24 +70,15 @@ Protocol 3 adds, all optional on existing frames:
 |---|---|
 | `lane.state` | `reason` (`pane-missing` or `agent-gone`) for a `dead` lane; an `agent-gone` dead is published only by the runner's observe loop, after 90 s of dead reads with no alive one between (a lane agent process still running in the pane counts as alive), and the hub raises one `RUNNER_LANE_DEAD` per lane and pane |
 | `lane.ack {key, id}` | new event: the lane confirmed the supervisor's lane message `id` |
-| `guard.sample` | `panes` (herdr's pane count, -1 when the runner could not read herdr) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
+| `guard.sample` | `panes` (hc's pane count, -1 when the runner could not read hc) and `lanes [{key, rssKb, top [{comm, rssKb, count}]}]` |
 | `cmd.result` | `result`: the effect's structured result (any JSON value; below) |
-| `lane.start` | `keywords`, `session`, `target {pane?, workspace?}`, `heavySlots`, `heavyMaxLoad` |
+| `lane.start` | `keywords`, `session`, `heavySlots`, `heavyMaxLoad` |
 | `lane.adopt {key, pane, cwd?, mode, model}` | new command: take an existing pane as lane `key` |
 | `lane.pause` | `step` (`goal`, `stop` or `both`, default `both`) |
 | `lane.recover` | `session` (resume that agent session when relaunching) |
 | `lane.send` | `mode` (`verified` or `guarded`), `refuseWhileAsking` |
 | `lane.notify {key, status, objection?: {at, reasons}, claim?: {at, evidence}}` | new command: the lane's status as the supervisor holds it |
 | `lane.git {key, op, root, path?, branch?, remote?}` | new command: `worktree-remove`, `branch-delete` or `remote-branch-delete` in `root` |
-
-Protocol 4 adds `guard.sample.herdr?: {state: up|down|hung|elevated, instance?: string, since: number}`,
-`herdr.state {state, instance?, detail}` on transitions, and `herdr.start {ok, detail}` for managed-unit start
-outcomes. `since` is the runner's wall time; the supervisor records its own receipt time for shared state.
-Samples without
-`herdr` have no effect on herdr state (the watch may still be confirming its first failure).
-
-Protocol 4 also adds the command `host.herdr {action: start|restart|stop|status}` (see [herdr outages](#herdr-outages)),
-verified with `{action, state: up|down|hung|elevated, instance?, managed, paused}` as read after the action.
 
 Protocol 7 adds the command `lane.attach {key, tree}` (`dori attach`): the runner validates `tree` like a `lane.start`
 input tree, writes it into the running lane's existing `briefs/<key>.files` directory under the next free `a<NNNN>`
@@ -97,10 +88,9 @@ with `LANE_ATTACH_UNMANAGED`.
 
 A verified `cmd.result` carries `result` per command type: `lane.start` and `lane.recover` `{pane, tab, startup?:
 {verdict, detail}}` (plus `relaunched`, `resumed` for recover), `lane.adopt` `{pane, tab, tokenFile}`, `lane.stop` and
-`lane.close` `{closed: tab|pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal, execution?}` (`/goal resume`, then `/resume` when the pane shows omo's Esc-paused footer, then the turn read back: `running` or `held`),
+`lane.close` `{closed: pane|none, gone}`, `lane.pause` `{goal?, working?, stopped?}`, `lane.resume` `{goal, execution?}` (`/goal resume`, then `/resume` when the pane shows omo's Esc-paused footer, then the turn read back: `running` or `held`),
 `lane.send` `{delivery, refusal?}`, `lane.notify` `{}`, `lane.attach` `{dir}`, `lane.git` `{code, out, err}` (each capped at 4 KiB),
-`lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`, `host.herdr` `{action, state, instance?,
-managed, paused}`. A runner effect that only returns a
+`lane.observe` `{status}`, `guard.kill` `{killed [{pid, lane?, comm, rssKb}]}`. A runner effect that only returns a
 detail sends no `result`.
 
 ## Queries
@@ -113,9 +103,9 @@ all, and an answer whose connection has closed is dropped: the caller times out 
 
 | Query | Body | `result` when `ok` |
 |---|---|---|
-| `q.panes` | `{qid}` | `{panes}`: herdr's pane list of the runner's host |
+| `q.panes` | `{qid}` | `{panes}`: hc's pane list of the runner's host |
 | `q.screen` | `{qid, pane, lines, source: visible\|recent}` | `{text}` (at most 400 lines; `lines` ignored for `visible`) |
-| `q.process` | `{qid, pane}` | `{info?, error?}`: herdr's process-info |
+| `q.process` | `{qid, pane}` | `{info?, error?}`: hc's process info |
 | `q.stat` | `{qid, paths}` | `{exists}`, one boolean per path |
 | `q.lane.inspect` | `{qid, key, cwd?, git?, roots?, branches?, done?, doneCwd?, session?, sessionsDir?}` | `{status, pane?, process?, cwd, cwdExists, git?, done?, session?}` |
 | `q.machine.observe` | `{qid}` | `{os, sampledAt, sample, panes}` |
@@ -451,13 +441,13 @@ chmod and the database lock-down is skipped. Socket paths over 107 UTF-8 bytes f
 ## Remote install
 
 `dori runner install <target> [--label <label>]` or `dori runner install --machine <label>` puts a runner on a Linux, macOS or Windows worker (Windows is covered at the end of this section). With `--machine` the machine is looked up like the guard's
-machines (herdr's saved machines plus `guardMachines`); a positional target is used as given and, once installed, is
+machines (`runner-machines.json` plus `guardMachines`); a positional target is used as given and, once installed, is
 saved in `<stateDir>/runner-machines.json` so the guard knows it too. The listen address comes from the target (see
 [Network link](#network-link)) and is recorded in `runner-endpoints.json` only after enrollment and the service
 install succeed. The supervisor issues the enrollment code in its own process and runs
 `ssh <target> sh -s`. That command line never changes: everything else goes on ssh's stdin as one sh script.
 `dori runner remove <label>` undoes an install: it removes the runner service and `~/.dori/runner` (keys included) on
-the worker, leaves herdr running, and only then revokes the runner and drops it from both state files.
+the worker, leaves hc's core running, and only then revokes the runner and drops it from both state files.
 
 - The bundle is `bun build src/runner/bin.ts --target=bun`, a single file holding only the runner. It is written to
   `~/.dori/runner/bin/dori.js` through a temporary file and `mv`. A Linux worker needs `bun` on its PATH. A macOS
@@ -491,40 +481,23 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   `gui/<uid>` (`user/<uid>` when there is no GUI session or it refuses the agent), enabled first and kickstarted, and the domain is recorded in
   `~/.dori/runner/launchd-domain`. Either way a new bundle takes effect.
 
-**herdr.** The worker's herdr gets a unit of its own, so it is up after a reboot and restarted after a crash:
+**hc.** hc is required, and its core gets an autostart unit or agent so it is up after a reboot:
 
-- `herdr` and `hc` are both looked up on the PATH of the user's login shell (`$SHELL -lc`), read before anything is
-  written; only when neither is found does the install stop with `RUNNER_INSTALL_NO_HERDR` (exit 7). A host with only
-  `hc` gets no herdr unit at all. That login PATH and `$SHELL` become the herdr unit's `PATH` and
-  `SHELL`, which every lane shell herdr opens inherits.
-- On Linux, `~/.config/systemd/user/herdr-server.service` (from `templates/herdr-runner-remote.service`) runs
-  `herdr server` with `Restart=on-failure`, like the lead host's unit but without its `OnFailure=` hook. The runner
-  unit has `Wants=herdr-server.service` and `After=herdr-server.service`, never `Requires=` or `BindsTo=`: herdr
-  starts first at boot, a herdr failure leaves the runner up, and a runner restart never restarts herdr. Both units are
-  enabled.
-- On macOS, the agent `~/Library/LaunchAgents/com.dori.herdr.plist` (from `templates/dori-herdr-launchd.plist`,
-  `KeepAlive`, `ThrottleInterval` 30, output to `~/.dori/runner/herdr.log`) goes into the runner's launchd domain. A
-  second `herdr server` on a socket another server holds prints `herdr server is already running` and exits 1 at once,
-  so the throttle spaces out KeepAlive's retries while another server holds the socket.
-- The install never stops or restarts a running herdr, because that ends every lane on the host. A herdr the unit
-  already runs is left alone: a reinstall or `dori update` only rewrites the unit file (`daemon-reload` on Linux; on
-  macOS launchd reads the plist at its next load). A herdr started by hand keeps running: the unit is enabled but not
-  started (on macOS the agent is loaded with `RunAtLoad` false), and the unit takes over once that herdr stops. On
-  Linux the runner is then restarted with `--job-mode=ignore-dependencies`, so its `Wants=` does not start the herdr
-  unit beside it. Only when no herdr answers is the unit started (`systemctl --user start`, after `reset-failed`; on
-  macOS by loading the agent).
-- With `hc` on the PATH, the install also sets up the hc core's autostart, before the runner restart. On Linux it
-  writes `~/.config/systemd/user/hc-core.service` (from `templates/hc-core.service`, a oneshot `hc server start`)
-  and runs `systemctl --user enable hc-core.service` and `start hc-core.service`; a failure exits 6. On macOS it
-  writes `~/Library/LaunchAgents/com.dori.hc.plist` (from `templates/dori-hc-launchd.plist`, `hc serve`,
-  `KeepAlive`, output to `~/.dori/runner/hc.log`) and enables and bootstraps it only when `launchctl print` doesn't
-  find `com.dori.hc` in the runner's domain. It never boots it out, since that would end every hc lane.
-- The script reports both runtimes, `DORI_HERDR started|managed|unmanaged|absent` and then `DORI_HC enabled|absent`.
+- `hc` is looked up on the PATH of the user's login shell (`$SHELL -lc`) before anything is written; without it the
+  install stops with `RUNNER_INSTALL_NO_HC` (exit 7).
+- On Linux it writes `~/.config/systemd/user/hc-core.service` (from `templates/hc-core.service`, a oneshot
+  `hc server start`), runs `systemctl --user enable hc-core.service dori-runner.service`, `start hc-core.service` and
+  `restart dori-runner.service`; a failure exits 6. The runner unit has `Wants=hc-core.service` and
+  `After=hc-core.service`. On macOS it writes `~/Library/LaunchAgents/com.dori.hc.plist` (from
+  `templates/dori-hc-launchd.plist`, `hc serve`, `KeepAlive`, output to `~/.dori/runner/hc.log`) and enables and
+  bootstraps it only when `launchctl print` doesn't find `com.dori.hc` in the runner's domain. It never boots it out,
+  since that would end every lane.
+- The script prints `DORI_HC enabled`.
 
-It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256> herdr=<started|managed|unmanaged|absent> hc=<enabled|absent> (...)`
-(`unmanaged`: a herdr not from the unit is running, and the unit takes over when it stops; `hc=enabled`: its core starts at boot), or exits 1 with
+It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256> hc=enabled (its core starts at boot)`
+(`hc=unknown` on Windows), or exits 1 with
 `RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (neither Linux nor macOS, or no POSIX shell),
-`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HERDR` (neither `herdr` nor `hc` on the
+`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HC` (no `hc` on the
 login PATH), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
 named when that failed).
 
@@ -539,7 +512,7 @@ Prerequisites:
 
 - Windows 10 1809 or Server 2019 (build 17763) or later, x64. Otherwise the script exits 4. ARM64 isn't supported.
 - OpenSSH server, reachable the same way as for the guard.
-- `herdr` on the PATH (exit 7). The install can't read its version, so the note says `herdr=unknown`.
+- No hc: hc has no Windows support, so the install never exits 7 and the note says `hc=unknown`.
 - The runner runs as a scheduled task at logon, so the user has to be logged on. An always-on worker needs
   auto-logon.
 
@@ -587,7 +560,6 @@ On Windows the runner:
   the lane shell pid recorded at launch (adopted lanes aren't attributed);
 - types lane launch lines as `-EncodedCommand` into pwsh or PowerShell 5.1 panes. `cmd.exe` panes are refused. On 5.1,
   an argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`;
-- only watches herdr (through CIM); it never installs or starts a herdr service.
 
 WSL and UNC runner dirs aren't supported. A Windows machine without a runner isn't guarded at all.
 
@@ -615,83 +587,13 @@ machine=<label> ...; killed ...`), tells the lanes, and pauses the newest lane o
 killed, but it kills nothing over ssh. A machine whose runner sent no fresh sample is skipped that round, and a machine
 without a runner isn't guarded.
 
-## herdr outages
-
-Each runner, including the local runner, watches herdr on the existing 30 s guard sampling timer. A readable pane
-list means `up`; a failed list and no server process means `down`; a failed list with a server process (or an
-unreadable process table) means `hung`. On Windows a list refused with PermissionDenied (os error 5) or herdr's
-elevated-server hint means `elevated`: the server runs as administrator (started from an administrator's ssh session,
-such as herdr's remote bridge) and refuses the unelevated runner. Two consecutive failures spanning at least 30 s are required. A gap longer
-than three sampling intervals resets the failure window and discards the first failed sample after waking.
-
-The runner starts an installed `herdr-server.service` on Linux or kickstarts `com.dori.herdr` in its saved launchd
-domain on macOS only while `down`. On Windows the runner owns the server: it starts `herdr server` itself through
-WMI (`Win32_Process.Create`) with its own unelevated token, outside its process tree and scheduled task, so a
-runner restart leaves herdr and its panes running. It also does so once at start, before anything reads herdr, when
-no server runs and the pause marker is absent, so it starts the server before an administrator session can. Attempts wait one minute, doubling to a thirty minute cap; `up` resets the
-cooldown. Each attempt is durably reported as `HERDR_START machine=<label> ok|failed <detail>`. An absent unit
-is reported through the down state without starting anything. A hung or elevated server is reported and left running. While the
-pause marker `~/.dori/runner/herdr-paused` exists (`dori runner herdr stop`), a down herdr is reported but not started.
-
-`dori runner herdr <start|restart|stop|status> --machine <label> [--yes]` sends `host.herdr` to that machine's runner
-(`local` is the lead host) through the supervisor's CLI relay:
-
-- `status` only reads: `RUNNER_HERDR machine=<label> action=status state=<up|down|hung|elevated> managed=<bool> paused=<bool> ...`.
-  `managed` is always true on Windows, where the runner starts the server itself.
-- `start` removes the pause marker and starts the installed unit (on Windows the runner's own server) when herdr is
-  down, then waits up to 15 s for the pane list to read. It refuses a hung server (`HERDR_HUNG`, use restart) and a
-  host without a herdr unit (`HERDR_UNMANAGED`).
-- On Windows `start`, `restart` and `stop` refuse an elevated server before ending or starting anything
-  (`HERDR_ELEVATED`): the runner can neither read nor end it. End it from an administrator terminal on that host
-  (`herdr server stop`) and the runner starts an unelevated one; or add `[server] allow_unelevated_clients = true` to
-  `%APPDATA%\herdr\config.toml` there and restart the server from an administrator terminal.
-- `restart` ends the server and starts the unit again. It refuses at once, before ending anything, on a host without a
-  herdr unit. It stops the unit (Linux `systemctl --user stop`, macOS `launchctl bootout`), sends `SIGTERM` to any
-  `herdr server` process of the user still running, `SIGKILL` after 10 s, then starts the unit (on macOS the agent is
-  bootstrapped again before the kickstart). On Windows it runs `herdr server stop`, then ends any server process of
-  the user still running (`taskkill`, `/F` after 10 s), then starts the runner's own server.
-- `stop` writes the pause marker first, then ends the server the same way and starts nothing.
-- `restart` and `stop` end every pane herdr runs on that machine. The CLI first prints
-  `RUNNER_HERDR_LANES machine=<label> ...` with the machine's open lanes (and the lead pane for `local`), and sends the
-  command only with `--yes`; without it, it exits 2 with `RUNNER_HERDR_CONFIRM`. After a restart the recovery sweep
-  relaunches those lanes in new tabs on their sessions; after a stop their recovery is held until `start`.
-
-The supervisor consumes explicit `herdr.state` transitions and `guard.sample.herdr` snapshots from protocol 4,
-with `HERDR_DOWN` / `HERDR_HUNG` / `HERDR_ELEVATED` (urgent; lane recovery and launches on that machine are held as
-for down) and `HERDR_UP ... server=<instance>` (digest). `dori doctor` names the elevated-server fix above for
-`elevated`, not a restart. A runner's first `up` is saved and says nothing.
-
-- The state and the time it was entered are saved on the runner's row in `runners.sqlite` (`herdr`, `herdrSince`),
-  so they survive a supervisor restart and other `dori` processes read them.
-- While a machine's herdr is down or hung the recovery sweep leaves that machine's lanes alone: nothing is read or relaunched
-  and no recovery attempt is counted. `dori recover <key>` for such a lane prints `LANE_RECOVERY_HELD <key> ...`.
-  After `HERDR_UP` the next sweep recovers them as usual, on their recorded session when they have one.
-- `dori launch --machine <label>` is refused at once with `HERDR_DOWN machine=<label> ...`, before any placement
-  check or runner call.
-- `dori status` shows `herdr <정상|다운|멈춤|미확인>` on each machine line.
-- `dori doctor`'s `runner <label>` check is FAIL while that machine's herdr is down (fix `dori runner herdr start
-  --machine <label>`) or hung (fix `dori runner herdr restart --machine <label> --yes`). Its local `herdr` check points a worker machine (a runner
-  labelled other than `local` in `~/.dori/runner/runner.json`) at the lead host's `dori runner herdr start` or, without
-  a herdr unit, `dori runner install`; the lead host keeps `systemctl --user start herdr-server.service`.
-- On the lead host the local runner reports as `machine=local`. While that herdr is down or hung the supervisor does
-  not create the lead pane again (`LEAD_PANE_HELD`, once per outage); it does after `HERDR_UP`.
-
-Lane records store `herdrInstance` from the current user's herdr server pids and process start times (`pgrep` /
-`ps`). Multiple matching server processes contribute to one sorted identity, so any such process changing
-conservatively invalidates old records. `terminalId`, when herdr provides it, additionally fences replacement
-terminals within the same server. Unknown server identity refuses a new launch or adoption. A record from an older
-runner acquires identity only when its pane exists and a foreground process from that pane's `process-info`
-is positively attributed to its key through `DORI_LANE_KEY` ancestry. Persist the stamp once; records already
-carrying `herdrInstance` do not request `process-info` for migration. Migration only reads pane state and writes
-the lane record. An unproven legacy record counts as absent and recovery opens a new tab without reusing or
-mutating its old pane, even if that pane is now an idle shell. Prompt text in argv alone is not ownership proof.
+Lane records store `hcInstance` (`hc:<core id>`), the hc core that opened the lane, and keep `tab` empty. With no
+known core a new launch or adoption is refused (`RUNNER_HC_INSTANCE_UNKNOWN`).
 
 Observe, recover, send, pause, resume, close, asking-screen reads and lane inspection compare the saved identity
 before touching the recorded pane. A mismatch means missing (`RUNNER_LANE_ABSENT` for steering); close forgets
-the lane without closing a reused pane. Recover resumes the saved session in a new tab, or reuses the restored
-tab only if its label still equals the lane key and it contains exactly one idle shell without an agent or
-foreground job. Other tabs are left alone. Remote launches without `tabWorkspace` find or create the workspace
-labelled `lanes`, so a fresh headless server needs no focused workspace.
+the lane without closing a reused pane. Recover opens the lane in a new hc terminal, on its saved session when it
+has one.
 
 ## Health and probe
 
@@ -704,11 +606,6 @@ from the file's mtime, so it is measured on the host's own clock.
 | `healthy` | the pid is alive and the file is at most 60 s old | 0 |
 | `stalled` | the pid is alive and the file is 60 to 120 s old | 1 |
 | `dead` | no file, no such process, or the file is older than 120 s | 1 |
-
-The probe also reads the host's herdr once and adds `herdr` (`herdr=` in the text line): `up` when
-`herdr workspace list` answers, otherwise `hung` when a `herdr server` process exists (`pgrep -f 'herdr server'`),
-`down` when none does, and `unknown` when pgrep cannot tell. It is one reading for diagnosis; the verdict and the exit
-code stay the runner's alone.
 
 ## Cleanup sweep
 
@@ -742,7 +639,7 @@ Age is the newest of mtime, ctime and atime, as systemd-tmpfiles counts it. The 
 sandbox dir, cwd, session dir or memory agent; the lead's memory agent; any git checkout (a directory holding `.git`);
 `~/.dori/secrets` and `~/.secrets`; anything a process holds open or runs in (Linux `/proc`, macOS `lsof`; Windows
 refuses to delete an open file); sockets, FIFOs, symlinks, lock files and other users' files; temp entries of live
-sessions (`tmux-*`, `herdr*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the rest of `TEMP_EXCLUDES`); and any root
+sessions (`tmux-*`, `senpi-*`, `.X11-unix`, `*.sock`, `*.lock` and the rest of `TEMP_EXCLUDES`); and any root
 that is the home dir, above it, or a secret store. When the in-use listing fails, that day's sweep skips the deleting
 targets and reports `inUse=failed`.
 
@@ -848,7 +745,7 @@ compared against a legacy path any more, and a `shadow_diffs` table left in `run
 
 ## Liveness rule
 
-A lane's agent is alive when its pane is in herdr's pane list and its `agent_status` is `idle`, `working`, `blocked`
+A lane's agent is alive when its pane is in hc's pane list and its `agent_status` is `idle`, `working`, `blocked`
 or `done` (`paneAlive` in `panes.ts`). Both sides use that rule: the runner reports no pane as `missing`, a pane
 whose agent is not alive as `dead`, and an alive one as `working` or `idle`; the supervisor applies it to its own
 pane list for the runner's machine. A paused lane whose pane is gone is therefore not alive on either side.
@@ -874,12 +771,12 @@ runner still at 9.
 
 Historical note (runners below protocol 8 can no longer connect): protocol 3 added the queries, the `cmd.result`
 `result` and the other protocol 3 fields above, and the runner's `state.sqlite` gained the nullable
-`commands.result_json` column; protocol 4 added herdr state and `host.herdr`; protocol 5 added the runner file
+`commands.result_json` column; protocol 4 added runtime state reports (since removed); protocol 5 added the runner file
 operations, `wait.check` and `job.run`; protocol 6 added the four secret control frames (see
 [Secrets over the link](#secrets-over-the-link)); protocol 7 added `lane.attach`. The supervisor keeps no per-command
 proto table: a connected runner speaks at least `MIN_PROTO` (`PROTO - 1`), which carries every command and query, and
 only lane file operations fail closed while a connected runner's proto is not known yet. The remaining per-feature
-checks (`secretsSupported`, the `host.herdr` check on a stored runner row) date from those versions and never refuse a
+checks (`secretsSupported`) date from those versions and never refuse a
 runner the current window accepts.
 
 ## Liveness and restarts
@@ -924,8 +821,8 @@ The restart circuit allows 3 restarts per runner per hour. A heartbeat or hello 
 Outages have hysteresis per machine: an outage ends only once the runner has stayed connected for 10 minutes. A
 disconnect before then folds into the same outage: no new `RUNNER_STALE` or `RUNNER_OFFLINE`, and owned lanes do not
 wake the lead a second time (staying down 10 minutes or a dead probe still does). The end of the outage is said once as
-`RUNNER_ONLINE machine=<label>` (digest), with the number of disconnects folded into it. The runner's unit is separate from herdr's (it only
-`Wants=` and is `After=` the herdr unit), so a restart never touches a lane's pane.
+`RUNNER_ONLINE machine=<label>` (digest), with the number of disconnects folded into it. The runner's unit is separate from hc's (it only
+`Wants=` and is `After=` `hc-core.service`), so a restart never touches a lane's pane.
 
 `dori status` shows the restarts of the last hour on the runner's machine line (`restarts1h` in `--json`). `dori doctor` checks the recorded runner endpoints, the local
 runner directory, and each runner's protocol, outbox backlog and restart circuit.
@@ -943,10 +840,10 @@ The urgent runner events are `LANE_RUNNER_LOST`, `LANE_ORPHAN`, `RUNNER_LAUNCH_F
 ## Command durability
 
 The runner commits a command's intent before the effect and its result after it. A runner that stops between the two
-never runs the command again on restart. It settles it from what herdr shows:
+never runs the command again on restart. It settles it from what hc shows:
 
 - **`lane.start`:** a pane whose process carries `DORI_LANE_KEY=<key>` makes it `verified`, no such pane makes it
-  `failed`, and herdr not answering leaves it `ambiguous`.
+  `failed`, and hc not answering leaves it `ambiguous`.
 - **Other commands:** they are `ambiguous`.
 
 Each outcome goes out as `cmd.result` (`RUNNER_CMD_RECOVERED` in the runner's log).
@@ -977,25 +874,24 @@ Command records are kept 30 days.
 ## Runner-owned lanes
 
 Every lane is runner-owned. `dori launch` starts a local lane through the local runner, the supervisor's child, and
-`dori launch --machine <label>` starts it through that machine's runner. There's no direct herdr path and no mode
+`dori launch --machine <label>` starts it through that machine's runner. There's no direct hc path and no mode
 that picks one: a `runners` config section is ignored (`CONFIG_KEYS_IGNORED`). A lane whose runner is down waits for it,
 and losing a runner never hands the lane back to the supervisor.
 
 **Launch.** `dori launch` registers the lane at once with `runner: <label>` and appends the runner footer to the
 brief. It then queues `lane.start` for the supervisor (`runner_admin` in `runners.sqlite`), which sends it once the
-runner is connected; a request waits at most 2 minutes. A runner launch needs `--cwd` and takes no `--pane` or
-`--workspace`. On the worker, the runner:
+runner is connected; a request waits at most 2 minutes. A runner launch needs `--cwd` and takes no target pane. On the worker, the runner:
 
 - checks the command against `runner-config.json` (the `cwd` must be under `allowedRoots`);
-- opens a herdr tab labelled with the key, writes the brief to `~/.dori/runner/briefs/<key>.md` and issues the lane a
+- opens an hc terminal named after the key, writes the brief to `~/.dori/runner/briefs/<key>.md` and issues the lane a
   fresh 32-byte token;
 - runs the agent of its own profile `default` (`agents.default`, with `{prompt}`, `{model}` and `{brief}` filled in),
   with `DORI_LANE_KEY` and `DORI_LANE_TOKEN` in front of it. The lead never sends an argv.
 
 The runner keeps only the token's sha256, with the lane's pane, tab and cwd, in `~/.dori/runner/lanes.json`; that is
-its hello inventory. Its `lane.started` gives the supervisor the pane and tab. `lane.close` and `lane.stop` close the
-tab, delete the brief and forget the token. `lane.recover` starts the lane again from its brief when its pane or agent
-is gone, and leaves a live one alone. The agent runs in the herdr pane, not under the runner, so a runner restart
+its hello inventory. Its `lane.started` gives the supervisor the pane. `lane.close` and `lane.stop` close the
+pane, delete the brief and forget the token. `lane.recover` starts the lane again from its brief when its pane or agent
+is gone, and leaves a live one alone. The agent runs in the hc pane, not under the runner, so a runner restart
 does not end a lane.
 
 **Reporting.** A runner lane's footer has it report with `~/.dori/runner/bin/dori` (a wrapper the installer puts there
@@ -1006,39 +902,6 @@ than the socket file: a restarted runner binds a new socket at the same path, an
 reaches it. The runner refuses a token that is not that key's own (`RUNNER_LANE_AUTH_FAILED`) and puts an
 accepted report in its outbox as `lane.report`. `heavy` takes the host's `~/.dori/heavy/slot.N`, the same slots
 the supervisor's scheduled heavy jobs use, so there's one heavy count per machine.
-
-**Agent state in herdr.** The lane sandbox keeps herdr's control socket out of reach, so omo's herdr extension in a
-sandboxed lane cannot report its state there itself. On Linux and macOS the runner serves each lane its own socket,
-`~/.dori/runner/sock/herdr.d/<key>/herdr` (opened before the lane's command runs, removed by `lane.close`), and the lane
-sandbox makes only that lane's one reachable and points `HERDR_SOCKET_PATH` at it. A line there is herdr's own socket
-request. The runner checks it against a closed list of methods and parameters, forwards it to herdr's socket
-(`HERDR_SOCKET_PATH`, else `<XDG_CONFIG_HOME or ~/.config>/herdr/herdr.sock`) and relays herdr's reply. Below, the own
-pane is the one the runner records for the lane, the own tab is the tab herdr reports for that pane (asked of herdr,
-never taken from the lane), and lane panes are the panes this runner split off for the lane. That set lives in the
-runner's memory: a pane leaves it on a successful `pane.close`, and the whole set goes when the lane's socket closes.
-
-- `ping` with no parameters, so the herdr CLI works inside a lane.
-- `pane.report_agent`, `pane.release_agent` and `pane.report_agent_session` for the own pane; `pane.report_metadata`
-  for the own pane or a lane pane (no workspace metadata). `resume_argv`, a command herdr would run outside the
-  sandbox, is refused.
-- `pane.get` and `pane.read` for a pane in the own tab; `pane.list` and `pane.layout`, with the reply cut down to the
-  own tab.
-- `pane.split` of the own pane or a lane pane, with only `target_pane_id`, `direction`, `ratio`, `cwd`, `focus` and
-  `right_click` (no env, no command). The new pane joins the lane panes.
-- `pane.rename`, `pane.close`, `pane.resize` and `pane.zoom` for a lane pane only, never the own pane.
-- `pane.send_input` (herdr's `pane run`) to a lane pane, once per pane, with `keys` absent or `["Enter"]`. A split pane
-  starts herdr's shell outside the sandbox, so the runner rewrites the text to
-  `exec <prefix> /bin/sh -c '<original text>'`. The prefix is the lane env plus the sandbox wrapper `sandboxCheck`
-  names (its argv without the final `--check`), kept as `sandboxPrefix` in the lane record, so the command gets the
-  lane's sandbox and the pane ends with it. Every sandboxed lane gets it, whatever form its profile's argv gives
-  the wrapper; an unsandboxed lane only when its argv starts with that wrapper. A lane started unsandboxed gets its text through unchanged. A sandboxed lane
-  whose record predates `sandboxPrefix` is refused until it's relaunched. After that first command,
-  `pane.send_text` and `pane.send_keys` may reach the pane.
-
-This is what omo's DAG pane needs: it splits a pane beside the lane, runs its viewer there, and the viewer closes its
-own pane when done. Any other method, a pane outside these rules or an unknown field gets herdr's error reply shape
-(`{"id", "error": {"code": "forbidden" | "invalid_request", "message"}}`) and logs `HERDR_REPORT_REFUSED`; nothing
-reaches herdr. Windows has no lane herdr socket.
 
 **Secrets.** The lane socket also takes `secret`: `{"kind": "secret", "key": "<key>", "token": "<token>"}`,
 sent by the lane's `dori secret env` at launch. It carries no names and means every store value; the token is checked

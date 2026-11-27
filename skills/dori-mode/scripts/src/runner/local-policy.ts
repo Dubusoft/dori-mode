@@ -63,8 +63,8 @@ export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolic
 /** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */
 export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot"];
 
-/** Keys layered onto the derived local policy like PLACEMENT_ONLY_KEYS: the named path grants and the lane runtime. */
-export const LAYERED_KEYS: readonly string[] = ["grants", "laneRuntime"];
+/** Keys layered onto the derived local policy like PLACEMENT_ONLY_KEYS: the named path grants. */
+export const LAYERED_KEYS: readonly string[] = ["grants"];
 
 /**
  * The local runner's policy when `<runnerDir>/runner-config.json` exists: a file that sets only PLACEMENT_ONLY_KEYS
@@ -91,6 +91,5 @@ export const localRunnerPolicy = (
     ...(parsed.reposRoot !== undefined ? { reposRoot: parsed.reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     ...(parsed.grants ? { grants: parsed.grants } : {}),
-    ...(parsed.laneRuntime ? { laneRuntime: parsed.laneRuntime } : {}),
   };
 };

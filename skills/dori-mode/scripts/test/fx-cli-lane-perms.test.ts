@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import { Registry, statusOf } from "../src/registry.ts";
-import { fakeLaneSocket } from "./fake-lane-socket.ts";
 
 // Each test spawns several `bun src/cli.ts` processes; under a loaded full run on a small host that outgrows bun's
 // default 5 s per test, so the limit here allows for process startup instead of failing on load.
@@ -52,21 +51,6 @@ test("the lead (no DORI_LANE_KEY) is not refused on the same commands", async ()
     expect(r.err).not.toContain("DORI_CLI_LANE_ONLY");
     expect(r.err).toContain("usage:");
   }
-});
-
-test("a pane its runner knows (whoami) is lane mode without DORI_LANE_KEY; an unknown pane or no socket is the lead", async () => {
-  const sock = fakeLaneSocket(dir, (req) => (req.kind === "whoami" ? (req.pane === "w:p7" ? { ok: true, key: "demo-lane" } : { ok: true }) : { ok: true }));
-  try {
-    const known = await cli(["hold", "list"], { HERDR_PANE_ID: "w:p7" });
-    expect(known.code).toBe(2);
-    expect(known.err).toStartWith("DORI_CLI_LANE_ONLY hold:");
-    expect(sock.requests).toEqual([{ kind: "whoami", pane: "w:p7" }]);
-    const unknown = await cli(["hold", "list"], { HERDR_PANE_ID: "lead:p1" });
-    expect(unknown.code).toBe(0);
-    expect(unknown.out.trim()).toBe("[]");
-  } finally { sock.close(); }
-  const noSocket = await cli(["hold", "list"], { HERDR_PANE_ID: "w:p7" });
-  expect(noSocket.code).toBe(0);
 });
 
 test("the lead objects on any lane; the reason is still required", async () => {

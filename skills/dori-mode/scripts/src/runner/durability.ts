@@ -6,8 +6,8 @@ import type { RunnerState } from "./state.ts";
  * (serve.ts `commandDispatcher`). This module covers the two crash windows:
  *
  * - Runner side, at start: a command still at `intent` is never run again. Its outcome is read back from the host
- *   instead: for `lane.start`, a herdr pane whose process carries `DORI_LANE_KEY=<key>` means the effect happened
- *   (`verified`), no such pane means it did not (`failed`, so the supervisor may start it again), and herdr not answering
+ *   instead: for `lane.start`, an hc pane whose process carries `DORI_LANE_KEY=<key>` means the effect happened
+ *   (`verified`), no such pane means it did not (`failed`, so the supervisor may start it again), and hc not answering
  *   leaves it `ambiguous`. Other lane commands have no effect left to observe and are `ambiguous`.
  * - Supervisor side, after its own restart: an `attempted` command is read back with `cmd.status`. A runner that holds
  *   no record of it (`unknown`) is never sent the same command again: the supervisor asks `lane.observe` and decides
@@ -31,7 +31,7 @@ const fromObservation = (seen: Observation): CommandOutcome => (seen === "presen
 
 export type ResolveDeps = {
   readonly state: Pick<RunnerState, "pendingIntents" | "recordResult">;
-  /** Whether lane `key`'s agent runs on this host now (herdr panes and `DORI_LANE_KEY`); `unknown` when herdr fails. */
+  /** Whether lane `key`'s agent runs on this host now (hc panes and `DORI_LANE_KEY`); `unknown` when hc fails. */
   readonly observeLane: (key: string) => Promise<Observation>;
   readonly publish: (body: RunnerEventBodies["cmd.result"]) => void;
 };
@@ -82,6 +82,6 @@ export const settleAttempted = async (
 ): Promise<SupervisorReadback> => {
   const outcome = await readBackCommand(deps, command);
   if (outcome === "retry") deps.resend();
-  if (outcome === "ambiguous") deps.emit(`OPERATION_AMBIGUOUS ${command.cmdId} ${command.type}${command.key ? ` ${command.key}` : ""}: the runner has no record and herdr could not tell whether it happened; not sent again`);
+  if (outcome === "ambiguous") deps.emit(`OPERATION_AMBIGUOUS ${command.cmdId} ${command.type}${command.key ? ` ${command.key}` : ""}: the runner has no record and hc could not tell whether it happened; not sent again`);
   return outcome;
 };

@@ -118,10 +118,10 @@ describe("RunnerCalls.query", () => {
   test("ok:false rejects with QueryFailed carrying the detail", async () => {
     const s = setup();
     const p = s.calls.query("local", "q.panes", {});
-    s.calls.onControl("local", qresult(s.controls[0]!.body.qid as string, false, "herdr down"));
+    s.calls.onControl("local", qresult(s.controls[0]!.body.qid as string, false, "hc down"));
     const err = await p.catch((e) => e);
     expect(err).toBeInstanceOf(QueryFailed);
-    expect(err.message).toBe("herdr down");
+    expect(err.message).toBe("hc down");
   });
 
   test("times out on the injected timer and rejects on disconnect", async () => {
@@ -157,9 +157,9 @@ test("file operations fail closed for an unknown proto before attempts, sends or
   expect([s.sent.length, s.controls.length, s.attempts.length, s.t.timers.length, s.calls.pending()]).toEqual([0, 0, 0, 0, 0]);
 });
 
-test("an unknown proto still sends host.herdr and ordinary queries", async () => {
+test("an unknown proto still sends commands and ordinary queries", async () => {
   const s = setup({ proto: undefined });
-  const command = s.calls.call("box", "host.herdr", {} as never);
+  const command = s.calls.call("box", "lane.observe", { key: "a" } as never);
   s.calls.onEvent("box", result(s.sent[0]!.body.cmdId as string, "verified", "ok", {}));
   expect((await command).state).toBe("verified");
   const query = s.calls.query("box", "q.panes", {});

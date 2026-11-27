@@ -6,8 +6,8 @@ To message a lane, local or remote, use `dori lane send <key> --text "..."` inst
 
 Never send to a shell, a stopped agent or an approval prompt. Before you type into a pane:
 
-1. check it runs a live agent (`herdr pane process-info --pane <id>`), not a shell, a stopped agent or a startup screen;
-2. read it (`herdr pane read <id> --source recent-unwrapped --lines 40`) and confirm the input line is empty and no approval or question prompt is open;
+1. check it runs a live agent (the runner's process read of the pane), not a shell, a stopped agent or a startup screen;
+2. read it (`hc read <id> --lines 40`) and confirm the input line is empty and no approval or question prompt is open;
 3. send once, as one argument;
 4. confirm delivery from a state change: the pane's `agent_status` moving to working, or the message showing up in the session record. Short of that, read the input line back: only when your own text is still sitting there unsubmitted, press Enter once more; still there after that, the send failed. If the line is empty but no change shows up, treat the send as unconfirmed.
 
@@ -126,7 +126,7 @@ An answer that goes to the lead gets no notice from the supervisor: the lead's `
 ### Failures
 
 - **Lane closed, replaced or moved**: the undelivered message is superseded, never redirected to another session; the owner gets the "not delivered" notice and the lead is woken once to take the answer over with `dori decision close`.
-- **Pane busy**: the message waits in the queue. The runner never clears an input line, presses Escape or types over other text; it only presses Enter on its own unsubmitted text. The runner serializes its own sends, but the gap between reading the screen and typing is not atomic, so text typed into the pane in that gap can still collide. Strict isolation needs an atomic input condition in herdr or a direct session channel.
+- **Pane busy**: the message waits in the queue. The runner never clears an input line, presses Escape or types over other text; it only presses Enter on its own unsubmitted text. The runner serializes its own sends, but the gap between reading the screen and typing is not atomic, so text typed into the pane in that gap can still collide. Strict isolation needs an atomic input condition in hc or a direct session channel.
 - **Lane paused**: the message waits; delivery never resumes a paused lane.
 - **Runner offline or unreachable**: a send that surely did not happen waits for the reconnect. A send whose result was lost is retried under the same id, never as a new message, so the lane sees one copy.
 - **No ack**: an unconfirmed message reaches the lead after `ciConfirmMin` as `LANE_MESSAGE_UNCONFIRMED`, once, like any other lane message; until then the owner's notice says it waits.

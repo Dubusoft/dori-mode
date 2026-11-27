@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 
 import type { GuardThresholds } from "../src/config.ts";
 import {
-  clearShellModes,
   type GuardMachine,
   type MachineGuardState,
   type MachineSample,
@@ -13,81 +12,34 @@ import {
   loadMachineGuardState,
   machineBackoffMs,
   machineGuardTick,
-  parseMachineList,
-  readGuardMachines,
   saveMachineGuardState,
   sshArgv,
 } from "../src/remote-guard.ts";
-import type { Ran, RunOptions, Runner } from "../src/run.ts";
 import { writeRunnerMachine } from "../src/runner/machines.ts";
 
-type Call = { argv: string[]; opts: RunOptions | undefined };
-
-/** A Runner answering each call from `answer`, recording argv and options; a fresh fake forgets every machine's shell mode and its login shell answers the POSIX probe. */
-const fake = (answer: (argv: readonly string[], n: number) => Ran): { run: Runner; calls: Call[] } => {
-  clearShellModes();
-  const calls: Call[] = [];
-  const run: Runner = async (argv, opts) => {
-    calls.push({ argv: [...argv], opts });
-    if (argv.at(-1)?.startsWith("x=6;")) return ok("DORI_POSIX_42");
-    return answer(argv, calls.length - 1);
-  };
-  return { run, calls };
-};
-
-const ok = (out = ""): Ran => ({ code: 0, out, err: "" });
 const mac: GuardMachine = { label: "mac mini", target: "me@mac" };
 const T: GuardThresholds = { loadAlert: 10, loadOk: 4, memFreeMinPct: 10, diskFreeMinGb: 20, panesMax: 5, memFreeCritPct: 5, swapFreeCritPct: 5 };
 const healthy: MachineSample = { os: "darwin", load1: 1, memFreePct: 50, swapFreeGb: 2, swapTotalGb: 4, diskFreeGb: 100 };
 
-test("parseMachineList accepts the known shapes", () => {
-  expect(parseMachineList(JSON.stringify([{ label: "a", ssh_target: "u@a" }, { id: "b" }]))).toEqual([
-    { label: "a", target: "u@a" },
-    { label: "b", target: "b", id: "b" },
-  ]);
-  expect(parseMachineList(JSON.stringify([{ id: "m-7", label: "mac", ssh_target: "u@m" }]))).toEqual([{ label: "mac", target: "u@m", id: "m-7" }]);
-  expect(parseMachineList(JSON.stringify({ machines: [{ label: "a", target: "t" }] }))).toEqual([{ label: "a", target: "t" }]);
-  expect(parseMachineList(JSON.stringify({ result: { machines: [{ label: "a", ssh: "s" }] } }))).toEqual([{ label: "a", target: "s" }]);
-  expect(parseMachineList(JSON.stringify({ profiles: [{ label: "a", host: "h" }, { label: "off", enabled: false }, { nothing: 1 }] })))
-    .toEqual([{ label: "a", target: "h" }]);
-  expect(parseMachineList(JSON.stringify({ other: 1 }))).toEqual([]);
-});
-
-test("listGuardMachines merges overrides and sorts; herdr failure yields only overrides", async () => {
-  const good = fake(() => ok(JSON.stringify({ machines: [{ label: "z", target: "z1" }, { label: "a", target: "a1" }] })));
-  expect(await listGuardMachines(good.run, { a: "a2", m: "m1" })).toEqual([
+test("listGuardMachines merges config overrides and sorts by label", () => {
+  expect(listGuardMachines({ z: "z1", a: "a2", m: "m1" })).toEqual([
     { label: "a", target: "a2" },
     { label: "m", target: "m1" },
     { label: "z", target: "z1" },
   ]);
-  expect(good.calls[0]!.argv).toEqual(["herdr", "machine", "list", "--json"]);
-  expect(await listGuardMachines(fake(() => ({ code: 1, out: "", err: "no" })).run, { x: "x1" })).toEqual([{ label: "x", target: "x1" }]);
-  expect(await listGuardMachines(fake(() => ok("not json")).run, {})).toEqual([]);
+  expect(listGuardMachines({})).toEqual([]);
 });
 
-test("readGuardMachines reports a herdr failure or invalid JSON as not ok, with only the overrides; an override keeps the id", async () => {
-  expect(await readGuardMachines(fake(() => ({ code: 1, out: "", err: "herdr: down\nmore" })).run, { x: "x1" }))
-    .toEqual({ ok: false, detail: "herdr: down", machines: [{ label: "x", target: "x1" }] });
-  const bad = await readGuardMachines(fake(() => ok("not json")).run, {});
-  expect(bad.ok).toBe(false);
-  expect(bad.ok ? "" : bad.detail).toStartWith("invalid JSON: ");
-  expect(await readGuardMachines(fake(() => ok(JSON.stringify([{ id: "m1", label: "a", target: "a1" }]))).run, { a: "a2" }))
-    .toEqual({ ok: true, machines: [{ label: "a", target: "a2", id: "m1" }] });
-});
-
-test("readGuardMachines adds the runner-machines state file at the lowest precedence: herdr and overrides replace it by label", async () => {
+test("listGuardMachines reads the runner-machines state file at the lowest precedence: overrides replace it by label", () => {
   const dir = mkdtempSync(join(tmpdir(), "dori-rm-"));
   try {
     writeRunnerMachine(dir, "w1", "me@100.64.1.2");
-    writeRunnerMachine(dir, "a", "state-a");
     writeRunnerMachine(dir, "b", "state-b");
-    const herdr = fake(() => ok(JSON.stringify([{ id: "m1", label: "a", target: "herdr-a" }])));
-    expect((await readGuardMachines(herdr.run, { b: "override-b" }, dir)).machines).toEqual([
-      { label: "a", target: "herdr-a", id: "m1" }, { label: "b", target: "override-b" }, { label: "w1", target: "me@100.64.1.2" },
+    expect(listGuardMachines({ b: "override-b", a: "a1" }, dir)).toEqual([
+      { label: "a", target: "a1" }, { label: "b", target: "override-b" }, { label: "w1", target: "me@100.64.1.2" },
     ]);
-    // A herdr failure still lists the state machines; without a stateDir they are not read.
-    expect(await listGuardMachines(fake(() => ({ code: 1, out: "", err: "down" })).run, {}, dir)).toHaveLength(3);
-    expect(await listGuardMachines(fake(() => ok("[]")).run, {})).toEqual([]);
+    // Without a stateDir the state file is not read.
+    expect(listGuardMachines({})).toEqual([]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

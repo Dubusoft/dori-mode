@@ -16,7 +16,6 @@ import { sessionDirFor } from "../src/session-id.ts";
 import { pendingAcks, recordAck, recordHandled } from "../src/ack.ts";
 import { clearLaunchHold, dequeueLaunch, enqueueLaunch } from "../src/routing.ts";
 import { depsFor, fakeClock, newWorld, withState, journalBytes, readJournal, writeJournal } from "./fakes.ts";
-import { markHerdr } from "./herdr-world.ts";
 import { JOURNAL_FILE, readWakes, SQLITE_FILE, SqliteStore } from "../src/store.ts";
 import { eventClass, resolveEventPolicy } from "../src/event-policy.ts";
 import { routeReports } from "../src/lane-reports.ts";
@@ -26,7 +25,6 @@ import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCar
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
-import { setListedRuntimes } from "../src/runtime/index.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -46,7 +44,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     startedAt = clock.at;
     pendingStart = undefined;
   };
-  // After /new omo's herdr integration can release the pane's agent for a moment while the old session shuts down;
+  // After /new omo's terminal integration can release the pane's agent for a moment while the old session shuts down;
   // `dead` instead ends the process for good.
   let release: { from: number; to: number; dead: boolean; pending?: { readonly delay: number; readonly gap: number; readonly dead: boolean } } | undefined;
   const syncRelease = () => {
@@ -66,7 +64,7 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   const file = join(dir, `2027-01-15T08-00-00-000Z_${session}.jsonl`);
   writeFileSync(file, "{}\n");
   utimesSync(file, clock.now() / 1000, clock.now() / 1000);
-  const pane = { pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "omo", agent_status: "idle", revision: 0 };
+  const pane = { pane_id: "hc:t1", workspace_id: "", cwd: "/repo", agent: "omo", agent_status: "idle", revision: 0 };
   world.panes.push(pane);
   let active = session;
   let launchedId = session;
@@ -78,6 +76,8 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   let hangs = 0;
   let softEvidence = true;
   let typed = "";
+  let waiting = false;
+  let terminals = 1;
   const auth: Record<string, string> = {};
   const calls: string[][] = [];
   const run: Runner = async (argv) => {
@@ -86,14 +86,52 @@ const fixture = (extra: Record<string, unknown> = {}) => {
     if (argv[0] === "omo" && argv[1] === "auth") return { code: 1, out: auth[argv[argv.indexOf("--provider") + 1] ?? ""] ?? "", err: "" };
     if (argv[0] === "ps" && argv[1] === "-A") return ok(pid ? `${pid} 10 /usr/bin/omo --session-id ${launchedId}\n102 ${pid} tail -F events\n103 1 tail -F orphan\n104 1 other-agent\n10 1 /bin/bash` : "");
     if (argv[0] === "ps" && argv[1] === "eww") return ok(argv.at(-1) === "103" ? `tail -F orphan PI_SESSION_ID=${session}` : "PI_SESSION_ID=other");
-    if (argv[0] === "herdr" && argv[2] === "list") return ok(JSON.stringify({ result: { panes: world.panes } }));
-    if (argv[0] === "herdr" && argv[2] === "process-info") return ok(JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_processes: pid ? [{ pid, argv: ["omo", "--session-id", launchedId] }] : [] } } }));
     if (argv[0] === "kill") {
       if (argv[2] === String(pid)) { pid = 0; pane.agent = ""; pane.agent_status = ""; }
       return ok();
     }
-    if (argv[0] === "herdr" && argv[2] === "run") {
-      admitted = argv[4] ?? "";
+    if (argv[0] !== "hc") throw new Error(`unexpected ${argv.join(" ")}`);
+    if (argv[1] === "--version") return ok("hc 0.1.22\n");
+    const [verb, addr = ""] = argv.slice(2);
+    const at = world.panes.find((p) => p.pane_id === `hc:${addr}`);
+    // Terminal reads right after a launch stand where the lead's readiness is polled (onWait); any other call ends that window.
+    if (verb === "ls") {
+      if (waiting) await onWait?.();
+      return ok(JSON.stringify({ terminals: world.panes.filter((p) => p.pane_id.startsWith("hc:")).map((p) => ({ address: p.pane_id.slice(3), state: "live" })) }));
+    }
+    if (verb === "get") {
+      if (!at) return { code: 1, out: "", err: `no terminal ${addr}` };
+      // Only the lead's terminal runs the fake omo; until confirmed (confirm false) its status never reads ready.
+      const lead = at === pane;
+      const state = lead && waiting && !confirm ? "unknown" : at.agent_status;
+      return ok(JSON.stringify({
+        address: addr, state: "live", cwd: at.cwd, created_ms: 1, pid: 10,
+        status: at.agent ? { app: at.agent, state } : null,
+        foreground: lead && pid ? { pid, argv: ["omo", "--session-id", launchedId] } : null,
+      }));
+    }
+    waiting = false;
+    if (verb === "run") {
+      // A new terminal at the lead's cwd: the fixture's pane object (the one its fakes change) moves there; a terminal it
+      // leaves behind stays a plain shell.
+      const made = `t${++terminals}`;
+      const old = world.panes.indexOf(pane);
+      if (old >= 0) world.panes[old] = { pane_id: pane.pane_id, workspace_id: "", cwd: "/repo", agent: "", agent_status: "" };
+      pane.pane_id = `hc:${made}`;
+      world.panes.push(pane);
+      return ok(JSON.stringify({ address: made }));
+    }
+    if (verb === "kill") {
+      if (!at) return { code: 1, out: "", err: `no terminal ${addr}` };
+      world.panes.splice(world.panes.indexOf(at), 1);
+      return ok();
+    }
+    if (verb === "rm") return ok();
+    // hc has no pane revision: each Enter shows on the screen (one more row past the prompt; a --lines read trims it).
+    if (verb === "read") return ok(JSON.stringify({ text: `${world.screen}${"\n".repeat(pane.revision)}` }));
+    const text = verb === "send" ? argv[5] ?? "" : undefined;
+    if (text?.startsWith("cd ")) {
+      admitted = text;
       const path = /@([^'\s]+)/.exec(admitted)?.[1];
       prompt = path ? readFileSync(path, "utf8") : undefined;
       active = /--session-id ([\w-]+)/.exec(admitted)?.[1] ?? "";
@@ -105,15 +143,11 @@ const fixture = (extra: Record<string, unknown> = {}) => {
       else writeFileSync(join(dir, "session-holders", active, `${pid}.json`), "{}");
       pane.agent = "omo";
       pane.agent_status = "idle";
+      waiting = true;
       return ok();
     }
-    if (argv[0] === "herdr" && argv[2] === "wait") {
-      await onWait?.();
-      return confirm ? ok() : { code: 1, out: "", err: "not ready" };
-    }
-    if (argv[0] === "herdr" && argv[2] === "read") return ok(world.screen);
-    if (argv[0] === "herdr" && argv[2] === "send-text") { typed = argv[4] ?? ""; return ok(); }
-    if (argv[0] === "herdr" && argv[2] === "send-keys") {
+    if (text !== undefined) typed = text;
+    if (verb === "send" || verb === "keys") {
       pane.revision++;
       if (typed === "/new") {
         active = randomUUID();
@@ -160,8 +194,13 @@ const fixture = (extra: Record<string, unknown> = {}) => {
   };
 };
 
+/** A launch line typed into an hc terminal (`hc send <addr> -- cd <dir> && omo ...`). */
+const isLaunch = (call: readonly string[]): boolean => call[0] === "hc" && call[2] === "send" && (call[5] ?? "").startsWith("cd ");
+/** Text typed into an hc terminal other than a launch line (`hc send <addr> -- <text>`, one paste and Enter). */
+const isTyped = (call: readonly string[]): boolean => call[0] === "hc" && call[2] === "send" && !(call[5] ?? "").startsWith("cd ");
+
 const restartStarts = (f: ReturnType<typeof fixture>): string[][] =>
-  f.calls.filter((call) => call[2] === "run" || (call[2] === "send-text" && call[4] === "/new"));
+  f.calls.filter((call) => isLaunch(call) || (isTyped(call) && call[5] === "/new"));
 
 /** The startup prompt's first instruction: every event past the take cursor is read with `dori inbox take`. */
 const TAKE_FIRST = "Run dori inbox take now";
@@ -191,7 +230,7 @@ test("warm idle delivery appends once without restarting the lead", async () => 
   supervisor.enqueue("discord:1:1", "INBOUND warm");
   await supervisor.flush();
   expect(f.log()).toEqual([{ id: "discord:1:1", line: "INBOUND warm" }]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
 });
 
 test("a lane's dori report question reaches the lead as an urgent LANE_REPORT within 10 s, with only a [dori] pointer typed", async () => {
@@ -200,7 +239,7 @@ test("a lane's dori report question reaches the lead as an urgent LANE_REPORT wi
   let pointedAt: number | undefined;
   const base = f.deps.run;
   const run: Runner = async (argv, options) => {
-    if (argv[0] === "herdr" && argv[2] === "send-text") pointedAt ??= f.clock.now();
+    if (isTyped(argv)) pointedAt ??= f.clock.now();
     return base(argv, options);
   };
   f.deps = { ...f.deps, run };
@@ -226,7 +265,7 @@ test("a lane's dori report question reaches the lead as an urgent LANE_REPORT wi
   expect(eventClass("LANE_REPORT local-lane question which base branch?", f.deps.tunables.eventPolicy)).toBe("lead-urgent");
   expect(eventClass("LANE_REPORT local-lane milestone tests green", f.deps.tunables.eventPolicy)).toBe("lead-digest");
   // Only the pointer is typed, never the report's text: the lead reads it with dori inbox take.
-  const typedTexts = f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? "");
+  const typedTexts = f.calls.filter((call) => isTyped(call)).map((call) => call[5] ?? "");
   expect(typedTexts).toHaveLength(1);
   expect(typedTexts[0]).toStartWith(POINTER_PREFIX);
   expect(typedTexts[0]).not.toContain("base branch");
@@ -241,8 +280,8 @@ test("a forced restart takes a warm idle lead without traffic and applies model 
   requestLeadRestart(f.deps.config, f.clock.now(), "test/forced", "high");
   const supervisor = new Supervisor(f.deps);
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/model test/forced");
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4])).toContain("/thinking high");
+  expect(f.calls.filter((call) => isTyped(call)).map((call) => call[5])).toContain("/model test/forced");
+  expect(f.calls.filter((call) => isTyped(call)).map((call) => call[5])).toContain("/thinking high");
   expect(restartStarts(f)).toHaveLength(1);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(readJournal(f.state.dir).models).toEqual([{ model: "test/forced", thinking: "high" }]);
@@ -258,11 +297,11 @@ test.each(["working", "blocked", "unknown"])("a forced restart waits for a %s le
   supervisor.enqueue("queued", "INBOUND queued");
   await supervisor.flush();
   expect(f.log()).toEqual([{ id: "queued", line: "INBOUND queued" }]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
   expect(pendingLeadRestart(f.state.dir)?.id).toBe(request.id);
   f.pane.agent_status = "idle";
   await new Supervisor(f.deps).flush();
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
+  expect(f.calls).toContainEqual(["hc", "--json", "send", "t1", "--", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
 });
 
@@ -276,8 +315,8 @@ test("a forced restart captures edited config and preserves a newer request arri
     f.pane.agent_status = "working";
   });
   await supervisor.flush();
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model edited/model"]);
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/thinking medium"]);
+  expect(f.calls).toContainEqual(["hc", "--json", "send", "t1", "--", "/model edited/model"]);
+  expect(f.calls).toContainEqual(["hc", "--json", "send", "t1", "--", "/thinking medium"]);
   expect(pendingLeadRestart(f.state.dir)?.models[0]?.model).toBe("newer/model");
 });
 
@@ -296,7 +335,7 @@ test.each([false, true])("a durable wait wakes a cold=%s lead through normal del
 
 test.each([false, true])("a close after a taken and reported claim wakes the lead at once, restart=%s between them", async (restart) => {
   const f = fixture();
-  const pointers = () => f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text" && (call[4] ?? "").startsWith(POINTER_PREFIX)).length;
+  const pointers = () => f.calls.filter((call) => isTyped(call) && (call[5] ?? "").startsWith(POINTER_PREFIX)).length;
   let supervisor = new Supervisor(f.deps);
   supervisor.enqueue("done-claim:alpha:1", "LANE_DONE_CLAIMED alpha w:p1 proof");
   await supervisor.flush();
@@ -317,7 +356,7 @@ const MERGED_7 = "CI_MERGED acme/app#7 into dev lane=alpha head=abc merge=def ht
 /** Enqueues each step's events, flushes, and returns how many pointers that flush sent and what the lead then takes. */
 const finishSteps = async (steps: readonly (readonly (readonly [string, string])[])[], restartAt = -1) => {
   const f = fixture();
-  const pointers = () => f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text" && (call[4] ?? "").startsWith(POINTER_PREFIX)).length;
+  const pointers = () => f.calls.filter((call) => isTyped(call) && (call[5] ?? "").startsWith(POINTER_PREFIX)).length;
   let supervisor = new Supervisor(f.deps);
   const seen: { pointers: number; taken: string[] }[] = [];
   for (const [i, step] of steps.entries()) {
@@ -425,8 +464,8 @@ test("at the TTL boundary cold delivery starts a fresh session in the same pane 
   expect(f.prompt()).toContain(TAKE_FIRST);
   const launched = restartStarts(f);
   expect(launched).toHaveLength(1);
-  expect(launched[0]?.[3]).toBe("lead:p1");
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(launched[0]?.[3]).toBe("t1");
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
   expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toEqual(["103"]);
   expect(f.prompt()).toContain(`tail -c +${Buffer.byteLength(`${JSON.stringify(f.log()[0])}\n`) + 1}`);
   expect(taken(f)).toEqual(["cold\tINBOUND cold"]);
@@ -555,7 +594,7 @@ const lifecycle = (children: number, since: number, background: { source: string
     data: { state: children ? "waiting_children" : "done", since: new Date(since).toISOString(), waitingOn: { children, background, human: [] } },
   }) + "\n";
 
-const restarted = (f: ReturnType<typeof fixture>): string[][] => f.calls.filter((call) => call[2] === "run" || call[0] === "kill");
+const restarted = (f: ReturnType<typeof fixture>): string[][] => f.calls.filter((call) => isLaunch(call) || call[0] === "kill");
 
 test("a lead's own child work is read from its newest session-lifecycle entry; monitors and deliveries are not its children", () => {
   const f = fixture();
@@ -587,7 +626,7 @@ test("a lead-restart request waits while the idle lead waits on its own child, a
   expect(lines.filter((line) => line.startsWith(`LEAD_RESTART_DEFERRED request ${request.id}`))).toHaveLength(1);
   appendFileSync(f.file, lifecycle(0, f.clock.now()));
   const after = await quiet(() => supervisor.flush());
-  expect(f.calls).toContainEqual(["herdr", "pane", "send-text", "lead:p1", "/model test/forced"]);
+  expect(f.calls).toContainEqual(["hc", "--json", "send", "t1", "--", "/model test/forced"]);
   expect(pendingLeadRestart(f.state.dir)).toBeUndefined();
   expect(after.filter((line) => line.startsWith(`LEAD_RESTART_TRIGGER request dori lead-restart ${request.id}`))).toHaveLength(1);
 });
@@ -662,7 +701,7 @@ test("an expired but working lead receives an append and is never stopped", asyn
   supervisor.enqueue("working", "INBOUND working");
   await supervisor.flush();
   expect(f.log().map((event) => event.id)).toEqual(["working"]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
 });
 
 test("events arriving during restart stay queued and follow the prompt handoff exactly once", async () => {
@@ -686,7 +725,7 @@ test("events arriving during restart stay queued and follow the prompt handoff e
 });
 
 const restartSession = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir).restart;
-const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => call[2] === "run").map((call) => /--session-id ([\w-]+)/.exec(call[4] ?? "")?.[1]);
+const launchedSessions = (f: ReturnType<typeof fixture>) => f.calls.filter((call) => isLaunch(call)).map((call) => /--session-id ([\w-]+)/.exec(call[5] ?? "")?.[1]);
 
 test.each(["idle", "done"])("an %s cold lead switches session, model and thinking without relaunching omo", async (status) => {
   // Given a reusable process; even its own environment and its shell must survive cleanup.
@@ -704,20 +743,20 @@ test.each(["idle", "done"])("an %s cold lead switches session, model and thinkin
   // When the cold delivery restarts it.
   const lines = await quiet(() => supervisor.flush());
   // Then the four submissions are ordered and all confirmation uses the actual new id.
-  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
+  const texts = f.calls.filter((call) => isTyped(call) && !call[5]?.startsWith(POINTER_PREFIX)).map((call) => call[5]);
   expect(texts.slice(0, 3)).toEqual(["/new", "/model test/other", "/thinking high"]);
   expect(texts).toHaveLength(4);
   // The prompt itself is typed, on one line; no prompt file exists for the new lead to miss.
   expect(texts[3]).toStartWith("Dori mode. ");
   expect(texts[3]).toContain(TAKE_FIRST);
   expect(texts[3]).not.toContain("\n");
-  expect(f.calls.some((call) => call[2] === "send-text" && /lead-[0-9a-f-]{36}\.md/.test(call[4] ?? ""))).toBe(false);
+  expect(f.calls.some((call) => isTyped(call) && /lead-[0-9a-f-]{36}\.md/.test(call[5] ?? ""))).toBe(false);
   expect(readdirSync(f.state.dir).filter((name) => /^lead-.*\.md$/.test(name))).toEqual([]);
   expect(f.session()).not.toBe(old);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
   expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
-  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_RESTARTED hc:t1 ${f.session()}`);
   expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(f.session());
   // argv still names the old session: a later event must nevertheless reach the new, warm session.
   supervisor.enqueue("after", "INBOUND after");
@@ -737,7 +776,7 @@ test("a soft restart without a new session file falls back to a process launch",
   const lines = await quiet(() => supervisor.flush());
   // Then the same batch is launched once through the hard path.
   expect(f.clock.now() - before).toBeGreaterThanOrEqual(20_000);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).toContain("101");
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
   expect(lines.some((line) => line.endsWith("; falling back to a process restart"))).toBe(true);
@@ -754,7 +793,7 @@ test("a soft restart types nothing after /new until the new session has started"
   const sends: [string, number, number | undefined][] = [];
   const run: Runner = async (argv, options) => {
     if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
-    if (argv[2] === "send-text" && argv[4] !== "/new" && !argv[4]?.startsWith(POINTER_PREFIX)) sends.push([argv[4] ?? "", f.clock.now(), f.startedAt()]);
+    if (isTyped(argv) && argv[5] !== "/new" && !argv[5]?.startsWith(POINTER_PREFIX)) sends.push([argv[5] ?? "", f.clock.now(), f.startedAt()]);
     return base(argv, options);
   };
   const supervisor = new Supervisor({ ...f.deps, run });
@@ -764,8 +803,8 @@ test("a soft restart types nothing after /new until the new session has started"
   // Then /model, /thinking and the prompt are typed only once the new session has started and settled.
   expect(sends.map(([text]) => text.split(" ")[0])).toEqual(["/model", "/thinking", "Dori"]);
   for (const [, at, started] of sends) expect(at - (started ?? Number.POSITIVE_INFINITY)).toBeGreaterThanOrEqual(SOFT_SESSION_SETTLE_MS);
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
 });
 
 test("a /new session that never starts falls back to a process launch without typing more", async () => {
@@ -778,9 +817,9 @@ test("a /new session that never starts falls back to a process launch without ty
   // When its start deadline expires.
   const lines = await quiet(() => supervisor.flush());
   // Then no further command is typed into it and the batch is launched once through the hard path.
-  expect(f.calls.filter((call) => call[2] === "send-text" && /^\/(model|thinking) |^Dori mode\. /.test(call[4] ?? ""))).toEqual([]);
+  expect(f.calls.filter((call) => isTyped(call) && /^\/(model|thinking) |^Dori mode\. /.test(call[5] ?? ""))).toEqual([]);
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED new session did not start after /new"))).toHaveLength(1);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.log()).toEqual([{ id: "soft-stall", line: "INBOUND stall" }]);
 });
 
@@ -797,9 +836,9 @@ test.each([
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
   // Then only a differing value is typed, and a model always with its provider.
-  const texts = f.calls.filter((call) => call[2] === "send-text" && !call[4]?.startsWith(POINTER_PREFIX)).map((call) => call[4]);
+  const texts = f.calls.filter((call) => isTyped(call) && !call[5]?.startsWith(POINTER_PREFIX)).map((call) => call[5]);
   expect(texts.slice(1, -1)).toEqual([...commands]);
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
 });
 
 test("a bare lead-restart model is stored with the configured provider", () => {
@@ -820,9 +859,9 @@ test("a soft restart waits out the agent release gap while omo switches to the /
   // When the cold delivery restarts it in place.
   const lines = await quiet(() => supervisor.flush());
   // Then the same process is reused: nothing is killed or launched.
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
   expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
   expect(f.calls.filter((call) => call[0] === "kill").map((call) => call[2])).not.toContain("101");
 });
 
@@ -842,7 +881,7 @@ test.each([["dead", 1_000, Infinity, true], ["missing past the grace", 1_000, 60
   expect(failed[0]).toContain("reused lead is not live");
   if (dead) expect(f.clock.now() - before).toBeLessThan(SOFT_RELEASE_GRACE_MS);
   else expect(f.clock.now() - before).toBeGreaterThanOrEqual(SOFT_RELEASE_GRACE_MS);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.log()).toEqual([{ id: "soft-dead", line: "INBOUND dead" }]);
   expect(restartSession(f)).toBeUndefined();
 });
@@ -854,7 +893,7 @@ test("a soft fallback preserves the journaled offset and records each batch even
   const base = f.deps.run;
   let offset: number | undefined;
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "send-text" && argv[4] === "/new") {
+    if (isTyped(argv) && argv[5] === "/new") {
       offset = restartSession(f).offset;
       appendFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "later", line: "INBOUND later" })}\n`);
       return { code: 1, out: "", err: "send failed" };
@@ -872,7 +911,7 @@ test("a soft fallback preserves the journaled offset and records each batch even
   ]);
   expect(offset).toBeGreaterThan(0);
   expect(f.prompt()).toContain(`tail -c +${(offset ?? 0) + 1} -F`);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
 });
 
 test.each([false, true])("a live omo blocks hard launch after soft failure, recovery=%s", async (recovery) => {
@@ -895,8 +934,8 @@ test.each([false, true])("a live omo blocks hard launch after soft failure, reco
       kills.push([...argv]);
       return { code: 0, out: "", err: "" };
     }
-    const result = await base(argv, options);
-    return argv[2] === "send-text" && argv[4] === "/new" ? { code: 1, out: "", err: "send failed before /new" } : result;
+    // hc types and submits in one call: a failed send of /new reaches nothing.
+    return isTyped(argv) && argv[5] === "/new" ? { code: 1, out: "", err: "send failed before /new" } : base(argv, options);
   };
   const deps = { ...f.deps, run };
   const supervisor = new Supervisor(deps);
@@ -906,13 +945,13 @@ test.each([false, true])("a live omo blocks hard launch after soft failure, reco
   // Then launch was not typed, and the same transaction remains retryable with its events.
   expect(kills.some((call) => call[2] === "101")).toBe(true);
   expect(f.session()).toBe(old);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
   expect(restartSession(f)).toMatchObject({ phase: "soft-failed", events: [event] });
   expect(f.log()).toEqual([event]);
   // Once the shell actually returns, recovery can admit exactly one launch.
   f.noAgent();
   await quiet(() => new Supervisor(deps).flush());
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(restartSession(f)).toBeUndefined();
   expect(f.log()).toEqual([event]);
 });
@@ -931,11 +970,11 @@ test("a soft restart ignores existing quota lines during commands and quota text
   // When the new session persists the prompt pointer.
   const lines = await quiet(() => supervisor.flush());
   // Then live session evidence succeeds without killing or relaunching omo.
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
   expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toBe(false);
   expect(f.calls.filter((call) => call[0] === "kill")).toEqual([]);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
-  expect(f.calls.filter((call) => call[2] === "send-text").map((call) => call[4]).slice(0, 3)).toEqual([
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
+  expect(f.calls.filter((call) => isTyped(call)).map((call) => call[5]).slice(0, 3)).toEqual([
     "/new", "/model test/other", "/thinking high",
   ]);
 });
@@ -952,11 +991,19 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   const submitted: string[] = [];
   const run: Runner = async (argv, options) => {
     if (argv[0] === "ps" && argv[1] === "eww") return { code: 0, out: "PI_SESSION_ID=other", err: "" };
-    if (argv[0] === "herdr" && argv[2] === "send-text") {
-      editor += argv[4] ?? "";
+    // hc pastes the text and presses Enter in one `send`; `keys` presses Enter again.
+    if (isTyped(argv)) {
+      editor += argv[5] ?? "";
       popup = editor.startsWith("/") && editor.includes(" ");
-    } else if (argv[0] === "herdr" && argv[2] === "send-keys") {
-      if (popup) { popup = false; f.pane.revision++; f.world.screen = `❯ ${editor}`; return { code: 0, out: "", err: "" }; }
+    }
+    if (isTyped(argv) || (argv[0] === "hc" && argv[2] === "keys")) {
+      if (popup) {
+        popup = false;
+        f.pane.revision++;
+        f.world.screen = `❯ ${editor}`;
+        f.calls.push([...argv]);
+        return { code: 0, out: "", err: "" };
+      }
       submitted.push(editor);
       editor = "";
     }
@@ -971,8 +1018,8 @@ test("a soft command whose first Enter only accepts the autocomplete is entered 
   // Then each command is submitted on its own line and the soft restart succeeds.
   expect(submitted.slice(0, 3)).toEqual(["/new", "/model test/other", "/thinking high"]);
   expect(submitted[3]).toStartWith("Dori mode. ");
-  expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${f.session()}`);
-  expect(f.calls.filter((call) => call[2] === "run")).toEqual([]);
+  expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${f.session()}`);
+  expect(f.calls.filter((call) => isLaunch(call))).toEqual([]);
 });
 
 test.each([false, true])("soft evidence only accepts prompt files modified at or after soft entry, stale=%s", async (stalePrompt) => {
@@ -996,7 +1043,7 @@ test.each([false, true])("soft evidence only accepts prompt files modified at or
   const lines = await quiet(() => supervisor.flush());
   // Then only current evidence confirms; stale evidence exhausts the bounded deadline.
   expect(lines.some((line) => line.startsWith("LEAD_SOFT_RESTARTED "))).toBe(!stalePrompt);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(stalePrompt ? 1 : 0);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(stalePrompt ? 1 : 0);
   if (stalePrompt) expect(f.clock.now() - startedAt).toBeGreaterThanOrEqual(20_000);
   expect(f.clock.now() - startedAt).toBeLessThan(30_000);
 });
@@ -1017,11 +1064,12 @@ test.each([false, true])("a missing held-session jsonl is skipped during restart
   await quiet(() => new Supervisor(f.deps).flush());
   // Then the absent file does not abort either restart path.
   expect(restartSession(f)).toBeUndefined();
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(force ? 1 : 0);
-  if (!force) expect(f.calls.some((call) => call[2] === "send-text" && call[4] === "/new")).toBe(true);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(force ? 1 : 0);
+  if (!force) expect(f.calls.some((call) => isTyped(call) && call[5] === "/new")).toBe(true);
 });
 
-test.each(["send", "enter", "busy", "screen"])("a soft %s failure forces a single hard fallback", async (failure) => {
+// hc types and submits in one `send`, so a failed Enter is a failed send.
+test.each(["send", "busy", "screen"])("a soft %s failure forces a single hard fallback", async (failure) => {
   // Given a soft step which fails, with an owner message whose restart reaction must not be duplicated.
   const f = fixture();
   f.cold();
@@ -1029,12 +1077,13 @@ test.each(["send", "enter", "busy", "screen"])("a soft %s failure forces a singl
   const base = f.deps.run;
   let failed = false;
   const run: Runner = async (argv, options) => {
-    if (!failed && argv[2] === (failure === "send" ? "send-text" : "send-keys")) {
+    if (!failed && isTyped(argv)) {
       failed = true;
+      if (failure === "send") return { code: 1, out: "", err: "send failed" };
       const result = await base(argv, options);
       if (failure === "busy") f.pane.agent_status = "working";
       if (failure === "screen") f.world.screen = "Cannot find module";
-      return failure === "send" || failure === "enter" ? { code: 1, out: "", err: "send failed" } : result;
+      return result;
     }
     return base(argv, options);
   };
@@ -1045,7 +1094,7 @@ test.each(["send", "enter", "busy", "screen"])("a soft %s failure forces a singl
   const lines = await quiet(() => supervisor.flush());
   await supervisor.reactionsSettled();
   // Then a busy reused process is still stopped and the hard launch receives the batch exactly once.
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
   expect(lines.filter((line) => line.startsWith("LEAD_SOFT_RESTART_FAILED "))).toHaveLength(1);
   expect(reactions.ops).toEqual(["add 11/22 \u23F3"]);
@@ -1059,8 +1108,8 @@ test("recovering soft intent without evidence falls back without another new com
   // When the supervisor recovers.
   await quiet(() => new Supervisor(f.deps).flush());
   // Then no interactive command is replayed.
-  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[5] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
 });
 
@@ -1071,8 +1120,8 @@ test("a journaled forced restart bypasses the soft path even for an idle lead", 
   // When it is recovered.
   await quiet(() => new Supervisor(f.deps).flush());
   // Then only the process path is used.
-  expect(f.calls.some((call) => call[4] === "/new")).toBe(false);
-  expect(f.calls.filter((call) => call[2] === "run")).toHaveLength(1);
+  expect(f.calls.some((call) => call[5] === "/new")).toBe(false);
+  expect(f.calls.filter((call) => isLaunch(call))).toHaveLength(1);
   expect(f.calls.some((call) => call[0] === "kill" && call[2] === "101")).toBe(true);
 });
 
@@ -1092,9 +1141,9 @@ test.each([false, true])("recovering a soft restart, ready=%s, never resends the
   // When recovery runs, only confirmation and cleanup are allowed.
   const lines = await quiet(() => new Supervisor(f.deps).flush());
   // Then it confirms the existing session without typing anything again.
-  expect(f.calls.some((call) => call[2] === "send-text" || call[2] === "run")).toBe(false);
-  expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${actual}`);
-  if (!ready) expect(lines).toContain(`LEAD_SOFT_RESTARTED lead:p1 ${actual}`);
+  expect(f.calls.some((call) => isTyped(call) || isLaunch(call))).toBe(false);
+  expect(lines).toContain(`LEAD_RESTARTED hc:t1 ${actual}`);
+  if (!ready) expect(lines).toContain(`LEAD_SOFT_RESTARTED hc:t1 ${actual}`);
   expect(readWakes(f.state.dir, 0).at(-1)?.session).toBe(actual);
   expect(existsSync(path)).toBe(false);
   const saved = new SqliteStore(join(f.state.dir, SQLITE_FILE));
@@ -1224,34 +1273,40 @@ test("stale ready state from the old occupant cannot confirm a new generation", 
   f.noAgent();
   f.cold();
   let stale = true;
+  // The first read after the launch still shows the old occupant, ready, in the foreground.
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "process-info" && f.command() && stale) {
+    const result = await f.deps.run(argv, options);
+    if (argv[0] === "hc" && argv[2] === "get" && f.command() && stale) {
       stale = false;
-      return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { foreground_processes: [{ argv: ["omo", "--session-id", "old-generation"] }] } } }) };
+      return { ...result, out: JSON.stringify({ ...JSON.parse(result.out), status: { app: "omo", state: "idle" }, foreground: { pid: 99, argv: ["omo", "--session-id", "old-generation"] } }) };
     }
-    return f.deps.run(argv, options);
+    return result;
   };
   const supervisor = new Supervisor({ ...f.deps, run });
   supervisor.enqueue("fresh", "INBOUND fresh");
   await supervisor.flush();
-  expect(f.calls.filter((call) => call[2] === "wait")).toHaveLength(2);
+  expect(stale).toBe(false);
   expect(restartStarts(f)).toHaveLength(1);
+  expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
 
 test("the shell interval before a new agent registers is not a startup failure", async () => {
   const f = fixture();
   f.noAgent();
-  let waiting = true;
+  // The first read after the launch shows the terminal's shell with no agent registered yet.
+  let registering = true;
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "wait" && waiting) {
-      waiting = false;
-      return { code: 1, out: "", err: "agent_not_running" };
+    const result = await f.deps.run(argv, options);
+    if (argv[0] === "hc" && argv[2] === "get" && f.command() && registering) {
+      registering = false;
+      return { ...result, out: JSON.stringify({ ...JSON.parse(result.out), status: null, foreground: null }) };
     }
-    return f.deps.run(argv, options);
+    return result;
   };
   const supervisor = new Supervisor({ ...f.deps, run });
   supervisor.enqueue("registering", "INBOUND registering");
   await supervisor.flush();
+  expect(registering).toBe(false);
   expect(restartStarts(f)).toHaveLength(1);
   expect(readJournal(f.state.dir).restart).toBeUndefined();
 });
@@ -1261,14 +1316,14 @@ test("a lead that wakes during cold process resolution receives a warm append wi
   f.cold();
   let lists = 0;
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "list" && ++lists === 3) f.pane.agent_status = "working";
+    if (argv[0] === "hc" && argv[2] === "ls" && ++lists === 3) f.pane.agent_status = "working";
     return f.deps.run(argv, options);
   };
   const supervisor = new Supervisor({ ...f.deps, run });
   supervisor.enqueue("race", "INBOUND race");
   await supervisor.flush();
   expect(f.log().map((event) => event.id)).toEqual(["race"]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
 });
 
 test("a large multibyte event reaches the new lead through take without exceeding the pane command line", async () => {
@@ -1320,8 +1375,8 @@ test.each([
   ["PENDING-REPORT lane detail", "digest"],
   ["STALE-REPORT lane detail", "digest"],
   ["PROGRESS-FAILED lane thread hook failed: 500", "digest"],
-  ["LANE_WATCH_WARN lane herdr pane list failed", "digest"],
-  ["SWEEP_WARN dead-panes herdr pane list failed", "digest"],
+  ["LANE_WATCH_WARN lane hc ls failed", "digest"],
+  ["SWEEP_WARN dead-panes hc ls failed", "digest"],
   ["WORKTREE_CLEANED lane /data/repos/worktrees/x", "digest"],
   ["HOST_GUARD COMPUTE_READY load 1", "digest"],
   ["HOST_GUARD COMPUTE_BUSY load 100", "digest"],
@@ -1460,7 +1515,7 @@ test("the next warm urgent delivery includes held digest once", async () => {
   await after.flush();
   await after.flush();
   expect(f.log().map((event) => event.id)).toEqual(["digest", "urgent"]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
 });
 
 test("GitHub digest survives restart then joins an actionable PR event exactly once", async () => {
@@ -1477,7 +1532,7 @@ test("GitHub digest survives restart then joins an actionable PR event exactly o
   restarted.enqueue("github:closed", "GH_PR acme/app#7 closed sha=abc url");
   await restarted.flush();
   expect(f.log().map((event) => event.id)).toEqual(["github:failing", "github:closed"]);
-  expect(f.calls.some((call) => call[0] === "kill" || call[2] === "run")).toBe(false);
+  expect(f.calls.some((call) => call[0] === "kill" || isLaunch(call))).toBe(false);
 });
 
 test("the next cold urgent delivery includes held digest in the new session prompt", async () => {
@@ -1682,63 +1737,13 @@ const quiet = async (body: () => Promise<void>): Promise<string[]> => {
   return lines;
 };
 
-/** herdr answers for pane recreation: workspace "Dori" (w7), a new tab with root pane w7:p9, and pane close. */
-const recreating = (f: ReturnType<typeof fixture>, next: Runner): Runner => async (argv, options) => {
-  if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { workspaces: [{ workspace_id: "w7", label: "Dori" }] } }), err: "" };
-  if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "create") {
-    f.calls.push([...argv]);
-    f.world.panes.push({ pane_id: "w7:p9", workspace_id: "w7", cwd: "/repo", agent: "omo", agent_status: "idle" });
-    return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w7:p9" } } }), err: "" };
-  }
-  if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "close") {
-    f.calls.push([...argv]);
-    f.world.panes.splice(f.world.panes.findIndex((p) => p.pane_id === argv[3]), 1);
-    return { code: 0, out: "", err: "" };
-  }
-  return next(argv, options);
-};
-
-test("while the lead host's herdr is down the lead pane is not created again; after HERDR_UP it is", async () => {
-  const f = fixture();
-  f.world.panes.splice(f.world.panes.indexOf(f.pane), 1);
-  markHerdr(f.deps.config.stateDir, "local", "down", 1_000);
-  const persisted: string[] = [];
-  const supervisor = new Supervisor({ ...f.deps, run: recreating(f, f.deps.run), config: { ...f.deps.config } }, { persistLeadPane: (pane) => { persisted.push(pane); } });
-  const held = await quiet(async () => {
-    expect(await supervisor.repairLeadPane()).toBeUndefined();
-    expect(await supervisor.repairLeadPane()).toBeUndefined();
-  });
-  expect(held.filter((line) => line.startsWith("LEAD_PANE_HELD"))).toEqual([
-    `LEAD_PANE_HELD herdr on machine=local has been unreadable since ${new Date(1_000).toISOString()}; the lead pane is created again after HERDR_UP`,
-  ]);
-  expect(f.calls.filter((call) => call[0] === "herdr" && (call[1] === "tab" || call[1] === "workspace"))).toEqual([]);
-  expect(persisted).toEqual([]);
-  markHerdr(f.deps.config.stateDir, "local", "up", 2_000);
-  const lines = await quiet(async () => { expect(await supervisor.repairLeadPane()).toBe("w7:p9"); });
-  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w7:p9");
-  expect(persisted).toEqual(["w7:p9"]);
-});
-
-test("a lead pane closed by hand together with its Dori workspace is recreated in a new Dori workspace and cold-started with the pending events", async () => {
+test("a lead terminal closed by hand is recreated as a new dori-lead hc terminal and cold-started with the pending events", async () => {
   const f = fixture();
   f.cold();
-  // The owner closes the lead's only pane: the process is gone and herdr drops the now empty Dori workspace with it.
+  // The owner closes the lead's terminal: the process is gone with it.
   f.world.panes.splice(f.world.panes.indexOf(f.pane), 1);
   f.noAgent();
-  const workspaces: { workspace_id: string; label: string }[] = [];
-  const run: Runner = async (argv, options) => {
-    if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { workspaces } }), err: "" };
-    if (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "create") {
-      f.calls.push([...argv]);
-      workspaces.push({ workspace_id: "w8", label: "Dori" });
-      // A fresh shell at the root pane: the fixture's pane object stands for it, so a launch typed there takes it over.
-      Object.assign(f.pane, { pane_id: "w8:p1", workspace_id: "w8" });
-      f.world.panes.push(f.pane);
-      return { code: 0, out: JSON.stringify({ result: { root_pane: { pane_id: "w8:p1", tab_id: "w8:t1", workspace_id: "w8" } } }), err: "" };
-    }
-    if (argv[0] === "herdr" && argv[1] === "tab" && argv[2] === "rename") { f.calls.push([...argv]); return { code: 0, out: "", err: "" }; }
-    return f.deps.run(argv, options);
-  };
+  const run = f.deps.run;
   const persisted: string[] = [];
   const supervisor = new Supervisor({ ...f.deps, run, config: { ...f.deps.config } }, { persistLeadPane: (pane) => { persisted.push(pane); } });
   supervisor.enqueue("inbound:1", "INBOUND hello");
@@ -1752,90 +1757,20 @@ test("a lead pane closed by hand together with its Dori workspace is recreated i
     while (!delivery.due) f.clock.at += 1000;
     await delivery.tick();
   });
-  expect(retries).toEqual([expect.stringMatching(/^SUPERVISOR_RETRY lead pane lead:p1 does not exist; attempt 1/)]);
-  expect(f.calls).toContainEqual(["herdr", "workspace", "create", "--label", "Dori", "--cwd", "/repo", "--no-focus"]);
-  expect(f.calls).toContainEqual(["herdr", "tab", "rename", "w8:t1", "dori-lead"]);
-  expect(persisted).toEqual(["w8:p1"]);
-  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w8:p1");
-  const [launched] = launchedSessions(f);
-  expect(launchedSessions(f)).toHaveLength(1);
-  expect(f.calls.find((call) => call[2] === "run")?.[3]).toBe("w8:p1");
-  expect(f.prompt()).toContain(TAKE_FIRST);
-  expect(lines).toContain(`LEAD_RESTARTED w8:p1 ${launched}`);
-  expect(restartSession(f)).toBeUndefined();
-  expect(delivery.due).toBe(true);
-  expect(taken(f)).toEqual(["inbound:1\tINBOUND hello"]);
-});
-
-/**
- * hc over the fixture: terminal t5 (`hc:t5`) answers with the fixture lead's processes, status and screen (its herdr
- * fakes still drive the fake omo), so a lead moved onto hc runs the same lead. hc calls are recorded in f.calls.
- */
-const hcLead = (f: ReturnType<typeof fixture>, next: Runner): Runner => {
-  const pane = "hc:t5";
-  let made = false;
-  const ok = (json: unknown) => ({ code: 0, out: JSON.stringify(json), err: "" });
-  return async (argv, options) => {
-    if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "list") {
-      const panes = (JSON.parse((await next(argv, options)).out) as { result: { panes: { pane_id: string }[] } }).result.panes;
-      return ok({ result: { panes: panes.filter((p) => !p.pane_id.startsWith("hc:")) } });
-    }
-    if (argv[0] !== "hc") return next(argv, options);
-    f.calls.push([...argv]);
-    if (argv[1] === "--version") return { code: 0, out: "hc 0.1.22\n", err: "" };
-    const verb = argv[2];
-    if (verb === "run") {
-      // The fixture's pane object (the one its fakes change) becomes the new terminal; the old herdr pane stays a shell.
-      made = true;
-      f.pane.pane_id = pane;
-      f.world.panes.push({ pane_id: "lead:p1", workspace_id: "test", cwd: "/repo", agent: "", agent_status: "" });
-      return ok({ address: "t5" });
-    }
-    if (verb === "ls") return ok({ terminals: made ? [{ address: "t5", state: "live" }] : [] });
-    if (verb === "get") {
-      if (!made) return { code: 1, out: "", err: "no such terminal" };
-      const info = (JSON.parse((await next(["herdr", "pane", "process-info", "--pane", pane], options)).out) as { result: { process_info: { shell_pid: number; foreground_processes: { pid: number; argv: string[] }[] } } }).result.process_info;
-      const fg = info.foreground_processes[0];
-      return ok({
-        address: "t5", state: "live", cwd: "/repo", created_ms: 1, pid: info.shell_pid, name: "dori-lead",
-        status: f.pane.agent ? { app: f.pane.agent, state: f.pane.agent_status } : null, foreground: fg ? { pid: fg.pid, argv: fg.argv } : null,
-      });
-    }
-    if (verb === "send") {
-      const text = argv[5] ?? "";
-      if (text.startsWith("cd ")) return next(["herdr", "pane", "run", pane, text], options);
-      await next(["herdr", "pane", "send-text", pane, text], options);
-      return next(["herdr", "pane", "send-keys", pane, "enter"], options);
-    }
-    if (verb === "keys") return next(["herdr", "pane", "send-keys", pane, "enter"], options);
-    if (verb === "read") return ok({ text: f.world.screen });
-    throw new Error(`unexpected ${argv.join(" ")}`);
-  };
-};
-
-test("with leadRuntime hc a herdr lead moves at its next restart: no /new, a dori-lead hc terminal takes the launch and the old pane is closed", async () => {
-  cleanups.push(() => { setListedRuntimes({ herdr: true, hc: false }); });
-  const f = fixture({ leadRuntime: "hc" });
-  f.cold();
-  const persisted: string[] = [];
-  const supervisor = new Supervisor({ ...f.deps, run: hcLead(f, recreating(f, f.deps.run)), config: { ...f.deps.config } }, { persistLeadPane: (pane) => { persisted.push(pane); } });
-  supervisor.enqueue("cold", "INBOUND cold");
-  const lines = await quiet(() => supervisor.flush());
-  // An idle lead on the configured runtime would get /new in place; this one is stopped and started on hc instead.
-  expect(f.calls.some((call) => call[2] === "send-text" && call[4] === "/new")).toBe(false);
+  expect(retries).toEqual([expect.stringMatching(/^SUPERVISOR_RETRY lead pane hc:t1 does not exist; attempt 1/)]);
   const made = f.calls.find((call) => call[0] === "hc" && call[2] === "run") ?? [];
   expect(made.slice(0, 8)).toEqual(["hc", "--json", "run", "--bg", "--no-parent", "--no-notify", "--cwd", "/repo"]);
   expect(made.slice(8)).toEqual(["--label", "dori.lead=1", "--name", "dori-lead", "--", expect.any(String)]);
-  expect(f.calls).toContainEqual(["herdr", "pane", "close", "lead:p1"]);
-  expect(lines).toContain("LEAD_RUNTIME_MOVED lead:p1 -> hc:t5 leadRuntime=hc");
-  const launches = f.calls.filter((call) => call[0] === "herdr" && call[2] === "run");
-  expect(launches.map((call) => call[3])).toEqual(["hc:t5"]);
-  const session = /--session-id ([\w-]+)/.exec(launches[0]?.[4] ?? "")?.[1];
-  expect(lines).toContain(`LEAD_RESTARTED hc:t5 ${session}`);
-  expect(persisted).toEqual(["hc:t5"]);
-  expect(supervisor.leadPane).toBe("hc:t5");
+  expect(persisted).toEqual(["hc:t2"]);
+  expect(lines).toContain("LEAD_PANE_RECREATED hc:t1 -> hc:t2");
+  const [launched] = launchedSessions(f);
+  expect(launchedSessions(f)).toHaveLength(1);
+  expect(f.calls.find((call) => isLaunch(call))?.[3]).toBe("t2");
+  expect(f.prompt()).toContain(TAKE_FIRST);
+  expect(lines).toContain(`LEAD_RESTARTED hc:t2 ${launched}`);
   expect(restartSession(f)).toBeUndefined();
-  expect(f.log()).toEqual([{ id: "cold", line: "INBOUND cold" }]);
+  expect(delivery.due).toBe(true);
+  expect(taken(f)).toEqual(["inbound:1\tINBOUND hello"]);
 });
 
 test("a starting restart is never typed into a pane whose foreground is an agent, and launches once a plain shell is back", async () => {
@@ -1844,7 +1779,7 @@ test("a starting restart is never typed into a pane whose foreground is an agent
   writeJournal(f.state.dir, ({ events: [{ id: "x", line: "INBOUND x" }], restart: { session: "22222222-2222-4222-8222-222222222222", events: [{ id: "x", line: "INBOUND x" }], offset: 0, phase: "starting" } }));
   // "stopping" already logged the cold batch before the launch.
   writeFileSync(join(f.state.dir, "lead-events.log"), `${JSON.stringify({ id: "x", line: "INBOUND x" })}\n`);
-  await expect(new Supervisor(f.deps).flush()).rejects.toThrow("LEAD_PANE_BUSY lead:p1: foreground is not a plain shell (omo)");
+  await expect(new Supervisor(f.deps).flush()).rejects.toThrow("LEAD_PANE_BUSY hc:t1: foreground is not a plain shell (omo)");
   expect(restartStarts(f)).toHaveLength(0);
   expect(restartSession(f).phase).toBe("starting");
   f.noAgent();
@@ -1859,7 +1794,7 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.setConfirm(false);
   f.hang(1); // the launch never initialises: no holder file, no session jsonl
-  const deps = { ...f.deps, run: recreating(f, f.deps.run), config: { ...f.deps.config } };
+  const deps = { ...f.deps, run: f.deps.run, config: { ...f.deps.config } };
   // One supervisor process: the recreated pane id lives in its deps (and in config through persistLeadPane).
   const supervisor = new Supervisor(deps);
   supervisor.enqueue("stuck", "INBOUND stuck");
@@ -1868,7 +1803,7 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
       await expect(supervisor.flush()).rejects.toThrow("STARTUP_UNCONFIRMED");
       expect(restartSession(f)).toMatchObject({ phase: "submitted", unconfirmed: i });
     }
-    await expect(supervisor.flush()).rejects.toThrow("lead pane recreated as w7:p9");
+    await expect(supervisor.flush()).rejects.toThrow("lead pane recreated as hc:t2");
   });
   const [launched] = launchedSessions(f);
   const pending = restartSession(f);
@@ -1877,23 +1812,23 @@ test("a submitted launch that never confirms is abandoned after the limit: scree
   expect(pending.session).not.toBe(launched);
   // the never-confirmed process was stopped by its exact session, then the screen was read before the pane closed
   expect(f.calls.filter((call) => call[0] === "kill" && call[2] === "201")).toHaveLength(1);
-  const read = f.calls.findIndex((call) => call.join(" ") === "herdr pane read lead:p1 --source recent --lines 80");
+  const read = f.calls.findIndex((call) => call.join(" ") === "hc --json read t1 --lines 80");
   const killed = f.calls.findIndex((call) => call[0] === "kill" && call[2] === "201");
-  const closed = f.calls.findIndex((call) => call.join(" ") === "herdr pane close lead:p1");
+  const closed = f.calls.findIndex((call) => call.join(" ") === "hc --json kill t1");
   expect(read).toBeGreaterThanOrEqual(0);
   expect(killed).toBeGreaterThan(read);
   expect(closed).toBeGreaterThan(killed);
-  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-pane-lead_p1-"));
+  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-pane-hc_t1-"));
   expect(saved).toHaveLength(1);
   expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe("❯ ");
-  expect(lines).toContain(`LEAD_PANE_SCREEN_SAVED lead:p1 ${join(f.state.dir, saved[0] ?? "")}`);
-  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w7:p9");
+  expect(lines).toContain(`LEAD_PANE_SCREEN_SAVED hc:t1 ${join(f.state.dir, saved[0] ?? "")}`);
+  expect(lines).toContain("LEAD_PANE_RECREATED hc:t1 -> hc:t2");
   expect(existsSync(join(f.state.dir, `lead-${launched}.md`))).toBe(false);
   // the next backoff retry launches the fresh session into the new pane
   f.setConfirm(true);
   await quiet(() => supervisor.flush());
   expect(launchedSessions(f)).toEqual([launched, pending.session]);
-  expect(f.calls.filter((call) => call[2] === "run").at(-1)?.[3]).toBe("w7:p9");
+  expect(f.calls.filter((call) => isLaunch(call)).at(-1)?.[3]).toBe("t2");
   expect(restartSession(f)).toBeUndefined();
 });
 
@@ -1903,24 +1838,27 @@ test("argv-less foreground entries never crash, and a pane held by a process the
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
   f.hang(1);
   let foreign = false;
-  // After the launch the old pane runs something else (the owner's own omo); herdr lists its entries without argv.
+  // After the launch the old terminal runs something else (the owner's own omo); hc shows its foreground without argv.
   const run: Runner = async (argv, options) => {
-    if (argv[2] === "process-info" && argv[4] === "lead:p1" && foreign) return { code: 0, err: "", out: JSON.stringify({ result: { process_info: { shell_pid: 10, foreground_process_group_id: 300, foreground_processes: [{ pid: 300 }, { pid: 301, name: "node" }] } } }) };
+    if (argv[0] === "hc" && argv[2] === "get" && argv[3] === "t1" && foreign) {
+      f.calls.push([...argv]);
+      return { code: 0, err: "", out: JSON.stringify({ address: "t1", state: "live", cwd: "/repo", created_ms: 1, pid: 10, status: null, foreground: { pid: 300, name: "node" } }) };
+    }
     const out = await f.deps.run(argv, options);
-    if (argv[2] === "run") foreign = true;
+    if (isLaunch(argv)) foreign = true;
     return out;
   };
-  const deps = { ...f.deps, run: recreating(f, run), config: { ...f.deps.config } };
+  const deps = { ...f.deps, run, config: { ...f.deps.config } };
   const supervisor = new Supervisor(deps);
   supervisor.enqueue("owner", "INBOUND owner");
   const lines = await quiet(async () => {
     for (let i = 1; i <= UNCONFIRMED_LIMIT; i++) {
-      await expect(supervisor.flush()).rejects.toThrow(i < UNCONFIRMED_LIMIT ? "STARTUP_UNCONFIRMED" : "lead pane recreated as w7:p9");
+      await expect(supervisor.flush()).rejects.toThrow(i < UNCONFIRMED_LIMIT ? "STARTUP_UNCONFIRMED" : "lead pane recreated as hc:t2");
     }
   });
-  expect(lines).toContain("LEAD_PANE_LEFT lead:p1: its foreground is not the supervisor's; left open, nothing in it stopped");
-  expect(lines).toContain("LEAD_PANE_RECREATED lead:p1 -> w7:p9");
-  expect(f.calls.some((call) => call[2] === "close")).toBe(false);
+  expect(lines).toContain("LEAD_PANE_LEFT hc:t1: its foreground is not the supervisor's; left open, nothing in it stopped");
+  expect(lines).toContain("LEAD_PANE_RECREATED hc:t1 -> hc:t2");
+  expect(f.calls.some((call) => call[0] === "hc" && call[2] === "kill")).toBe(false);
   expect(f.calls.some((call) => call[0] === "kill" && (call[2] === "300" || call[2] === "301"))).toBe(false);
   const pending = restartSession(f);
   expect(pending.phase).toBe("starting");
@@ -1929,7 +1867,7 @@ test("argv-less foreground entries never crash, and a pane held by a process the
   f.noAgent();
   await quiet(() => supervisor.flush());
   expect(launchedSessions(f)).toEqual([expect.any(String), pending.session]);
-  expect(f.calls.filter((call) => call[2] === "run").map((call) => call[3])).toEqual(["lead:p1", "w7:p9"]);
+  expect(f.calls.filter((call) => isLaunch(call)).map((call) => call[3])).toEqual(["t1", "t2"]);
   expect(restartSession(f)).toBeUndefined();
 });
 
@@ -1939,12 +1877,11 @@ test("an old lead that never leaves its pane is moved to a new pane after the li
   writeJournal(f.state.dir, { events: [{ id: "x", line: "INBOUND x" }], restart: { session: "22222222-2222-4222-8222-222222222222", events: [{ id: "x", line: "INBOUND x" }], offset: 0, phase: "stopping", force: true } });
   f.world.screen = "0;276;0c11;rgb:1e1e/1e1e/2e2e\\0;276;0c11;rgb:1e1e/1e1e/2e2e";
   let stuck = true;
-  const recreate = recreating(f, f.deps.run);
   const run: Runner = async (argv, options) => {
     if (argv[0] === "kill" && argv[2] === "101" && stuck) { f.calls.push([...argv]); return { code: 0, out: "", err: "" }; }
-    // closing the pane ends what the kill could not
-    if (argv[0] === "herdr" && argv[2] === "close" && argv[3] === "lead:p1") { stuck = false; f.noAgent(); }
-    return recreate(argv, options);
+    // killing the old terminal ends what the kill could not
+    if (argv[0] === "hc" && argv[2] === "kill" && argv[3] === "t1") { stuck = false; f.noAgent(); }
+    return f.deps.run(argv, options);
   };
   const posted: string[] = [];
   const supervisor = new Supervisor({ ...f.deps, run, config: { ...f.deps.config } }, { announce: async (text) => { posted.push(text); } });
@@ -1958,23 +1895,23 @@ test("an old lead that never leaves its pane is moved to a new pane after the li
     // the next retry starts a fresh lead in the new pane
     await supervisor.flush();
   });
-  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-pane-lead_p1-"));
+  const saved = readdirSync(f.state.dir).filter((name) => name.startsWith("lead-pane-hc_t1-"));
   expect(saved).toHaveLength(1);
   expect(readFileSync(join(f.state.dir, saved[0] ?? ""), "utf8")).toBe(f.world.screen);
-  const read = f.calls.findIndex((call) => call.join(" ") === "herdr pane read lead:p1 --source recent --lines 80");
-  const created = f.calls.findIndex((call) => call[1] === "tab" && call[2] === "create");
-  const closed = f.calls.findIndex((call) => call.join(" ") === "herdr pane close lead:p1");
+  const read = f.calls.findIndex((call) => call.join(" ") === "hc --json read t1 --lines 80");
+  const created = f.calls.findIndex((call) => call[0] === "hc" && call[2] === "run");
+  const closed = f.calls.findIndex((call) => call.join(" ") === "hc --json kill t1");
   expect(read).toBeGreaterThanOrEqual(0);
   expect(created).toBeGreaterThan(read);
   expect(closed).toBeGreaterThan(created);
   // only the lead's own tree (process, child, detached session-owned monitor): never the shell or another agent
   expect(new Set(f.calls.filter((call) => call[0] === "kill" && call[1] === "-KILL").map((call) => call[2]))).toEqual(new Set(["101", "102", "103"]));
-  expect(f.calls.filter((call) => call[2] === "run").map((call) => call[3])).toEqual(["w7:p9"]);
-  expect(lines).toContain(`LEAD_RESTARTED w7:p9 22222222-2222-4222-8222-222222222222`);
+  expect(f.calls.filter((call) => isLaunch(call)).map((call) => call[3])).toEqual(["t2"]);
+  expect(lines).toContain(`LEAD_RESTARTED hc:t2 22222222-2222-4222-8222-222222222222`);
   expect(restartSession(f)).toBeUndefined();
   await supervisor.reactionsSettled();
-  expect(posted.filter((text) => text.includes("w7:p9"))).toHaveLength(1);
-  expect(posted.find((text) => text.includes("w7:p9"))).toContain(join(f.state.dir, saved[0] ?? ""));
+  expect(posted.filter((text) => text.includes("hc:t2"))).toHaveLength(1);
+  expect(posted.find((text) => text.includes("hc:t2"))).toContain(join(f.state.dir, saved[0] ?? ""));
 });
 
 test("what an old occupant left above the launch line (its own words, a broken terminal's escape replies) cannot block readiness; a startup error after it still does", async () => {
@@ -1984,7 +1921,7 @@ test("what an old occupant left above the launch line (its own words, a broken t
     f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
     const run: Runner = async (argv, options) => {
       const out = await f.deps.run(argv, options);
-      if (argv[2] === "run") f.world.screen = `the previous lead: the quota cache hit its rate limit\n0;276;0c11;rgb:1e1e/1e1e/2e2e\n$ ${argv[4]}\n${after}`;
+      if (isLaunch(argv)) f.world.screen = `the previous lead: the quota cache hit its rate limit\n0;276;0c11;rgb:1e1e/1e1e/2e2e\n$ ${argv[5]}\n${after}`;
       return out;
     };
     const supervisor = new Supervisor({ ...f.deps, run });
@@ -1992,7 +1929,7 @@ test("what an old occupant left above the launch line (its own words, a broken t
     const flushed = quiet(() => supervisor.flush());
     if (ready) {
       const lines = await flushed;
-      expect(lines).toContain(`LEAD_RESTARTED lead:p1 ${launchedSessions(f)[0]}`);
+      expect(lines).toContain(`LEAD_RESTARTED hc:t1 ${launchedSessions(f)[0]}`);
     } else await expect(flushed).rejects.toThrow("STARTUP_UNCONFIRMED");
   }
 });
@@ -2001,8 +1938,8 @@ test("an unconfirmed session that did initialise is never killed or relaunched p
   const f = fixture();
   f.cold();
   f.noAgent(); // Exercise process-launch confirmation rather than the reusable-process path.
-  f.setConfirm(false); // e.g. blocked on a dialog: herdr never reports it ready, but omo wrote its holder file
-  const supervisor = new Supervisor({ ...f.deps, run: recreating(f, f.deps.run) });
+  f.setConfirm(false); // e.g. blocked on a dialog: hc never reports it ready, but omo wrote its holder file
+  const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("blocked", "INBOUND blocked");
   await quiet(async () => {
     for (let i = 1; i <= UNCONFIRMED_LIMIT + 1; i++) await expect(supervisor.flush()).rejects.toThrow("STARTUP_UNCONFIRMED");
@@ -2010,7 +1947,7 @@ test("an unconfirmed session that did initialise is never killed or relaunched p
   const [launched] = launchedSessions(f);
   expect(launchedSessions(f)).toHaveLength(1);
   expect(restartSession(f)).toMatchObject({ session: launched, phase: "submitted", unconfirmed: UNCONFIRMED_LIMIT + 1 });
-  expect(f.calls.some((call) => (call[0] === "kill" && call[2] === "201") || call[2] === "close" || call[1] === "tab")).toBe(false);
+  expect(f.calls.some((call) => (call[0] === "kill" && call[2] === "201") || (call[0] === "hc" && (call[2] === "kill" || call[2] === "run")))).toBe(false);
 });
 
 test("a foreground process group other than the shell is not a plain shell", () => {
@@ -2021,10 +1958,10 @@ test("a foreground process group other than the shell is not a plain shell", () 
 
 /** Model selections through either a process launch or the interactive model commands, in argv spelling. */
 const launches = (f: ReturnType<typeof fixture>) => f.calls.flatMap((call, i) => {
-  if (call[2] === "run") return [call[4] ?? ""];
-  if (call[2] !== "send-text" || !call[4]?.startsWith("/model ")) return [];
-  const next = f.calls.slice(i + 1).find((item) => item[2] === "send-text")?.[4];
-  return [`--model ${call[4].slice("/model ".length)}${next?.startsWith("/thinking ") ? ` --thinking ${next.slice("/thinking ".length)}` : ""}`];
+  if (isLaunch(call)) return [call[5] ?? ""];
+  if (!isTyped(call) || !call[5]?.startsWith("/model ")) return [];
+  const next = f.calls.slice(i + 1).find((item) => isTyped(item))?.[5];
+  return [`--model ${call[5].slice("/model ".length)}${next?.startsWith("/thinking ") ? ` --thinking ${next.slice("/thinking ".length)}` : ""}`];
 });
 const journal = (f: ReturnType<typeof fixture>) => readJournal(f.state.dir);
 const muted = async (work: () => Promise<void>) => {
@@ -2483,7 +2420,7 @@ const inToolCall = (f: ReturnType<typeof fixture>, at: number, answered = false)
     ...(answered ? [entry({ role: "toolResult", toolCallId: "call_1", content: [] }, at + 1_000)] : []),
   ].join("\n") + "\n");
 };
-const typed = (f: ReturnType<typeof fixture>): string[] => f.calls.filter((call) => call[0] === "herdr" && call[2] === "send-text").map((call) => call[4] ?? "");
+const typed = (f: ReturnType<typeof fixture>): string[] => f.calls.filter((call) => isTyped(call)).map((call) => call[5] ?? "");
 // The footer omo showed on a lead the owner stopped with Esc during `gh pr checks --watch` (2026-10-23).
 const PAUSED_SCREEN = "❯ \n(😺 OmO Native by Q Kim) ◉ watching lead events (5m) Paused · 4 updates held · type to continue, /resume to resume";
 
@@ -2536,7 +2473,7 @@ test("a working lead between tool calls, or one whose call started after it acke
 test("an idle lead paused by Esc gets /resume typed before its pointer; still unacked after push.escalateMin it is restarted", async () => {
   const f = fixture({ ackTimeoutSec: 60 });
   f.world.screen = PAUSED_SCREEN;
-  // herdr reports an Esc-paused omo as done.
+  // hc reports an Esc-paused omo as done.
   f.pane.agent_status = "done";
   const supervisor = new Supervisor(f.deps);
   supervisor.enqueue("discord:1:1", "INBOUND 1 1 hi");

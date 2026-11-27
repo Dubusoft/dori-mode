@@ -3,7 +3,7 @@ import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
 import { paneRow, readScreen } from "./panes.ts";
-import { infoOf, paneRuntime, runtimeOfPane } from "./runtime/index.ts";
+import { infoOf, sessionRuntime } from "./runtime/index.ts";
 import { procTable, resolveSession, sessionDirFor } from "./session-id.ts";
 import { LANE_PERMISSION_FLAGS } from "./runner/lane-launch.ts";
 import { TransientSuperviseError } from "./supervise-journal.ts";
@@ -32,7 +32,7 @@ export const STARTUP_ERROR = /Cannot find module|All fallback models failed|No A
 
 /** The lead pane's shell and foreground processes, from the runtime that holds it; undefined when it gave none. */
 export const processInfo = async (deps: FlowDeps): Promise<ProcessInfo | undefined> =>
-  infoOf(await paneRuntime(deps.run, deps.config.leadPane).processInfo(deps.config.leadPane));
+  infoOf(await sessionRuntime(deps.run).processInfo(deps.config.leadPane));
 
 /** The old lead's tree was killed but is still listed: it is stuck in its pane, not refused. */
 export const LEAD_STAYS = /old lead has not exited|cannot stop owned lead process/;
@@ -74,16 +74,7 @@ export const confirmLead = async (deps: FlowDeps, session: string): Promise<bool
   // the status gate until the bounded startup deadline.
   const deadline = deps.clock.now() + 30_000;
   for (let attempt = 0; attempt < 60 && deps.clock.now() <= deadline; attempt++) {
-    // herdr waits for the agent's status itself; hc has no such wait, so its status is read below every 500 ms.
-    if (runtimeOfPane(deps.config.leadPane) === "herdr") {
-      const ready = await deps.run(["herdr", "agent", "wait", deps.config.leadPane, "--until", "idle", "--until", "working", "--until", "done", "--timeout", String(Math.max(1, deadline - deps.clock.now()))]);
-      if (ready.code !== 0) {
-        // During replacement herdr can briefly report agent_not_running before
-        // the new occupant registers. This is not failed admission.
-        await deps.clock.sleep(500);
-        continue;
-      }
-    }
+    // hc has no wait for an agent status, so the status is read every 500 ms.
     const pane = await paneRow(deps.run, deps.config.leadPane);
     const info = await processInfo(deps);
     if (!info) return false;

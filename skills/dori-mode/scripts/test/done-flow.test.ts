@@ -106,7 +106,7 @@ test("the claim notice and the objection go to the lane through its runner, whic
   await objectDone(at(T0 + MIN), (await at(T0).registry.read("demo-lane")) ?? lane, [";printf PANE_INJECTION;#"]);
   expect(world.ops.filter((e) => e.op === "send").map((e) => e.key)).toEqual(["demo-lane", "demo-lane"]);
   expect(sent(world).some((text) => text.includes("PANE_INJECTION"))).toBe(false);
-  expect(world.calls.filter((c) => c[0] === "herdr")).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "hc")).toEqual([]);
   expect(statusOf((await at(T0).registry.read("demo-lane")) ?? lane)).toBe("not-done");
 });
 
@@ -136,7 +136,7 @@ test("sendVerified types nothing when the pane list cannot be read", async () =>
   const deps = at(T0);
   const run = async (argv: readonly string[]) => (argv[2] === "list" ? { code: 1, out: "", err: "server down" } : deps.run(argv));
   expect(await sendVerified(run, deps.clock, "w:p1", "[LEAD] hello")).toBe("failed");
-  expect(world.calls.filter((c) => c[2] === "send-text")).toEqual([]);
+  expect(world.calls.filter((c) => c[0] === "hc" && c[2] === "send")).toEqual([]);
 });
 
 test("five quiet minutes after a claim is handed over the lane is closed, and the next pass removes its queued worktree", async () => {
@@ -633,46 +633,47 @@ test("closing directly refuses while a signal is not live and leaves the pane al
 });
 
 test("delivery is confirmed by the pane's agent status moving to working, with exactly one Enter", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.panes = [{ pane_id: "hc:t1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   world.onEnterStatus = "working";
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("delivered");
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] please report")).toBe("delivered");
+  // hc pastes the text and presses Enter in one send.
+  expect(world.calls.filter((c) => c[0] === "hc" && (c[2] === "send" || c[2] === "keys"))).toHaveLength(1);
 });
 
 test("text still in the input line gets exactly one more Enter, and still there after it the send failed", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.panes = [{ pane_id: "hc:t1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   world.screens = ["❯ ", ...Array<string>(10).fill("❯ [LEAD] stuck text still here")];
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] stuck text still here")).toBe("failed");
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] stuck text still here")).toBe("failed");
   expect(sent(world)).toEqual(["[LEAD] stuck text still here"]);
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(2);
+  expect(world.calls.filter((c) => c[0] === "hc" && c[2] === "keys")).toHaveLength(1);
 });
 
 test("other text in the input line (maybe the owner's) is never typed into or submitted", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.panes = [{ pane_id: "hc:t1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   world.screen = "❯ half a sentence";
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("failed");
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] please report")).toBe("failed");
   world.screen = "an ask-user dialog, no prompt";
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("failed");
-  expect(world.calls.filter((c) => c[2] === "send-text" || c[2] === "send-keys")).toEqual([]);
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] please report")).toBe("failed");
+  expect(world.calls.filter((c) => c[0] === "hc" && (c[2] === "send" || c[2] === "keys"))).toEqual([]);
 });
 
 test("the same text left unsubmitted by an earlier send only gets Enter, never a second copy", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
+  world.panes = [{ pane_id: "hc:t1", workspace_id: "w", agent: "pi", agent_status: "idle" }];
   world.onEnterStatus = "working";
   world.screens = ["❯ [LEAD] please report"];
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] please report")).toBe("delivered");
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] please report")).toBe("delivered");
   expect(sent(world)).toEqual([]);
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+  expect(world.calls.filter((c) => c[0] === "hc" && c[2] === "keys")).toHaveLength(1);
 });
 
 test("a pane that was already working cannot show a change, so the send is unconfirmed, not delivered", async () => {
-  world.panes = [{ pane_id: "w:p1", workspace_id: "w", agent: "pi", agent_status: "working" }];
-  expect(await sendVerified(at(T0).run, at(T0).clock, "w:p1", "[LEAD] queued while busy")).toBe("unconfirmed");
-  expect(world.calls.filter((c) => c[2] === "send-keys")).toHaveLength(1);
+  world.panes = [{ pane_id: "hc:t1", workspace_id: "w", agent: "pi", agent_status: "working" }];
+  expect(await sendVerified(at(T0).run, at(T0).clock, "hc:t1", "[LEAD] queued while busy")).toBe("unconfirmed");
+  expect(world.calls.filter((c) => c[0] === "hc" && (c[2] === "send" || c[2] === "keys"))).toHaveLength(1);
 });
 
 test("text with a backtick never reaches a pane", async () => {
-  await expect(sendVerified(at(T0).run, at(T0).clock, "w:p1", "run `rm -rf`")).rejects.toBeInstanceOf(UnsafeTextError);
+  await expect(sendVerified(at(T0).run, at(T0).clock, "hc:t1", "run `rm -rf`")).rejects.toBeInstanceOf(UnsafeTextError);
   expect(world.calls).toHaveLength(0);
 });
 

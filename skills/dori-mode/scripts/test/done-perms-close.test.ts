@@ -150,13 +150,11 @@ test("closing a lane leaves its thread alone, whether another open lane shares i
 });
 
 // Item 4: lane identity and permissions.
-test("callerLane is DORI_LANE_KEY, else the open lane registered for HERDR_PANE_ID; the lead pane and no env mean the lead", async () => {
-  const d = at(T0);
-  expect(await callerLane(d, {})).toBeUndefined();
-  expect(await callerLane(d, { DORI_LANE_KEY: "demo-lane" })).toBe("demo-lane");
-  expect(await callerLane(d, { HERDR_PANE_ID: "w:p1" })).toBe("demo-lane");
-  expect(await callerLane(d, { HERDR_PANE_ID: "lead:p1" })).toBeUndefined();
-  expect(await callerLane(d, { HERDR_PANE_ID: "w:unknown" })).toBeUndefined();
+test("callerLane is DORI_LANE_KEY; without it (or blank) the caller is the lead, even from a pane registered to a lane", async () => {
+  await at(T0).registry.write({ ...lane, pane: "hc:t7" });
+  expect(callerLane({})).toBeUndefined();
+  expect(callerLane({ DORI_LANE_KEY: " " })).toBeUndefined();
+  expect(callerLane({ DORI_LANE_KEY: "demo-lane" })).toBe("demo-lane");
 });
 
 test("a lane may act only on its own key and may not send at all; the lead may do both anywhere", () => {

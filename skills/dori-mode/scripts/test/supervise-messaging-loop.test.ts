@@ -47,7 +47,7 @@ const fixture = (kind: OwnerNoticeKind, reminded = true, closed = false) => {
     if (socket === undefined) delete process.env.NOTIFY_SOCKET; else process.env.NOTIFY_SOCKET = socket;
   });
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" });
   const base = depsFor(world, fakeClock(T0), state.dir, {
     discord: { applicationId: "100", guildId: "200", ownerId: "123456789012345" },
     discordChannels: ["11"], defaultModel: "test/model",

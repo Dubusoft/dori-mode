@@ -28,7 +28,7 @@ export const RESTART_TRIGGER = "(restart)";
 
 /**
  * Who a wake was for: `owner` (a person's message, its reminder, or an event-less restart), `lane` (lane work: reports,
- * panes, PRs, merges, waits, outcomes and decisions), or `noise` (everything else: host guard, runner links, herdr,
+ * panes, PRs, merges, waits, outcomes and decisions), or `noise` (everything else: host guard, runner links,
  * gateway, issues). A wake with several triggers counts for the first of owner, lane, noise that any of them names.
  */
 export type WakeSource = "owner" | "lane" | "noise";

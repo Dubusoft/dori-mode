@@ -52,13 +52,17 @@ const fixture = () => {
   cleanups.push(state.done);
   const clock = fakeClock(T0);
   const world = newWorld();
-  world.panes.push({ pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" });
+  world.panes.push({ pane_id: "hc:t1", workspace_id: "", agent: "omo", agent_status: "working" });
+  const lead = { address: "t1", state: "live", created_ms: 1, status: { app: "omo", state: "working" } };
+  const hc = (json: unknown) => ({ code: 0, out: JSON.stringify(json), err: "" });
   const run: Runner = async (argv) => {
-    if (argv[0] === "herdr" && argv[2] === "list") return { code: 0, out: JSON.stringify({ result: { panes: world.panes } }), err: "" };
-    if (argv[0] === "herdr" && argv[2] === "read") return { code: 0, out: "working", err: "" };
+    const verb = argv[0] === "hc" && argv[1] === "--json" ? argv[2] : undefined;
+    if (verb === "ls") return hc({ terminals: [{ address: lead.address, state: lead.state }] });
+    if (verb === "get" && argv[3] === lead.address) return hc(lead);
+    if (verb === "read" && argv[3] === lead.address) return hc({ text: "working" });
     throw new Error(`unexpected ${argv.join(" ")}`);
   };
-  const deps = () => ({ ...depsFor(world, clock, state.dir), run });
+  const deps = () => ({ ...depsFor(world, clock, state.dir, { leadPane: "hc:t1" }), run });
   const log = (): { id: string; line: string }[] =>
     readFileSync(join(state.dir, "lead-events.log"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const open = () => {

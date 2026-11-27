@@ -3,7 +3,7 @@ import { backoffMs, RECONNECT_MAX_MS } from "./transport.ts";
 
 /**
  * The local runner as a child process of `supervise` (design 0.1 (c), section 4). `startLocalRunner` spawns
- * `dori runner serve` with the lane-mode variables removed from its environment (so the runner is never in lane mode),
+ * `dori runner serve` with the lane-mode variable removed from its environment (so the runner is never in lane mode),
  * restarts it whenever it exits with transport.ts `backoffMs` (1 s doubling to 60 s, with jitter; a child that stayed up
  * for RECONNECT_MAX_MS starts again from the first step), and kills it when `signal` aborts: SIGTERM, up to
  * LOCAL_STOP_GRACE_MS for it to exit, then SIGKILL. `restart()` (the liveness monitor's restart for `local`) stops the
@@ -14,8 +14,8 @@ import { backoffMs, RECONNECT_MAX_MS } from "./transport.ts";
  */
 
 export const LOCAL_STOP_GRACE_MS = 10_000;
-/** The variables that put `dori` into lane mode; the runner child never inherits them. */
-export const LANE_MODE_ENV = ["DORI_LANE_KEY", "HERDR_PANE_ID"] as const;
+/** The variable that puts `dori` into lane mode; the runner child never inherits them. */
+export const LANE_MODE_ENV = ["DORI_LANE_KEY"] as const;
 
 export type ChildProcess = { readonly pid: number; readonly exited: Promise<number>; kill(sig: "SIGTERM" | "SIGKILL"): void };
 
@@ -39,7 +39,7 @@ export const spawnProcess: LocalChildDeps["spawn"] = (argv, env) => {
   return { pid: proc.pid, exited: proc.exited, kill: (sig) => { proc.kill(sig); } };
 };
 
-/** `env` without the lane-mode variables. */
+/** `env` without the lane-mode variable. */
 export const childEnv = (env: Readonly<Record<string, string>>): Record<string, string> =>
   Object.fromEntries(Object.entries(env).filter(([name]) => !(LANE_MODE_ENV as readonly string[]).includes(name)));
 

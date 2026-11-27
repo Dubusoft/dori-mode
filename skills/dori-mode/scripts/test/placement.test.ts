@@ -28,9 +28,9 @@ test("a blank --machine is ignored", () => {
   expect(resolvePlacement({ machine: "  ", done: RESEARCH }, config({ defaultMachine: "big" }))).toEqual({ machine: "big", source: "default", movable: true });
 });
 
-test("while no runner declares a repo, every workspace task (--cwd, --pane, --workspace, a Done repo) runs locally, not on defaultMachine", () => {
+test("while no runner declares a repo, every workspace task (--cwd, a Done repo) runs locally, not on defaultMachine", () => {
   const c = config({ defaultMachine: "big" });
-  for (const input of [{ cwd: "/data/repos/app", done: RESEARCH }, { pane: "w:p1", done: RESEARCH }, { workspace: "w", done: RESEARCH }, { done: "closed acme/app#9" }]) {
+  for (const input of [{ cwd: "/data/repos/app", done: RESEARCH }, { done: "closed acme/app#9" }]) {
     expect(resolvePlacement(input, c)).toEqual({ machine: LOCAL_MACHINE, source: "workspace", movable: false });
   }
 });

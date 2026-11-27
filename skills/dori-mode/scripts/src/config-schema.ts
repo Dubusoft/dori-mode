@@ -6,7 +6,7 @@ type Json = Record<string, unknown>;
 /** The top-level key that holds a file's schema version; absent means version 0 (written before versions existed). */
 export const CONFIG_SCHEMA_KEY = "schemaVersion";
 /** The version this dori writes. Raise it together with a new CONFIG_MIGRATIONS entry. */
-export const CONFIG_SCHEMA_VERSION = 8;
+export const CONFIG_SCHEMA_VERSION = 9;
 
 export type ConfigMigration = {
   /** The version a file has after this step. */
@@ -55,6 +55,8 @@ export const CONFIG_MIGRATIONS: readonly ConfigMigration[] = [
   // Autopilot is always on: a task runs when it is marked for autopilot in toodo, and `dori autopilot pause` stops it.
   { to: 7, drops: { "autopilot.mode": "autopilot is always on; a task's toodo autopilot mark decides, and dori autopilot pause stops it" } },
   { to: 8, drops: { secrets: "every stored secret arrives in every lane environment at launch" } },
+  // hc is the only terminal runtime, so the lead's runtime choice means nothing any more.
+  { to: 9, drops: { leadRuntime: "hc is the only terminal runtime; the lead's pane always opens on hc" } },
 ];
 
 export class ConfigSchemaError extends Error {}

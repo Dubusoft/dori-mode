@@ -57,7 +57,7 @@ const upgradeRunnersNow = async (cfg: Awaited<ReturnType<typeof loadConfig>>): P
   const { SupervisorAuth } = await import("./runner/auth.ts");
   const rows = readRunnerRows(cfg.stateDir);
   const genOf = (label: string): number => readRunnerRows(cfg.stateDir).find((r) => r.label === label)?.maxGen ?? 0;
-  const machines = await listGuardMachines(run, cfg.guardMachines, cfg.stateDir);
+  const machines = listGuardMachines(cfg.guardMachines, cfg.stateDir);
   let bundle: string | undefined;
   const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
   const before = new Map(rows.map((r) => [r.label, r.maxGen]));
@@ -109,7 +109,7 @@ export type RunnerAdminDeps = { readonly die: (message: string, code?: number) =
  */
 export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number> => {
   // enroll, install, revoke, rotate, reset-gen and upgrade run on the supervisor host against <stateDir>.
-  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) [--set KEY=VALUE ...] [--unset KEY ...] [--yes] | setup [--machine LABEL] [--set KEY=VALUE ...] [--unset KEY ...] [--yes] [--new] | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade | herdr start|restart|stop|status --machine LABEL [--yes]";
+  const usage = "usage: dori runner serve [--label LABEL] [--enroll | --enroll-only] [--listen HOST:PORT] | probe [--json] | enroll --machine LABEL | install (TARGET [--label LABEL] | --machine LABEL) [--set KEY=VALUE ...] [--unset KEY ...] [--yes] | setup [--machine LABEL] [--set KEY=VALUE ...] [--unset KEY ...] [--yes] [--new] | remove LABEL | revoke LABEL | rotate LABEL | reset-gen LABEL | upgrade";
   const parsed = parseArgs({
     args: process.argv.slice(3), allowPositionals: true,
     options: {
@@ -124,7 +124,7 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
     if (!value || !LABEL_PATTERN.test(value)) die(usage);
     return value as string;
   };
-  if (parsed.values.yes && sub !== "herdr" && sub !== "setup" && sub !== "install") die(usage);
+  if (parsed.values.yes && sub !== "setup" && sub !== "install") die(usage);
   if (parsed.values.label !== undefined && sub !== "install") die(usage);
   if ((parsed.values.set !== undefined || parsed.values.unset !== undefined) && sub !== "setup" && sub !== "install") die(usage);
   if (parsed.values.new && sub !== "setup") die(usage);
@@ -147,9 +147,7 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
     let machine: GuardMachine | undefined;
     if (parsed.values.machine !== undefined) {
       const label = labelArg(parsed.values.machine);
-      const { readGuardMachines } = await import("./remote-guard.ts");
-      const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
-      machine = machines.machines.find((m) => m.label === label) ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+      machine = listGuardMachines(cfg.guardMachines, cfg.stateDir).find((m) => m.label === label) ?? die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     }
     let code: number;
     try {
@@ -158,18 +156,6 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
       code = die(e instanceof Error ? e.message : String(e));
     }
     process.exit(code);
-  }
-  if (sub === "herdr") {
-    const label = labelArg(parsed.values.machine);
-    const cfg = await loadConfig();
-    const { readRunnerRows } = await import("./runner/hub.ts");
-    const { runnerHerdrMain } = await import("./runner/herdr-cli.ts");
-    process.exit(await runnerHerdrMain({ action: target, machine: label, yes: parsed.values.yes === true }, {
-      calls: cliRunnerCall(cliSocketPath(defaultRunnerDir())),
-      rows: () => readRunnerRows(cfg.stateDir),
-      lanes: async () => (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed"),
-      out: (line) => { console.log(line); }, err: (line) => { console.error(line); },
-    }));
   }
   if (sub === "upgrade") {
     if (target !== undefined || parsed.values.machine !== undefined) die(usage);
@@ -211,12 +197,9 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
     const keys = await runnerKeys();
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
-    const { readGuardMachines } = await import("./remote-guard.ts");
-    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
-    const machine = direct ?? machines.machines.find((m) => m.label === label)
-      ?? die(`RUNNER_UNKNOWN_MACHINE ${label}${machines.ok ? "" : `: ${machines.detail}`}`);
+    const machine = direct ?? listGuardMachines(cfg.guardMachines, cfg.stateDir).find((m) => m.label === label) ?? die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const { SupervisorAuth } = await import("./runner/auth.ts");
-    const { buildBundle, herdrInstallNote, installRunner } = await import("./runner/install.ts");
+    const { buildBundle, hcInstallNote, installRunner } = await import("./runner/install.ts");
     const { runnerListenAddress } = await import("./runner/endpoints.ts");
     const auth = new SupervisorAuth(cfg.stateDir, { now: realClock.now });
     try {
@@ -229,7 +212,7 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
       });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
       if (direct) writeRunnerMachine(cfg.stateDir, direct.label, direct.target);
-      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${result.ok ? herdrInstallNote(result.herdr, result.hc) : herdrInstallNote(undefined)}`);
+      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${hcInstallNote(result.ok ? result.hc : undefined)}`);
     } finally {
       auth.close();
     }
@@ -246,12 +229,10 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
     const label = labelArg(target);
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
-    const { readGuardMachines } = await import("./remote-guard.ts");
-    const machines = await readGuardMachines(run, cfg.guardMachines, cfg.stateDir);
     const { hasLocalRunnerState, planRemove, removeRunner } = await import("./runner/remove.ts");
-    // A label dropped from herdr and config but still known locally (keys, hub row, endpoint) is cleaned up here only.
-    const plan = planRemove(machines, label, hasLocalRunnerState(cfg.stateDir, label));
-    if (plan.kind === "unknown") die(`RUNNER_UNKNOWN_MACHINE ${label}${plan.detail === undefined ? "" : `: ${plan.detail}`}`);
+    // A label dropped from config and runner-machines state but still known locally (keys, hub row, endpoint) is cleaned up here only.
+    const plan = planRemove(listGuardMachines(cfg.guardMachines, cfg.stateDir), label, hasLocalRunnerState(cfg.stateDir, label));
+    if (plan.kind === "unknown") die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const { runnerOf } = await import("./lane-ops.ts");
     const busy = (await new Registry(cfg.stateDir).open()).filter((lane) => statusOf(lane) !== "closed" && runnerOf(lane) === label);
     if (busy.length) die(`RUNNER_REMOVE_BUSY runner=${label} open lanes: ${busy.map((lane) => lane.key).join(",")}; close them or run dori runner evacuate ${label} first`);
@@ -288,10 +269,10 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
     const label = labelArg(target);
     const cfg = await loadConfig();
     setDefaultRunTimeout(cfg.runTimeoutMs);
-    const { machineKind, readGuardMachines, sshArgv } = await import("./remote-guard.ts");
+    const { sshArgv } = await import("./remote-guard.ts");
     const { openLaneReports } = await import("./lane-report-store.ts");
     const { evacuate } = await import("./runner/evacuate.ts");
-    const machine = (await readGuardMachines(run, cfg.guardMachines, cfg.stateDir)).machines.find((m) => m.label === label);
+    const machine = listGuardMachines(cfg.guardMachines, cfg.stateDir).find((m) => m.label === label);
     if (!machine) die(`RUNNER_UNKNOWN_MACHINE ${label}`);
     const sshTarget = (machine as NonNullable<typeof machine>).target;
     // The worker's commands take the form of its kind (POSIX sh or Windows PowerShell); found once, on first use.

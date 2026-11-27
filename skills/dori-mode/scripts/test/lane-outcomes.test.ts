@@ -33,7 +33,7 @@ const lane = (key: string, extra: Partial<Lane> = {}): Lane => ({
 
 const deliveredOutcome = async () => {
   const f = fixture();
-  const pane = { pane_id: "lead:p1", workspace_id: "test", agent: "omo", agent_status: "working" };
+  const pane = { pane_id: "hc:t1", workspace_id: "test", agent: "omo", agent_status: "working" };
   f.world.panes.push(pane);
   // Keep the push step away from the input: only supervisor observations advance these tests.
   f.world.screen = "❯ owner draft";
@@ -42,7 +42,6 @@ const deliveredOutcome = async () => {
   utimesSync(session, T0 / 1000, T0 / 1000);
   const supervisor = new Supervisor({ ...f.deps, tunables: { ...f.deps.tunables, cacheTtlMin: 60 }, run: async (argv, opts) => {
     if (argv[0] === "ps" && argv[1] === "-A") return { code: 0, out: `101 10 /usr/bin/omo --session-id ${session}`, err: "" };
-    if (argv[0] === "herdr" && argv[2] === "process-info") return { code: 0, out: JSON.stringify({ result: { process_info: { shell_pid: 10 } } }), err: "" };
     return f.deps.run(argv, opts);
   } });
   supervisor.enqueue("closed:alpha", "LANE_CLOSED alpha x");
@@ -61,9 +60,9 @@ for (const ended of ["idle", "done"]) {
     expect(f.unreported()).toEqual([]);
     f.pane.agent_status = ended;
     f.clock.at += 1_000;
-    const before = f.world.calls.filter((call) => call[2] === "list").length;
+    const before = f.world.calls.filter((call) => call[0] === "hc" && call[2] === "ls").length;
     await f.supervisor.flush();
-    expect(f.world.calls.filter((call) => call[2] === "list").length - before).toBe(1);
+    expect(f.world.calls.filter((call) => call[0] === "hc" && call[2] === "ls").length - before).toBe(1);
     expect(f.unreported()).toHaveLength(1);
     expect(f.unreported()[0]).toMatchObject({ id: `unreported:alpha:${T0}:1`, at: T0 + 2_000 });
     expect(f.unreported()[0]?.line).toStartWith("UNREPORTED alpha ");
@@ -380,7 +379,7 @@ test("open obligations are listed for inbox take until reported", async () => {
 test("dori status names unreported lanes as a problem", () => {
   const base = {
     at: new Date(T0).toISOString(), services: [], lanes: [], waits: [], unacked: 0,
-    lead: { pane: "lead:p1", state: "warm", cacheTtlMin: 60, capTokens: 100_000 },
+    lead: { pane: "hc:t1", state: "warm", cacheTtlMin: 60, capTokens: 100_000 },
     github: { repos: [], failures: [], issueAuthors: ["owner"], issueRepos: [] },
     gateway: { state: "live", text: "" },
     events: { hours: 24, wakes: 0, measured: 0, calls: 0, kinds: [] },
