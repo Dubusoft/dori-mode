@@ -64,7 +64,7 @@ test("lane.start on the runner, its lane.started, then a done report make exactl
   await t.deps.registry.patch("lane-a", { fileRun: FILES.run });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: true, expectedLaneGen: 0, files: FILES });
   const run = herdr.find((a) => a[2] === "run");
-  expect(run?.[4]).toStartWith(`export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
+  expect(run?.[4]).toStartWith(`export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=${lanes.tokenPath("lane-a")} DORI_LANE_OUT=${join(runnerDir, "briefs", "lane-a.out")}; eval "$(dori secret env)"; omo --model m1 `);
   expect(lanes.tokenFor("lane-a", "lane-token-1")).toBe(true);
   expect(lanes.tokenFor("lane-a", "other")).toBe(false);
   const [type, started] = published[0] as [RunnerEventType, object];
@@ -308,7 +308,7 @@ printf "export SHARED='%s'\\n" "$PULL_VALUE"
     },
   });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# brief", done: "x", thread: "none", cwd: "/repo", agentProfile: "omo", mode: "ulw", model: "m1", sandbox: false, expectedLaneGen: 0, files: FILES, tabWorkspace: "w1" });
-  expect(command).toStartWith("export DORI_LANE_KEY=lane-a ");
+  expect(command).toStartWith("export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a ");
   expect(command).toContain(`eval "$(${remote ? cli : "dori"} secret env)";`);
   if (!remote) expect(command).not.toContain(cli);
   expect(command).not.toContain("launch-test-value");
@@ -338,7 +338,7 @@ test("a sandboxed lane records the checked wrapper as its split-pane prefix even
   });
   await lanes.start({ cmdId: "c1", key: "lane-a", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "sandboxed", mode: "ulw", model: "m", sandbox: true, expectedLaneGen: 0, files: FILES });
   await lanes.start({ cmdId: "c2", key: "lane-b", briefText: "# b\n", done: "x", thread: "none", cwd: "/repo", agentProfile: "default", mode: "ulw", model: "m", sandbox: false, expectedLaneGen: 0, files: FILES });
-  expect(lanes.records()["lane-a"]?.sandboxPrefix).toStartWith("env DORI_LANE_KEY=lane-a ");
+  expect(lanes.records()["lane-a"]?.sandboxPrefix).toStartWith("env DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a ");
   expect(lanes.records()["lane-a"]?.sandboxPrefix).toEndWith(` ${wrapper}`);
   expect(lanes.records()["lane-b"]?.sandboxPrefix).toBeUndefined();
 });

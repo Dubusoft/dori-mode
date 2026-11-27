@@ -56,7 +56,7 @@ test("a pwsh pane gets a nested encoded command with env, quoting and argv order
   const line = typed(t.calls);
   const tokenFile = t.lanes.tokenPath("lane-a");
   const script = decode(line, "pwsh");
-  expect(script).toStartWith(`$env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_LANE_OUT='${join(tokenFile, "..", "lane-a.out").replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; Set-Location -LiteralPath '/repo'; & 'omo' '--model' 'm1' '`);
+  expect(script).toStartWith(`$env:DO_NOT_TRACK='1'; $env:DORI_LANE_KEY='lane-a'; $env:DORI_LANE_TOKEN_FILE='${tokenFile.replace(/'/g, "''")}'; $env:DORI_LANE_OUT='${join(tokenFile, "..", "lane-a.out").replace(/'/g, "''")}'; $env:DORI_HEAVY_SLOTS='2'; $env:DORI_HEAVY_MAX_LOAD='3'; $env:PSExecutionPolicyPreference='Bypass'; Set-Location -LiteralPath '/repo'; & 'omo' '--model' 'm1' '`);
   expect(script).toEndWith("'; exit $LASTEXITCODE");
   expect(script).not.toContain("DORI_LANE_TOKEN='");
   expect(t.calls.some((a) => a.join(" ").includes("-NoProfile"))).toBe(false);
@@ -96,7 +96,7 @@ test("Windows PowerShell 5.1 refuses a double quote in argv, pwsh allows it", as
 test("a POSIX pane exports its environment and pulls secrets while a cmd pane is refused", async () => {
   const posix = setup("zsh");
   await posix.lanes.start(START);
-  expect(typed(posix.calls)).toStartWith("export DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=");
+  expect(typed(posix.calls)).toStartWith("export DO_NOT_TRACK=1 DORI_LANE_KEY=lane-a DORI_LANE_TOKEN_FILE=");
   expect(typed(posix.calls)).toContain(" secret env)\"; omo --model m1 ");
   const cmd = setup("cmd.exe");
   await expect(cmd.lanes.start(START)).rejects.toThrow("RUNNER_LANE_TARGET_INVALID");

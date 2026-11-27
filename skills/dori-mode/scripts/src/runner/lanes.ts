@@ -29,7 +29,7 @@ export { LANE_SOCKET, type LaneRequest, type LaneSocketLanes, serveLaneSocket } 
  * `lane.start` opens a herdr tab labelled with the lane key (or takes the idle shell pane `target` names), writes the
  * brief to `~/.dori/runner/briefs/<key>.md` (not /tmp), issues the lane a fresh 32-byte token, writes it to
  * `briefs/<key>.<gen>.token` (0600, one file per launch generation) and runs the agent of the requested profile from the runner's policy with
- * `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given, and
+ * `DO_NOT_TRACK=1`, `DORI_LANE_KEY` and `DORI_LANE_TOKEN_FILE` (and `DORI_HEAVY_SLOTS` / `DORI_HEAVY_MAX_LOAD` when given, and
  * `LANE_SANDBOX_REPOS` / `LANE_SANDBOX_WORKTREES` when the policy has a repos or worktree root) in front of it,
  * so the token itself is never on a command line (shell history, process listings). Only the token's sha256 is kept,
  * in `lanes.json` (0600) with the lane's pane, tab and cwd; that file is the hello inventory. The agent runs inside
@@ -498,7 +498,7 @@ export class RunnerLanes {
     if (shell === "pwsh" || shell === "powershell") {
       try {
         command = powershellLaunchLine(shell, [
-          ["DORI_LANE_KEY", key], ["DORI_LANE_TOKEN_FILE", tokenFile],
+          ["DO_NOT_TRACK", "1"], ["DORI_LANE_KEY", key], ["DORI_LANE_TOKEN_FILE", tokenFile],
           ...(input.fileRun ? [["DORI_LANE_OUT", laneFilePaths(this.deps.runnerDir, key).output] as const] : []),
           ...(input.heavySlots !== undefined ? [["DORI_HEAVY_SLOTS", String(input.heavySlots)] as const] : []),
           ...(input.heavyMaxLoad !== undefined ? [["DORI_HEAVY_MAX_LOAD", String(input.heavyMaxLoad)] as const] : []),
@@ -511,6 +511,9 @@ export class RunnerLanes {
     } else {
       const worktreeRoot = effectiveWorktreeRoot(this.deps.policy);
       const env = [
+        // omo 5.1.84+ asks a first-run telemetry consent question on screen; a lane cannot answer it (and a sandboxed
+        // lane may not keep the answer), so every lane starts opted out and never stops at that dialog.
+        "DO_NOT_TRACK=1",
         `DORI_LANE_KEY=${quote(key)}`, `DORI_LANE_TOKEN_FILE=${quote(tokenFile)}`,
         ...(input.fileRun ? [`DORI_LANE_OUT=${quote(laneFilePaths(this.deps.runnerDir, key).output)}`] : []),
         ...(input.heavySlots !== undefined ? [`DORI_HEAVY_SLOTS=${input.heavySlots}`] : []),
