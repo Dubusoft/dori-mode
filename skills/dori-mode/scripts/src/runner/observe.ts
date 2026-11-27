@@ -2,6 +2,7 @@ import { procLanes, sampleProcs, type Proc } from "../lane-memory.ts";
 import { listPanes, type Pane } from "../panes.ts";
 import { LANE_KEY } from "../registry.ts";
 import type { Runner } from "../run.ts";
+import { infoOf, paneRuntime } from "../runtime/index.ts";
 import type { TurnEvidence, TurnHold, TurnStopCause } from "./protocol.ts";
 import { laneStatus, type ObservedLane } from "./serve.ts";
 
@@ -90,12 +91,7 @@ export type ObserveHostDeps = {
   readonly owned?: (panes: readonly Pane[]) => Promise<ReadonlyMap<string, string>>;
 };
 
-const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | undefined> => {
-  const r = await run(["herdr", "pane", "process-info", "--pane", pane]);
-  if (r.code !== 0) return undefined;
-  try { return (JSON.parse(r.out) as { result?: { process_info?: ProcessInfo } }).result?.process_info; }
-  catch { return undefined; }
-};
+const processInfo = async (run: Runner, pane: string): Promise<ProcessInfo | undefined> => infoOf(await paneRuntime(run, pane).processInfo(pane));
 
 const agentProcesses = (info: ProcessInfo | undefined) =>
   (info?.foreground_processes ?? []).filter((p): p is typeof p & { readonly pid: number } => typeof p.pid === "number" && p.pid !== info?.shell_pid);

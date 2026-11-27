@@ -5,12 +5,13 @@ import { omoSessionsDir } from "../config.ts";
 import { type HostSample, sampleHost } from "../host-guard.ts";
 import { listPanes, type Pane, readScreen } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
+import { paneRuntime } from "../runtime/index.ts";
 import { procTable, resolveSession } from "../session-id.ts";
 import { checkDone, type SignalIo } from "../signals.ts";
 import { gitFacts } from "./lane-git.ts";
 import { checkQuery, type RunnerPolicy } from "./policy.ts";
 import type {
-  AnySupervisorControl, JsonValue, LaneInspection, MachineObservation, ProcessInfo, QueryBodies, QueryResults, QueryType, RunnerControlBodies,
+  AnySupervisorControl, JsonValue, LaneInspection, MachineObservation, QueryBodies, QueryResults, QueryType, RunnerControlBodies,
 } from "./protocol.ts";
 import { laneStatus } from "./serve.ts";
 import { checkLaneFilesBody, LaneFileError } from "../lane-file-contract.ts";
@@ -65,17 +66,9 @@ export const queryScreen = async (deps: Pick<QueryDeps, "run">, body: Body<"q.sc
   return { text: await readScreen(deps.run, body.pane, body.source === "recent" ? lines : undefined) };
 };
 
-/** herdr's process-info of `pane`: the info, or the error text of a failed or unreadable answer. */
-export const queryProcess = async (deps: Pick<QueryDeps, "run">, body: Body<"q.process">): Promise<QueryResults["q.process"]> => {
-  const r = await deps.run(["herdr", "pane", "process-info", "--pane", body.pane]);
-  if (r.code !== 0) return { error: (r.err || r.out).trim() || `herdr exited ${r.code}` };
-  try {
-    const info = (JSON.parse(r.out) as { result?: { process_info?: ProcessInfo } }).result?.process_info;
-    return info ? { info } : { error: "herdr process-info: no process_info in the answer" };
-  } catch {
-    return { error: "herdr process-info: unreadable answer" };
-  }
-};
+/** The process-info of `pane` from the runtime holding it, or that runtime's error text. */
+export const queryProcess = (deps: Pick<QueryDeps, "run">, body: Body<"q.process">): Promise<QueryResults["q.process"]> =>
+  paneRuntime(deps.run, body.pane).processInfo(body.pane);
 
 /** `q.stat`: whether each path exists on this host. */
 export const queryStat = (deps: Pick<QueryDeps, "exists">, body: Body<"q.stat">): QueryResults["q.stat"] => {

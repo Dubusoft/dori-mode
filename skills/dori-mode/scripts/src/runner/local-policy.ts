@@ -63,12 +63,12 @@ export const runnerPolicy = (runnerDir: string, remote: boolean, cfg: LocalPolic
 /** The runner-config keys that only declare placement; a file holding nothing else keeps the derived local policy. */
 export const PLACEMENT_ONLY_KEYS: readonly string[] = ["workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot"];
 
-/** A key layered onto the derived local policy like PLACEMENT_ONLY_KEYS: the named path grants. */
-export const LAYERED_GRANT_KEY = "grants";
+/** Keys layered onto the derived local policy like PLACEMENT_ONLY_KEYS: the named path grants and the lane runtime. */
+export const LAYERED_KEYS: readonly string[] = ["grants", "laneRuntime"];
 
 /**
  * The local runner's policy when `<runnerDir>/runner-config.json` exists: a file that sets only PLACEMENT_ONLY_KEYS
- * (and `grants`) layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
+ * (and LAYERED_KEYS) layers them onto `localPolicy(cfg)` (the lead host declares its repos in the same format as a worker), and a file
  * with any other key is the whole policy, unchanged. A layered `reposRoot` and the effective worktree root join
  * allowedRoots, so the repos discovered there pass the root check. The file's effective worktree root (its
  * `worktreeRoot`, else `<reposRoot>/worktrees`) replaces the config's; without either the config's stays. Retired keys
@@ -80,7 +80,7 @@ export const localRunnerPolicy = (
   const raw: unknown = JSON.parse(readFileSync(join(runnerDir, POLICY_FILE), "utf8"));
   const parsed = parsePolicy(raw, env.home ?? homedir(), tmpdir(), { runnerDir, ...(env.warn ? { warn: env.warn } : {}), ...runtimeDirOption() });
   const keys = typeof raw === "object" && raw !== null ? Object.keys(raw).filter((key) => !Object.hasOwn(RETIRED_POLICY_KEYS, key)) : [];
-  if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key) || key === LAYERED_GRANT_KEY)) return parsed;
+  if (!keys.every((key) => PLACEMENT_ONLY_KEYS.includes(key) || LAYERED_KEYS.includes(key))) return parsed;
   const local = localPolicy(cfg, env);
   const worktreeRoot = effectiveWorktreeRoot(parsed);
   return {
@@ -91,5 +91,6 @@ export const localRunnerPolicy = (
     ...(parsed.reposRoot !== undefined ? { reposRoot: parsed.reposRoot } : {}),
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     ...(parsed.grants ? { grants: parsed.grants } : {}),
+    ...(parsed.laneRuntime ? { laneRuntime: parsed.laneRuntime } : {}),
   };
 };
