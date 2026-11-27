@@ -106,6 +106,31 @@ test("ensureHc installs a missing hc, updates an old one in place, and refuses w
   expect(ensureHc(never)).rejects.toThrow(/^RUNNER_HC_UNAVAILABLE hc is not on the runner's PATH: install it with curl -fsSL /);
 });
 
+test("on Windows ensureHc installs with install.ps1 under Windows PowerShell, and the runtime starts the core and opens PowerShell terminals", async () => {
+  const seen: string[][] = [];
+  let version: string | undefined;
+  const run = async (argv: readonly string[]): Promise<Ran> => {
+    seen.push([...argv]);
+    if (argv[1] === "--version") return version ? { code: 0, out: `hc ${version}`, err: "" } : fail("not found", 127);
+    if (argv[0] === "powershell.exe") version = HC_MIN_VERSION;
+    return { code: 0, out: "", err: "" };
+  };
+  expect(await ensureHc(run, "win32")).toBe(HC_MIN_VERSION);
+  expect(seen[1]).toEqual(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "irm https://releases.herdr.dev/core/install.ps1 | iex"]);
+  const never = async (argv: readonly string[]): Promise<Ran> => (argv[1] === "--version" ? fail("not found", 127) : { code: 0, out: "", err: "" });
+  expect(ensureHc(never, "win32")).rejects.toThrow(/^RUNNER_HC_UNAVAILABLE hc is not on the runner's PATH: install it with powershell -c "irm /);
+
+  const hc = fakeHc();
+  const rt = hcRuntime(hc.run, undefined, "win32");
+  expect(await rt.instance()).toBe("hc:core-1");
+  expect(hc.calls.slice(1)).toEqual([["hc", "--json", "server", "start"], ["hc", "--json", "server", "status"]]);
+  await rt.open({ key: "lane-a", cwd: "C:\\w" });
+  expect(hc.calls.find((a) => a[2] === "run")?.at(-1)).toBe("powershell.exe");
+  const posix = fakeHc();
+  await hcRuntime(posix.run, "zsh", "linux").instance();
+  expect(posix.calls.slice(1)).toEqual([["hc", "--json", "server", "status"]]);
+});
+
 test("an hc lane opens a terminal running only the shell, types the launch line into it, and is killed and removed on close", async () => {
   const hc = fakeHc();
   const runnerDir = join(mkdtempSync(join(tmpdir(), "runtime-hc-")), "runner");

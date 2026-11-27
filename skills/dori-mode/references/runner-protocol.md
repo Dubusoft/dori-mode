@@ -512,7 +512,10 @@ Prerequisites:
 
 - Windows 10 1809 or Server 2019 (build 17763) or later, x64. Otherwise the script exits 4. ARM64 isn't supported.
 - OpenSSH server, reachable the same way as for the guard.
-- No hc: hc has no Windows support, so the install never exits 7 and the note says `hc=unknown`.
+- No hc needed up front: the install never exits 7 and the note says `hc=unknown`. The runner installs hc (x64 only)
+  itself with `install.ps1` (`irm https://releases.herdr.dev/core/install.ps1 | iex`, no admin, into
+  `%LOCALAPPDATA%\Programs\herdr-core`) when its first lane opens, or updates an older one, and starts hc's core with
+  `hc server start` (on Windows `hc server status` never starts one).
 - The runner runs as a scheduled task at logon, so the user has to be logged on. An always-on worker needs
   auto-logon.
 
@@ -558,8 +561,9 @@ On Windows the runner:
 - keeps the machine awake with `SetThreadExecutionState`;
 - samples memory, swap, disk, load and processes through `runner-sample.ps1`, and attributes processes to lanes from
   the lane shell pid recorded at launch (adopted lanes aren't attributed);
-- types lane launch lines as `-EncodedCommand` into pwsh or PowerShell 5.1 panes. `cmd.exe` panes are refused. On 5.1,
-  an argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`;
+- opens each lane in an hc terminal running Windows PowerShell 5.1 and types its launch line there as a nested
+  `powershell -NoLogo -EncodedCommand`. An argv with a double quote is refused with `RUNNER_LANE_ARGV_UNSAFE`, and a
+  review lane (sandbox only) with `RUNNER_LANE_REVIEW_UNSANDBOXED`;
 
 WSL and UNC runner dirs aren't supported. A Windows machine without a runner isn't guarded at all.
 

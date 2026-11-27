@@ -53,7 +53,7 @@ import { HC_CORE_UNIT, HC_CORE_UNIT_TEMPLATE, HC_INSTALL_URL, HC_LAUNCHD_LABEL, 
  * ssh's own 255 or a timeout is unreachable.
  *
  * Windows workers (`machineKind` says `windows`) get `windowsInstallScript` instead, with the same exit code meanings
- * (hc has no Windows build, so a Windows install never exits 7).
+ * (a Windows install never exits 7: the runner installs hc there itself when its first lane opens, runtime/hc.ts ensureHc).
  * Nothing travels on ssh's stdin there (a large script streamed into a PowerShell console host's stdin does not reliably
  * finish): each pass uploads the script with scp as `.dori-runner-install-<random>.ps1` into the user's profile directory
  * (the scp start directory on Windows OpenSSH), then runs the short `winRun` encoded command over ssh, which reads that

@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import type { Pane } from "../panes.ts";
 import type { Ran, Runner } from "../run.ts";
 import type { ProcessInfo } from "../runner/protocol.ts";
@@ -7,6 +7,9 @@ import { HC_PANE_PREFIX, type OpenSpec, type OpenedSession, type SessionRuntime 
 /** The oldest hc the adapter is tested against; an older one is updated before a lane opens on it. */
 export const HC_MIN_VERSION = "0.1.22";
 export const HC_INSTALL_URL = "https://releases.herdr.dev/core/install.sh";
+/** hc's Windows installer: x64 only, no admin, into `%LOCALAPPDATA%\Programs\herdr-core` (HC_WINDOWS_DIR). */
+export const HC_WINDOWS_INSTALL_URL = "https://releases.herdr.dev/core/install.ps1";
+const HC_WINDOWS_DIR = ["Programs", "herdr-core"];
 const INSTALL_TIMEOUT_MS = 180_000;
 
 /**
@@ -52,21 +55,39 @@ export const hcVersion = async (run: Runner): Promise<string | undefined> => {
 };
 
 /**
- * Makes sure hc is on this host at HC_MIN_VERSION or later: a missing hc is installed with the release installer
- * (into ~/.local/bin), an older one is updated in place (`hc update --version`, which
- * keeps running terminals). Throws `RUNNER_HC_UNAVAILABLE` with the fix when it still is not.
+ * On Windows, puts hc's install folder on this process's PATH: the installer adds it to the user's PATH in the
+ * registry, which a runner started before the install (or the install it just ran) does not see.
  */
-export const ensureHc = async (run: Runner): Promise<string> => {
+const windowsHcPath = (): void => {
+  const local = process.env.LOCALAPPDATA;
+  if (!local) return;
+  const dir = win32.join(local, ...HC_WINDOWS_DIR);
+  const path = process.env.PATH ?? "";
+  if (!path.split(win32.delimiter).some((entry) => entry.toLowerCase() === dir.toLowerCase())) process.env.PATH = path ? `${dir}${win32.delimiter}${path}` : dir;
+};
+
+/**
+ * Makes sure hc is on this host at HC_MIN_VERSION or later: a missing hc is installed with the release installer
+ * (install.sh into ~/.local/bin; on Windows install.ps1 under Windows PowerShell), an older one is updated in place
+ * (`hc update --version`, which keeps running terminals). Throws `RUNNER_HC_UNAVAILABLE` with the fix when it still is not.
+ */
+export const ensureHc = async (run: Runner, platform: NodeJS.Platform = process.platform): Promise<string> => {
+  const windows = platform === "win32";
+  if (windows) windowsHcPath();
   let version = await hcVersion(run);
   if (version === undefined) {
-    await run(["sh", "-c", `curl -fsSL ${HC_INSTALL_URL} | sh`], { timeoutMs: INSTALL_TIMEOUT_MS });
+    await run(windows
+      ? ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `irm ${HC_WINDOWS_INSTALL_URL} | iex`]
+      : ["sh", "-c", `curl -fsSL ${HC_INSTALL_URL} | sh`], { timeoutMs: INSTALL_TIMEOUT_MS });
   } else if (!versionAtLeast(version, HC_MIN_VERSION)) {
     await run(["hc", "update", "--version", HC_MIN_VERSION], { timeoutMs: INSTALL_TIMEOUT_MS });
   } else return version;
   version = await hcVersion(run);
   if (version !== undefined && versionAtLeast(version, HC_MIN_VERSION)) return version;
   throw new Error(`RUNNER_HC_UNAVAILABLE hc ${version ?? "is not on the runner's PATH"}${version ? ` is older than ${HC_MIN_VERSION}` : ""}: `
-    + `install it with curl -fsSL ${HC_INSTALL_URL} | sh (or hc update) and make sure ~/.local/bin is on the runner's PATH`);
+    + (windows
+      ? `install it with powershell -c "irm ${HC_WINDOWS_INSTALL_URL} | iex" (or hc update); hc has x64 Windows builds only`
+      : `install it with curl -fsSL ${HC_INSTALL_URL} | sh (or hc update) and make sure ~/.local/bin is on the runner's PATH`));
 };
 
 const hc = async (run: Runner, argv: readonly string[]): Promise<{ readonly ran: Ran; readonly json: Json }> => {
@@ -119,14 +140,22 @@ const terminalName = (key: string): string | undefined =>
  * notes (`--no-parent --no-notify`: the supervisor is the only thing that types into a lane), and the launch line is
  * typed into that shell. Nothing but the shell is on the terminal's command line, so `hc get`, `hc ls` and `ps` show no
  * lane variable; the lane's secrets reach it only inside the shell, through `dori secret env` over the lane socket.
+ * On Windows the shell is Windows PowerShell, and the runner (a logon task in the user's desktop session) starts the
+ * core itself: there `hc server status` never starts one.
  */
-export const hcRuntime = (run: Runner, shell: string = process.env.SHELL || "/bin/sh"): SessionRuntime => {
+export const hcRuntime = (
+  run: Runner, shell?: string, platform: NodeJS.Platform = process.platform,
+): SessionRuntime => {
+  const windows = platform === "win32";
+  const laneShell = shell ?? (windows ? "powershell.exe" : process.env.SHELL || "/bin/sh");
   let ensured: Promise<string> | undefined;
-  const ready = (): Promise<string> => ensured ??= ensureHc(run).catch((e: unknown) => { ensured = undefined; throw e; });
+  const ready = (): Promise<string> => ensured ??= ensureHc(run, platform).catch((e: unknown) => { ensured = undefined; throw e; });
   return {
-    // `server status` starts a stopped core; its id outlives core restarts, as hc terminals do.
+    // `server status` starts a stopped core (`server start` first on Windows, a no-op while one runs); its id outlives
+    // core restarts, as hc terminals do.
     instance: async () => {
       await ready();
+      if (windows) await hc(run, ["server", "start"]);
       const { ran, json } = await hc(run, ["server", "status"]);
       const core = json.core as { id?: unknown } | undefined;
       return ran.code === 0 && typeof core?.id === "string" ? `hc:${core.id}` : undefined;
@@ -158,7 +187,7 @@ export const hcRuntime = (run: Runner, shell: string = process.env.SHELL || "/bi
       await ready();
       const name = terminalName(spec.key);
       const argv = (named: boolean) => ["run", "--bg", "--no-parent", "--no-notify", "--cwd", spec.cwd, "--label", spec.label ?? `dori.lane=${spec.key}`,
-        ...(named && name ? ["--name", name] : []), "--", shell];
+        ...(named && name ? ["--name", name] : []), "--", laneShell];
       let made = await hc(run, argv(true));
       if (made.ran.code !== 0 && name) made = await hc(run, argv(false));
       if (made.ran.code !== 0 || typeof made.json.address !== "string") throw failure("run", made.ran);
