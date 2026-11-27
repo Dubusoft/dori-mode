@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -95,7 +95,7 @@ const units = async (d: DoctorDeps): Promise<Check[]> => {
  * refused, not run bare). Windows has no lane sandbox: its lanes run without one by design, a WARN so it stays in view.
  * Other platforms have no wrapper: lanes there need runners.<label>.allowUnsandboxed.
  */
-const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which">): Promise<Check[]> => {
+const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which" | "env">): Promise<Check[]> => {
   const platform = d.platform ?? process.platform;
   if (platform === "win32") return [warn("lane sandbox", "none: Windows has no lane sandbox, so lanes on this machine run WITHOUT one (each launch says SANDBOX_SKIPPED)", "none needed: Windows runners run lanes unsandboxed by design")];
   if (platform !== "linux" && platform !== "darwin") return [ok("lane sandbox", `not available on ${platform}; lanes on this machine need runners.<label>.allowUnsandboxed in the lead config`)];
@@ -115,8 +115,10 @@ const sandbox = async (d: Pick<DoctorDeps, "home" | "run" | "platform" | "which"
   const templateHash = createHash("sha256").update(laneSandboxScript(template)).digest("hex");
   // Only a current wrapper is asked for its table: an older one has no --explain.
   const [exposed, allowed] = await Promise.all([exposure(d, installed), installedHash === templateHash ? permissions(d, installed) : undefined]);
-  if (allowed) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed, allowed];
-  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed];
+  // After the exposure probe, never beside it: both probe lanes use the same input and output directories.
+  const hc = await hcExposure(d, installed, refresh);
+  if (allowed) return [ok("lane sandbox", mac ? `${installed} works (seatbelt: sandbox-exec available)` : `${installed} works (bwrap available)`), exposed, hc, allowed];
+  return [warn("lane sandbox", `${installed} differs from templates/${basename(template)} (LANE_SANDBOX_OUTDATED)`, refresh), exposed, hc];
 };
 
 /**
@@ -162,23 +164,83 @@ const exposure = async (d: Pick<DoctorDeps, "home" | "run">, installed: string):
   const hidden = existsSync(hidePath) ? readFileSync(hidePath, "utf8").split(/\r?\n/).map((l) => l.replace(/#.*/, "").trim()).filter(Boolean) : [];
   const candidates = [...new Set([...SENSITIVE, ...keys].map((p) => join(d.home, p)).concat(hidden).flatMap(globMatches))].filter(nonEmpty);
   if (candidates.length === 0) return ok("lane exposure", "none of the known credential stores exist on this host");
-  // The wrapper binds a lane's input and output directories without -try (a lane missing its inputs must not start), so
-  // the probe lane gets empty ones for the run.
-  const briefs = join(defaultRunnerDir(d.home), "briefs");
-  const laneDirs = ["doctor-probe.files", "doctor-probe.out"].map((n) => join(briefs, n));
-  for (const dir of laneDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
-  let probe: Awaited<ReturnType<Runner>>;
-  try {
-    probe = await d.run(["env", "DORI_LANE_KEY=doctor-probe", installed, "/bin/sh", "-c", PROBE, "lane-exposure", ...candidates], { ...T, cwd: "/" });
-  } finally {
-    for (const dir of laneDirs) rmSync(dir, { recursive: true, force: true });
-  }
+  const probe = await asProbeLane(d, installed, [], ["/bin/sh", "-c", PROBE, "lane-exposure", ...candidates]);
   if (probe.code !== 0) return warn("lane exposure", `could not probe what a lane can read (${probe.err.trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
   const seen = new Set(probe.out.split(/\r?\n/).filter(Boolean));
   const home = (p: string) => (p.startsWith(`${d.home}/`) ? `~/${p.slice(d.home.length + 1)}` : p);
   const readable = candidates.filter((p) => seen.has(p));
   if (readable.length) return warn("lane exposure", `a lane can read ${readable.map(home).join(", ")}`, "dori update installs the current wrapper; list any other path in ~/.dori/lane-sandbox-hide");
   return ok("lane exposure", `${candidates.length} sensitive path(s) checked, none readable in a lane`);
+};
+
+/**
+ * Runs `argv` behind the installed wrapper as the probe lane (DORI_LANE_KEY=doctor-probe, cwd /, plus `env`). The wrapper
+ * binds a lane's input and output directories without -try (a lane missing its inputs must not start), so the probe lane
+ * gets empty ones for the run; two probes at once would remove each other's.
+ */
+const asProbeLane = async (d: Pick<DoctorDeps, "home" | "run">, installed: string, env: readonly string[], argv: readonly string[]): ReturnType<Runner> => {
+  const briefs = join(defaultRunnerDir(d.home), "briefs");
+  const laneDirs = ["doctor-probe.files", "doctor-probe.out"].map((n) => join(briefs, n));
+  for (const dir of laneDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    return await d.run(["env", "DORI_LANE_KEY=doctor-probe", ...env, installed, ...argv], { ...T, cwd: "/" });
+  } finally {
+    for (const dir of laneDirs) rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+/** The variables through which a program in an hc terminal finds herdr-core's control socket; the wrapper unsets them. */
+const HC_VARS = ["HC_SOCKET", "HC_SESSION", "HC_TERMINAL_SOCKET", "HC_TERMINAL_ID", "HC_SCOPE"] as const;
+/** Prints `env <name>` for each hc variable left in its environment and `socket <path>` for each argument it can connect to. */
+const HC_PROBE = `const net = require("node:net");
+for (const k of ${JSON.stringify(HC_VARS)}) if (process.env[k] !== undefined) console.log("env " + k);
+for (const p of process.argv.slice(1)) await new Promise((done) => { const s = net.connect(p); s.on("connect", () => { console.log("socket " + p); s.destroy(); done(); }); s.on("error", done); });`;
+
+/**
+ * herdr-core's (hc) control sockets on this host: each socket in its state dir and in its runtime dir (XDG_RUNTIME_DIR, else
+ * /run/user/<uid> as hc uses), a level of session dirs deep, and the sockets HC_SOCKET and the hc config's socket name.
+ */
+const hcSockets = (d: Pick<DoctorDeps, "home" | "env">): string[] => {
+  const env = d.env ?? process.env;
+  const socket = (p: string): boolean => {
+    try {
+      return lstatSync(p).isSocket();
+    } catch {
+      return false;
+    }
+  };
+  const entries = (dir: string): string[] => {
+    try {
+      return readdirSync(dir).map((n) => join(dir, n));
+    } catch {
+      return []; // no such dir on this host
+    }
+  };
+  const runtime = env.XDG_RUNTIME_DIR || (process.getuid ? `/run/user/${process.getuid()}` : undefined);
+  const dirs = [join(env.XDG_STATE_HOME || join(d.home, ".local", "state"), "herdr-core"), ...(runtime ? [join(runtime, "herdr-core")] : [])];
+  const conf = join(env.XDG_CONFIG_HOME || join(d.home, ".config"), "herdr-core", "config.toml");
+  const configured = existsSync(conf) ? /^\s*socket\s*=\s*["']([^"']*)["']/m.exec(readFileSync(conf, "utf8"))?.[1]?.replace(/^~\//, `${d.home}/`) : undefined;
+  const found = dirs.flatMap(entries).flatMap((p) => [p, ...entries(p)]).concat(env.HC_SOCKET ?? [], configured ?? []);
+  return [...new Set(found.filter(socket))];
+};
+
+/**
+ * Whether a lane can reach herdr-core's control socket, measured by connecting to each hc socket on this host from a probe
+ * lane behind the installed wrapper, started with the hc variables an hc terminal gives its programs. Whoever reaches the
+ * socket runs any command on the host, outside the sandbox (hc exec), so a reachable socket or an hc variable that
+ * survives the wrapper is a FAIL.
+ */
+const hcExposure = async (d: Pick<DoctorDeps, "home" | "run" | "env">, installed: string, refresh: string): Promise<Check> => {
+  const sockets = hcSockets(d);
+  if (sockets.length === 0) return ok("lane hc socket", "no herdr-core (hc) control socket on this host");
+  const probe = await asProbeLane(d, installed, HC_VARS.filter((v) => v !== "HC_SOCKET").map((v) => `${v}=doctor-probe`), [process.execPath, "-e", HC_PROBE, ...sockets]);
+  if (probe.code !== 0) return warn("lane hc socket", `could not probe whether a lane reaches herdr-core's control socket (${(probe.err || probe.out).trim() || `exit ${probe.code}`})`, "run dori doctor again once the lane sandbox check passes");
+  const lines = probe.out.split(/\r?\n/);
+  const reached = sockets.filter((p) => lines.includes(`socket ${p}`));
+  const leaked = HC_VARS.filter((v) => lines.includes(`env ${v}`));
+  const problems = [...(reached.length ? [`a lane can connect to ${reached.join(", ")} and so run any command outside the sandbox (hc exec)`] : []), ...(leaked.length ? [`a lane still gets ${leaked.join(", ")}`] : [])];
+  if (problems.length) return fail("lane hc socket", problems.join("; "), refresh);
+  return ok("lane hc socket", `${sockets.length} hc socket(s) checked, none reachable from a lane, and no hc variable reaches it`);
 };
 
 /**

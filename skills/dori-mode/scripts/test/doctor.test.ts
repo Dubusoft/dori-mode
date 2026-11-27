@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { defaultConfig, loadConfig } from "../src/config.ts";
 import { type Check, configSources, type DoctorDeps, doctorExit, renderDoctor, runDoctor, runnerChecks } from "../src/doctor.ts";
@@ -89,6 +89,8 @@ const fixture = (patch: Patch = {}) => {
   writeFileSync(join(state.dir, "memory", "system", "human.md"), "## Open\n- one item\n");
   const deps: DoctorDeps = {
     run, http, clock, configPath: "/home/test/config.json", envPath: "/home/test/.dori/env", token: TOKEN, tokenSource: "file", exists: () => true, home: state.dir, platform: "linux", which: () => "/usr/bin/bwrap",
+    // A runtime dir of its own: the host's may hold a live herdr-core socket.
+    env: { XDG_RUNTIME_DIR: join(state.dir, "run") },
     config: {
       ...defaultConfig("/home/test"), stateDir: state.dir, leadCwd: state.dir, leadPane: "lead:p1", laneWorkspace: "w1",
       memoryCheck: { ...defaultConfig("/home/test").memoryCheck, repo: join(state.dir, "memory") },
@@ -198,6 +200,41 @@ test("doctor probes lane exposure through the shipped Linux template, whose lane
   expect(find(checks, "lane exposure")).toMatchObject({ level: "OK", detail: expect.stringContaining("none readable in a lane") });
   // The probe lane's directories do not outlive the run.
   for (const n of ["doctor-probe.files", "doctor-probe.out"]) expect(existsSync(join(defaultRunnerDir(home), "briefs", n))).toBe(false);
+});
+
+test("doctor fails when a lane can connect to herdr-core's control socket or keeps an hc variable, and passes behind a wrapper that leaves it neither", async () => {
+  const f = fixture();
+  const home = f.deps.home;
+  const wrapper = join(home, ".local", "bin", "lane-sandbox");
+  const sock = join(home, "run", "herdr-core", "default.sock");
+  mkdirSync(dirname(sock), { recursive: true });
+  const server = Bun.listen({ unix: sock, socket: { data() {} } });
+  const argvs: string[][] = [];
+  const real = async (argv: readonly string[], opts?: { cwd?: string }): Promise<Ran> => {
+    if (argv[0] !== "env") return f.deps.run(argv, {});
+    argvs.push([...argv]);
+    const child = Bun.spawn([...argv], { cwd: opts?.cwd, stdout: "pipe", stderr: "pipe" });
+    return { code: await child.exited, out: await new Response(child.stdout).text(), err: await new Response(child.stderr).text() };
+  };
+  try {
+    // A wrapper that runs the command as it is: the probe connects, and the hc variables reach it.
+    writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexec "$@"\n');
+    const exposed = find(await runDoctor({ ...f.deps, run: real }), "lane hc socket");
+    expect(argvs.at(-1)?.slice(0, 2)).toEqual(["env", "DORI_LANE_KEY=doctor-probe"]);
+    expect(argvs.at(-1)).toContain(wrapper);
+    expect(exposed).toMatchObject({ level: "FAIL", fix: expect.stringContaining("dori update") });
+    expect(exposed.detail).toContain(`a lane can connect to ${sock}`);
+    expect(exposed.detail).toContain("HC_TERMINAL_ID");
+
+    // A wrapper that unsets the variables and under which the socket is not there (the probe dials a missing path): OK.
+    writeFileSync(wrapper, '#!/bin/sh\nif [ "$1" = --check ]; then echo DORI_LANE_FILES=1; exit 0; fi\nexec env -u HC_SOCKET -u HC_SESSION -u HC_TERMINAL_SOCKET -u HC_TERMINAL_ID -u HC_SCOPE "$1" "$2" "$3" /nonexistent/hc.sock\n');
+    expect(find(await runDoctor({ ...f.deps, run: real }), "lane hc socket")).toMatchObject({ level: "OK", detail: "1 hc socket(s) checked, none reachable from a lane, and no hc variable reaches it" });
+  } finally {
+    server.stop(true);
+  }
+  // No hc socket on the host: nothing to probe.
+  rmSync(dirname(sock), { recursive: true, force: true });
+  expect(find(await runDoctor({ ...f.deps, run: real }), "lane hc socket")).toMatchObject({ level: "OK", detail: "no herdr-core (hc) control socket on this host" });
 });
 
 test("doctor shows what a lane may write and what it cannot see, read off the installed wrapper's --explain", async () => {
