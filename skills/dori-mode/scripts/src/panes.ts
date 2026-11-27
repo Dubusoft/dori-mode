@@ -1,5 +1,6 @@
 import type { Clock, Runner } from "./run.ts";
 import { agentRefusal, ALIVE_STATUSES } from "./pane-state.ts";
+import { listedRuntimes, paneRuntime, sessionRuntime } from "./runtime/index.ts";
 
 export { agentRefusal, ALIVE_STATUSES };
 
@@ -24,14 +25,11 @@ export type Pane = {
 
 export class UnsafeTextError extends Error {}
 
-export const listPanes = async (run: Runner): Promise<Pane[]> => {
-  const r = await run(["herdr", "pane", "list"]);
-  if (r.code !== 0) throw new Error(`herdr pane list failed: ${r.err || r.out}`);
-  return (JSON.parse(r.out) as { result: { panes: Pane[] } }).result.panes;
-};
+/** The panes of every runtime listed in this process (runtime/index.ts `listRuntime`); one unreadable list throws. */
+export const listPanes = async (run: Runner): Promise<Pane[]> =>
+  (await Promise.all(listedRuntimes().map((kind) => sessionRuntime(run, kind).listPanes()))).flat();
 
-export const readScreen = async (run: Runner, pane: string, lines?: number): Promise<string> =>
-  (await run(["herdr", "pane", "read", pane, "--source", lines ? "recent" : "visible", ...(lines ? ["--lines", String(lines)] : [])])).out;
+export const readScreen = (run: Runner, pane: string, lines?: number): Promise<string> => paneRuntime(run, pane).read(pane, lines);
 
 /** A lane's agent is alive when its pane is in herdr's pane list and its agent_status is one of ALIVE_STATUSES. */
 export const paneAlive = (pane: Pane | undefined): boolean =>
@@ -102,7 +100,7 @@ export const leftInInput = async (run: Runner, clock: Clock, pane: string, text:
   const stuck = async (): Promise<boolean> => inputState(await readScreen(run, pane), holds(text, true)) === "ours";
   if (!settled) await clock.sleep(SUBMIT_CHECK_MS);
   if (!(await stuck())) return false;
-  await run(["herdr", "pane", "send-keys", pane, "enter"]);
+  await paneRuntime(run, pane).key(pane, "enter");
   await clock.sleep(SUBMIT_CHECK_MS);
   if (!(await stuck())) return false;
   console.error(`sendVerified ${pane}: text still in the input line after a second Enter`);
@@ -115,9 +113,7 @@ export const CONFIRM_BACKOFF_MS: readonly number[] = [150, 300, 600, 900, 1000, 
 /** Raw send: types the text and presses Enter once. Not exported, so no caller outside this file can skip the guard below. */
 const typeAndEnter = async (run: Runner, pane: string, text: string): Promise<"sent" | "failed"> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
-  if ((await run(["herdr", "pane", "send-text", pane, text])).code !== 0) return "failed";
-  await run(["herdr", "pane", "send-keys", pane, "enter"]);
-  return "sent";
+  return (await paneRuntime(run, pane).sendText(pane, text)) ? "sent" : "failed";
 };
 
 /**
@@ -138,7 +134,7 @@ const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ r
   }
   if (!refusal) {
     const input = inputState(await readScreen(run, pane), holds(text));
-    if (input === "ours") return { sent: (await run(["herdr", "pane", "send-keys", pane, "enter"])).code === 0 ? "sent" : "failed", status };
+    if (input === "ours") return { sent: (await paneRuntime(run, pane).key(pane, "enter")) ? "sent" : "failed", status };
     if (input === "busy") refusal = `pane ${pane} input line holds other text (or shows no prompt)`;
   }
   if (refusal) {

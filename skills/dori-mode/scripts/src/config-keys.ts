@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 
 import { AUTO_REPORT_SCOPES, CONFIG_FILE_KEYS, DEFAULT_LANE_SANDBOX, defaultConfig, HOOK_KEYS, LEGACY_RUNNER_KEYS } from "./config.ts";
 import { DEFAULT_POLICY, effectiveWorktreeRoot, GUARD_KEYS, RUNNER_POLICY_KEYS } from "./runner/policy.ts";
+import { RUNTIME_KINDS } from "./runtime/types.ts";
 import { writeFileAtomic } from "./setup.ts";
 
 export type Json = Record<string, unknown>;
@@ -50,7 +51,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
-export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants", "hostCommands"];
+export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants", "hostCommands", "laneRuntime"];
 
 /** One entry per RUNNER_POLICY_KEYS member, same order. */
 export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
@@ -67,6 +68,7 @@ export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
   spec("worktreeRoot", "string", "Where this host's lane worktrees live; absent: <reposRoot>/worktrees"),
   spec("grants", "json", "Named path grants a lane may get with dori launch --grant: name -> {write: [dirs], read: [dirs]}; the owner edits it (set with --set; setup does not ask it)"),
   spec("hostCommands", "json", "Ops this worker runs on its own host for dori host <op>: name -> {argv, lanes, repos, timeoutSec?, cwd?} (no secrets); the owner edits it (set with --set; setup does not ask it)"),
+  spec("laneRuntime", "enum", "Terminal runtime new lanes open on: herdr (default) or hc (herdr-core, installed on the first hc lane); open lanes stay where they are (set with --set; setup does not ask it)", { values: [...RUNTIME_KINDS] }),
 ];
 
 export class ConfigKeyError extends Error {}
@@ -234,6 +236,7 @@ export const runnerConfigDefault = (home?: string, platform?: NodeJS.Platform): 
     case "sandbox": return DEFAULT_POLICY.sandbox;
     case "jobs": return DEFAULT_POLICY.jobs;
     case "detectWorkspaces": return "true";
+    case "laneRuntime": return "herdr";
     case "worktreeRoot": return typeof next.reposRoot === "string" && next.reposRoot ? effectiveWorktreeRoot({ reposRoot: next.reposRoot }, platform) : undefined;
     default: return undefined;
   }

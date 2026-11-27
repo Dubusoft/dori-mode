@@ -7,6 +7,7 @@ import { basename, dirname, isAbsolute, join, posix, relative, resolve as resolv
 import { defaultRunnerDir, RUNNER_PATHS } from "./fs-safety.ts";
 import { hostCommands as parseHostCommands, type SecretCommand } from "../config.ts";
 import { validateFileKey } from "../lane-file-contract.ts";
+import { RUNTIME_KINDS, type RuntimeKind } from "../runtime/types.ts";
 import {
   isQueryType, ProtocolError, SUPERVISOR_COMMAND_TYPES, validateFrame, type AnySupervisorCommand, type AnySupervisorControl,
 } from "./protocol.ts";
@@ -57,6 +58,12 @@ export type RunnerPolicy = {
    * already run on its host.
    */
   readonly hostCommands?: Readonly<Record<string, SecretCommand>>;
+  /**
+   * The terminal runtime new lanes open on this host: `herdr` (absent: the default) or `hc` (herdr-core, installed or
+   * updated to HC_MIN_VERSION on the first hc lane). A lane already open stays on the runtime that opened it, so
+   * switching back is one edit; a `target` pane is always a herdr pane.
+   */
+  readonly laneRuntime?: RuntimeKind;
 };
 
 /** One named entry of runner-config `grants`. */
@@ -86,7 +93,7 @@ export const laneCwd = (runnerDir: string, key: string): string => join(lanesDir
 
 /** The top-level keys runner-config.json may hold; parsePolicy throws on any other (RETIRED_POLICY_KEYS aside). */
 export const RUNNER_POLICY_KEYS = [
-  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot", "grants", "hostCommands",
+  "agents", "allowedRoots", "sandbox", "jobs", "guard", "heavyKill", "sandboxCheck", "workspaces", "detectWorkspaces", "reposRoot", "worktreeRoot", "grants", "hostCommands", "laneRuntime",
 ] as const;
 
 /**
@@ -200,6 +207,7 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
     }
   }
   if (value.detectWorkspaces !== undefined && typeof value.detectWorkspaces !== "boolean") throw new Error("runner-config: detectWorkspaces must be true|false");
+  if (value.laneRuntime !== undefined && !RUNTIME_KINDS.includes(value.laneRuntime as RuntimeKind)) throw new Error(`runner-config: laneRuntime must be ${RUNTIME_KINDS.join("|")}`);
   const rootPath = (key: "reposRoot" | "worktreeRoot"): string | undefined => {
     const raw = value[key];
     if (raw === undefined) return undefined;
@@ -268,6 +276,7 @@ export function parsePolicy(value: unknown, home: string = homedir(), tmp: strin
     ...(worktreeRoot !== undefined ? { worktreeRoot } : {}),
     ...(grants ? { grants } : {}),
     ...(hostCommands ? { hostCommands } : {}),
+    ...(value.laneRuntime !== undefined ? { laneRuntime: value.laneRuntime as RuntimeKind } : {}),
     agents,
     allowedRoots,
     sandbox: (value.sandbox as RunnerPolicy["sandbox"] | undefined) ?? DEFAULT_POLICY.sandbox,

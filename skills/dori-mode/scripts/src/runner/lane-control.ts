@@ -1,5 +1,6 @@
 import { listPanes, readScreen, sendGuarded, statusLookup } from "../panes.ts";
 import { RUN_KILL_GRACE_MS, RUN_TIMEOUT_CODE, type Clock, type Runner } from "../run.ts";
+import { paneRuntime, runtimeOfPane } from "../runtime/index.ts";
 import type { CommandResults, ExecutionOutcome, GoalOutcome, PauseStep, ProcessInfo, StartupVerdict } from "./protocol.ts";
 
 /**
@@ -44,7 +45,7 @@ export const goalCommand = async (deps: ControlDeps, pane: string, text: string,
  * a monitor event, a queued message), so stopping is confirmed, never assumed; a failed status lookup confirms nothing.
  */
 export const stopTurn = async (deps: ControlDeps, pane: string): Promise<boolean> => {
-  await deps.run(["herdr", "pane", "send-keys", pane, "escape"]);
+  await paneRuntime(deps.run, pane).key(pane, "escape");
   for (let attempt = 0; attempt < READ_BACK_TRIES; attempt++) {
     const after = await statusLookup(deps.run, pane);
     if (!after.error && after.status !== "working") return true;
@@ -174,6 +175,7 @@ export const resolveTargetPane = async (run: Runner, target: { readonly pane?: s
     id = shells[0]?.pane_id;
   }
   if (!id) throw invalid("no target pane");
+  if (runtimeOfPane(id) !== "herdr") throw invalid(`pane ${id} is an hc terminal; a lane target must be an idle herdr shell pane (an hc lane opens its own terminal)`);
   const got = await run(["herdr", "pane", "get", id]);
   if (got.code !== 0) throw invalid(`pane ${id} does not exist on this host: ${got.err || got.out}`);
   const info = parse<{ result: { pane: PaneInfo } }>(got.out, `herdr pane get ${id}`).result.pane;

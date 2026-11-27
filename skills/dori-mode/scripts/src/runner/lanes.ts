@@ -9,9 +9,9 @@ import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane 
 import type { Clock, Runner } from "../run.ts";
 import { agentArgv, argvModel, outsideDenyRules, powershellLaunchLine, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
-import { cmdRefused, inspectCreated, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
+import { cmdRefused, type PaneShell, pause, resolveTargetPane, resume, resumeArgv, startupPoll, TargetError } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
-import { herdrProcess } from "./herdr-watch.ts";
+import { infoOf, listRuntime, paneRuntime, runtimeOfPane, sessionRuntime, type RuntimeKind } from "../runtime/index.ts";
 import { addInput, captureOutput, laneFilePaths, prepareInput, removeLaneTree, validateBriefFiles, type FileReaders } from "./lane-files.ts";
 import { checkLaneFilesBody, LaneFileError, treeDigest } from "../lane-file-contract.ts";
 import { laneProcessAlive, turnStop } from "./observe.ts";
@@ -163,7 +163,9 @@ const launchOptions = (o: { [K in keyof LaunchOptions]?: LaunchOptions[K] | unde
 type Launched = { readonly pane: string; readonly tab: string; readonly resumed: boolean; readonly startup: StartupVerdict; readonly cwd: string; readonly model?: string };
 
 export class RunnerLanes {
-  constructor(private readonly deps: RunnerLanesDeps) {}
+  constructor(private readonly deps: RunnerLanesDeps) {
+    if (deps.policy.laneRuntime === "hc" || Object.values(this.records()).some((r) => runtimeOfPane(r.pane) === "hc")) listRuntime("hc");
+  }
 
   /**
    * `outsideDenyRules` for this host: what a sandboxed lane may also reach, its own `cwd` (named, not left to omo's
@@ -177,25 +179,34 @@ export class RunnerLanes {
     return outsideDenyRules(dirs.filter((dir): dir is string => dir !== undefined), paths.join);
   }
 
-  private instance(): Promise<string | undefined> {
-    return this.deps.instance ? this.deps.instance() : herdrProcess(this.deps.run).then((p) => p.instance);
+  /** The running server of runtime `kind` (the record field keeps its herdr name: `herdrInstance` holds either). */
+  private instance(kind: RuntimeKind = "herdr"): Promise<string | undefined> {
+    return kind === "herdr" && this.deps.instance ? this.deps.instance() : sessionRuntime(this.deps.run, kind).instance();
   }
 
-  /** Pre-proto-4 records acquire identity only from a live foreground process positively attributed to their key. */
+  /** The runtime new lanes open on: runner-config `laneRuntime`, else herdr; a `target` pane is herdr's. */
+  private launchRuntime(input: LaunchInput): RuntimeKind {
+    return input.target ? "herdr" : this.deps.policy.laneRuntime ?? "herdr";
+  }
+
+  /**
+   * Pre-proto-4 records acquire identity only from a live foreground process positively attributed to their key.
+   * `knownInstance` is the herdr server's; a record on another runtime is checked against that runtime's own.
+   */
   async currentPane(record: LaneRecord, panes?: readonly Pane[], knownInstance?: string): Promise<Pane | undefined> {
-    const instance = knownInstance ?? await this.instance();
+    const kind = runtimeOfPane(record.pane);
+    if (kind !== "herdr") knownInstance = undefined;
+    const instance = knownInstance ?? await this.instance(kind);
     if (!instance || record.herdrInstance && record.herdrInstance !== instance) return undefined;
-    const pane = (panes ?? await listPanes(this.deps.run)).find((p) => p.pane_id === record.pane);
+    const pane = (panes ?? await paneRuntime(this.deps.run, record.pane).listPanes()).find((p) => p.pane_id === record.pane);
     if (!record.herdrInstance) {
       if (!pane) return undefined;
-      const got = await this.deps.run(["herdr", "pane", "process-info", "--pane", record.pane]);
-      if (got.code !== 0) return undefined;
-      let info: ProcessInfo | undefined;
-      try { info = (JSON.parse(got.out) as { result?: { process_info?: ProcessInfo } }).result?.process_info; } catch { return undefined; }
+      const info: ProcessInfo | undefined = infoOf(await paneRuntime(this.deps.run, record.pane).processInfo(record.pane));
+      if (!info) return undefined;
       const owner = procLanes(await (this.deps.procs ?? (() => sampleProcs(this.deps.run)))());
       const foreground = info?.foreground_processes ?? [];
       const attributed = foreground.some((p) => p.pid !== undefined && owner.get(p.pid) === record.key);
-      if (!attributed || instance !== knownInstance && instance !== await this.instance()) return undefined;
+      if (!attributed || instance !== knownInstance && instance !== await this.instance(kind)) return undefined;
       this.update(record.key, (r) => ({ ...r, herdrInstance: instance, ...(pane?.terminal_id ? { terminalId: pane.terminal_id } : {}) }));
       return pane;
     }
@@ -366,8 +377,10 @@ export class RunnerLanes {
   /** Opens the lane's pane (a new tab, or the checked `target` pane) and runs its agent there; publishes `lane.started`. */
   private async launch(input: LaunchInput): Promise<Launched> {
     const { key } = input;
-    const herdrInstance = await this.instance();
-    if (!herdrInstance) throw new Error("RUNNER_HERDR_INSTANCE_UNKNOWN cannot identify the herdr server");
+    const kind = this.launchRuntime(input);
+    listRuntime(kind);
+    const herdrInstance = await this.instance(kind);
+    if (!herdrInstance) throw new Error(`RUNNER_${kind.toUpperCase()}_INSTANCE_UNKNOWN cannot identify the ${kind} server`);
     const brief = this.briefPath(key);
     const keywords = input.keywords ?? (input.mode === "mass-ulw" ? "mass-ulw" : "ulw");
     const prompt = `${keywords}. Read and execute the lane brief at ${brief} in full. You are the ${key} lane; report as the brief's footer says.`;
@@ -394,15 +407,16 @@ export class RunnerLanes {
     writeRunnerFile(tokenFile, token);
     const { command, sandboxPrefix } = await this.buildLaunchCommand(input, { shell, argv, cwd, tokenFile, granted, rollback });
     // The lane sandbox binds the socket's directory when the command starts, so it has to exist by then.
-    if (shell === "posix") this.deps.herdrReports?.open(key);
+    // herdr's report socket carries a sandboxed agent's state to herdr; hc reads OSC 7501 off the terminal instead.
+    if (shell === "posix" && kind === "herdr") this.deps.herdrReports?.open(key);
     input.mayStart?.(true);
-    const ran = await this.deps.run(["herdr", "pane", "run", pane, command]);
+    const ran = await paneRuntime(this.deps.run, pane).run(pane, command);
     if (ran.code !== 0) {
       input.mayStart?.(false);
       if (!previous) this.deps.herdrReports?.close(key);
       rmSync(tokenFile, { force: true });
       await rollback();
-      throw new Error(`herdr pane run failed: ${(ran.err || ran.out).trim()}`);
+      throw new Error(`${kind === "herdr" ? "herdr pane run" : "hc send"} failed: ${(ran.err || ran.out).trim()}`);
     }
     this.save({
       ...this.records(),
@@ -457,21 +471,20 @@ export class RunnerLanes {
       tab = target.tab ?? "";
       cwd = target.cwd ?? cwd;
     } else {
-      const tabWorkspace = input.tabWorkspace ?? (this.deps.remote ? await ensureLaneWorkspace(this.deps.run, this.deps.runnerDir, input.cwd, () => {}) : undefined);
-      const workspace = tabWorkspace ? ["--workspace", tabWorkspace] : [];
-      const created = await this.deps.run(["herdr", "tab", "create", ...workspace, "--cwd", input.cwd, "--label", key, "--no-focus"]);
-      if (created.code !== 0) throw new Error(`herdr tab create failed: ${(created.err || created.out).trim()}`);
-      const made = (JSON.parse(created.out) as { result: { root_pane: { pane_id: string; tab_id?: string }; tab_id?: string } }).result;
-      pane = made.root_pane.pane_id;
-      tab = made.tab_id ?? made.root_pane.tab_id ?? "";
+      const kind = this.launchRuntime(input);
+      const tabWorkspace = kind !== "herdr" ? undefined
+        : input.tabWorkspace ?? (this.deps.remote ? await ensureLaneWorkspace(this.deps.run, this.deps.runnerDir, input.cwd, () => {}) : undefined);
+      const runtime = sessionRuntime(this.deps.run, kind);
+      const opened = await runtime.open({ key, cwd: input.cwd, ...(tabWorkspace ? { workspace: tabWorkspace } : {}) });
+      pane = opened.pane;
+      tab = opened.tab;
       const openedTab = tab;
-      rollback = async () => { await this.deps.run(["herdr", "tab", "close", openedTab]); };
+      rollback = async () => { await runtime.close(opened.pane, openedTab || undefined); };
+      terminalId = opened.terminalId;
+      shell = opened.shell;
+      shellPid = opened.shellPid;
       // A cmd.exe pane cannot run the POSIX launch line: the tab is closed before anything is typed.
-      const inspected = await inspectCreated(this.deps.run, pane);
-      terminalId = inspected.terminalId;
-      shell = inspected.shell;
-      shellPid = inspected.shellPid;
-      if (inspected.shell === "cmd") {
+      if (opened.shell === "cmd") {
         await rollback();
         throw new TargetError("RUNNER_LANE_TARGET_INVALID", cmdRefused(pane));
       }
@@ -560,6 +573,7 @@ export class RunnerLanes {
    */
   async adopt(body: SupervisorCommandBodies["lane.adopt"]): Promise<Effect<"lane.adopt">> {
     if (this.records()[body.key]) throw new Error(`RUNNER_LANE_EXISTS ${body.key}`);
+    if (runtimeOfPane(body.pane) !== "herdr") throw new Error(`RUNNER_LANE_TARGET_INVALID pane ${body.pane} is an hc terminal; only a herdr pane can be adopted`);
     const owner = this.keyForPane(body.pane);
     if (owner) throw new Error(`RUNNER_LANE_TARGET_BUSY pane ${body.pane} is already lane ${owner}`);
     const herdrInstance = await this.instance();
@@ -611,10 +625,9 @@ export class RunnerLanes {
     const record = this.record(key);
     const current = await this.currentPane(record);
     const closed: "tab" | "pane" | "none" = !current ? "none" : record.tab ? "tab" : record.pane ? "pane" : "none";
-    if (closed === "tab") await this.deps.run(["herdr", "tab", "close", record.tab]);
-    else if (closed === "pane") await this.deps.run(["herdr", "pane", "close", record.pane]);
+    if (closed !== "none") await paneRuntime(this.deps.run, record.pane).close(record.pane, closed === "tab" ? record.tab : undefined);
     let gone = !current;
-    try { if (current) gone = !(await listPanes(this.deps.run)).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
+    try { if (current) gone = !(await paneRuntime(this.deps.run, record.pane).listPanes()).some((p) => p.pane_id === record.pane || (record.tab !== "" && p.tab_id === record.tab)); }
     catch { gone = false; }
     // A pane still listed (or a list that cannot be read) may still run the agent: its record and token stay, so it can
     // still report and a later close can reach it.
@@ -716,7 +729,7 @@ export class RunnerLanes {
   async recover(key: string, session?: string, tabWorkspace?: string, briefText?: string, files?: LaneBriefFiles): Promise<Effect<"lane.recover">> {
     const record = this.record(key);
     if ((briefText === undefined) !== (files === undefined)) throw new LaneFileError("LANE_FILES_INVALID", key, "invalid file payload (recover-pair); regenerate the brief or report and retry");
-    const panes = await listPanes(this.deps.run);
+    const panes = await paneRuntime(this.deps.run, record.pane).listPanes();
     const pane = await this.currentPane(record, panes);
     // A pane still in its startup window whose agent has not reported yet is starting, not dead: closing its tab would
     // kill the launch in progress, so it is left alone like a live one. So is a pane whose agent process still runs.
@@ -731,7 +744,8 @@ export class RunnerLanes {
     if (sandboxedLane(record.profile, record.sandbox)) await this.checkSandbox(key);
     prepareInput(this.deps.runnerDir, key, briefText, files, true);
     const restored = record.herdrInstance && !pane && panes.some((p) => p.tab_id === record.tab) ? await this.restoredShell(record) : undefined;
-    if (pane && record.tab) await this.deps.run(["herdr", "tab", "close", record.tab]);
+    // An hc terminal has no tab: the dead one (its shell left behind) is removed before the relaunch opens a new one.
+    if (pane && (record.tab || runtimeOfPane(record.pane) !== "herdr")) await paneRuntime(this.deps.run, record.pane).close(record.pane, record.tab || undefined);
     const launched = await this.launch({
       sandbox: record.sandbox,
       fileRun: files.run,

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
-import { listPanes } from "../panes.ts";
+import { sessionRuntime } from "../runtime/index.ts";
 import type { Runner } from "../run.ts";
 import { GUARD_SAMPLE_MS } from "./guard.ts";
 import type { HerdrHealth, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
@@ -201,7 +201,7 @@ export class HerdrWatch {
    */
   async boot(): Promise<void> {
     if ((this.deps.platform ?? process.platform) !== "win32" || (this.deps.paused?.() ?? false)) return;
-    try { await listPanes(this.deps.run); return; } catch { /* not answering: is there a server at all? */ }
+    try { await sessionRuntime(this.deps.run, "herdr").listPanes(); return; } catch { /* not answering: is there a server at all? */ }
     if ((await this.process()).running) return;
     const result = await this.start();
     if (!result) return;
@@ -216,7 +216,7 @@ export class HerdrWatch {
     this.lastTick = at;
     let panes: number;
     let failure = "";
-    try { panes = (await listPanes(this.deps.run)).length; } catch (e) { panes = -1; failure = e instanceof Error ? e.message : String(e); }
+    try { panes = (await sessionRuntime(this.deps.run, "herdr").listPanes()).length; } catch (e) { panes = -1; failure = e instanceof Error ? e.message : String(e); }
     if (panes >= 0) {
       this.misses = 0;
       this.failedAt = undefined;
