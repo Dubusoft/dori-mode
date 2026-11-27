@@ -38,7 +38,9 @@
 # refuse to run sandboxed and run outside the profile. A unix socket connect is not a file read to
 # Seatbelt, so sockets get their own rules: none under ~/.dori
 # but the lane socket (sock/lane.d/lane) and the lane's own herdr report socket (sock/herdr.d/<key>/herdr, which
-# HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there.
+# HERDR_SOCKET_PATH names), none under ~/.config but the ssh agent's when SSH_AUTH_SOCK lives there. herdr-core's (hc)
+# state and runtime dirs and any other hc control socket (HC_SOCKET, the hc config's socket) are refused outright like
+# the hide list below, as hc runs commands on the host for whoever reaches it.
 # Host paths listed one per line in ~/.dori/lane-sandbox-hide ('#' starts a comment; the lead owns that file), ~/.dori's
 # own entries included, are refused outright, reads, writes and socket connects alike, over every rule above. Every path
 # is resolved first (macOS /var and /tmp are symlinks into /private) and reaches the profile as a -D parameter, never as
@@ -84,7 +86,7 @@ MAC_CREDENTIALS=(
 HOST_RUN=".dori/runner .dori/bin .dori/src .dori/dori-boot-prep.sh .dori/config.json* .dori/ops .dori/lead
   .dori/lane-attachments .dori/worktrees .ssh Library/LaunchAgents Library/Keychains .bashrc .bash_profile .bash_login .bash_logout .profile
   .zshrc .zprofile .zshenv .zlogin .zlogout .local/bin .bun/bin .cargo/bin .gitconfig .config/git .config/gh
-  .config/herdr"
+  .config/herdr .config/herdr-core"
 # The directories holding HOST_RUN entries, refused as themselves only: renaming one away would leave its old path free
 # for a symlink into a writable directory.
 HOST_RUN_PARENTS=". .dori .config .local .bun .cargo Library"
@@ -351,6 +353,32 @@ build_profile() {
       fi
     done <"$H/.dori/lane-sandbox-hide"
   fi
+  # herdr-core (hc): whoever reaches its control socket runs any command on the host, outside the sandbox (hc exec, hc
+  # run), and its state dir holds every terminal's screen and the environment the core restarts terminals with. Refused
+  # like the hide list: its state dir, its runtime dir under XDG_RUNTIME_DIR when set (where its sockets live), and each
+  # socket HC_SOCKET, HC_TERMINAL_SOCKET or the hc config's socket names, with its holder sockets. The runner opens lane
+  # terminals with hc from outside the sandbox; a lane reports its state over OSC 7501, terminal output, not the socket.
+  local hc_paths hc_conf s
+  hc_paths=("${XDG_STATE_HOME:-$H/.local/state}/herdr-core")
+  if [ -n "${XDG_RUNTIME_DIR:-}" ]; then hc_paths+=("$XDG_RUNTIME_DIR/herdr-core"); fi
+  hc_conf=${XDG_CONFIG_HOME:-$H/.config}/herdr-core/config.toml
+  s=
+  if [ -f "$hc_conf" ]; then
+    s=$(sed -n "s/^[[:space:]]*socket[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$hc_conf" | head -n 1)
+    case "$s" in "~/"*) s=$H/${s#"~/"} ;; esac
+  fi
+  for p in "${HC_SOCKET:-}" "${HC_TERMINAL_SOCKET:-}" "$s"; do
+    if [ -n "$p" ]; then hc_paths+=("$p" "${p%.sock}.holder.*.sock"); fi
+  done
+  for p in "${hc_paths[@]}"; do
+    deny_target "HC$n" "$p"
+    XHIDE+=("$SHOWN")
+    h_rules="$h_rules
+(deny file-read* $TARGET)
+(deny file-write* $TARGET)
+(deny network-outbound (remote unix-socket $TARGET))"
+    n=$((n + 1))
+  done
 
   # Later rules win over earlier ones in SBPL. Writes: the $HOME and Homebrew grant, then the HOST_RUN refusals, then
   # the specific write grants (which re-open the lane's out dir, a cwd-less lane's cwd and the login
@@ -492,6 +520,8 @@ C=$(pwd -P)
 build_profile
 
 export LANE_SANDBOX_ACTIVE=1 TMPDIR="$LT" HERDR_SOCKET_PATH="$H/.dori/runner/sock/herdr.d/$key/herdr"
+# Nor does a lane learn where herdr-core's (hc) control socket is (the profile refuses its sockets above).
+unset HC_SOCKET HC_SESSION HC_TERMINAL_SOCKET HC_TERMINAL_ID HC_SCOPE
 # omo starts its engine with an empty OpenSSL bundle (SSL_CERT_FILE/SSL_CERT_DIR under ~/.omo/engine-trust/defaults)
 # and its agent shell inherits it, so curl, git and gh there fail every TLS verification. With SSL_CERT_FILE already
 # set omo keeps it and only adds its own roots for itself; the system bundle is what these tools read by default.

@@ -100,7 +100,7 @@ test("a lane reaches herdr only through its own report socket directory, read-on
   expect(argv.findIndex((a, i) => a === "--ro-bind-try" && argv[i + 1] === own)).toBeLessThan(argv.findIndex((a, i) => a === "--remount-ro" && argv[i + 1] === join(home, ".dori", "runner")));
   const setenv = argv.flatMap((a, i) => (a === "--setenv" && argv[i + 1] === "HERDR_SOCKET_PATH" ? [argv[i + 2]] : []));
   expect(setenv).toEqual([join(own, "herdr")]);
-  expect(argv.some((a) => a.startsWith(join(home, ".config", "herdr")))).toBe(false);
+  expect(argv.some((a) => a === join(home, ".config", "herdr") || a.startsWith(join(home, ".config", "herdr/")))).toBe(false);
 });
 
 test("the D-Bus session bus and the systemd user manager's sockets are covered, so a lane cannot start a unit outside the sandbox", async () => {
@@ -121,6 +121,43 @@ test("the D-Bus session bus and the systemd user manager's sockets are covered, 
   }
 });
 
+test("herdr-core's (hc) runtime and state dirs and each socket HC_SOCKET or its config names are hidden after every read-write bind, its config is read-only and the hc variables are unset", async () => {
+  const root = tempDir();
+  const home = join(root, "home");
+  const run = join(root, "run-user"), other = join(root, "other");
+  for (const d of [join(run, "herdr-core"), other, join(home, "hcs"), join(home, ".config", "herdr-core")]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(home, ".config", "herdr-core", "config.toml"), 'socket = "~/hcs/x.sock"\n');
+  const core = join(run, "herdr-core", "default.sock");
+  const named = [join(other, "y.sock"), join(other, "y.holder.ab.sock"), join(home, "hcs", "x.sock"), join(home, "hcs", "x.holder.cd.sock")];
+  const servers = [core, ...named].map((path) => Bun.listen({ unix: path, socket: { data() {} } }));
+  try {
+    const env = { DORI_LANE_KEY: "lane-a", XDG_RUNTIME_DIR: run, HC_SOCKET: named[0] as string, HC_TERMINAL_SOCKET: core, HC_SESSION: "default", HC_TERMINAL_ID: "t1", HC_SCOPE: "s" };
+    const argv = await sandboxArgv(home, env);
+    const state = join(home, ".local", "state", "herdr-core");
+    // The state dir is made on the host when missing, so a core started after the lane cannot show through.
+    expect(statSync(state).isDirectory()).toBe(true);
+    for (const dir of [state, join(run, "herdr-core")]) {
+      const tmpfs = argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === dir);
+      expect(tmpfs).toBeGreaterThan(lastReadWrite(argv, home));
+      expect(argv.findIndex((a, i) => i > tmpfs && a === "--remount-ro" && argv[i + 1] === dir)).toBeGreaterThan(tmpfs);
+    }
+    // Each named socket and its holder sockets: an empty read-only file after every read-write bind (~/hcs is one).
+    for (const s of named) expect(hiddenFile(argv, s)).toBeGreaterThan(lastReadWrite(argv, home));
+    // HC_TERMINAL_SOCKET is in the hidden runtime dir, so it has no mount point of its own.
+    expect(argv).not.toContain(core);
+    const config = join(home, ".config");
+    expect(argv.findIndex((a, i) => a === "--ro-bind" && argv[i + 1] === join(config, "herdr-core"))).toBeGreaterThan(argv.findIndex((a, i) => a === "--bind" && argv[i + 1] === config));
+    for (const v of ["HC_SOCKET", "HC_SESSION", "HC_TERMINAL_SOCKET", "HC_TERMINAL_ID", "HC_SCOPE"]) expect(argv.findIndex((a, i) => a === "--unsetenv" && argv[i + 1] === v)).toBeGreaterThan(-1);
+
+    const child = Bun.spawn(["bash", LANE_SANDBOX_TEMPLATE, "--explain"], { cwd: join(home, "work"), env: { PATH: process.env.PATH ?? "", HOME: home, ...env }, stdout: "pipe", stderr: "pipe" });
+    const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect({ code, err }).toEqual({ code: 0, err: "" });
+    for (const p of [state, join(run, "herdr-core"), ...named]) expect(explainRows(out)).toContain(`hide ${p}`);
+  } finally {
+    for (const s of servers) s.stop(true);
+  }
+});
+
 test("~/.config is no longer a hidden tree: it is bound read-write, only ~/.config/herdr is hidden, with an ssh agent socket kept, and what the host runs stays read-only", async () => {
   const home = join(tempDir(), "home");
   const config = join(home, ".config");
@@ -130,7 +167,7 @@ test("~/.config is no longer a hidden tree: it is bound read-write, only ~/.conf
   writeFileSync(agent, "");
   const argv = await sandboxArgv(home, { DORI_LANE_KEY: "lane-a", SSH_AUTH_SOCK: agent });
   expect([...new Set(argv.filter((a) => a.startsWith(config)))].sort()).toEqual([
-    config, join(config, "autostart"), join(config, "environment.d"), join(config, "gcloud"), join(config, "gh"), join(config, "git"), join(config, "herdr"), agent, join(config, "systemd"),
+    config, join(config, "autostart"), join(config, "environment.d"), join(config, "gcloud"), join(config, "gh"), join(config, "git"), join(config, "herdr"), join(config, "herdr-core"), agent, join(config, "systemd"),
   ].sort());
   expect(argv.findIndex((a, i) => a === "--tmpfs" && argv[i + 1] === config)).toBe(-1);
   // gcloud is a credential store: its own empty tmpfs, after every read-write bind.
@@ -1021,6 +1058,31 @@ test("the gh login file is hidden under the kept gh config bind, and --explain s
   expect(rows).not.toContain(`hide ${join(gh, "config.yml")}`);
 });
 
+test("macOS: herdr-core's (hc) state and runtime dirs and each socket HC_SOCKET or its config names are refused, its config is not writable and the hc variables are unset", async () => {
+  const { root, home, wt } = macHome();
+  const run = join(root, "run"), other = join(root, "other"), state = join(home, ".local", "state", "herdr-core");
+  for (const d of [join(run, "herdr-core"), other, join(home, ".config", "herdr-core"), join(state, "default")]) mkdirSync(d, { recursive: true });
+  writeFileSync(join(home, ".config", "herdr-core", "config.toml"), "socket = '~/hcs/x.sock'\n");
+  const env = { DORI_LANE_KEY: "lane-a", XDG_RUNTIME_DIR: run, HC_SOCKET: join(other, "y.sock"), HC_TERMINAL_SOCKET: join(run, "herdr-core", "default.sock"), HC_SESSION: "default", HC_TERMINAL_ID: "t1", HC_SCOPE: "s" };
+
+  const sb = await seatbelt(home, wt, env);
+  const refused = [join(run, "herdr-core", "default.sock"), join(run, "herdr-core", "default.holder.ab.sock"), join(other, "y.sock"), join(other, "y.holder.ab.sock"), join(home, "hcs", "x.sock"), join(home, "hcs", "x.holder.cd.sock"), join(state, "default", "default.sock")];
+  expect(refused.filter((p) => allows(sb, "network-outbound", p))).toEqual([]);
+  // The state dir holds every terminal's screen and the environment the core restarts terminals with.
+  expect({ read: allows(sb, "file-read-data", join(state, "default", "terminals.json")), write: allows(sb, "file-write-data", join(state, "default", "restart-env.json")) }).toEqual({ read: false, write: false });
+  expect({ read: allows(sb, "file-read-data", join(home, ".config", "herdr-core", "config.toml")), write: allows(sb, "file-write-data", join(home, ".config", "herdr-core", "config.toml")) }).toEqual({ read: true, write: false });
+  // Only hc's own sockets: the lane socket and another socket beside HC_SOCKET stay reachable.
+  expect(allows(sb, "network-outbound", join(home, ".dori", "runner", "sock", "lane.d", "lane"))).toBe(true);
+  expect(allows(sb, "network-outbound", join(other, "z.sock"))).toBe(true);
+
+  const out = join(root, "hc-env");
+  const sbx = join(root, "env-sandbox-exec");
+  writeFileSync(sbx, `#!/bin/sh\nenv | grep '^HC_' > "${out}"; exit 0\n`);
+  chmodSync(sbx, 0o755);
+  expect((await runMacos(home, wt, ["true"], env, sbx)).code).toBe(0);
+  expect(readFileSync(out, "utf8")).toBe("");
+});
+
 test("macOS: --explain lists every path the profile names, each with the access the profile gives it", async () => {
   const { root, home, wt, token } = macHome();
   const hidden = join(root, "private"), runs = join(root, "runs"), notes = join(root, "notes"), repos = join(root, "repos"), worktrees = join(root, "worktrees");
@@ -1034,7 +1096,7 @@ test("macOS: --explain lists every path the profile names, each with the access 
   const rows = explainRows(explained.out).map((l) => ({ mode: l.slice(0, l.indexOf(" ")), path: l.slice(l.indexOf(" ") + 1) }));
 
   // Every path parameter the profile's file rules use is a row (sockets, /dev and the keychain's temp copies are not paths).
-  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|U|CRED|HIDE)\d+$|^(HOME_DIR|HOMEBREW|DORI_RUNNER|DORI_SECRETS|REVIEW_INPUTS|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
+  const named = Object.entries(sb.params).filter(([k]) => /^(W|R|O|U|CRED|HIDE|HC)\d+$|^(HOME_DIR|HOMEBREW|DORI_RUNNER|DORI_SECRETS|REVIEW_INPUTS|HOOKS|KEYCHAIN|SSH|SSH_CONFIG|SSH_KNOWN_HOSTS)$/.test(k)).map(([, v]) => v);
   // A glob's parameter is its regex, which the row's pattern (as listed) matches.
   expect(named.filter((p) => !rows.some((r) => r.path === p || (p.startsWith("^") && new RegExp(p).test(r.path))))).toEqual([]);
   expect(sb.params.REPOS_GIT).toBeDefined();

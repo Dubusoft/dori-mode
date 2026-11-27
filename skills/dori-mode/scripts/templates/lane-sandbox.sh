@@ -34,7 +34,8 @@
 # .git's hooks are bound read-only again. What no lane may read is hidden after every read-write bind, so neither the
 # cwd nor a grant can re-expose it: ~/.dori/runner, ~/.ssh, ~/.dori/state and ~/.config/herdr (herdr's control socket
 # drives the lead's panes), each an empty read-only tmpfs with only the lane's own runner entries, ssh known_hosts and
-# config, state/review-inputs and the ssh agent socket bound back; the credential stores below (~/.dori/env, secrets
+# config, state/review-inputs and the ssh agent socket bound back; herdr-core's (hc) runtime and state dirs and any other
+# hc control socket (HC_SOCKET, the hc config's socket), as hc runs commands on the host for whoever reaches it; the credential stores below (~/.dori/env, secrets
 # and gh's hosts.yml login among them: a lane gets GH_TOKEN only through its environment at launch (dori secret env)), each hidden file an empty
 # read-only file, and every other host path listed one per line in
 # ~/.dori/lane-sandbox-hide ('#' starts a comment), ~/.dori's own entries included; the lead owns that file, and a lane
@@ -134,7 +135,7 @@ DORI_HOST="runner bin src dori-boot-prep.sh config.json* ops lead lane-attachmen
 host_run_files=(.bashrc .bash_profile .bash_login .bash_logout .profile .zshrc .zprofile .zshenv .zlogin .zlogout
   .gitconfig)
 host_run_dirs=(.local/bin .bun/bin .cargo/bin .config/systemd .config/autostart .config/environment.d .config/git
-  .config/gh)
+  .config/gh .config/herdr-core)
 if [ "$explain" = 0 ]; then for p in "${host_run_dirs[@]}"; do mkdir -p "$H/$p"; done; fi
 opts=(--perms 0755 --tmpfs /)
 shopt -s nullglob dotglob
@@ -266,6 +267,9 @@ for s in "$U/bus" "$U/at-spi/bus"; do
 done
 if [ -d "$U/systemd" ]; then opts+=(--tmpfs "$U/systemd" --remount-ro "$U/systemd"); fi
 opts+=(--unsetenv DBUS_SESSION_BUS_ADDRESS)
+# Nor does a lane learn where herdr-core's (hc) control socket is: its sockets are hidden below. A lane inside an hc
+# terminal still reports its state over OSC 7501, which is terminal output, not the socket.
+for v in HC_SOCKET HC_SESSION HC_TERMINAL_SOCKET HC_TERMINAL_ID HC_SCOPE; do opts+=(--unsetenv "$v"); done
 
 # Working directory
 C=$(pwd -P)
@@ -460,6 +464,37 @@ if [ -f "$H/.dori/lane-sandbox-hide" ]; then
     hide_glob "$p"
   done <"$H/.dori/lane-sandbox-hide"
 fi
+# herdr-core (hc): whoever reaches its control socket runs any command on the host, outside the sandbox (hc exec, hc
+# run), and its state dir holds every terminal's screen and the environment the core restarts terminals with. The runner
+# opens lane terminals with hc from outside the sandbox. Hidden: the core's runtime dir under $XDG_RUNTIME_DIR (and
+# /run/user/<uid>, which hc uses without it), where its sockets and holder sockets live, and its state dir, each made
+# here when missing so a core started after the lane cannot put a socket where it shows; then each socket HC_SOCKET,
+# HC_TERMINAL_SOCKET or the hc config's socket names, with its holder sockets. The config itself is read-only above.
+hc_dirs=("${XDG_STATE_HOME:-$H/.local/state}/herdr-core")
+if [ "$explain" = 0 ]; then mkdir -p -m 700 "${hc_dirs[0]}"; fi
+for u in "$U" "/run/user/$(id -u)"; do
+  [ -d "$u" ] || continue
+  case " ${hc_dirs[*]} " in *" $u/herdr-core "*) continue ;; esac
+  if [ "$explain" = 0 ] && [ -w "$u" ]; then mkdir -p -m 700 "$u/herdr-core"; fi
+  hc_dirs+=("$u/herdr-core")
+done
+for d in "${hc_dirs[@]}"; do
+  [ -d "$d" ] || continue
+  hide_path "$d"
+  trees+=("$(readlink -f "$d")")
+done
+hc_socks=("${HC_SOCKET:-}" "${HC_TERMINAL_SOCKET:-}")
+hc_conf=${XDG_CONFIG_HOME:-$H/.config}/herdr-core/config.toml
+if [ -f "$hc_conf" ]; then
+  s=$(sed -n "s/^[[:space:]]*socket[[:space:]]*=[[:space:]]*[\"']\([^\"']*\)[\"'].*/\1/p" "$hc_conf" | head -n 1)
+  case "$s" in "~/"*) s=$H/${s#"~/"} ;; esac
+  hc_socks+=("$s")
+fi
+for s in "${hc_socks[@]}"; do
+  [ -n "$s" ] || continue
+  hide_path "$s"
+  hide_glob "${s%.sock}.holder.*.sock"
+done
 if [ "$review" = 1 ]; then
   hide_path "$H/.gitconfig"
   case "${SSH_AUTH_SOCK:-}" in "$H"/*) hide_path "$SSH_AUTH_SOCK" ;; esac
