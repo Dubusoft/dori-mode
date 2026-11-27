@@ -406,13 +406,18 @@ export type SecretCommand = {
   readonly cwd?: string;
 };
 
-/** The config's `secretCommands`; throws TypeError unless absent or { <op>: { argv, secrets, lanes, repos, timeoutSec?, cwd? } }. */
-const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> => {
+/**
+ * One command table: `secretCommands` (config.json, run on the supervisor host with store secrets) or, with
+ * `withSecrets` false, runner-config `hostCommands` (run on that runner's own host, no `secrets` key). Throws TypeError
+ * unless absent or { <op>: { argv, secrets?, lanes, repos, timeoutSec?, cwd? } }.
+ */
+const commandTable = (field: string, withSecrets: boolean, raw: unknown): Readonly<Record<string, SecretCommand>> => {
   if (raw == null) return {};
-  const bad = (what: string) => new TypeError(`secretCommands${what} must be { "<op>": { "argv": [non-empty strings], "secrets": [SECRET_NAMEs], "lanes": [strings], "repos": [strings], "timeoutSec"?: 1..3600, "cwd"?: absolute path } } with op matching ^[a-z][a-z0-9-]{0,63}$`);
+  const keys = ["argv", ...(withSecrets ? ["secrets"] : []), "lanes", "repos", "timeoutSec", "cwd"];
+  const bad = (what: string) => new TypeError(`${field}${what} must be { "<op>": { "argv": [non-empty strings], ${withSecrets ? `"secrets": [SECRET_NAMEs], ` : ""}"lanes": [strings], "repos": [strings], "timeoutSec"?: 1..3600, "cwd"?: absolute path } } with op matching ^[a-z][a-z0-9-]{0,63}$`);
   if (!isRecord(raw)) throw bad("");
   return Object.fromEntries(Object.entries(raw).map(([op, rule]) => {
-    if (!/^[a-z][a-z0-9-]{0,63}$/.test(op) || !isRecord(rule) || Object.keys(rule).some((key) => !["argv", "secrets", "lanes", "repos", "timeoutSec", "cwd"].includes(key))) throw bad(`.${op}`);
+    if (!/^[a-z][a-z0-9-]{0,63}$/.test(op) || !isRecord(rule) || Object.keys(rule).some((key) => !keys.includes(key))) throw bad(`.${op}`);
     const argv = stringList(rule.argv, bad, `.${op}.argv`);
     if (argv.length === 0 || argv.some((part) => part === "")) throw bad(`.${op}.argv`);
     const names = stringList(rule.secrets, bad, `.${op}.secrets`);
@@ -427,6 +432,11 @@ const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> =
     }];
   }));
 };
+
+const secretCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> => commandTable("secretCommands", true, raw);
+
+/** Runner-config `hostCommands`: secretCommands' shape without `secrets` (each entry's `secrets` is `[]`); throws TypeError. */
+export const hostCommands = (raw: unknown): Readonly<Record<string, SecretCommand>> => commandTable("hostCommands", false, raw);
 
 /** Lead-side settings for one runner (config `runners.<label>`). */
 export type RunnerConfig = { readonly allowUnsandboxed?: boolean };

@@ -89,6 +89,18 @@ An op with no `secrets` is a host command: work the sandbox blocks, such as a sa
 
 It still runs unsandboxed as the host user. Never register one that runs a file a lane can write; keep scripts under a path like `~/.dori/ops`.
 
+### Worker host commands
+
+Work that has to happen on the worker a lane runs on (a Mac's keychain, a TestFlight upload) goes in that worker's `~/.dori/runner/runner-config.json` `hostCommands`, which the owner edits and lanes cannot write:
+
+```json
+"hostCommands": {
+  "probe-sandbox": { "argv": ["/Users/me/.dori/ops/probe-sandbox.sh"], "lanes": ["*"], "timeoutSec": 120 }
+}
+```
+
+The shape is `secretCommands` without `secrets`: a worker op gets no store value. `dori host <op>` (or `dori secret run <op>`) in a lane on that worker runs a listed op on the worker itself, outside the lane sandbox, with the same environment, output cap, redaction, timeout and lane/repo check as above; a refusal names `runner-config hostCommands`. Any other op goes to the supervisor's `secretCommands` as before, and when the supervisor refuses it the detail's `ops this lane may run` list includes the worker's ops too. A name in both tables runs on the worker. The local runner ignores `hostCommands`: `secretCommands` already run on its host. Production deploy credentials stay in `secretCommands`.
+
 ## Masking
 
 Stored values are registered with dori's output masking. The supervisor loads all of them at start and reloads when `~/.dori/secrets` changes (`SECRET_STORE_WATCH_FAILED` if that fails); runners load them at start and add each value they hand out. Values shorter than 8 characters aren't masked. Masking is a safety net: a transformed value (encoded, split) won't match.

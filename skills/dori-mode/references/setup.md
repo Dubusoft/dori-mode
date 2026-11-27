@@ -83,6 +83,7 @@ The config is written atomically (mode 600). `references/scripts.md` explains ev
 | `agents` | [required] |
 | `allowedRoots`, `sandbox` (`required`\|`optional`), `jobs` (`allow`\|`deny`), `guard`, `heavyKill`, `sandboxCheck`, `workspaces`, `reposRoot`, `worktreeRoot` | [optional] |
 | `detectWorkspaces` | [optional], never asked: set it with `--set detectWorkspaces=false` |
+| `grants`, `hostCommands` | [optional], never asked: the owner edits them (`--set` takes them too) |
 
 The runner-config `defaultCwd` key is retired: a lane started without `--cwd` starts in `~/.dori/runner/lanes/<key>` on its runner. A file that still holds it loads with one `RUNNER_CONFIG_KEY_IGNORED defaultCwd` line and the key has no effect; `dori runner setup` removes it (with `RUNNER_SETUP_KEY_REMOVED defaultCwd` and a `.bak`).
 

@@ -27,8 +27,10 @@ export type SecretChild = {
 export type SecretSpawner = (argv: readonly string[], opts: { readonly env: Record<string, string>; readonly cwd: string }) => SecretChild;
 
 export type SecretRunnerDeps = SecretSource & {
-  /** The config `secretCommands`, read again per request. */
+  /** The config `secretCommands` (or a worker's runner-config `hostCommands`), read again per request. */
   readonly commands: () => Promise<Readonly<Record<string, SecretCommand>>>;
+  /** Where `commands` come from, named in a refusal; default `config secretCommands`. */
+  readonly source?: string;
   /** The lane's repo when the caller passes none (local runner: the lane worktree's origin). */
   readonly laneRepo?: (key: string) => Promise<string | undefined>;
   readonly log: (line: string) => void;
@@ -118,8 +120,9 @@ export const secretCommandRunner = (deps: SecretRunnerDeps) => async (key: strin
     return refuse("RUNNER_SECRET_DENIED", `${detail}; ops this lane may run: ${allowed.length ? allowed.sort().join(", ") : "none"}`);
   };
   const command = Object.hasOwn(commands, op) ? commands[op] : undefined;
-  if (!command) return deny(`${op} is not a configured secret command (config secretCommands)`);
-  if (!await ruleMatches(command, key, laneRepo)) return deny(`${key} may not run ${op} (config secretCommands)`);
+  const source = deps.source ?? "config secretCommands";
+  if (!command) return deny(`${op} is not a configured secret command (${source})`);
+  if (!await ruleMatches(command, key, laneRepo)) return deny(`${key} may not run ${op} (${source})`);
   const values: Record<string, string> = {};
   for (const name of command.secrets) {
     const read = await readSecretValue(deps, name);

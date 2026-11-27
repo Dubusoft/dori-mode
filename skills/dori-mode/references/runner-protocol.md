@@ -258,6 +258,15 @@ layers them onto the policy derived from config.json.
 `RUNNER_CMD_REJECTED unknown-field` (the lead reports `LAUNCH_GRANT_UNSUPPORTED`; `dori runner update` there), and
 every other start is unchanged.
 
+### Host commands
+
+A worker's runner-config.json `hostCommands` (`{ "<op>": { argv, lanes, repos, timeoutSec?, cwd? } }`, config
+`secretCommands` without `secrets`) lists the ops its own lanes may run on that worker, outside the lane sandbox, with
+`dori host <op>`. The worker runner answers a lane socket `secret-run` for a listed op itself (secretCommandRunner) and
+sends any other op to the supervisor as `secret.run`, as before; a supervisor `RUNNER_SECRET_DENIED` gets the worker's
+matching ops added to its list. Nothing crosses the link for a worker op, so it needs no protocol bump. The local runner
+ignores the key. See [secrets.md](secrets.md#worker-host-commands).
+
 The former `defaultCwd` key is retired. A runner-config.json that still holds it loads as before, the key is ignored
 and each load logs one `RUNNER_CONFIG_KEY_IGNORED defaultCwd: ...` line; `dori runner setup` removes it.
 

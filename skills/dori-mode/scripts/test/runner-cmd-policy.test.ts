@@ -357,3 +357,22 @@ describe("runner-config grants", () => {
     expect(() => resolveGrants(table([]), ["gone"], o)).toThrow("RUNNER_CMD_REJECTED grant-unknown gone");
   });
 });
+
+describe("runner-config hostCommands", () => {
+  const parse = (hostCommands: unknown) => parsePolicy({ hostCommands }, "/home/u", "/tmp", { runnerDir: "/home/u/.dori/runner", platform: "linux" });
+  const refusal = (hostCommands: unknown): string => {
+    try { parse(hostCommands); return "parsed"; } catch (e) { return (e as Error).message; }
+  };
+  test("parses secretCommands' shape without secrets: each op gets no secrets and the default timeout", () => {
+    expect(parse({ "ios-upload": { argv: ["/Users/u/.dori/ops/upload.sh"], lanes: ["ap-*"], repos: ["acme/app"], cwd: "/Users/u" } }).hostCommands).toEqual({
+      "ios-upload": { argv: ["/Users/u/.dori/ops/upload.sh"], secrets: [], lanes: ["ap-*"], repos: ["acme/app"], timeoutSec: 300, cwd: "/Users/u" },
+    });
+    expect(parsePolicy({}, "/home/u", "/tmp", { platform: "linux" }).hostCommands).toBeUndefined();
+  });
+  test("refuses a secrets key, a bad op name, an empty argv and a relative cwd", () => {
+    expect(refusal({ up: { argv: ["/bin/true"], secrets: ["TOKEN"], lanes: ["*"] } })).toStartWith("runner-config: hostCommands.up must be");
+    expect(refusal({ Up: { argv: ["/bin/true"], lanes: ["*"] } })).toStartWith("runner-config: hostCommands.Up must be");
+    expect(refusal({ up: { argv: [], lanes: ["*"] } })).toStartWith("runner-config: hostCommands.up.argv must be");
+    expect(refusal({ up: { argv: ["/bin/true"], lanes: ["*"], cwd: "rel" } })).toStartWith("runner-config: hostCommands.up.cwd must be");
+  });
+});

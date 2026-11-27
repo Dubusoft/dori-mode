@@ -142,6 +142,7 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
     "usage: dori host <op>",
     "  same as dori secret run <op>: the supervisor host runs the registered command config secretCommands.<op> (a sandbox",
     "  probe, systemctl --user daemon-reload) outside the lane and prints its redacted output, exiting with its code.",
+    "  On a worker, an op in its runner-config hostCommands runs on that worker host instead.",
     "  A refused op lists the ops this lane may run.",
   ].join("\n"),
 };

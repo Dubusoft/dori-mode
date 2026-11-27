@@ -50,7 +50,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
-export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants"];
+export const RUNNER_UNASKED_KEYS: readonly string[] = ["detectWorkspaces", "grants", "hostCommands"];
 
 /** One entry per RUNNER_POLICY_KEYS member, same order. */
 export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
@@ -66,6 +66,7 @@ export const RUNNER_CONFIG_KEYS: readonly KeySpec[] = [
   spec("reposRoot", "string", "Every checkout directly under it is a declared repo"),
   spec("worktreeRoot", "string", "Where this host's lane worktrees live; absent: <reposRoot>/worktrees"),
   spec("grants", "json", "Named path grants a lane may get with dori launch --grant: name -> {write: [dirs], read: [dirs]}; the owner edits it (set with --set; setup does not ask it)"),
+  spec("hostCommands", "json", "Ops this worker runs on its own host for dori host <op>: name -> {argv, lanes, repos, timeoutSec?, cwd?} (no secrets); the owner edits it (set with --set; setup does not ask it)"),
 ];
 
 export class ConfigKeyError extends Error {}
