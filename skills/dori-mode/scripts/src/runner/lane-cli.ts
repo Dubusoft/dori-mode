@@ -13,14 +13,15 @@ import type { Connector, Transport } from "./transport.ts";
 
 /**
  * The `dori` a lane runs on a worker machine (design 3.4): the runner bundle in lane mode, set by `DORI_LANE_KEY`. It
- * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret env` and `secret run` (alias `host <op>`), and only for the lane's own
+ * takes only `report` (and `report ack <id>`), `claim-done`, `lane status`, `heavy`, `secret env`, `secret run` (alias `host <op>`) and the read-only
+ * `toodo get|search|guidelines`, and only for the lane's own
  * key; any other subcommand exits 2 with `DORI_CLI_LANE_ONLY <cmd>`. A report goes to the runner's lane socket with the lane's token, read from
  * the file `DORI_LANE_TOKEN_FILE` names (or, for a lane an older runner started, `DORI_LANE_TOKEN` itself), so the
  * runner accepts it only from the lane it started. `heavy` uses the host's `~/.dori/heavy/slot.N` directories,
  * the same ones `dori heavy` on the host takes, so every footer on a machine shares one slot count.
  */
 
-export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret", "host"] as const;
+export const LANE_CLI_COMMANDS = ["report", "claim-done", "lane", "heavy", "secret", "host", "toodo"] as const;
 
 /** How long a request keeps retrying a missing or refusing lane socket (a supervisor/runner restart), and how often. */
 export const LANE_SOCKET_RETRY_MS = 60_000;
@@ -112,7 +113,9 @@ const request = async (connect: Connector, body: object, clock: Clock = realCloc
   }
 };
 
-const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret env and secret run (alias host <op>)";
+const LANE_ONLY_TEXT = "inside a lane dori takes only report, claim-done, report ack, lane status and heavy, plus secret env, secret run (alias host <op>) and toodo get|search|guidelines";
+
+const TOODO_USAGE = "usage: dori toodo get [<task id>] | dori toodo search <query> | dori toodo guidelines (read-only: Toodo writes go through dori report)";
 
 const REPORT_USAGE = "usage: dori report <key> <progress|blocked|milestone|done> --text \"...\" [--evidence \"...\"] | dori report <key> question --text \"<question>\" --option \"<A>\" --option \"<B>\" --recommend N --reason \"<why>\" [--waiting \"<what is paused>\"] [--nonblocking] | dori report <key> request --text \"<what you need from the owner>\" --reason \"<why>\" [--file <path>] [--waiting \"<what is paused>\"] [--nonblocking]";
 const CLAIM_DONE_USAGE = "usage: dori claim-done <key> --evidence \"<merge SHA, ...>\"";
@@ -144,6 +147,13 @@ const LANE_HELP: Record<(typeof LANE_CLI_COMMANDS)[number], string> = {
     "  probe, systemctl --user daemon-reload) outside the lane and prints its redacted output, exiting with its code.",
     "  On a worker, an op in its runner-config hostCommands runs on that worker host instead.",
     "  A refused op lists the ops this lane may run.",
+  ].join("\n"),
+  toodo: [
+    TOODO_USAGE,
+    "  get without an id shows this lane's own task (description, criteria, notes, refs) with its dependencies and related tasks",
+    "  search looks through the titles, descriptions and refs of the tasks in the lane task's workspace",
+    "  guidelines lists that workspace's rules and memories",
+    "  A lane reads its own task, the tasks it depends on or is related to, and its workspace; anything else is refused.",
   ].join("\n"),
 };
 
@@ -190,6 +200,23 @@ export const laneCliMain = async (args: readonly string[], deps: LaneCliDeps): P
     if (typeof result.stderr === "string" && result.stderr) write("stderr", result.stderr);
     if (result.truncated === true) deps.err(`dori: ${op} output was truncated at 64 KiB per stream`);
     return typeof result.exitCode === "number" && Number.isInteger(result.exitCode) ? result.exitCode : 1;
+  }
+  if (sub === "toodo") {
+    const [op, ...args] = rest;
+    const query = args.join(" ").trim();
+    let verb: object | undefined;
+    if (op === "guidelines" && !args.length) verb = { op };
+    else if (op === "get" && args.length <= 1) {
+      const id = args[0] === undefined ? undefined : Number(args[0].replace(/^#/, ""));
+      if (id === undefined || (Number.isSafeInteger(id) && id >= 0)) verb = id === undefined ? { op } : { op, id };
+    } else if (op === "search" && query) verb = { op, query };
+    if (!verb) { deps.err(TOODO_USAGE); return 2; }
+    let reply: Reply = { ok: true };
+    const code = await send({ kind: "toodo", ...verb }, (r) => { reply = r; });
+    if (code !== 0) return code;
+    if (typeof reply.text === "string") deps.out(reply.text);
+    if (reply.truncated === true) deps.err("dori: the Toodo answer was cut at 256 KiB");
+    return 0;
   }
   if (sub === "secret") {
     if (rest.length !== 1 || rest[0] !== "env") { deps.err("usage: dori secret env | dori secret run <op>"); return 2; }

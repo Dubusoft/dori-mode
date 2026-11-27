@@ -24,6 +24,9 @@ export const TOODO_MAX_IDS = 500;
 export type ToodoClientConfig = { readonly url: string; readonly tokenFile: string };
 export type ToodoFetch = (url: string, init: RequestInit) => Promise<Response>;
 
+/** The read commands of toodo-server's `/api/rpc` that ToodoClient sends (all in toodo's read-only device scope). */
+export type ToodoReadCommand = "list_tasks" | "get_task" | "list_guidelines" | "get_workspace" | "list_task_relations";
+
 export class ToodoUnreadable extends Error {
   constructor(message: string, readonly status?: number) {
     super(message);
@@ -146,7 +149,7 @@ export class ToodoClient {
   }
 
   /** One read command; `allow404` returns undefined on 404 instead of throwing. */
-  private async call(command: "list_tasks" | "get_task" | "list_guidelines" | "get_workspace", args: unknown, allow404 = false): Promise<unknown> {
+  private async call(command: ToodoReadCommand, args: unknown, allow404 = false): Promise<unknown> {
     const url = `${this.config.url.replace(/\/+$/, "")}/api/rpc/${command}`;
     const token = this.token();
     for (let attempt = 1; ; attempt++) {
@@ -171,6 +174,14 @@ export class ToodoClient {
       if (response.status !== 200) throw new ToodoUnreadable(`toodo-server ${command} answered HTTP ${response.status}${response.status === 401 ? " (the token was refused)" : ""}${tried}`, response.status);
       try { return JSON.parse(text) as unknown; } catch { throw new ToodoUnreadable(`toodo-server ${command} answered non-JSON`); }
     }
+  }
+
+  /**
+   * One read command's reply as toodo-server sends it, unparsed (undefined on 404): what a lane's `dori toodo` shows
+   * (toodo-lane-read.ts). Only read commands are typed, so a lane's request can never reach a write.
+   */
+  raw(command: ToodoReadCommand, args: unknown): Promise<unknown> {
+    return this.call(command, args, true);
   }
 
   /** The tasks with these ids that toodo still has (archived or deleted ones are absent), in batches of TOODO_MAX_IDS. */

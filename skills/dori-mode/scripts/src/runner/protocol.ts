@@ -5,7 +5,7 @@
  * - runner -> supervisor events carry `seq` (per runner, durable, never reset by a new `gen`) and go through the outbox;
  * - supervisor -> runner commands carry `cmdSeq` (per runner, issued by the supervisor) and a `cmdId` in the body;
  * - control frames (hello, heartbeat, acks, command status, the `q.*` queries and their `q.result`, and since proto 6
- *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`)
+ *   the secret frames `secret.get`/`secret.run` and `secret.value`/`secret.run.result`, since proto 10 `toodo.read`/`toodo.read.result`)
  *   carry neither and are never queued or journaled. A secret value travels only inside an AEAD `sealed` box (auth.ts),
  *   never in clear: supervisor to runner in an answer.
  *
@@ -23,14 +23,16 @@ import type { Check } from "../signals.ts";
 
 /**
  * The protocol version this code speaks. A runner speaks exactly this; a supervisor also accepts `PROTO - 1`. Proto 6
- * adds the secret control frames, proto 7 the `lane.attach` command, proto 9 `lanes.closed`, so
+ * adds the secret control frames, proto 7 the `lane.attach` command, proto 9 `lanes.closed`, proto 10 `toodo.read`, so
  * the supervisor must be upgraded before its runners.
  */
-export const PROTO = 9;
+export const PROTO = 10;
 /** The lowest protocol version a supervisor admits (`checkProto`): every admitted connection speaks at least this. */
 export const MIN_PROTO = PROTO - 1;
 /** The first protocol version with `lanes.closed` / `lanes.closed.result` (the cleanup sweep's closed lanes). */
 export const CLOSED_LANES_PROTO = 9;
+/** The first protocol version with `toodo.read` / `toodo.read.result` (a lane's read-only Toodo view, toodo-lane-read.ts). */
+export const TOODO_READ_PROTO = 10;
 /** The first protocol version with the secret frames (`secret.get`, `secret.value`, `secret.run`, `secret.run.result`). */
 export const SECRET_PROTO = 6;
 /** Whether a peer that announced `proto` understands the secret frames; an unknown version does not. */
@@ -573,6 +575,8 @@ const RUNNER_CONTROL_SCHEMAS = {
   "secret.run": { rid: req("string"), key: req("string"), op: req("string"), repo: opt("string") },
   /** Since proto 9: ask for the lanes of this runner the registry records as closed (the cleanup sweep's closedNodeModules). */
   "lanes.closed": { rid: req("string") },
+  /** Since proto 10: a read-only Toodo read (`op` get, search or guidelines) for lane `key`, answered sealed. */
+  "toodo.read": { rid: req("string"), key: req("string"), op: req("string"), id: opt("int"), query: opt("string") },
 } satisfies Readonly<Record<string, Shape>>;
 
 const SEALED = { n: req("string"), c: req("string") } satisfies Shape;
@@ -624,6 +628,8 @@ const SUPERVISOR_CONTROL_SCHEMAS = {
   "secret.value": SECRET_ANSWER,
   /** Since proto 6: the answer to `secret.run` `rid`, shaped like `secret.value`; the sealed result carries exit code and capped output. */
   "secret.run.result": SECRET_ANSWER,
+  /** Since proto 10: the answer to `toodo.read` `rid`, shaped like `secret.value`; the sealed result is `{text, truncated}`. */
+  "toodo.read.result": SECRET_ANSWER,
   /** Since proto 9: the answer to `lanes.closed` `rid`; `lanes` on `ok`, the reason in `detail` otherwise. Nothing sealed (no secret). */
   "lanes.closed.result": {
     rid: req("string"), ok: req("bool"), detail: opt("string"),

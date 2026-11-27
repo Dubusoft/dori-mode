@@ -200,7 +200,7 @@ describe("remote runner secrets over the link", () => {
     const { sup, run } = await connected({ proto: 5 });
     const logs: string[] = [];
     const grant = remoteSecretGranter({ client: run.client, laneRepo: async () => "acme/app", log: (l) => { logs.push(l); } });
-    expect(await grant("lane-a")).toEqual({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: "supervisor speaks proto 5; secrets need proto 6" });
+    expect(await grant("lane-a")).toEqual({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: "supervisor speaks proto 5; secret.get needs proto 6" });
     for (const pair of sup.net.pairs) pair.pump();
     expect(sup.received).toEqual([]);
     expect(run.timers).toEqual([]);

@@ -4,7 +4,7 @@ import type { Clock } from "../run.ts";
 import { BadMacTally, isRejectCode, type PendingRunnerHello, type RunnerAuth, type Session } from "./auth.ts";
 import { OutboxEventTooLarge, type Outbox } from "./outbox.ts";
 import {
-  CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
+  CLOSED_LANES_PROTO, MAX_FRAME_BYTES, PROTO, SECRET_PROTO, TOODO_READ_PROTO, decodeFrame, secretsSupported, encodeFrame, isQueryType, runnerControl, runnerEvent, ProtocolError,
   type AnyRunnerControl, type AnyRunnerEvent, type ClosedLaneBody, type AnySupervisorCommand, type AnySupervisorControl, type InventoryLane, type RejectCode, type RunnerControlBodies, type WorkspaceEntry,
   type RunnerControlType, type RunnerEventBodies, type RunnerEventType, type SupervisorCommand, type SupervisorControlBodies, type SupervisorFrame,
 } from "./protocol.ts";
@@ -59,9 +59,9 @@ export const SECRET_TIMEOUT_MS = 30_000;
  */
 export const SECRET_RUN_TIMEOUT_MS = SECRET_COMMAND_MAX_TIMEOUT_SEC * 1000 + 60_000;
 
-/** The secret frames a runner sends through `secretRequest`, and the answer type each one waits for. */
-export type SecretRequestType = "secret.get" | "secret.run";
-const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result" } as const;
+/** The sealed frames a runner sends through `secretRequest`, and the answer type each one waits for. */
+export type SecretRequestType = "secret.get" | "secret.run" | "toodo.read";
+const SECRET_ANSWER = { "secret.get": "secret.value", "secret.run": "secret.run.result", "toodo.read": "toodo.read.result" } as const;
 
 /** The outcome of `secretRequest`: the opened box's plaintext (JSON, never logged), or a refusal with its code. */
 export type SecretReply =
@@ -305,7 +305,7 @@ export class RunnerClient {
   }
 
   /**
-   * Asks the supervisor over the authenticated link (`secret.get` or `secret.run`, a sealed control frame with a fresh
+   * Asks the supervisor over the authenticated link (`secret.get`, `secret.run` or, since proto 10, `toodo.read`: a control frame with a fresh
    * 32-hex rid) and resolves with the opened `s2r` box of the matching answer, or a refusal: `RUNNER_SECRET_FAILED`
    * when not connected, on a lost connection or a box that does not open; `RUNNER_SECRET_UNSUPPORTED` without an auth
    * session; `RUNNER_SECRET_OUTDATED` when the supervisor's `hello.ok` proto is below `SECRET_PROTO`;
@@ -313,7 +313,7 @@ export class RunnerClient {
    * logs a body.
    */
   secretRequest<T extends SecretRequestType>(type: T, body: Omit<RunnerControlBodies[T], "rid">): Promise<SecretReply> {
-    return this.secretAsk(type, (rid) => ({ ...body, rid }) as RunnerControlBodies[T]);
+    return this.secretAsk(type, (rid) => ({ ...body, rid }) as RunnerControlBodies[T], type === "toodo.read" ? TOODO_READ_PROTO : SECRET_PROTO);
   }
 
   /**
@@ -348,7 +348,7 @@ export class RunnerClient {
     const session = this.session;
     if (!session) return Promise.resolve({ ok: false, code: "RUNNER_SECRET_UNSUPPORTED", detail: "unauthenticated link" });
     if (!secretsSupported(this.helloProto) || (this.helloProto as number) < needProto) {
-      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; secrets need proto ${needProto}` });
+      return Promise.resolve({ ok: false, code: "RUNNER_SECRET_OUTDATED", detail: `supervisor speaks proto ${this.helloProto}; ${type} needs proto ${needProto}` });
     }
     const rid = randomBytes(16).toString("hex");
     const timeoutMs = type === "secret.run" ? SECRET_RUN_TIMEOUT_MS : SECRET_TIMEOUT_MS;
@@ -372,7 +372,7 @@ export class RunnerClient {
   }
 
   /** Settles the open request an (already MAC-checked) secret answer answers; others are dropped. */
-  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" }): void {
+  private secretAnswer(frame: AnySupervisorControl & { readonly type: "secret.value" | "secret.run.result" | "toodo.read.result" }): void {
     const body = frame.body;
     const pending = this.secrets.get(body.rid);
     if (!pending || pending.answer !== frame.type || !this.session) return;
@@ -472,6 +472,7 @@ export class RunnerClient {
       }
       case "secret.value":
       case "secret.run.result":
+      case "toodo.read.result":
         this.secretAnswer(frame);
         return;
       case "lanes.closed.result": {
