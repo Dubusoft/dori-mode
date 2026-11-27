@@ -29,14 +29,17 @@ export class UnsafeTextError extends Error {}
 export const listPanes = async (run: Runner): Promise<Pane[]> =>
   (await Promise.all(listedRuntimes().map((kind) => sessionRuntime(run, kind).listPanes()))).flat();
 
+/** Pane `pane` as the runtime that holds it lists it (no other runtime is asked); undefined when absent. Throws when that list cannot be read. */
+export const paneRow = async (run: Runner, pane: string): Promise<Pane | undefined> =>
+  (await paneRuntime(run, pane).listPanes()).find((p) => p.pane_id === pane);
+
 export const readScreen = (run: Runner, pane: string, lines?: number): Promise<string> => paneRuntime(run, pane).read(pane, lines);
 
 /** A lane's agent is alive when its pane is in herdr's pane list and its agent_status is one of ALIVE_STATUSES. */
 export const paneAlive = (pane: Pane | undefined): boolean =>
   pane?.agent_status !== undefined && ALIVE_STATUSES.has(pane.agent_status);
 
-export const agentStatus = async (run: Runner, pane: string): Promise<string | undefined> =>
-  (await listPanes(run)).find((p) => p.pane_id === pane)?.agent_status;
+export const agentStatus = async (run: Runner, pane: string): Promise<string | undefined> => (await paneRow(run, pane))?.agent_status;
 
 /** Like agentStatus, but a failed lookup comes back as its error text instead of being swallowed. */
 export const statusLookup = async (run: Runner, pane: string): Promise<{ readonly status?: string; readonly error?: string }> => {
@@ -126,9 +129,9 @@ const guardedSend = async (run: Runner, pane: string, text: string): Promise<{ r
   let refusal: string | undefined;
   let status: string | undefined;
   try {
-    const panes = await listPanes(run);
-    status = panes.find((p) => p.pane_id === pane)?.agent_status;
-    refusal = agentRefusal(panes, pane) ?? (status !== undefined && ALIVE_STATUSES.has(status) ? undefined : `pane ${pane} agent is not live (${status ?? "unknown"})`);
+    const found = await paneRow(run, pane);
+    status = found?.agent_status;
+    refusal = agentRefusal(found ? [found] : [], pane) ?? (status !== undefined && ALIVE_STATUSES.has(status) ? undefined : `pane ${pane} agent is not live (${status ?? "unknown"})`);
   } catch (e) {
     refusal = `pane list unreadable: ${(e instanceof Error ? e.message : String(e)).slice(0, 120)}`;
   }

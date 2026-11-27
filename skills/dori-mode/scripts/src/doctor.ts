@@ -13,7 +13,9 @@ import { readWakes } from "./store.ts";
 import { legacyPaneKeys, managedPanesPath } from "./managed-panes.ts";
 import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
-import { listPanes } from "./panes.ts";
+import { paneRow } from "./panes.ts";
+import { runtimeOfPane } from "./runtime/index.ts";
+import { HC_INSTALL_URL, HC_MIN_VERSION, hcVersion, versionAtLeast } from "./runtime/hc.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { Registry, statusOf } from "./registry.ts";
 import { type Clock, realClock, type Runner, run } from "./run.ts";
@@ -359,14 +361,16 @@ const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
     const legacy = raw && typeof raw === "object" && !Array.isArray(raw) ? legacyPaneKeys(raw as Record<string, unknown>) : [];
     if (legacy.length) checks.push(warn("config pane keys", `${legacy.join(", ")} in ${d.configPath} are ignored; the supervisor manages them in ${where}`, `delete ${legacy.join(", ")} from ${d.configPath}`));
   } catch { /* the config check above already reports an unreadable config */ }
+  checks.push(...await leadRuntime(d));
   const restart = "systemctl --user restart dori-supervisor.service";
   if (!c.leadPane) checks.push(warn("leadPane", `no lead pane recorded in ${where}`, restart));
   if (!c.laneWorkspace) checks.push(warn("lanes workspace", `no lanes workspace recorded in ${where}`, restart));
   if (!c.leadPane && !c.laneWorkspace) return checks;
   try {
     if (c.leadPane) {
-      const found = (await listPanes(d.run)).some((p) => p.pane_id === c.leadPane);
-      checks.push(found ? ok("leadPane", `${c.leadPane} exists in herdr`) : fail("leadPane", `${c.leadPane} is not a herdr pane`, "dori lead-restart"));
+      const found = (await paneRow(d.run, c.leadPane)) !== undefined;
+      const runtime = runtimeOfPane(c.leadPane);
+      checks.push(found ? ok("leadPane", `${c.leadPane} exists in ${runtime}`) : fail("leadPane", `${c.leadPane} is not a ${runtime} pane`, "dori lead-restart"));
     }
     if (c.laneWorkspace) {
       const listed = await d.run(["herdr", "workspace", "list"], T);
@@ -377,6 +381,24 @@ const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
   } catch {
     checks.push(fail("leadPane", "cannot list herdr panes", "systemctl --user start herdr-server.service"));
   }
+  return checks;
+};
+
+/**
+ * config `leadRuntime`: the runtime the lead's pane is on now (a WARN while it is on the other one, until the next lead
+ * restart moves it), and with hc, that hc is on this host at HC_MIN_VERSION or later.
+ */
+const leadRuntime = async (d: DoctorDeps): Promise<Check[]> => {
+  const { leadRuntime: want, leadPane } = d.config;
+  const checks: Check[] = [];
+  if (want === "hc") {
+    const version = await hcVersion(d.run);
+    checks.push(version && versionAtLeast(version, HC_MIN_VERSION) ? ok("lead hc", `hc ${version}`)
+      : fail("lead hc", version ? `hc ${version} is older than ${HC_MIN_VERSION}` : "hc is not on PATH", `curl -fsSL ${HC_INSTALL_URL} | sh (or hc update), or set "leadRuntime": "herdr" in ${d.configPath}`));
+  }
+  const have = leadPane ? runtimeOfPane(leadPane) : want;
+  checks.push(have === want ? ok("leadRuntime", want)
+    : warn("leadRuntime", `config leadRuntime is ${want} but the lead pane ${leadPane} is on ${have}; it moves at the next lead restart`, "dori lead-restart"));
   return checks;
 };
 

@@ -8,6 +8,7 @@ import { ensureHc, HC_MIN_VERSION, hcRuntime } from "../src/runtime/hc.ts";
 import { unlistRuntime } from "../src/runtime/index.ts";
 import { RunnerLanes } from "../src/runner/lanes.ts";
 import { parsePolicy } from "../src/runner/policy.ts";
+import { resolveSession } from "../src/session-id.ts";
 import { fakeClock } from "./fakes.ts";
 
 const dirs: string[] = [];
@@ -61,6 +62,15 @@ test("an hc terminal reads as a herdr pane: its reported agent and status, an hc
   expect(await rt.processInfo("hc:t3")).toEqual({ info: { shell_pid: 41, foreground_process_group_id: 42, foreground_processes: [{ pid: 42, name: "omo", argv: ["omo", "go"] }] } });
   expect(await rt.processInfo("hc:t9")).toEqual({ error: "not found" });
   expect(await rt.read("hc:t3", 2)).toBe("two\nthree");
+});
+
+test("resolveSession finds the agent under an hc terminal's shell, as under a herdr pane's", async () => {
+  const hc = fakeHc();
+  const id = "44444444-4444-4444-8444-444444444444";
+  hc.terminals.set("t2", { address: "t2", state: "live", pid: 41, created_ms: 1, foreground: { pid: 42, name: "omo", argv: ["omo"] } });
+  const table = [{ pid: 41, ppid: 1, cmd: "zsh" }, { pid: 42, ppid: 41, cmd: `/usr/bin/omo --session-id ${id}` }, { pid: 43, ppid: 1, cmd: "/usr/bin/omo" }];
+  expect(await resolveSession("hc:t2", "/w", table, { run: hc.run, sessionsDir: "/none" })).toEqual({ id, via: "argv", pid: 42 });
+  expect(hc.calls).toContainEqual(["hc", "--json", "get", "t2"]);
 });
 
 test("listPanes gathers hc terminals only once hc is listed, and a pane id picks the runtime that reads it", async () => {

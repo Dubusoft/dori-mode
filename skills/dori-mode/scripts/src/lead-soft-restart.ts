@@ -2,13 +2,14 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import type { FlowDeps } from "./done-flow.ts";
-import { ALIVE_STATUSES, listPanes, readScreen, sendGuarded } from "./panes.ts";
+import { ALIVE_STATUSES, paneRow, readScreen, sendGuarded } from "./panes.ts";
+import { paneRuntime } from "./runtime/index.ts";
 import { sessionDirFor } from "./session-id.ts";
 import { plainShell, processInfo, STARTUP_ERROR, STARTUP_EVIDENCE_MS } from "./lead-process.ts";
 import { TransientSuperviseError } from "./supervise-journal.ts";
 
 export const softLive = async (deps: FlowDeps): Promise<boolean> => {
-  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const pane = await paneRow(deps.run, deps.config.leadPane);
   return !!pane?.agent && ALIVE_STATUSES.has(pane.agent_status ?? "");
 };
 
@@ -18,7 +19,7 @@ export const softLive = async (deps: FlowDeps): Promise<boolean> => {
  * a command still shown there gets Enter again, so the next command is never typed onto the same line.
  */
 export const softCommand = async (deps: FlowDeps, command: string, prompt = false): Promise<void> => {
-  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const pane = await paneRow(deps.run, deps.config.leadPane);
   if (!pane?.agent || (pane.agent_status !== "idle" && pane.agent_status !== "done")) throw new TransientSuperviseError("lead left idle/done before soft command");
   const before = await readScreen(deps.run, deps.config.leadPane);
   const previous = new Set(before.split("\n"));
@@ -33,7 +34,7 @@ export const softCommand = async (deps: FlowDeps, command: string, prompt = fals
   const deadline = deps.clock.now() + 5_000;
   let enters = 1;
   for (let attempt = 0; attempt <= 25; attempt++) {
-    const after = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+    const after = await paneRow(deps.run, deps.config.leadPane);
     const screen = await readScreen(deps.run, deps.config.leadPane);
     const addedLines = screen.split("\n").filter((line) => !previous.has(line));
     // omo's herdr integration can release the pane's agent once /new has shut the old session down; that is /new
@@ -42,7 +43,7 @@ export const softCommand = async (deps: FlowDeps, command: string, prompt = fals
     if (!after?.agent || (after.agent_status !== "idle" && after.agent_status !== "done") || STARTUP_ERROR.test(addedLines.join("\n"))) throw new TransientSuperviseError("lead not ready after soft command");
     if (addedLines.some((line) => line.includes(command))) {
       if (enters >= 3) throw new TransientSuperviseError("soft command stayed in the editor");
-      if ((await deps.run(["herdr", "pane", "send-keys", deps.config.leadPane, "enter"])).code !== 0) throw new TransientSuperviseError("soft command send failed");
+      if (!(await paneRuntime(deps.run, deps.config.leadPane).key(deps.config.leadPane, "enter"))) throw new TransientSuperviseError("soft command send failed");
       enters++;
     } else if ((after.revision !== undefined && after.revision !== pane.revision) || screen !== before) return;
     if (deps.clock.now() >= deadline) break;
@@ -100,7 +101,7 @@ const softLiveCheck = (deps: FlowDeps): (() => Promise<boolean>) => {
 
 /** The new session's file once it has started and settled with its agent back, or undefined at the deadline. */
 export const softSessionStarted = async (deps: FlowDeps, old: string, startedAt: number | undefined): Promise<string | undefined> => {
-  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const pane = await paneRow(deps.run, deps.config.leadPane);
   const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);
@@ -132,7 +133,7 @@ export const softSessionStarted = async (deps: FlowDeps, old: string, startedAt:
 
 /** A new session must have persisted the unique startup-file pointer, not merely a holder directory. */
 export const softEvidence = async (deps: FlowDeps, old: string, markers: readonly string[], startedAt: number | undefined): Promise<string | undefined> => {
-  const pane = (await listPanes(deps.run)).find((p) => p.pane_id === deps.config.leadPane);
+  const pane = await paneRow(deps.run, deps.config.leadPane);
   const dir = sessionDirFor(deps.tunables.sessionsDir, pane?.cwd ?? deps.config.leadCwd);
   const deadline = deps.clock.now() + STARTUP_EVIDENCE_MS;
   const live = softLiveCheck(deps);

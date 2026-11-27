@@ -7,6 +7,7 @@ import { DEFAULT_DISPLAY_TIME_ZONE, validTimeZone } from "./display-time.ts";
 import { legacyPaneKeys, managedPanesPath, resolveManagedPanes } from "./managed-panes.ts";
 import { CONFIG_SCHEMA_KEY } from "./config-schema.ts";
 import { redactSecrets } from "./redact.ts";
+import { RUNTIME_KINDS, type RuntimeKind } from "./runtime/types.ts";
 import { SECRET_NAME } from "./secret-name.ts";
 
 export type ArgvTemplate = readonly string[];
@@ -161,8 +162,16 @@ export type DoriConfig = {
   /** The herdr workspace new local lane tabs open in, from dori state (managed-panes.ts); never read from the config file after migration. */
   readonly laneWorkspace: string;
   readonly ignorePanes: readonly string[];
-  /** The lead's herdr pane, from dori state (managed-panes.ts) or DORI_LEAD_PANE; the supervisor creates and records it. */
+  /**
+   * The lead's pane (a herdr pane id, or `hc:<address>` for an hc terminal), from dori state (managed-panes.ts) or
+   * DORI_LEAD_PANE; the supervisor creates and records it.
+   */
   readonly leadPane: string;
+  /**
+   * The terminal runtime the supervisor opens the lead's pane on (config key `leadRuntime`): herdr (default) or hc. A
+   * lead running on the other runtime moves at its next process restart (dori lead-restart).
+   */
+  readonly leadRuntime: RuntimeKind;
   /** The lead session's working directory (config key `leadCwd`, formerly `defaultCwd`); local lanes started without --cwd start here too. */
   readonly leadCwd: string;
   readonly agentCommand: ArgvTemplate;
@@ -301,6 +310,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   laneWorkspace: "",
   ignorePanes: [],
   leadPane: "",
+  leadRuntime: "herdr",
   leadCwd: join(home, ".dori", "lead"),
   agentCommand: ["omo", "--model", "{model}", "{prompt}"],
   defaultModel: "anthropic-subscription/claude-opus-5-5",
@@ -329,6 +339,13 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   reportQuietLanes: [],
   threadCloseAfterHours: 24,
 });
+
+/** The config's `leadRuntime`; absent is herdr. Throws TypeError unless it names a runtime. */
+const leadRuntime = (raw: unknown): RuntimeKind => {
+  if (raw == null) return "herdr";
+  if (typeof raw !== "string" || !(RUNTIME_KINDS as readonly string[]).includes(raw)) throw new TypeError(`leadRuntime must be ${RUNTIME_KINDS.join(" or ")}, not ${JSON.stringify(raw)}`);
+  return raw as RuntimeKind;
+};
 
 /** The config's `threadCloseAfterHours`; absent is 24. Throws TypeError unless it is a positive number. */
 const threadCloseAfterHours = (raw: unknown): number => {
@@ -539,7 +556,7 @@ export const CONFIG_FILE_KEYS = [
   "discord", "stateDir", "leadCwd", "worktreeRoot", "agentCommand", "defaultModel", "leadModel", "leadThinking",
   "leadArgs", "discordChannels", "alertsChannel", "decisionsChannel", "githubIssueAuthors", "ownerLanguage", "displayTimeZone", "laneRules", "laneSandbox", "guardMachines",
   "runners", "secretCommands", "placement", "buttonHooks", "hooks", "ciMergeBase", "ignorePanes", "autopilot", "review",
-  "memoryLimits", "autoReport", "reportQuietLanes", "threadCloseAfterHours",
+  "memoryLimits", "autoReport", "reportQuietLanes", "threadCloseAfterHours", "leadRuntime",
 ] as const;
 
 /** The config's `displayTimeZone`, trimmed; absent or blank is UTC. Throws TypeError unless it is a zone name `Intl` knows. */
@@ -629,6 +646,7 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
     autoReport: autoReport(raw.autoReport),
     reportQuietLanes: reportQuietLanes(raw.reportQuietLanes),
     threadCloseAfterHours: threadCloseAfterHours(raw.threadCloseAfterHours),
+    leadRuntime: leadRuntime(raw.leadRuntime),
     memoryLimits: memoryLimits(raw.memoryLimits),
     secretCommands: secretCommands(raw.secretCommands),
     displayTimeZone: displayTimeZone(raw.displayTimeZone),

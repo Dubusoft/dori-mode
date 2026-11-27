@@ -48,6 +48,7 @@ export const DORI_CONFIG_KEYS: readonly KeySpec[] = [
   spec("autoReport", "enum", "Whose clean done claims the supervisor reports to the owner itself instead of waking the lead (off restores the lead's report)", { values: [...AUTO_REPORT_SCOPES] }),
   spec("reportQuietLanes", "list", "Lane key patterns (* wildcard) whose lanes post their own results: their done claims are recorded reported with no post and no lead report"),
   spec("threadCloseAfterHours", "json", "Hours a finished work thread waits, with the owner's close button on its last report, before the supervisor closes it (a number; default 24)"),
+  spec("leadRuntime", "enum", "Terminal runtime the lead's pane opens on: herdr (default) or hc (herdr-core); a running lead moves at its next dori lead-restart", { values: [...RUNTIME_KINDS] }),
 ];
 
 /** Runner-config keys `dori runner setup` never asks; `--set`/`--unset` still take them. */
