@@ -4,6 +4,29 @@ import type { RunnerPolicy } from "./policy.ts";
 
 export const quote = (arg: string): string => (/^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`);
 
+const psQuote = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+
+/**
+ * The line typed into a Windows lane's hc terminal (Windows PowerShell 5.1): a nested `powershell -NoLogo
+ * -EncodedCommand <base64(utf16le(script))>`, so the variables live only in the nested process and the typed text is
+ * plain base64. PowerShell 5.1 mangles native arguments containing a double quote, so such an argv is refused
+ * (`RUNNER_LANE_ARGV_UNSAFE`). The nested shell enters `cwd` before the agent starts: it loads the user's profile, and a
+ * profile that changes directory would otherwise start the agent outside the lane's directory.
+ */
+export const powershellLaunchLine = (env: readonly (readonly [string, string])[], argv: readonly string[], cwd: string): string => {
+  if (argv.some((arg) => arg.includes('"'))) {
+    throw new Error("RUNNER_LANE_ARGV_UNSAFE Windows PowerShell 5.1 cannot pass an argument containing a double quote");
+  }
+  const script = [
+    ...env.map(([name, value]) => `$env:${name}=${psQuote(value)}`),
+    "$env:PSExecutionPolicyPreference='Bypass'",
+    `Set-Location -LiteralPath ${psQuote(cwd)}`,
+    `& ${argv.map(psQuote).join(" ")}`,
+    "exit $LASTEXITCODE",
+  ].join("; ");
+  return `powershell -NoLogo -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+};
+
 /** The old lane `.omo/mcp.json` (figma disabled) that launch.ts used to write; the same bytes as `LEGACY_LANE_MCP` there. */
 export const LEGACY_LANE_MCP = `${JSON.stringify({ mcpServers: { figma: { enabled: false, url: "https://mcp.figma.com/mcp" } } }, null, 2)}\n`;
 

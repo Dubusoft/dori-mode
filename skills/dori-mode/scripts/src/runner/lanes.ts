@@ -6,7 +6,7 @@ import type { Proc } from "../lane-memory.ts";
 import { ASK_SCREEN_LINES, askingLine, screenQuestion, type ScreenQuestion } from "../ask-user.ts";
 import { listPanes, paneAlive, readScreen, sendGuarded, sendVerified, type Pane } from "../panes.ts";
 import type { Clock, Runner } from "../run.ts";
-import { agentArgv, argvModel, outsideDenyRules, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
+import { agentArgv, argvModel, outsideDenyRules, powershellLaunchLine, quote, removeLegacyLaneMcp } from "./lane-launch.ts";
 import { ensureRunnerSubdir, RUNNER_PATHS, writeRunnerFile } from "./fs-safety.ts";
 import { pause, resume, resumeArgv, startupPoll } from "./lane-control.ts";
 import { checkCwd, effectiveWorktreeRoot, laneCwd, rejectionText, resolveGrants, runnerPaths, runtimeDirOption, type RunnerPolicy } from "./policy.ts";
@@ -120,6 +120,8 @@ export type RunnerLanesDeps = {
   readonly realpath?: (path: string) => string;
   /** Runs before each start without holding it up: on macOS the BrowserSkill window check (browser-window.ts). */
   readonly browserCheck?: (key: string) => Promise<void>;
+  /** This host's OS (default `process.platform`): on win32 a lane's terminal runs Windows PowerShell, which gets `powershellLaunchLine`. */
+  readonly platform?: NodeJS.Platform;
 };
 
 export type Effect<T extends keyof CommandResults> = { readonly detail: string; readonly result: CommandResults[T] };
@@ -357,7 +359,16 @@ export class RunnerLanes {
     const gen = (previous?.gen ?? 0) + 1;
     const tokenFile = this.tokenFileOf(key, gen);
     writeRunnerFile(tokenFile, token);
-    const { command, sandboxPrefix } = this.buildLaunchCommand(input, argv, tokenFile, granted);
+    let command: string;
+    let sandboxPrefix: string | undefined;
+    try {
+      ({ command, sandboxPrefix } = this.buildLaunchCommand(input, argv, tokenFile, granted));
+    } catch (e) {
+      // A refused launch line (a review lane or an unsafe argv on Windows) starts nothing.
+      rmSync(tokenFile, { force: true });
+      await runtime.close(pane);
+      throw e;
+    }
     input.mayStart?.(true);
     const ran = await runtime.run(pane, command);
     if (ran.code !== 0) {
@@ -390,12 +401,28 @@ export class RunnerLanes {
     return { pane, resumed, startup, cwd, ...(model ? { model } : {}) };
   }
 
-  /** Builds the POSIX launch line and the sandbox wrapper argv for commands running with the same lane permissions. */
+  /**
+   * Builds the launch line and the sandbox wrapper argv for commands running with the same lane permissions: on a
+   * Windows host (no lane sandbox) the PowerShell line, which refuses a review lane (it runs only sandboxed); else the
+   * POSIX line.
+   */
   private buildLaunchCommand(
     input: LaunchInput, argv: readonly string[], tokenFile: string, granted: ReturnType<typeof resolveGrants> | undefined,
   ): { readonly command: string; readonly sandboxPrefix: string | undefined } {
     const { key } = input;
     const review = input.profile === REVIEW_PROFILE;
+    if ((this.deps.platform ?? process.platform) === "win32") {
+      if (review) throw new Error(`RUNNER_LANE_REVIEW_UNSANDBOXED ${key}: a review lane runs only in the lane sandbox, which a Windows runner does not have`);
+      return {
+        command: powershellLaunchLine([
+          ["DO_NOT_TRACK", "1"], ["DORI_LANE_KEY", key], ["DORI_LANE_TOKEN_FILE", tokenFile],
+          ...(input.fileRun ? [["DORI_LANE_OUT", laneFilePaths(this.deps.runnerDir, key).output] as const] : []),
+          ...(input.heavySlots !== undefined ? [["DORI_HEAVY_SLOTS", String(input.heavySlots)] as const] : []),
+          ...(input.heavyMaxLoad !== undefined ? [["DORI_HEAVY_MAX_LOAD", String(input.heavyMaxLoad)] as const] : []),
+        ], argv, input.cwd),
+        sandboxPrefix: undefined,
+      };
+    }
     const worktreeRoot = effectiveWorktreeRoot(this.deps.policy);
     const env = [
       // omo 5.1.84+ asks a first-run telemetry consent question on screen; a lane cannot answer it (and a sandboxed
