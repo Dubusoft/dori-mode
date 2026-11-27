@@ -229,7 +229,7 @@ export const runnerAdminMain = async ({ die }: RunnerAdminDeps): Promise<number>
       });
       if (!result.ok) die(`${result.code} runner=${label} ${result.detail}`);
       if (direct) writeRunnerMachine(cfg.stateDir, direct.label, direct.target);
-      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${herdrInstallNote(result.ok ? result.herdr : undefined)}`);
+      console.log(`RUNNER_INSTALLED runner=${label} version=${result.ok ? result.version : ""} ${result.ok ? herdrInstallNote(result.herdr, result.hc) : herdrInstallNote(undefined)}`);
     } finally {
       auth.close();
     }

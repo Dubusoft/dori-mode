@@ -26,7 +26,7 @@ import { take, takeAwaitingReminders, takeCarriedReminders, takeOutput, writeCar
 import { POINTER_PREFIX } from "../src/supervise-push.ts";
 import { recordReported } from "../src/lane-outcomes.ts";
 import { TransientSuperviseError } from "../src/supervise-journal.ts";
-import { unlistRuntime } from "../src/runtime/index.ts";
+import { setListedRuntimes } from "../src/runtime/index.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const done of cleanups.splice(0)) done(); });
@@ -1814,7 +1814,7 @@ const hcLead = (f: ReturnType<typeof fixture>, next: Runner): Runner => {
 };
 
 test("with leadRuntime hc a herdr lead moves at its next restart: no /new, a dori-lead hc terminal takes the launch and the old pane is closed", async () => {
-  cleanups.push(() => { unlistRuntime("hc"); });
+  cleanups.push(() => { setListedRuntimes({ herdr: true, hc: false }); });
   const f = fixture({ leadRuntime: "hc" });
   f.cold();
   const persisted: string[] = [];

@@ -36,7 +36,8 @@ import { runnerVersion } from "./version.ts";
 import { enrollOverStdio, enrollRunner, RunnerAuth } from "./auth.ts";
 import { GUARD_SAMPLE_MS, RunnerGuard } from "./guard.ts";
 import { jobRunEffect, waitCheckEffect } from "./jobs.ts";
-import { HerdrWatch, herdrProcess } from "./herdr-watch.ts";
+import { HerdrWatch, herdrInUse, herdrProcess } from "./herdr-watch.ts";
+import { runtimeOfPane } from "../runtime/index.ts";
 import { selectPlatform } from "./platform.ts";
 import { processCommands } from "./cleanup-artifacts.ts";
 import { CLEANUP_STATUS_FILE, cleanupPaths, cleanupSettings, inUsePaths, runCleanup, startCleanup } from "./cleanup.ts";
@@ -180,7 +181,7 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       return owned;
     };
     const observedLanes = async () => {
-      const [panes, process] = await Promise.all([listPanes(run), herdrProcess(run)]);
+      const [panes, process] = await Promise.all([listPanes(run), herdrActive() ? herdrProcess(run) : Promise.resolve({ running: false } as { running: boolean; instance?: string })]);
       const instance = process.instance ?? "";
       const owned = await ownedPanes(panes, instance);
       return { lanes: await observeHost({ run, panes, owned: async () => owned, ...(winSample ? { procs: hostProcs } : {}) }), panes, instance };
@@ -221,9 +222,12 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
       ...(winSample ? { procs: hostProcs } : {}), ...(herdrReports ? { herdrReports } : {}), ...(browserCheck ? { browserCheck } : {}),
     });
     lanesForReports = runnerLanes;
+    // herdr is watched only while this host uses it: lanes open on herdr, or a lane record still sits on a herdr pane.
+    // Asked at each use, since a policy reload can switch laneRuntime.
+    const herdrActive = (): boolean => herdrInUse(policy.laneRuntime, Object.values(runnerLanes.records()).map((r) => r.pane));
     // Every runner guards its host, the local one included: the supervisor reads its samples and kills from the board
     // and does not kill by itself. Thresholds and heavyKill come from runner-config.json, else the config defaults.
-    const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir), platform: process.platform });
+    const herdr = new HerdrWatch({ run, now: realClock.now, monotonic: () => performance.now(), publish, paused: () => herdrPaused(runnerDir), platform: process.platform, active: herdrActive });
     const paneCount = () => herdr.sample();
     const guard = new RunnerGuard({
       herdr: () => herdr.snapshot(),
@@ -347,7 +351,9 @@ const serveMain = async (values: { label?: string; enroll?: boolean; "enroll-onl
     ensureRunnerSubdir(runnerDir, RUNNER_PATHS.lanes);
     ensureRunnerSubdir(join(runnerDir, RUNNER_PATHS.sock), LANE_SOCKET_DIR);
     const laneListeners = [listenUnix(laneSocketPath(runnerDir))];
-    for (const key of Object.keys(runnerLanes.records())) herdrReports?.open(key);
+    // Only a lane on a herdr pane reports through herdr's socket (an hc lane's state is read off its terminal), so an hc
+    // host with no herdr lane serves no report proxy at all.
+    for (const record of Object.values(runnerLanes.records())) if (runtimeOfPane(record.pane) === "herdr") herdrReports?.open(record.key);
     // The local runner hands out store secrets itself; a remote one asks the supervisor over the authenticated link.
     let laneSocketLanes: LaneSocketLanes = runnerLanes;
     if (remote) {

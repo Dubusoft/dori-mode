@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { Pane } from "../panes.ts";
 import type { Ran, Runner } from "../run.ts";
 import type { ProcessInfo } from "../runner/protocol.ts";
@@ -7,6 +8,20 @@ import { HC_PANE_PREFIX, type OpenSpec, type OpenedSession, type SessionRuntime 
 export const HC_MIN_VERSION = "0.1.22";
 export const HC_INSTALL_URL = "https://releases.herdr.dev/core/install.sh";
 const INSTALL_TIMEOUT_MS = 180_000;
+
+/**
+ * hc's core autostart on a host whose lanes (or lead) run on hc. On Linux the hc client starts its core in transient
+ * `systemd-run --user` units that do not come back after a reboot until some hc command runs, so the systemd user unit
+ * HC_CORE_UNIT (templates/hc-core.service: oneshot `hc server start`, idempotent while a core runs) starts it at boot.
+ * macOS has no user systemd and a core ends with whatever started it, so the launchd agent HC_LAUNCHD_LABEL
+ * (templates/dori-hc-launchd.plist) owns the foreground core `hc serve` (KeepAlive, ThrottleInterval 30 so a second core
+ * on a taken socket retries spaced out). Both templates carry `@HC_BIN@`, `@PATH@` and (plist) `@HOME@` markers filled on
+ * the host; `dori runner install` and the lead host's setup write them.
+ */
+export const HC_CORE_UNIT = "hc-core.service";
+export const HC_LAUNCHD_LABEL = "com.dori.hc";
+export const HC_CORE_UNIT_TEMPLATE = join(import.meta.dir, "..", "..", "templates", HC_CORE_UNIT);
+export const HC_LAUNCHD_PLIST_TEMPLATE = join(import.meta.dir, "..", "..", "templates", "dori-hc-launchd.plist");
 const RM_TRIES = 5;
 
 type Json = Record<string, unknown>;

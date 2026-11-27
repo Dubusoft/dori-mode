@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { resolveCredential } from "./credentials.ts";
 import { alertsChannelOf, deliveryConfigError } from "./config.ts";
 import { applyConfigPatch, configReloader, watchConfigFiles } from "./config-watch.ts";
+import { listHostRuntimes, localLanesOnHerdr, readHostRuntimes } from "./host-runtimes.ts";
 import { ensureLaneWorkspace, ManagedPanesError, saveLeadPane } from "./managed-panes.ts";
 import { readRunnerRows } from "./runner/hub.ts";
 import { RunnerGuardBoard } from "./runner/guard.ts";
@@ -292,6 +293,9 @@ export const supervisorSweeps = (
       // A bad deadline warns every round and the sweeps read per lane.
       if (!Number.isFinite(deps.tunables.sweepMachineDeadlineMs) || deps.tunables.sweepMachineDeadlineMs <= 0) throw new SuperviseError("sweepMachineDeadlineMs must be positive");
       const open = await deps.registry.open();
+      // Each round re-reads which runtimes this host uses (config reload, runner-config, lanes opened and closed), so the
+      // pane lists of this round and the tasks until the next one ask only those (no herdr call on an hc-only host).
+      listHostRuntimes(deps.config, home || homedir(), open);
       const machines = new Map<string, string | undefined>([
         [machineRunner(undefined), undefined], ...open.flatMap((l) => l.machine ? [[machineRunner(l.machine), l.machine] as const] : []), ...unavailable,
       ]);
@@ -364,6 +368,8 @@ export const supervisorSweeps = (
       if (!guardMachines || now - guardMachines.at >= MACHINE_LIST_TTL_MS) {
         const listed = await readGuardMachines(deps.run, deps.config.guardMachines, deps.config.stateDir);
         if (listed.ok) guardMachines = { at: now, list: listed.machines };
+        // A host without herdr has no saved herdr machines: the overrides and runner-install targets are the whole list.
+        else if (!readHostRuntimes(deps.config, home || homedir(), await deps.registry.open()).herdr) guardMachines = { at: now, list: listed.machines };
         else {
           guardMachines = { at: now - MACHINE_LIST_TTL_MS + MACHINE_LIST_RETRY_MS, list: guardMachines?.list ?? listed.machines };
           await emit(`SWEEP_WARN machine-guard herdr machine list failed: ${listed.detail}`);
@@ -459,6 +465,7 @@ const pause: Pause = (ms, signal) => new Promise<void>((resolve) => {
  * The supervisor owns the lead pane and the lanes workspace: before its tasks start it recreates a lead pane that is
  * missing (none recorded, or herdr lost it) and finds or creates the lanes workspace, both recorded in dori state. A herdr
  * failure here is logged and left to the lead-pane repair retries and to the next launch, which ensures the workspace again.
+ * When the local runner opens its lanes on hc (host-runtimes.ts localLanesOnHerdr) no lanes workspace is looked up.
  */
 const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promise<FlowDeps> => {
   let config = deps.config;
@@ -468,6 +475,7 @@ const ensureManagedPanes = async (deps: FlowDeps, supervisor: Supervisor): Promi
   } catch (error) {
     console.error(`LEAD_PANE_ENSURE_FAILED ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (!localLanesOnHerdr()) return { ...deps, config };
   try {
     const laneWorkspace = await ensureLaneWorkspace(deps.run, config.stateDir, config.leadCwd, (line) => { console.log(line); });
     config = { ...config, laneWorkspace };
@@ -1002,6 +1010,9 @@ export const supervise = async (
         });
       },
     }));
+    // Before the first pane list (the lead-pane repair below): an hc-only host must not list herdr panes.
+    // An unreadable registry leaves config and runner-config to decide until the first sweep round.
+    listHostRuntimes(deps.config, process.env.HOME || homedir(), await deps.registry.open().catch(() => []));
     deps = await ensureManagedPanes(deps, supervisor);
     const ops = scheduleOps = probe.step("schedules", () => openOperations(deps.config));
     const home = process.env.HOME ?? "";

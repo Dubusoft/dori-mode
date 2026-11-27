@@ -15,11 +15,12 @@ import { MEMORY_FILE, resolveMemoryRepo } from "./memory-check.ts";
 import { fetchHttp, type Http } from "./messenger/http.ts";
 import { paneRow } from "./panes.ts";
 import { runtimeOfPane } from "./runtime/index.ts";
-import { HC_INSTALL_URL, HC_MIN_VERSION, hcVersion, versionAtLeast } from "./runtime/hc.ts";
+import { HC_CORE_UNIT, HC_INSTALL_URL, HC_MIN_VERSION, hcVersion, versionAtLeast } from "./runtime/hc.ts";
+import { hostServices, type HostRuntimes, listHostRuntimes, runtimesNote } from "./host-runtimes.ts";
 import type { RecoveryLane } from "./recover.ts";
 import { Registry, statusOf } from "./registry.ts";
 import { type Clock, realClock, type Runner, run } from "./run.ts";
-import { LEGACY_PRESENCE, SERVICES, unitState } from "./status.ts";
+import { LEGACY_PRESENCE, unitState } from "./status.ts";
 import { openOperations } from "./operations.ts";
 import { checkRunnerDir, defaultRunnerDir, RUNNER_PATHS } from "./runner/fs-safety.ts";
 import { HERDR_ELEVATED_FIX, herdrUnitInstalled } from "./runner/herdr-watch.ts";
@@ -70,14 +71,18 @@ const MESSAGE_CONTENT_LIMITED = 1 << 19;
 const RESTART = "systemctl --user restart dori-supervisor.service";
 const LEAD_WAKE_WARNING_THRESHOLD = 20;
 
-const units = async (d: DoctorDeps): Promise<Check[]> => {
+/**
+ * The lead host's units (host-runtimes.ts hostServices): herdr-server only while herdr is used here, hc-core while hc is. hc-core
+ * is a oneshot that hands the core to hc's own transient units, so enabled is OK whatever its active state.
+ */
+const units = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
   const checks: Check[] = [];
-  const [herdrUnit, supUnit] = await Promise.all(SERVICES.map((name) => unitState(d.run, name)));
+  const states = await Promise.all(hostServices(rt).map((name) => unitState(d.run, name)));
   const [legacy, procs] = await Promise.all([unitState(d.run, LEGACY_PRESENCE), d.run(["pgrep", "-f", "(dori|cli\\.ts) presence"], T)]);
-  for (const u of [herdrUnit, supUnit]) {
-    if (!u) continue;
+  for (const u of states) {
     const id = `unit ${u.name.replace(/\.service$/, "")}`;
-    if (u.enabled === "enabled" && u.active === "active") checks.push(ok(id, "enabled, active"));
+    if (u.name === HC_CORE_UNIT && u.enabled === "enabled") checks.push(ok(id, `enabled, ${u.active}`));
+    else if (u.enabled === "enabled" && u.active === "active") checks.push(ok(id, "enabled, active"));
     else if (u.enabled === "not-found" || u.active === "unknown") checks.push(fail(id, `not installed (${u.enabled}/${u.active})`, "dori setup --autostart"));
     else checks.push(fail(id, `${u.enabled}, ${u.active}`, `systemctl --user enable --now ${u.name}`));
   }
@@ -325,7 +330,9 @@ export const herdrFix = (d: Pick<DoctorDeps, "home" | "exists">): string => {
     : `on the lead host: dori runner install --machine ${label} (installs the herdr unit)`;
 };
 
-const herdr = async (d: DoctorDeps): Promise<Check[]> => {
+/** This host's herdr server, only while herdr is used here (host-runtimes.ts); otherwise one OK row saying why not. */
+const herdr = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
+  if (!rt.herdr) return [ok("herdr", `not used on this host (${runtimesNote(rt)})`)];
   const up = await d.run(["herdr", "workspace", "list"], T);
   if (up.code !== 0) return [fail("herdr", "server not reachable", herdrFix(d))];
   const procs = await d.run(["pgrep", "-f", "herdr server"], T);
@@ -348,11 +355,12 @@ const paths = async (d: DoctorDeps): Promise<Check[]> => {
 };
 
 /**
- * The lead pane and lanes workspace the supervisor manages (dori state, not the config): each must exist in herdr. One
- * that is missing is a WARN, since the supervisor creates it at start and a launch re-creates the lanes workspace.
+ * The lead pane and lanes workspace the supervisor manages (dori state, not the config): the pane must exist in its
+ * runtime and, while herdr is used on this host, the lanes workspace in herdr (a host without herdr has none). One that
+ * is missing is a WARN, since the supervisor creates it at start and a launch re-creates the lanes workspace.
  * Legacy config keys naming them are reported as ignored.
  */
-const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
+const managedPanes = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
   const c = d.config;
   const where = managedPanesPath(c.stateDir);
   const checks: Check[] = [];
@@ -364,22 +372,24 @@ const managedPanes = async (d: DoctorDeps): Promise<Check[]> => {
   checks.push(...await leadRuntime(d));
   const restart = "systemctl --user restart dori-supervisor.service";
   if (!c.leadPane) checks.push(warn("leadPane", `no lead pane recorded in ${where}`, restart));
-  if (!c.laneWorkspace) checks.push(warn("lanes workspace", `no lanes workspace recorded in ${where}`, restart));
-  if (!c.leadPane && !c.laneWorkspace) return checks;
+  const laneWorkspace = rt.herdr ? c.laneWorkspace : "";
+  if (rt.herdr && !laneWorkspace) checks.push(warn("lanes workspace", `no lanes workspace recorded in ${where}`, restart));
+  if (!c.leadPane && !laneWorkspace) return checks;
+  const leadRuntimeKind = c.leadPane ? runtimeOfPane(c.leadPane) : "herdr";
   try {
     if (c.leadPane) {
       const found = (await paneRow(d.run, c.leadPane)) !== undefined;
       const runtime = runtimeOfPane(c.leadPane);
       checks.push(found ? ok("leadPane", `${c.leadPane} exists in ${runtime}`) : fail("leadPane", `${c.leadPane} is not a ${runtime} pane`, "dori lead-restart"));
     }
-    if (c.laneWorkspace) {
+    if (laneWorkspace) {
       const listed = await d.run(["herdr", "workspace", "list"], T);
       let found = false;
       try { found = listed.code === 0 && (JSON.parse(listed.out) as { result?: { workspaces?: { workspace_id?: string }[] } }).result?.workspaces?.some((w) => w.workspace_id === c.laneWorkspace) === true; } catch { found = false; }
       checks.push(found ? ok("lanes workspace", `${c.laneWorkspace} exists in herdr`) : warn("lanes workspace", `${c.laneWorkspace} is not a herdr workspace; the next launch or supervisor start finds or creates one`, restart));
     }
   } catch {
-    checks.push(fail("leadPane", "cannot list herdr panes", "systemctl --user start herdr-server.service"));
+    checks.push(fail("leadPane", `cannot list ${leadRuntimeKind} panes`, leadRuntimeKind === "hc" ? "hc server start" : "systemctl --user start herdr-server.service"));
   }
   return checks;
 };
@@ -404,7 +414,7 @@ const leadRuntime = async (d: DoctorDeps): Promise<Check[]> => {
 
 const isDiscord = (d: DoctorDeps): boolean => Boolean(d.config.discord) || d.config.discordChannels.length > 0 || d.token !== undefined;
 
-const config = async (d: DoctorDeps): Promise<Check[]> => {
+const config = async (d: DoctorDeps, rt: HostRuntimes): Promise<Check[]> => {
   if (d.configError) return [fail("config", `${d.configPath} does not load: ${d.configError}`, "fix the JSON, or dori setup")];
   if (!d.exists(d.configPath)) return [fail("config", `${d.configPath} is missing`, "dori setup")];
   const c = d.config;
@@ -424,7 +434,7 @@ const config = async (d: DoctorDeps): Promise<Check[]> => {
   if (blank.length) checks.push(warn("lead command", `${blank.join(", ")} set but blank; the lead uses the lane default`, `set a value or remove ${blank.join(", ")} from ${d.configPath}`));
   const pending = pendingLeadRestart(c.stateDir);
   if (pending) checks.push(warn("lead restart", `request ${pending.id}: ${pending.models.map((m) => m.thinking ? `${m.model} (thinking ${m.thinking})` : m.model).join(" -> ")}; applies at the next idle boundary, even below the context cap`, "wait for the lead to become idle; the supervisor applies the queued restart"));
-  checks.push(...await managedPanes(d));
+  checks.push(...await managedPanes(d, rt));
   return checks;
 };
 
@@ -710,8 +720,22 @@ export const secretStoreChecks = async (d: Pick<DoctorDeps, "config" | "home" | 
   return [ok(id, entries.length ? `${entries.length} secrets` : "no secrets stored")];
 };
 
-export const runDoctor = async (d: DoctorDeps): Promise<Check[]> =>
-  (await Promise.all([units(d), herdr(d), paths(d), config(d), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), Promise.resolve(homeEntries(d)), secretStoreChecks(d)])).flat();
+/**
+ * host-runtimes.ts for this host: config leadRuntime and leadPane, the local runner-config and the open local lanes (none
+ * when unreadable). Also the runtimes this run's pane lists ask (listHostRuntimes), so a host without herdr lists no herdr.
+ */
+const doctorRuntimes = async (d: DoctorDeps): Promise<HostRuntimes> => {
+  const registry = new Registry(d.config.stateDir);
+  let lanes: Awaited<ReturnType<Registry["open"]>> = [];
+  // An unreadable registry is the lane recovery check's report; the runtimes then follow config and runner-config alone.
+  if (d.exists(registry.dir)) try { lanes = await registry.open(); } catch { lanes = []; }
+  return listHostRuntimes(d.config, d.home, lanes);
+};
+
+export const runDoctor = async (d: DoctorDeps): Promise<Check[]> => {
+  const rt = await doctorRuntimes(d);
+  return (await Promise.all([units(d, rt), herdr(d, rt), paths(d), config(d, rt), Promise.resolve(configSources(d)), discord(d), Promise.resolve(gateway(d)), Promise.resolve(issues(d)), Promise.resolve(leadWakes(d)), Promise.resolve(memory(d)), tools(d), recovery(d), Promise.resolve(runnerChecks(d)), sandbox(d), Promise.resolve(homeEntries(d)), secretStoreChecks(d)])).flat();
+};
 
 export const doctorExit = (checks: readonly Check[]): number => (checks.some((c) => c.level === "FAIL") ? 1 : 0);
 

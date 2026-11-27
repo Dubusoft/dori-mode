@@ -1,0 +1,16 @@
+[Unit]
+Description=herdr-core (hc) core autostart (the lanes of this host live in it)
+# Installed by `dori runner install` (and `dori setup` on a lead host on hc). `hc server start` hands the core to its own
+# transient systemd-run units (hc-serve-*, hc-hold-*), which do not come back after a reboot by themselves; this unit
+# runs it once at login/boot. It is safe while a core already runs, and stopping this unit never stops the core.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h
+# PATH comes from the user's login shell, as the herdr unit's does.
+Environment=PATH=@PATH@
+ExecStart=@HC_BIN@ server start
+
+[Install]
+WantedBy=default.target

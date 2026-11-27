@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { HerdrWatch, herdrProcess, startManagedHerdr } from "../src/runner/herdr-watch.ts";
+import { HerdrWatch, herdrInUse, herdrProcess, startManagedHerdr } from "../src/runner/herdr-watch.ts";
 import { HerdrDownInference, type HerdrRecord } from "../src/runner/herdr-down.ts";
 import { decodeFrame, encodeFrame, runnerEvent, type RunnerEventType } from "../src/runner/protocol.ts";
 import { eventClass } from "../src/event-policy.ts";
@@ -170,4 +170,46 @@ test("supervisor uses explicit proto 4 health and routes start outcomes", () => 
   expect(infer.event("lab", elevated)?.line).toStartWith("HERDR_ELEVATED machine=lab lane recovery on this machine is held");
   expect(store.get("lab")?.state).toBe("elevated");
   expect(eventClass("HERDR_ELEVATED machine=lab")).toBe("lead-urgent");
+});
+
+test("herdr is in use unless laneRuntime is hc and no lane record sits on a herdr pane", () => {
+  expect(herdrInUse(undefined, [])).toBe(true);
+  expect(herdrInUse("herdr", ["hc:t1@1"])).toBe(true);
+  expect(herdrInUse("hc", [])).toBe(false);
+  expect(herdrInUse("hc", ["hc:t1@1", "hc:t2@2"])).toBe(false);
+  expect(herdrInUse("hc", ["hc:t1@1", "w1-p3"])).toBe(true);
+});
+
+test("while herdr is not in use the watch never reads, starts or reports herdr and counts hc terminals; the gate is read at each sample", async () => {
+  let active = false;
+  const calls: string[] = [];
+  const events: [RunnerEventType, unknown][] = [];
+  let at = 0;
+  let starts = 0;
+  const watch = new HerdrWatch({
+    run: async (argv) => {
+      calls.push(argv.join(" "));
+      if (argv[0] === "hc") return argv.includes("ls") ? ok('{"terminals":[{"address":"t1","state":"live"},{"address":"t2","state":"live"}]}') : ok(`{"address":"${argv.at(-1)}","state":"live"}`);
+      return bad();
+    },
+    now: () => 1_000_000 + at, monotonic: () => at,
+    process: async () => ({ running: false }),
+    start: async () => { starts++; return { ok: true, detail: "started" }; },
+    publish: (type, body) => { events.push([type, body]); },
+    active: () => active,
+    platform: "win32",
+  });
+  await watch.boot();
+  for (at = 0; at <= 90_000; at += 30_000) expect(await watch.sample()).toBe(2);
+  expect(watch.snapshot()).toBeUndefined();
+  expect(events).toEqual([]);
+  expect(starts).toBe(0);
+  expect(calls.some((c) => c.startsWith("herdr"))).toBe(false);
+  // A policy reload back to herdr (or a herdr lane) turns the watch on at the next sample.
+  active = true;
+  await watch.sample(); at += 30_000; await watch.sample();
+  expect(watch.snapshot()?.state).toBe("down");
+  expect(starts).toBe(1);
+  active = false;
+  expect(watch.snapshot()).toBeUndefined();
 });

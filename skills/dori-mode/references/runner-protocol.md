@@ -493,8 +493,9 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
 
 **herdr.** The worker's herdr gets a unit of its own, so it is up after a reboot and restarted after a crash:
 
-- `herdr` must be on the PATH of the user's login shell (`$SHELL -lc`), read before anything is written; without it
-  the install stops with `RUNNER_INSTALL_NO_HERDR`. That login PATH and `$SHELL` become the herdr unit's `PATH` and
+- `herdr` and `hc` are both looked up on the PATH of the user's login shell (`$SHELL -lc`), read before anything is
+  written; only when neither is found does the install stop with `RUNNER_INSTALL_NO_HERDR` (exit 7). A host with only
+  `hc` gets no herdr unit at all. That login PATH and `$SHELL` become the herdr unit's `PATH` and
   `SHELL`, which every lane shell herdr opens inherits.
 - On Linux, `~/.config/systemd/user/herdr-server.service` (from `templates/herdr-runner-remote.service`) runs
   `herdr server` with `Restart=on-failure`, like the lead host's unit but without its `OnFailure=` hook. The runner
@@ -512,11 +513,18 @@ the worker, leaves herdr running, and only then revokes the runner and drops it 
   Linux the runner is then restarted with `--job-mode=ignore-dependencies`, so its `Wants=` does not start the herdr
   unit beside it. Only when no herdr answers is the unit started (`systemctl --user start`, after `reset-failed`; on
   macOS by loading the agent).
+- With `hc` on the PATH, the install also sets up the hc core's autostart, before the runner restart. On Linux it
+  writes `~/.config/systemd/user/hc-core.service` (from `templates/hc-core.service`, a oneshot `hc server start`)
+  and runs `systemctl --user enable hc-core.service` and `start hc-core.service`; a failure exits 6. On macOS it
+  writes `~/Library/LaunchAgents/com.dori.hc.plist` (from `templates/dori-hc-launchd.plist`, `hc serve`,
+  `KeepAlive`, output to `~/.dori/runner/hc.log`) and enables and bootstraps it only when `launchctl print` doesn't
+  find `com.dori.hc` in the runner's domain. It never boots it out, since that would end every hc lane.
+- The script reports both runtimes, `DORI_HERDR started|managed|unmanaged|absent` and then `DORI_HC enabled|absent`.
 
-It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256> herdr=<started|managed|unmanaged> (...)`
-(`unmanaged`: a herdr not from the unit is running, and the unit takes over when it stops), or exits 1 with
+It prints `RUNNER_INSTALLED runner=<label> version=<first 12 hex of the bundle's sha256> herdr=<started|managed|unmanaged|absent> hc=<enabled|absent> (...)`
+(`unmanaged`: a herdr not from the unit is running, and the unit takes over when it stops; `hc=enabled`: its core starts at boot), or exits 1 with
 `RUNNER_INSTALL_UNREACHABLE` (ssh failed or timed out), `RUNNER_INSTALL_UNSUPPORTED` (neither Linux nor macOS, or no POSIX shell),
-`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HERDR` (no `herdr` on the
+`RUNNER_INSTALL_NO_BUN` (on macOS: none found and the download failed), `RUNNER_INSTALL_NO_HERDR` (neither `herdr` nor `hc` on the
 login PATH), `RUNNER_INSTALL_ENROLL_FAILED` or `RUNNER_INSTALL_FAILED` (with the systemd, linger or launchd step
 named when that failed).
 

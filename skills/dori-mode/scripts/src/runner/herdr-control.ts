@@ -1,8 +1,8 @@
 import { existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { listPanes } from "../panes.ts";
 import type { Runner } from "../run.ts";
+import { sessionRuntime } from "../runtime/index.ts";
 import { writeRunnerFile } from "./fs-safety.ts";
 import {
   HERDR_ELEVATED_FIX, herdrElevatedError, herdrProcess, herdrUnitInstalled, launchdDomain, startManagedHerdr, winHerdrServers,
@@ -71,7 +71,7 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
   const state = async (): Promise<{ state: HerdrHealth["state"]; instance?: string }> => {
     let up = true;
     let failure = "";
-    try { await listPanes(deps.run); } catch (e) { up = false; failure = e instanceof Error ? e.message : String(e); }
+    try { await sessionRuntime(deps.run, "herdr").listPanes(); } catch (e) { up = false; failure = e instanceof Error ? e.message : String(e); }
     if (!up && herdrElevatedError(failure, os)) return { state: "elevated" };
     const proc = await herdrProcess(deps.run, { platform: os, ...(deps.user ? { user: deps.user } : {}) });
     if (up) return { state: "up", ...(proc.instance ? { instance: proc.instance } : {}) };
@@ -131,7 +131,7 @@ export const hostHerdr = (deps: HerdrControlDeps): ((action: HerdrAction) => Pro
     if (!started) throw new Error("HERDR_UNMANAGED no herdr unit is installed on this host; dori runner install --machine <label> installs one");
     if (!started.ok) throw new Error(`HERDR_START_FAILED ${started.detail}`);
     for (const until = deps.now() + HERDR_UP_WAIT_MS; ;) {
-      try { await listPanes(deps.run); return os === "win32" ? "server started" : "unit started"; } catch { /* not answering yet */ }
+      try { await sessionRuntime(deps.run, "herdr").listPanes(); return os === "win32" ? "server started" : "unit started"; } catch { /* not answering yet */ }
       if (deps.now() >= until) throw new Error(`HERDR_START_UNCONFIRMED the unit started but herdr did not answer within ${HERDR_UP_WAIT_MS / 1000} s`);
       await deps.sleep(POLL_MS);
     }

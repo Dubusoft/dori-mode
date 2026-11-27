@@ -81,6 +81,20 @@ test("status lists working lanes with model, age and last progress; paused and c
   expect(text).not.toContain("beta");
 });
 
+test("status lists hc-core instead of herdr-server on a lead host on hc, and herdr-server again while a local lane sits on herdr", async () => {
+  const f = await fixture();
+  const runnerDir = join(f.dir, "runner");
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(join(runnerDir, "runner-config.json"), JSON.stringify({ laneRuntime: "hc" }));
+  const deps: StatusDeps = { ...f.deps, runnerDir, config: { ...f.deps.config, leadRuntime: "hc", leadPane: "hc:t1" } };
+  const s = await collectStatus(deps);
+  expect(s.services.map((u) => u.name)).toEqual(["hc-core.service", "dori-supervisor.service", "dori-presence.service"]);
+  expect(renderStatus(s)).toContain("\n■ 서비스\n- hc-core: 실행 중\n- dori-supervisor: 실행 중\n");
+  expect(f.calls.some((c) => c.includes("herdr-server"))).toBe(false);
+  await f.registry.write(lane("old", { pane: "w1:p3" }));
+  expect((await collectStatus(deps)).services.map((u) => u.name)).toEqual(["herdr-server.service", "hc-core.service", "dori-supervisor.service", "dori-presence.service"]);
+});
+
 test("status shows services, pending waits, watched repos with poll time and failures, and the gateway", async () => {
   const f = await fixture();
   writeFileSync(join(f.dir, "waits.json"), JSON.stringify([{ key: "ci-pr-7", until: "merged o/r#7", note: "n", deadline: NOW + 1 }]));

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
-import { sessionRuntime } from "../runtime/index.ts";
+import { runtimeOfPane, sessionRuntime } from "../runtime/index.ts";
 import type { Runner } from "../run.ts";
 import { GUARD_SAMPLE_MS } from "./guard.ts";
 import type { HerdrHealth, RunnerEventBodies, RunnerEventType } from "./protocol.ts";
@@ -174,6 +174,23 @@ export type HerdrWatchDeps = {
   readonly paused?: () => boolean;
   /** The host OS (default process.platform): an elevated-server refusal is read only on win32. */
   readonly platform?: string;
+  /**
+   * Whether herdr is in use on this host (default always), asked at every boot, sample and snapshot because a policy
+   * reload can change it: the runner says no while its policy's laneRuntime is hc and no lane record sits on a herdr
+   * pane (`herdrInUse`). While not in use herdr is never read, started or reported (no snapshot), and the pane count is
+   * hc's terminal count instead.
+   */
+  readonly active?: () => boolean;
+};
+
+/**
+ * Whether a runner host uses herdr: its lanes open on herdr (`laneRuntime` unset or herdr), or one of its lane records
+ * still sits on a herdr pane (an hc host keeps watching herdr until its last herdr lane is gone).
+ */
+export const herdrInUse = (laneRuntime: string | undefined, lanePanes: Iterable<string>): boolean => {
+  if (laneRuntime !== "hc") return true;
+  for (const pane of lanePanes) if (runtimeOfPane(pane) === "herdr") return true;
+  return false;
 };
 
 export class HerdrWatch {
@@ -191,7 +208,10 @@ export class HerdrWatch {
     this.start = deps.start ?? (() => startManagedHerdr({ run: deps.run }));
   }
 
-  snapshot(): HerdrHealth | undefined { return this.health; }
+  /** herdr's last state; undefined before the first sample and whenever herdr is not in use on this host. */
+  snapshot(): HerdrHealth | undefined { return this.active() ? this.health : undefined; }
+
+  private active(): boolean { return this.deps.active?.() ?? true; }
 
   /**
    * Once at runner start on Windows: start the server right away when none runs, unless `dori runner herdr stop` holds
@@ -200,7 +220,7 @@ export class HerdrWatch {
    * regular watch only starts it after failures spanning 30 s. Elsewhere the herdr unit's manager starts it at boot.
    */
   async boot(): Promise<void> {
-    if ((this.deps.platform ?? process.platform) !== "win32" || (this.deps.paused?.() ?? false)) return;
+    if ((this.deps.platform ?? process.platform) !== "win32" || (this.deps.paused?.() ?? false) || !this.active()) return;
     try { await sessionRuntime(this.deps.run, "herdr").listPanes(); return; } catch { /* not answering: is there a server at all? */ }
     if ((await this.process()).running) return;
     const result = await this.start();
@@ -209,11 +229,21 @@ export class HerdrWatch {
     this.deps.publish("herdr.start", result);
   }
 
-  /** Called by the guard's existing pane count read, so the watch adds no pane-list requests. */
+  /**
+   * Called by the guard's existing pane count read, so the watch adds no pane-list requests. While herdr is not in use
+   * it counts hc's terminals instead (-1 when hc does not answer) and forgets herdr's state, so herdr coming back into
+   * use starts from a fresh `up`/`down` reading.
+   */
   async sample(): Promise<number> {
     const at = this.deps.monotonic();
     const waking = this.lastTick !== undefined && at - this.lastTick > 3 * GUARD_SAMPLE_MS;
     this.lastTick = at;
+    if (!this.active()) {
+      this.health = undefined;
+      this.misses = 0;
+      this.failedAt = undefined;
+      try { return (await sessionRuntime(this.deps.run, "hc").listPanes()).length; } catch { return -1; }
+    }
     let panes: number;
     let failure = "";
     try { panes = (await sessionRuntime(this.deps.run, "herdr").listPanes()).length; } catch (e) { panes = -1; failure = e instanceof Error ? e.message : String(e); }

@@ -1,19 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listPanes, readScreen } from "../src/panes.ts";
 import type { Ran } from "../src/run.ts";
 import { ensureHc, HC_MIN_VERSION, hcRuntime } from "../src/runtime/hc.ts";
-import { unlistRuntime } from "../src/runtime/index.ts";
-import { RunnerLanes } from "../src/runner/lanes.ts";
+import { setListedRuntimes } from "../src/runtime/index.ts";
+import { LANES_FILE, RunnerLanes } from "../src/runner/lanes.ts";
 import { parsePolicy } from "../src/runner/policy.ts";
 import { resolveSession } from "../src/session-id.ts";
 import { fakeClock } from "./fakes.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
-  unlistRuntime("hc");
+  setListedRuntimes({ herdr: true, hc: false });
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -73,6 +73,21 @@ test("resolveSession finds the agent under an hc terminal's shell, as under a he
   expect(hc.calls).toContainEqual(["hc", "--json", "get", "t2"]);
 });
 
+test("with herdr unlisted and hc listed, listPanes never invokes the herdr binary", async () => {
+  const hc = fakeHc();
+  const calls: string[][] = [];
+  const run = async (argv: readonly string[]): Promise<Ran> => {
+    calls.push([...argv]);
+    return argv[0] === "herdr" ? fail("herdr: command not found", 127) : hc.run(argv);
+  };
+  hc.terminals.set("t1", { address: "t1", state: "live", created_ms: 1 });
+  setListedRuntimes({ herdr: false, hc: true });
+  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["hc:t1"]);
+  setListedRuntimes({ herdr: false, hc: false });
+  expect(await listPanes(run)).toEqual([]);
+  expect(calls.some((argv) => argv[0] === "herdr")).toBe(false);
+});
+
 test("listPanes gathers hc terminals only once hc is listed, and a pane id picks the runtime that reads it", async () => {
   const hc = fakeHc();
   const run = async (argv: readonly string[]): Promise<Ran> =>
@@ -80,13 +95,19 @@ test("listPanes gathers hc terminals only once hc is listed, and a pane id picks
   hc.terminals.set("t1", { address: "t1", state: "live", created_ms: 1 });
   expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["w1:p1"]);
   expect(hc.calls).toEqual([]);
+  const runnerDir = mkdtempSync(join(tmpdir(), "runtime-hc-"));
+  dirs.push(runnerDir);
   const lanes = new RunnerLanes({
-    runnerDir: mkdtempSync(join(tmpdir(), "runtime-hc-")), run, clock: fakeClock(0), publish: () => {},
+    runnerDir, run, clock: fakeClock(0), publish: () => {},
     policy: { agents: {}, allowedRoots: [], sandbox: "optional", jobs: "allow", laneRuntime: "hc" },
   });
   expect(lanes.records()).toEqual({});
-  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["w1:p1", "hc:t1"]);
+  // laneRuntime hc with no herdr lane: herdr is not in use (herdrInUse), so its panes are no longer listed.
+  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["hc:t1"]);
   expect(await readScreen(run, "hc:t1", 1)).toBe("three");
+  // A lane still on a herdr pane keeps herdr listed, read at the next listing with no sync call.
+  writeFileSync(join(runnerDir, LANES_FILE), JSON.stringify({ k: { key: "k", pane: "w1:p1" } }));
+  expect((await listPanes(run)).map((p) => p.pane_id)).toEqual(["w1:p1", "hc:t1"]);
 });
 
 test("ensureHc installs a missing hc, updates an old one in place, and refuses with the fix when neither works", async () => {

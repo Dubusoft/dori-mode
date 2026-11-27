@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -157,7 +157,9 @@ export const setupMain = async (args: readonly string[]): Promise<number> => {
         envPath: join(home, ".dori", "env"),
         unitDir: join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "systemd", "user"),
         templatesDir: join(import.meta.dir, "..", "templates"),
-        bins: { dori: Bun.which("dori") ?? join(home, ".bun", "bin", "dori"), herdr: Bun.which("herdr") ?? undefined, shell: process.env.SHELL || "/bin/bash" },
+        bins: { dori: Bun.which("dori") ?? join(home, ".bun", "bin", "dori"), herdr: Bun.which("herdr") ?? undefined,
+          // hc's installer puts it in ~/.local/bin, which a login PATH may not hold yet.
+          hc: Bun.which("hc") ?? (existsSync(join(home, ".local", "bin", "hc")) ? join(home, ".local", "bin", "hc") : undefined), shell: process.env.SHELL || "/bin/bash" },
       },
       input,
     );
